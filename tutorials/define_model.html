@@ -168,6 +168,7 @@
 <li class="toctree-l1 current has-children"><a class="reference internal" href="../tutorial.html">Basic Tutorials</a><input checked="" class="toctree-checkbox" id="toctree-checkbox-1" name="toctree-checkbox-1" role="switch" type="checkbox"/><label for="toctree-checkbox-1"><div class="visually-hidden">Toggle child pages in navigation</div><i class="icon"><svg><use href="#svg-arrow-right"></use></svg></i></label><ul class="current">
 <li class="toctree-l2 current current-page"><a class="current reference internal" href="#">Define Your Model</a></li>
 <li class="toctree-l2"><a class="reference internal" href="mps_mpo.html">MPS and MPO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quantum_number.html">Quantum Numbers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="compress_mps.html">Compressing MPS</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ttn_basic.html">Basics of Tree Tensor Networks</a></li>
 </ul>
@@ -504,11 +505,11 @@ div.rendered_html tbody tr:hover {
 </div>
 <div class="output_area stderr docutils container">
 <div class="highlight"><pre>
-2024-07-12 11:54:57,317[INFO] Use NumPy as backend
-2024-07-12 11:54:57,318[INFO] numpy random seed is 9012
-2024-07-12 11:54:57,319[INFO] random seed is 1092
-2024-07-12 11:54:57,330[INFO] Git Commit Hash: 9a327f63d43e99e633f35b00776fcc0a1c5b5f95
-2024-07-12 11:54:57,331[INFO] use 64 bits
+2024-10-18 18:06:50,222[INFO] Use NumPy as backend
+2024-10-18 18:06:50,223[INFO] numpy random seed is 9012
+2024-10-18 18:06:50,224[INFO] random seed is 1092
+2024-10-18 18:06:50,234[INFO] Git Commit Hash: 78f357ae99aca8f0016db0474caf2293f3b459ac
+2024-10-18 18:06:50,235[INFO] use 64 bits
 </pre></div></div>
 </div>
 <section id="Basics">
@@ -519,7 +520,7 @@ div.rendered_html tbody tr:hover {
 <li><p>The DOF at wich the operation is operated on, such as “spin 0”, “exiton 1”. In mathematical expression this is usually the subscript for an operator, i.e., <span class="math notranslate nohighlight">\(\hat X_0\)</span> or <span class="math notranslate nohighlight">\(\hat a^\dagger_1\)</span></p></li>
 <li><p>The factor or coefficient for the operator.</p></li>
 </ul>
-<p>There is an additional useful attributes that is sometimes quite useful: the quantum number.</p>
+<p>There is an additional useful attributes that is sometimes quite useful: the quantum number. The idea of quantum number will be described in detail in another tutorial.</p>
 <p><code class="docutils literal notranslate"><span class="pre">Op</span></code> are constructed from the above 4 attributes. The first 2 are necessary and the last 2 are optional.</p>
 <div class="nbinput docutils container">
 <div class="prompt highlight-none notranslate"><div class="highlight"><pre><span></span>[2]:
@@ -885,7 +886,9 @@ BasisHalfSpin(dof: (&#39;spin&#39;, 0), nbas: 2)
 </div>
 <div class="output_area stderr docutils container">
 <div class="highlight"><pre>
-2024-07-12 11:54:57,487[DEBUG] # of operator terms: 1
+2024-10-18 18:06:50,378[DEBUG] # of operator terms: 1
+2024-10-18 18:06:50,379[DEBUG] Input operator terms: 1
+2024-10-18 18:06:50,381[DEBUG] After combination of the same terms: 1
 </pre></div></div>
 </div>
 <div class="nboutput nblast docutils container">

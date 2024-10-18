@@ -12,7 +12,7 @@
         gtag('js', new Date());
         gtag('config', 'G-3HTENNM8CV');
     </script>
-    <link rel="index" title="Index" href="../genindex.html" /><link rel="search" title="Search" href="../search.html" /><link rel="next" title="Compressing MPS" href="compress_mps.html" /><link rel="prev" title="Define Your Model" href="define_model.html" />
+    <link rel="index" title="Index" href="../genindex.html" /><link rel="search" title="Search" href="../search.html" /><link rel="next" title="Quantum Numbers" href="quantum_number.html" /><link rel="prev" title="Define Your Model" href="define_model.html" />
 
     <meta name="generator" content="sphinx-5.3.0, furo 2022.09.29"/>
         <title>MPS and MPO - Renormalizer 0.1.0 documentation</title>
@@ -168,6 +168,7 @@
 <li class="toctree-l1 current has-children"><a class="reference internal" href="../tutorial.html">Basic Tutorials</a><input checked="" class="toctree-checkbox" id="toctree-checkbox-1" name="toctree-checkbox-1" role="switch" type="checkbox"/><label for="toctree-checkbox-1"><div class="visually-hidden">Toggle child pages in navigation</div><i class="icon"><svg><use href="#svg-arrow-right"></use></svg></i></label><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="define_model.html">Define Your Model</a></li>
 <li class="toctree-l2 current current-page"><a class="current reference internal" href="#">MPS and MPO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quantum_number.html">Quantum Numbers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="compress_mps.html">Compressing MPS</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ttn_basic.html">Basics of Tree Tensor Networks</a></li>
 </ul>
@@ -515,11 +516,11 @@ div.rendered_html tbody tr:hover {
 </div>
 <div class="output_area stderr docutils container">
 <div class="highlight"><pre>
-2024-07-12 11:55:00,344[INFO] Use NumPy as backend
-2024-07-12 11:55:00,345[INFO] numpy random seed is 9012
-2024-07-12 11:55:00,346[INFO] random seed is 1092
-2024-07-12 11:55:00,356[INFO] Git Commit Hash: 9a327f63d43e99e633f35b00776fcc0a1c5b5f95
-2024-07-12 11:55:00,357[INFO] use 64 bits
+2024-10-18 18:06:53,146[INFO] Use NumPy as backend
+2024-10-18 18:06:53,146[INFO] numpy random seed is 9012
+2024-10-18 18:06:53,147[INFO] random seed is 1092
+2024-10-18 18:06:53,157[INFO] Git Commit Hash: 78f357ae99aca8f0016db0474caf2293f3b459ac
+2024-10-18 18:06:53,158[INFO] use 64 bits
 </pre></div></div>
 </div>
 <p>First, construct all terms in the Hamiltonian in a <code class="docutils literal notranslate"><span class="pre">list</span></code> or <code class="docutils literal notranslate"><span class="pre">OpSum</span></code>.</p>
@@ -672,8 +673,8 @@ array([[0., 0., 0., 0., 0., 0., 0., 0.],
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-(&lt;Matrix at 0x7fef89bd7670 (1, 2, 2) float64&gt;,
- &lt;Matrix at 0x7fefa8601940 (2, 8, 1) float64&gt;)
+(&lt;Matrix at 0x7fc795e4be50 (1, 2, 2) float64&gt;,
+ &lt;Matrix at 0x7fc7b0ee3df0 (2, 8, 1) float64&gt;)
 </pre></div></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">Matrix</span></code> can be considered as a wrapper for <code class="docutils literal notranslate"><span class="pre">np.ndarray</span></code> with more metadata. The indices of the array are left virtual index, the physical index and the right virtual index. The underlaying matrix can be accessed via the <code class="docutils literal notranslate"><span class="pre">array</span></code> attribute.</p>
@@ -891,10 +892,10 @@ array([ 0.41298208, -0.00752657,  0.17205047,  0.13905035,  0.20172165,
 </div>
 <div class="output_area stderr docutils container">
 <div class="highlight"><pre>
-2024-07-12 11:55:00,507[DEBUG] # of operator terms: 3
-2024-07-12 11:55:00,508[DEBUG] symbolic mpo algorithm: qr
-2024-07-12 11:55:00,509[DEBUG] Input operator terms: 3
-2024-07-12 11:55:00,512[DEBUG] After combination of the same terms: 3
+2024-10-18 18:06:53,299[DEBUG] # of operator terms: 3
+2024-10-18 18:06:53,300[DEBUG] Input operator terms: 3
+2024-10-18 18:06:53,301[DEBUG] After combination of the same terms: 3
+2024-10-18 18:06:53,302[DEBUG] symbolic mpo algorithm: qr
 </pre></div></div>
 </div>
 <div class="nboutput nblast docutils container">
@@ -903,8 +904,8 @@ array([ 0.41298208, -0.00752657,  0.17205047,  0.13905035,  0.20172165,
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-(&lt;Matrix at 0x7fefa8601520 (1, 2, 2, 3) float64&gt;,
- &lt;Matrix at 0x7fef89bd7610 (3, 8, 8, 1) float64&gt;)
+(&lt;Matrix at 0x7fc795e59100 (1, 2, 2, 3) float64&gt;,
+ &lt;Matrix at 0x7fc7b0ed32e0 (3, 8, 8, 1) float64&gt;)
 </pre></div></div>
 </div>
 <p>Here the logging outputs that there are 3 terms in the Hamiltonian, since <span class="math notranslate nohighlight">\(\hat \sigma_z\)</span> with coefficient 0 is dropped automatically.</p>
@@ -959,7 +960,9 @@ array([ 0.41298208, -0.00752657,  0.17205047,  0.13905035,  0.20172165,
 </div>
 <div class="output_area stderr docutils container">
 <div class="highlight"><pre>
-2024-07-12 11:55:00,534[DEBUG] # of operator terms: 1
+2024-10-18 18:06:53,323[DEBUG] # of operator terms: 1
+2024-10-18 18:06:53,324[DEBUG] Input operator terms: 1
+2024-10-18 18:06:53,325[DEBUG] After combination of the same terms: 1
 </pre></div></div>
 </div>
 </section>
@@ -1063,12 +1066,12 @@ array([ 0.41298208, -0.00752657,  0.17205047,  0.13905035,  0.20172165,
       <footer>
         
         <div class="related-pages">
-          <a class="next-page" href="compress_mps.html">
+          <a class="next-page" href="quantum_number.html">
               <div class="page-info">
                 <div class="context">
                   <span>Next</span>
                 </div>
-                <div class="title">Compressing MPS</div>
+                <div class="title">Quantum Numbers</div>
               </div>
               <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
             </a>
