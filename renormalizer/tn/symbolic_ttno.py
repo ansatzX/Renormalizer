@@ -6,7 +6,7 @@ from renormalizer.mps.backend import np
 from renormalizer import Op, Model
 from renormalizer.model.basis import BasisSet
 from renormalizer.tn.treebase import BasisTree
-from renormalizer.mps.symbolic_mpo import _terms_to_table, _transform_table, _construct_symbolic_mpo_one_site, OpTuple
+from renormalizer.mps.symbolic_mpo import _terms_to_table, _construct_symbolic_mpo_one_site, OpTuple
 
 
 logger = logging.getLogger(__name__)
@@ -52,14 +52,12 @@ def symbolic_mo_to_numeric_mo_general(basis_sets: List[BasisSet], mo, dtype):
     return np.moveaxis(mo_tensor, mo.ndim - 1, -1)
 
 
-def construct_symbolic_mpo(tn: BasisTree, terms: List[Op], const: float = 0):
-    algo = "Hopcroft-Karp"
+def construct_symbolic_ttno(tn: BasisTree, terms: List[Op], const: float = 0, algo: str = "qr"):
     nodes = tn.postorder_list()
     basis = list(chain(*[n.basis_sets for n in nodes]))
     model = Model(basis, [])
     qn_size = model.qn_size
-    table, factor = _terms_to_table(model, terms, const)
-    table, factor, primary_ops = _transform_table(table, factor)
+    table, primary_ops, factor = _terms_to_table(model, terms, const)
 
     dummy_in_ops = [[OpTuple([0], qn=np.zeros(qn_size, dtype=int), factor=1)]]
     out_ops: List[List[OpTuple]]

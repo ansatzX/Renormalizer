@@ -271,12 +271,12 @@ class Mpo(MatrixProduct):
         if len(terms) == 0:
             raise ValueError("Terms all have factor 0.")
 
-        table, factor = _terms_to_table(model, terms, -self.offset)
+        table, primary_ops, factor = _terms_to_table(model, terms, -self.offset)
 
         self.dtype = factor.dtype
 
-        mpo_symbol, self.qn, self.qntot, self.qnidx, self.symbolic_out_ops_list, self.primary_ops \
-            = construct_symbolic_mpo(table, factor, algo=algo)
+        self.symbolic_mpo, self.qn, self.qntot, self.qnidx, self.symbolic_out_ops_list, self.primary_ops \
+            = construct_symbolic_mpo(table, primary_ops, factor, algo=algo)
         # from renormalizer.mps.symbolic_mpo import _format_symbolic_mpo
         # print(_format_symbolic_mpo(mpo_symbol))
         self.model = model
@@ -285,7 +285,7 @@ class Mpo(MatrixProduct):
         # evaluate the symbolic mpo
         assert model.basis is not None
 
-        for impo, mo in enumerate(mpo_symbol):
+        for impo, mo in enumerate(self.symbolic_mpo):
             mo_mat = symbolic_mo_to_numeric_mo(model.basis[impo], mo, self.dtype)
             self.append(mo_mat)
 
