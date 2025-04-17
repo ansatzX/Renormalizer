@@ -168,6 +168,7 @@
 <li class="toctree-l1 current has-children"><a class="reference internal" href="../tutorial.html">Basic Tutorials</a><input checked="" class="toctree-checkbox" id="toctree-checkbox-1" name="toctree-checkbox-1" role="switch" type="checkbox"/><label for="toctree-checkbox-1"><div class="visually-hidden">Toggle child pages in navigation</div><i class="icon"><svg><use href="#svg-arrow-right"></use></svg></i></label><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="define_model.html">Define Your Model</a></li>
 <li class="toctree-l2"><a class="reference internal" href="mps_mpo.html">MPS and MPO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="nuclear_basis.html">Nuclear Basis Set</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quantum_number.html">Quantum Numbers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="compress_mps.html">Compressing MPS</a></li>
 <li class="toctree-l2 current current-page"><a class="current reference internal" href="#">Basics of Tree Tensor Networks</a></li>
@@ -497,8 +498,8 @@ div.rendered_html tbody tr:hover {
 <div class="prompt highlight-none notranslate"><div class="highlight"><pre><span></span>[1]:
 </pre></div>
 </div>
-<div class="input_area highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">renormalizer</span> <span class="kn">import</span> <span class="n">BasisHalfSpin</span>
-<span class="kn">from</span> <span class="nn">renormalizer.tn</span> <span class="kn">import</span> <span class="n">TreeNodeBasis</span><span class="p">,</span> <span class="n">BasisTree</span>
+<div class="input_area highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">renormalizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">BasisHalfSpin</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">renormalizer.tn</span><span class="w"> </span><span class="kn">import</span> <span class="n">TreeNodeBasis</span><span class="p">,</span> <span class="n">BasisTree</span>
 </pre></div>
 </div>
 </div>
@@ -507,11 +508,11 @@ div.rendered_html tbody tr:hover {
 </div>
 <div class="output_area stderr docutils container">
 <div class="highlight"><pre>
-2024-10-18 18:06:59,029[INFO] Use NumPy as backend
-2024-10-18 18:06:59,030[INFO] numpy random seed is 9012
-2024-10-18 18:06:59,031[INFO] random seed is 1092
-2024-10-18 18:06:59,041[INFO] Git Commit Hash: 78f357ae99aca8f0016db0474caf2293f3b459ac
-2024-10-18 18:06:59,042[INFO] use 64 bits
+2025-04-17 14:24:49,387[INFO] Use NumPy as backend
+2025-04-17 14:24:49,388[INFO] numpy random seed is 9012
+2025-04-17 14:24:49,388[INFO] random seed is 1092
+2025-04-17 14:24:49,399[INFO] Git Commit Hash: bca9354a44d9e425271d4ba7b6dd2315d1969503
+2025-04-17 14:24:49,400[INFO] use 64 bits
 </pre></div></div>
 </div>
 <div class="nbinput docutils container">
@@ -808,7 +809,7 @@ TreeNodeBasis(BasisHalfSpin(dof: 0, nbas: 2), BasisHalfSpin(dof: 1, nbas: 2), Ba
 <div class="prompt highlight-none notranslate"><div class="highlight"><pre><span></span>[16]:
 </pre></div>
 </div>
-<div class="input_area highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">renormalizer.tn</span> <span class="kn">import</span> <span class="n">TTNS</span><span class="p">,</span> <span class="n">TTNO</span>
+<div class="input_area highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">renormalizer.tn</span><span class="w"> </span><span class="kn">import</span> <span class="n">TTNS</span><span class="p">,</span> <span class="n">TTNO</span>
 <span class="n">basis</span> <span class="o">=</span> <span class="n">BasisTree</span><span class="o">.</span><span class="n">binary</span><span class="p">([</span><span class="n">BasisHalfSpin</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">7</span><span class="p">)])</span>
 </pre></div>
 </div>
@@ -869,8 +870,8 @@ TreeNodeBasis(BasisHalfSpin(dof: 0, nbas: 2), BasisHalfSpin(dof: 1, nbas: 2), Ba
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-array([[-0.99496648, -0.10020826],
-       [-0.10020826,  0.99496648]])
+array([[-0.3001646 ,  0.95388742],
+       [-0.95388742, -0.3001646 ]])
 </pre></div></div>
 </div>
 <div class="nbinput docutils container">
@@ -886,9 +887,9 @@ array([[-0.99496648, -0.10020826],
 </div>
 <div class="output_area stderr docutils container">
 <div class="highlight"><pre>
-2024-10-18 18:06:59,226[DEBUG] # of operator terms: 1
-2024-10-18 18:06:59,228[DEBUG] Input operator terms: 1
-2024-10-18 18:06:59,230[DEBUG] After combination of the same terms: 1
+2025-04-17 14:24:49,581[DEBUG] # of operator terms: 1
+2025-04-17 14:24:49,583[DEBUG] Input operator terms: 1
+2025-04-17 14:24:49,585[DEBUG] After combination of the same terms: 1
 </pre></div></div>
 </div>
 <div class="nboutput nblast docutils container">
@@ -897,20 +898,20 @@ array([[-0.99496648, -0.10020826],
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-{0: array([[ 0.36219816, -0.05108033],
-        [-0.05108033,  0.63780184]]),
- 1: array([[0.52219779, 0.04792124],
-        [0.04792124, 0.47780221]]),
- 2: array([[0.51527382, 0.01204695],
-        [0.01204695, 0.48472618]]),
- 3: array([[ 0.45914641, -0.03186007],
-        [-0.03186007,  0.54085359]]),
- 4: array([[0.53935311, 0.17021523],
-        [0.17021523, 0.46064689]]),
- 5: array([[ 0.39225728, -0.05994727],
-        [-0.05994727,  0.60774272]]),
- 6: array([[ 0.67911799, -0.05841049],
-        [-0.05841049,  0.32088201]])}
+{0: array([[ 0.4740985 , -0.14972037],
+        [-0.14972037,  0.5259015 ]]),
+ 1: array([[ 0.4537315, -0.0110545],
+        [-0.0110545,  0.5462685]]),
+ 2: array([[ 0.60091036, -0.04768257],
+        [-0.04768257,  0.39908964]]),
+ 3: array([[0.53667262, 0.05222021],
+        [0.05222021, 0.46332738]]),
+ 4: array([[0.37583785, 0.04340422],
+        [0.04340422, 0.62416215]]),
+ 5: array([[0.5363176 , 0.04671489],
+        [0.04671489, 0.4636824 ]]),
+ 6: array([[ 0.45690134, -0.05808942],
+        [-0.05808942,  0.54309866]])}
 </pre></div></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">TTNS</span></code> by default will construct a hartree product state given the basis tree</p>
@@ -940,7 +941,7 @@ array([[-0.99496648, -0.10020826],
 <div class="prompt highlight-none notranslate"><div class="highlight"><pre><span></span>[22]:
 </pre></div>
 </div>
-<div class="input_area highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">renormalizer.tests.parameter</span> <span class="kn">import</span> <span class="n">holstein_model</span>
+<div class="input_area highlight-ipython3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">renormalizer.tests.parameter</span><span class="w"> </span><span class="kn">import</span> <span class="n">holstein_model</span>
 </pre></div>
 </div>
 </div>
@@ -1054,9 +1055,9 @@ array([[-0.99496648, -0.10020826],
 </div>
 <div class="output_area stderr docutils container">
 <div class="highlight"><pre>
-2024-10-18 18:06:59,315[DEBUG] # of operator terms: 27
-2024-10-18 18:06:59,316[DEBUG] Input operator terms: 27
-2024-10-18 18:06:59,317[DEBUG] After combination of the same terms: 27
+2025-04-17 14:24:49,656[DEBUG] # of operator terms: 27
+2025-04-17 14:24:49,657[DEBUG] Input operator terms: 27
+2025-04-17 14:24:49,658[DEBUG] After combination of the same terms: 27
 </pre></div></div>
 </div>
 <div class="nbinput docutils container">
@@ -1158,7 +1159,7 @@ array([[-0.99496648, -0.10020826],
 </div>
 <div class="output_area docutils container">
 <div class="highlight"><pre>
-0.011359353855681813
+0.01135935385568181
 </pre></div></div>
 </div>
 </section>

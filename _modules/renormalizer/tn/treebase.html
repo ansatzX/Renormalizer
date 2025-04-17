@@ -167,6 +167,7 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorial.html">Basic Tutorials</a><input class="toctree-checkbox" id="toctree-checkbox-1" name="toctree-checkbox-1" role="switch" type="checkbox"/><label for="toctree-checkbox-1"><div class="visually-hidden">Toggle child pages in navigation</div><i class="icon"><svg><use href="#svg-arrow-right"></use></svg></i></label><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/define_model.html">Define Your Model</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/mps_mpo.html">MPS and MPO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/nuclear_basis.html">Nuclear Basis Set</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/quantum_number.html">Quantum Numbers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/compress_mps.html">Compressing MPS</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/ttn_basic.html">Basics of Tree Tensor Networks</a></li>
@@ -225,26 +226,26 @@
         </div>
         <article role="main">
           <h1>Source code for renormalizer.tn.treebase</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span> <span class="nn">itertools</span> <span class="kn">import</span> <span class="n">chain</span>
-<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Any</span>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">itertools</span><span class="w"> </span><span class="kn">import</span> <span class="n">chain</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Any</span>
 
-<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
-<span class="kn">from</span> <span class="nn">print_tree</span> <span class="kn">import</span> <span class="n">print_tree</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">print_tree</span><span class="w"> </span><span class="kn">import</span> <span class="n">print_tree</span>
 
-<span class="kn">from</span> <span class="nn">renormalizer</span> <span class="kn">import</span> <span class="n">Op</span>
-<span class="kn">from</span> <span class="nn">renormalizer.model.basis</span> <span class="kn">import</span> <span class="n">BasisSet</span><span class="p">,</span> <span class="n">BasisDummy</span>
-<span class="kn">from</span> <span class="nn">renormalizer.tn.node</span> <span class="kn">import</span> <span class="n">NodeUnion</span><span class="p">,</span> <span class="n">TreeNodeBasis</span><span class="p">,</span> <span class="n">copy_connection</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">renormalizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">Op</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">renormalizer.model.basis</span><span class="w"> </span><span class="kn">import</span> <span class="n">BasisSet</span><span class="p">,</span> <span class="n">BasisDummy</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">renormalizer.tn.node</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeUnion</span><span class="p">,</span> <span class="n">TreeNodeBasis</span><span class="p">,</span> <span class="n">copy_connection</span><span class="p">,</span> <span class="n">build_connection_adj_mat</span><span class="p">,</span> <span class="n">TreeNodeText</span>
 
 
-<span class="k">class</span> <span class="nc">Tree</span><span class="p">:</span>
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Tree</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">):</span>
         <span class="k">assert</span> <span class="n">root</span><span class="o">.</span><span class="n">parent</span> <span class="ow">is</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">root</span> <span class="o">=</span> <span class="n">root</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">node_list</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">preorder_list</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">node_idx</span> <span class="o">=</span> <span class="p">{</span><span class="n">node</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">node</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">)}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">node_idx</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="n">NodeUnion</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="n">node</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">node</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">)}</span>
 
-    <span class="k">def</span> <span class="nf">preorder_list</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">func</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">NodeUnion</span><span class="p">]:</span>
-        <span class="k">def</span> <span class="nf">recursion</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">preorder_list</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">func</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">NodeUnion</span><span class="p">]:</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">recursion</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">func</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">ret</span> <span class="o">=</span> <span class="p">[</span><span class="n">node</span><span class="p">]</span>
             <span class="k">else</span><span class="p">:</span>
@@ -257,8 +258,8 @@
 
         <span class="k">return</span> <span class="n">recursion</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="nf">postorder_list</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">NodeUnion</span><span class="p">]:</span>
-        <span class="k">def</span> <span class="nf">recursion</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">postorder_list</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">NodeUnion</span><span class="p">]:</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">recursion</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">):</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">children</span><span class="p">:</span>
                 <span class="k">return</span> <span class="p">[</span><span class="n">node</span><span class="p">]</span>
             <span class="n">ret</span> <span class="o">=</span> <span class="p">[]</span>
@@ -270,7 +271,7 @@
         <span class="k">return</span> <span class="n">recursion</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="p">)</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span> <span class="nf">find_path</span><span class="p">(</span><span class="n">node1</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">,</span> <span class="n">node2</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">NodeUnion</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">find_path</span><span class="p">(</span><span class="n">node1</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">,</span> <span class="n">node2</span><span class="p">:</span> <span class="n">NodeUnion</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">NodeUnion</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Find the path from node1 to node2. Not most efficient but simple to implement&quot;&quot;&quot;</span>
         <span class="k">assert</span> <span class="n">node1</span> <span class="o">!=</span> <span class="n">node2</span>
         <span class="n">ancestors1</span> <span class="o">=</span> <span class="n">node1</span><span class="o">.</span><span class="n">ancestors</span>
@@ -283,20 +284,30 @@
         <span class="k">return</span> <span class="n">path1</span> <span class="o">+</span> <span class="n">path2</span><span class="p">[::</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">size</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">adj_matrix</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># adjacent matrix</span>
+        <span class="n">mat</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">)),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">node</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">):</span>
+            <span class="k">for</span> <span class="n">child</span> <span class="ow">in</span> <span class="n">node</span><span class="o">.</span><span class="n">children</span><span class="p">:</span>
+                <span class="n">j</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_idx</span><span class="p">[</span><span class="n">child</span><span class="p">]</span>
+                <span class="n">mat</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="n">j</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
+        <span class="k">return</span> <span class="n">mat</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">size</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">size</span>
 
-    <span class="k">def</span> <span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">iter</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="si">}</span><span class="s2"> with </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="si">}</span><span class="s2"> nodes&quot;</span>
 
 
-<div class="viewcode-block" id="BasisTree"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree">[docs]</a><span class="k">class</span> <span class="nc">BasisTree</span><span class="p">(</span><span class="n">Tree</span><span class="p">):</span>
+<div class="viewcode-block" id="BasisTree"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree">[docs]</a><span class="k">class</span><span class="w"> </span><span class="nc">BasisTree</span><span class="p">(</span><span class="n">Tree</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Tree of basis sets. The tree nodes are :class:`TreeNodeBasis`.</span>
 
@@ -307,7 +318,7 @@
 <span class="sd">    &quot;&quot;&quot;</span>
 
 <div class="viewcode-block" id="BasisTree.linear"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.linear">[docs]</a>    <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">linear</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">linear</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Generate a linear tree, i.e, MPS.</span>
 
@@ -326,7 +337,7 @@
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">node_list</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span></div>
 
 <div class="viewcode-block" id="BasisTree.binary"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.binary">[docs]</a>    <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">binary</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">binary</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Generate a binary tree.</span>
 
@@ -341,7 +352,7 @@
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">node_list</span> <span class="o">=</span> <span class="p">[</span><span class="n">TreeNodeBasis</span><span class="p">([</span><span class="n">basis</span><span class="p">])</span> <span class="k">for</span> <span class="n">basis</span> <span class="ow">in</span> <span class="n">basis_list</span><span class="p">]</span>
 
-        <span class="k">def</span> <span class="nf">binary_recursion</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="n">TreeNodeBasis</span><span class="p">,</span> <span class="n">offspring</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">TreeNodeBasis</span><span class="p">]):</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">binary_recursion</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="n">TreeNodeBasis</span><span class="p">,</span> <span class="n">offspring</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">TreeNodeBasis</span><span class="p">]):</span>
             <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">offspring</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="k">return</span>
             <span class="n">node</span><span class="o">.</span><span class="n">add_child</span><span class="p">(</span><span class="n">offspring</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
@@ -357,7 +368,7 @@
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">node_list</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span></div>
 
 <div class="viewcode-block" id="BasisTree.general_mctdh"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.general_mctdh">[docs]</a>    <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">general_mctdh</span><span class="p">(</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">general_mctdh</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span>
         <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">],</span>
         <span class="n">tree_order</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -402,6 +413,7 @@
 <span class="sd">        contract_label: list of bool</span>
 <span class="sd">            If ``contract_primitive`` is set to True,</span>
 <span class="sd">            this list determines which primitive basis should be contracted.</span>
+<span class="sd">            If not provided, all basis sets will be contracted.</span>
 <span class="sd">        dummy_label:</span>
 <span class="sd">            The label for the virtual nodes in MCTDH.</span>
 
@@ -450,7 +462,7 @@
                         <span class="n">i</span> <span class="o">+=</span> <span class="n">j</span>
 
         <span class="c1"># recursive tree construction</span>
-        <span class="k">def</span> <span class="nf">recursion</span><span class="p">(</span><span class="n">elementary_nodes_</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">TreeNodeBasis</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">TreeNodeBasis</span><span class="p">:</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">recursion</span><span class="p">(</span><span class="n">elementary_nodes_</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">TreeNodeBasis</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">TreeNodeBasis</span><span class="p">:</span>
             <span class="k">nonlocal</span> <span class="n">dummy_i</span>
             <span class="n">node</span> <span class="o">=</span> <span class="n">TreeNodeBasis</span><span class="p">([</span><span class="n">BasisDummy</span><span class="p">((</span><span class="n">dummy_label</span><span class="p">,</span> <span class="n">dummy_i</span><span class="p">))])</span>
             <span class="n">dummy_i</span> <span class="o">+=</span> <span class="mi">1</span>
@@ -466,7 +478,7 @@
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">root</span><span class="p">)</span></div>
 
 <div class="viewcode-block" id="BasisTree.binary_mctdh"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.binary_mctdh">[docs]</a>    <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">binary_mctdh</span><span class="p">(</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">binary_mctdh</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span> <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">],</span> <span class="n">contract_primitive</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">contract_label</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">dummy_label</span><span class="o">=</span><span class="s2">&quot;MCTDH virtual&quot;</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
@@ -479,7 +491,7 @@
         <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">general_mctdh</span><span class="p">(</span><span class="n">basis_list</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">contract_primitive</span><span class="p">,</span> <span class="n">contract_label</span><span class="p">,</span> <span class="n">dummy_label</span><span class="p">)</span></div>
 
 <div class="viewcode-block" id="BasisTree.ternary_mctdh"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.ternary_mctdh">[docs]</a>    <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">ternary_mctdh</span><span class="p">(</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ternary_mctdh</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span> <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">],</span> <span class="n">contract_primitive</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">contract_label</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">dummy_label</span><span class="o">=</span><span class="s2">&quot;MCTDH virtual&quot;</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
@@ -492,8 +504,8 @@
         <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">general_mctdh</span><span class="p">(</span><span class="n">basis_list</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">contract_primitive</span><span class="p">,</span> <span class="n">contract_label</span><span class="p">,</span> <span class="n">dummy_label</span><span class="p">)</span></div>
 
 <div class="viewcode-block" id="BasisTree.t3ns"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.t3ns">[docs]</a>    <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">t3ns</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">],</span> <span class="n">t3ns_label</span><span class="o">=</span><span class="s2">&quot;T3NS virtual&quot;</span><span class="p">):</span>
-        <span class="k">def</span> <span class="nf">recursion</span><span class="p">(</span><span class="n">parent</span><span class="p">,</span> <span class="n">basis_list_</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">t3ns</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">basis_list</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">],</span> <span class="n">t3ns_label</span><span class="o">=</span><span class="s2">&quot;T3NS virtual&quot;</span><span class="p">):</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">recursion</span><span class="p">(</span><span class="n">parent</span><span class="p">,</span> <span class="n">basis_list_</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]):</span>
             <span class="k">nonlocal</span> <span class="n">dummy_i</span>
             <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">basis_list_</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="k">return</span>
@@ -521,7 +533,15 @@
             <span class="n">recursion</span><span class="p">(</span><span class="n">root</span><span class="p">,</span> <span class="n">partition</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">root</span><span class="p">)</span></div>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="n">TreeNodeBasis</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="n">TreeNodeBasis</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Construct basis tree.</span>
+
+<span class="sd">        Parameters</span>
+<span class="sd">        ----------</span>
+<span class="sd">        root: TreeNodeBasis</span>
+<span class="sd">            the tree root</span>
+<span class="sd">        &quot;&quot;&quot;</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">root</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">:</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">TreeNodeBasis</span><span class="p">)</span>
@@ -551,36 +571,39 @@
         <span class="c1"># used as a dummy operator for calculating norm, etc</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dummy_ttno</span> <span class="o">=</span> <span class="kc">None</span>
 
-<div class="viewcode-block" id="BasisTree.print"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.print">[docs]</a>    <span class="k">def</span> <span class="nf">print</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">print_function</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="k">class</span> <span class="nc">print_tn_basis</span><span class="p">(</span><span class="n">print_tree</span><span class="p">):</span>
-            <span class="k">def</span> <span class="nf">get_children</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">):</span>
-                <span class="k">return</span> <span class="n">node</span><span class="o">.</span><span class="n">children</span>
-
-            <span class="k">def</span> <span class="nf">get_node_str</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">):</span>
-                <span class="k">return</span> <span class="nb">str</span><span class="p">([</span><span class="n">b</span><span class="o">.</span><span class="n">dofs</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">node</span><span class="o">.</span><span class="n">basis_sets</span><span class="p">])</span>
-
-        <span class="n">tree</span> <span class="o">=</span> <span class="n">print_tn_basis</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">root</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">print_function</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">tree</span><span class="o">.</span><span class="n">rows</span><span class="p">:</span>
-                <span class="n">print_function</span><span class="p">(</span><span class="n">row</span><span class="p">)</span></div>
+<div class="viewcode-block" id="BasisTree.print"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.print">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">print</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">print_function</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="n">text_list</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">:</span>
+            <span class="n">text</span> <span class="o">=</span> <span class="nb">str</span><span class="p">([</span><span class="n">b</span><span class="o">.</span><span class="n">dofs</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">node</span><span class="o">.</span><span class="n">basis_sets</span><span class="p">])</span>
+            <span class="k">if</span> <span class="n">node</span><span class="o">.</span><span class="n">bond_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">text</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot; </span><span class="si">{</span><span class="n">node</span><span class="o">.</span><span class="n">bond_dim</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="n">text_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">text</span><span class="p">)</span>
+        <span class="n">print_as_tree</span><span class="p">(</span><span class="n">text_list</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">adj_matrix</span><span class="p">,</span> <span class="n">print_function</span><span class="p">)</span></div>
 
     <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">basis_list</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">basis_list</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]:</span>
         <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="n">chain</span><span class="p">(</span><span class="o">*</span><span class="p">[</span><span class="n">n</span><span class="o">.</span><span class="n">basis_sets</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">]))</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">dof_list</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Any</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">dof_list</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Any</span><span class="p">]:</span>
         <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="n">chain</span><span class="p">(</span><span class="o">*</span><span class="p">[</span><span class="n">b</span><span class="o">.</span><span class="n">dofs</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">basis_list</span><span class="p">]))</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">basis_list_postorder</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">basis_list_postorder</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">BasisSet</span><span class="p">]:</span>
         <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="n">chain</span><span class="p">(</span><span class="o">*</span><span class="p">[</span><span class="n">n</span><span class="o">.</span><span class="n">basis_sets</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">postorder_list</span><span class="p">()]))</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">pbond_dims</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
-        <span class="k">return</span> <span class="p">[</span><span class="n">b</span><span class="o">.</span><span class="n">pbond_dims</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">]</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bond_dims</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">n</span><span class="o">.</span><span class="n">bond_dim</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;One of the bond dimensions is None: </span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">n</span><span class="o">.</span><span class="n">bond_dim</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">]</span>
 
-<div class="viewcode-block" id="BasisTree.add_auxiliary_space"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.add_auxiliary_space">[docs]</a>    <span class="k">def</span> <span class="nf">add_auxiliary_space</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">auxiliary_label</span><span class="o">=</span><span class="s2">&quot;Q&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;BasisTree&quot;</span><span class="p">:</span>
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pbond_dims</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">n</span><span class="o">.</span><span class="n">pbond_dims</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">node_list</span><span class="p">]</span>
+
+<div class="viewcode-block" id="BasisTree.add_auxiliary_space"><a class="viewcode-back" href="../../../ttn.html#renormalizer.tn.BasisTree.add_auxiliary_space">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">add_auxiliary_space</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">auxiliary_label</span><span class="o">=</span><span class="s2">&quot;Q&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;BasisTree&quot;</span><span class="p">:</span>
         <span class="c1"># make a new basis tree with auxiliary basis</span>
         <span class="n">node2_list</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="bp">self</span><span class="p">:</span>
@@ -600,7 +623,7 @@
         <span class="k">return</span> <span class="n">basis_tree2</span></div></div>
 
 
-<span class="k">def</span> <span class="nf">approximate_partition</span><span class="p">(</span><span class="n">sequence</span><span class="p">,</span> <span class="n">ngroups</span><span class="p">):</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">approximate_partition</span><span class="p">(</span><span class="n">sequence</span><span class="p">,</span> <span class="n">ngroups</span><span class="p">):</span>
     <span class="n">size</span> <span class="o">=</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">sequence</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">ngroups</span> <span class="o">+</span> <span class="mi">1</span>
     <span class="n">ret</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">ngroups</span><span class="p">):</span>
@@ -608,6 +631,23 @@
         <span class="n">end</span> <span class="o">=</span> <span class="nb">min</span><span class="p">((</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">size</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">sequence</span><span class="p">))</span>
         <span class="n">ret</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">sequence</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">])</span>
     <span class="k">return</span> <span class="n">ret</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">print_as_tree</span><span class="p">(</span><span class="n">text_list</span><span class="p">,</span> <span class="n">adj_matrix</span><span class="p">,</span> <span class="n">print_function</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="n">nodes</span> <span class="o">=</span> <span class="p">[</span><span class="n">TreeNodeText</span><span class="p">(</span><span class="n">text</span><span class="p">)</span> <span class="k">for</span> <span class="n">text</span> <span class="ow">in</span> <span class="n">text_list</span><span class="p">]</span>
+    <span class="n">root</span> <span class="o">=</span> <span class="n">build_connection_adj_mat</span><span class="p">(</span><span class="n">nodes</span><span class="p">,</span> <span class="n">adj_matrix</span><span class="p">)</span>
+
+    <span class="k">class</span><span class="w"> </span><span class="nc">print_text</span><span class="p">(</span><span class="n">print_tree</span><span class="p">):</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">get_children</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">node</span><span class="o">.</span><span class="n">children</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">get_node_str</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">node</span><span class="o">.</span><span class="n">text</span>
+
+    <span class="n">tree</span> <span class="o">=</span> <span class="n">print_text</span><span class="p">(</span><span class="n">root</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">print_function</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">tree</span><span class="o">.</span><span class="n">rows</span><span class="p">:</span>
+            <span class="n">print_function</span><span class="p">(</span><span class="n">row</span><span class="p">)</span>
 </pre></div>
         </article>
       </div>

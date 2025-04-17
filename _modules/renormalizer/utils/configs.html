@@ -167,6 +167,7 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../tutorial.html">Basic Tutorials</a><input class="toctree-checkbox" id="toctree-checkbox-1" name="toctree-checkbox-1" role="switch" type="checkbox"/><label for="toctree-checkbox-1"><div class="visually-hidden">Toggle child pages in navigation</div><i class="icon"><svg><use href="#svg-arrow-right"></use></svg></i></label><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/define_model.html">Define Your Model</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/mps_mpo.html">MPS and MPO</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/nuclear_basis.html">Nuclear Basis Set</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/quantum_number.html">Quantum Numbers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/compress_mps.html">Compressing MPS</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/ttn_basic.html">Basics of Tree Tensor Networks</a></li>
@@ -226,28 +227,17 @@
         <article role="main">
           <h1>Source code for renormalizer.utils.configs</h1><div class="highlight"><pre>
 <span></span><span class="c1"># -*- coding: utf-8 -*-</span>
-<span class="kn">from</span> <span class="nn">enum</span> <span class="kn">import</span> <span class="n">Enum</span>
-<span class="kn">import</span> <span class="nn">logging</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 
-<span class="kn">from</span> <span class="nn">renormalizer.utils.rk</span> <span class="kn">import</span> <span class="n">RungeKutta</span><span class="p">,</span> <span class="n">TaylorExpansion</span>
-<span class="kn">import</span> <span class="nn">scipy.linalg</span>
-<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">renormalizer.utils.rk</span><span class="w"> </span><span class="kn">import</span> <span class="n">RungeKutta</span><span class="p">,</span> <span class="n">TaylorExpansion</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">scipy.linalg</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 
-<div class="viewcode-block" id="BondDimDistri"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.BondDimDistri">[docs]</a><span class="k">class</span> <span class="nc">BondDimDistri</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Bond dimension distribution</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="c1"># here the `#:` syntax is for sphinx documentation.</span>
-    <span class="c1">#: uniform distribution.</span>
-    <span class="n">uniform</span> <span class="o">=</span> <span class="s2">&quot;uniform&quot;</span>
-    <span class="c1">#: Guassian distribution which peaks at the center.</span>
-    <span class="n">center_gauss</span> <span class="o">=</span> <span class="s2">&quot;center gaussian&quot;</span></div>
-
-
-<div class="viewcode-block" id="CompressCriteria"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressCriteria">[docs]</a><span class="k">class</span> <span class="nc">CompressCriteria</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+<div class="viewcode-block" id="CompressCriteria"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressCriteria">[docs]</a><span class="k">class</span><span class="w"> </span><span class="nc">CompressCriteria</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Criteria for compression.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
@@ -261,7 +251,7 @@
     <span class="n">both</span> <span class="o">=</span> <span class="s2">&quot;both&quot;</span></div>
 
 
-<div class="viewcode-block" id="OFS"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.OFS">[docs]</a><span class="k">class</span> <span class="nc">OFS</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+<div class="viewcode-block" id="OFS"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.OFS">[docs]</a><span class="k">class</span><span class="w"> </span><span class="nc">OFS</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    On the fly swapping criteria</span>
 <span class="sd">    &quot;&quot;&quot;</span>
@@ -275,7 +265,7 @@
     <span class="n">ofs_debug</span> <span class="o">=</span> <span class="s2">&quot;OFS-Debug&quot;</span></div>
 
 
-<div class="viewcode-block" id="CompressConfig"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig">[docs]</a><span class="k">class</span> <span class="nc">CompressConfig</span><span class="p">:</span>
+<div class="viewcode-block" id="CompressConfig"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig">[docs]</a><span class="k">class</span><span class="w"> </span><span class="nc">CompressConfig</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;MPS/MPO Compress Configuration.</span>
 
 <span class="sd">    Parameters</span>
@@ -287,10 +277,6 @@
 <span class="sd">        The threshold to keep states if ``criteria`` is set to</span>
 <span class="sd">        `CompressCriteria.threshold` or `CompressCriteria.both`.</span>
 <span class="sd">        Default is :math:`10^{-3}`.</span>
-<span class="sd">    bonddim_distri : `BondDimDistri`, optional</span>
-<span class="sd">        Bond dimension distribution if ``criteria`` is set to</span>
-<span class="sd">        `CompressCriteria.fixed` or `CompressCriteria.both`.</span>
-<span class="sd">        Default is `BondDimDistri.uniform`.</span>
 <span class="sd">    max_bonddim : int, optional</span>
 <span class="sd">        Maximum bond dimension ``M`` under various bond dimension distributions.</span>
 <span class="sd">        Default is 32.</span>
@@ -366,11 +352,10 @@
 <span class="sd">    renormalizer.mps.Mpo.contract : compress ``mpo @ mps/mpdm/mpo``</span>
 
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">criteria</span><span class="p">:</span> <span class="n">CompressCriteria</span> <span class="o">=</span> <span class="n">CompressCriteria</span><span class="o">.</span><span class="n">threshold</span><span class="p">,</span>
         <span class="n">threshold</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-3</span><span class="p">,</span>
-        <span class="n">bonddim_distri</span><span class="p">:</span> <span class="n">BondDimDistri</span> <span class="o">=</span> <span class="n">BondDimDistri</span><span class="o">.</span><span class="n">uniform</span><span class="p">,</span>
         <span class="n">max_bonddim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32</span><span class="p">,</span>
         <span class="n">vmethod</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;2site&quot;</span><span class="p">,</span>
         <span class="n">vprocedure</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -386,13 +371,11 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">criteria</span><span class="p">:</span> <span class="n">CompressCriteria</span> <span class="o">=</span> <span class="n">criteria</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_threshold</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span> <span class="o">=</span> <span class="n">threshold</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_distribution</span><span class="p">:</span> <span class="n">BondDimDistri</span> <span class="o">=</span> <span class="n">bonddim_distri</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_max_value</span> <span class="o">=</span> <span class="n">max_bonddim</span>
-        <span class="c1"># not in arg list, but still useful in some cases</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_min_value</span> <span class="o">=</span> <span class="mi">1</span>
         <span class="c1"># the length should be len(mps) + 1, the terminals are also counted. This is for accordance with mps.bond_dims</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">min_dims</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_max_value</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span><span class="p">)</span>
 
         <span class="c1"># variational compression parameters</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">vmethod</span> <span class="o">=</span> <span class="n">vmethod</span>
@@ -415,11 +398,11 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">ofs_swap_jw</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">ofs_swap_jw</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">threshold</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">threshold</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_threshold</span>
 
     <span class="nd">@threshold</span><span class="o">.</span><span class="n">setter</span>
-    <span class="k">def</span> <span class="nf">threshold</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">threshold</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">v</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;non-positive threshold&quot;</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">v</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
@@ -428,39 +411,23 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Can&#39;t set threshold to be larger than 1&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_threshold</span> <span class="o">=</span> <span class="n">v</span>
 
-<div class="viewcode-block" id="CompressConfig.set_bonddim"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.set_bonddim">[docs]</a>    <span class="k">def</span> <span class="nf">set_bonddim</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">length</span><span class="p">,</span> <span class="n">max_value</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">criteria</span> <span class="ow">is</span> <span class="n">CompressCriteria</span><span class="o">.</span><span class="n">threshold</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;compress config is using threshold criteria&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">max_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_max_value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-            <span class="n">max_value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_max_value</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_max_value</span> <span class="o">=</span> <span class="n">max_value</span>
-        <span class="k">if</span> <span class="n">max_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;max value is not set&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_distribution</span> <span class="ow">is</span> <span class="n">BondDimDistri</span><span class="o">.</span><span class="n">uniform</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="n">length</span><span class="p">,</span> <span class="n">max_value</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">int</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">half_length</span> <span class="o">=</span> <span class="n">length</span> <span class="o">//</span> <span class="mi">2</span>
-            <span class="n">x</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="o">-</span> <span class="n">half_length</span><span class="p">,</span> <span class="o">-</span> <span class="n">half_length</span> <span class="o">+</span> <span class="n">length</span><span class="p">)</span>
-            <span class="n">sigma</span> <span class="o">=</span> <span class="n">half_length</span> <span class="o">/</span> <span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_value</span> <span class="o">/</span> <span class="mi">3</span><span class="p">))</span>
-            <span class="n">seq</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">max_value</span> <span class="o">*</span> <span class="n">np</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="n">x</span> <span class="o">/</span> <span class="n">sigma</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span><span class="p">))</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span>
-            <span class="k">assert</span> <span class="ow">not</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">any</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">min_dims</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="n">length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_min_value</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">int</span><span class="p">)</span></div>
+<div class="viewcode-block" id="CompressConfig.set_bonddim"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.set_bonddim">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">set_bonddim</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">length</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="n">length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">bond_dim_max_value</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="nb">int</span><span class="p">)</span></div>
 
-    <span class="k">def</span> <span class="nf">_threshold_m_trunc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sigma</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_threshold_m_trunc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sigma</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">assert</span> <span class="mi">0</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span> <span class="o">&lt;</span> <span class="mi">1</span>
         <span class="c1"># count how many sing vals &lt; trunc</span>
         <span class="n">normed_sigma</span> <span class="o">=</span> <span class="n">sigma</span> <span class="o">/</span> <span class="n">scipy</span><span class="o">.</span><span class="n">linalg</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">sigma</span><span class="p">)</span>
         <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">normed_sigma</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span><span class="p">))</span>
 
-    <span class="k">def</span> <span class="nf">_fixed_m_trunc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sigma</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">left</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_fixed_m_trunc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sigma</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">left</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="n">bond_idx</span> <span class="o">=</span> <span class="n">idx</span> <span class="o">+</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">left</span> <span class="k">else</span> <span class="n">idx</span>
         <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span><span class="p">[</span><span class="n">bond_idx</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="n">sigma</span><span class="p">))</span>
 
-<div class="viewcode-block" id="CompressConfig.compute_m_trunc"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.compute_m_trunc">[docs]</a>    <span class="k">def</span> <span class="nf">compute_m_trunc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sigma</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">left</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<div class="viewcode-block" id="CompressConfig.compute_m_trunc"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.compute_m_trunc">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">compute_m_trunc</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sigma</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">left</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">criteria</span> <span class="ow">is</span> <span class="n">CompressCriteria</span><span class="o">.</span><span class="n">threshold</span><span class="p">:</span>
             <span class="n">trunc</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_threshold_m_trunc</span><span class="p">(</span><span class="n">sigma</span><span class="p">)</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">criteria</span> <span class="ow">is</span> <span class="n">CompressCriteria</span><span class="o">.</span><span class="n">fixed</span><span class="p">:</span>
@@ -472,13 +439,9 @@
             <span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">assert</span> <span class="kc">False</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_dims</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">bond_idx</span> <span class="o">=</span> <span class="n">idx</span> <span class="k">if</span> <span class="n">left</span> <span class="k">else</span> <span class="n">idx</span> <span class="o">+</span> <span class="mi">1</span>
-            <span class="n">min_trunc</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">min_dims</span><span class="p">[</span><span class="n">bond_idx</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="n">sigma</span><span class="p">))</span>
-            <span class="n">trunc</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">trunc</span><span class="p">,</span> <span class="n">min_trunc</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">trunc</span></div>
 
-<div class="viewcode-block" id="CompressConfig.update"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.update">[docs]</a>    <span class="k">def</span> <span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">&quot;CompressConfig&quot;</span><span class="p">):</span>
+<div class="viewcode-block" id="CompressConfig.update"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.update">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">&quot;CompressConfig&quot;</span><span class="p">):</span>
         <span class="c1"># use the stricter of the two</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">criteria</span> <span class="o">!=</span> <span class="n">other</span><span class="o">.</span><span class="n">criteria</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Can&#39;t update configs with different standard&quot;</span><span class="p">)</span>
@@ -492,7 +455,7 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">maximum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span><span class="p">,</span> <span class="n">other</span><span class="o">.</span><span class="n">max_dims</span><span class="p">)</span></div>
 
-<div class="viewcode-block" id="CompressConfig.relax"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.relax">[docs]</a>    <span class="k">def</span> <span class="nf">relax</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<div class="viewcode-block" id="CompressConfig.relax"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.relax">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">relax</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># relax the two criteria simultaneously</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span> <span class="o">*</span> <span class="mi">3</span><span class="p">,</span> <span class="mf">0.9</span>
@@ -502,22 +465,20 @@
                 <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="o">*</span> <span class="mf">0.8</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">full_like</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
             <span class="p">)</span></div>
 
-<div class="viewcode-block" id="CompressConfig.copy"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.copy">[docs]</a>    <span class="k">def</span> <span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;CompressConfig&quot;</span><span class="p">:</span>
+<div class="viewcode-block" id="CompressConfig.copy"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.CompressConfig.copy">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;CompressConfig&quot;</span><span class="p">:</span>
         <span class="n">new</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="fm">__new__</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="p">)</span>
         <span class="c1"># shallow copies</span>
         <span class="n">new</span><span class="o">.</span><span class="vm">__dict__</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
         <span class="c1"># deep copies</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">new</span><span class="o">.</span><span class="n">max_dims</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_dims</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">new</span><span class="o">.</span><span class="n">min_dims</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_dims</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">new</span></div>
 
     <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">bonddim_should_set</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bonddim_should_set</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">criteria</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">CompressCriteria</span><span class="o">.</span><span class="n">threshold</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_dims</span> <span class="ow">is</span> <span class="kc">None</span>
 
-    <span class="k">def</span> <span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">attrs</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;criteria&quot;</span><span class="p">,</span> <span class="s2">&quot;threshold&quot;</span><span class="p">]</span>
         <span class="n">lines</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">attr</span> <span class="ow">in</span> <span class="n">attrs</span><span class="p">:</span>
@@ -526,7 +487,7 @@
         <span class="k">return</span> <span class="s2">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">lines</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="OptimizeConfig"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.OptimizeConfig">[docs]</a><span class="k">class</span> <span class="nc">OptimizeConfig</span><span class="p">:</span>
+<div class="viewcode-block" id="OptimizeConfig"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.OptimizeConfig">[docs]</a><span class="k">class</span><span class="w"> </span><span class="nc">OptimizeConfig</span><span class="p">:</span>
 <span class="w">    </span><span class="sa">r</span><span class="sd">&quot;&quot;&quot; DMRG ground state algorithm optimization configuration</span>
 
 <span class="sd">        The procedure to do ground state optimization. In the sublist, the first</span>
@@ -537,7 +498,7 @@
 <span class="sd">        each symmetry block to avoid trapping into local minimum.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">procedure</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">procedure</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">procedure</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">procedure</span> <span class="o">=</span> <span class="p">[[</span><span class="mi">10</span><span class="p">,</span> <span class="mf">0.4</span><span class="p">],</span> <span class="p">[</span><span class="mi">20</span><span class="p">,</span> <span class="mf">0.2</span><span class="p">],</span> <span class="p">[</span><span class="mi">30</span><span class="p">,</span> <span class="mf">0.1</span><span class="p">],</span> <span class="p">[</span><span class="mi">40</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span> <span class="p">[</span><span class="mi">40</span><span class="p">,</span> <span class="mi">0</span><span class="p">]]</span>
         <span class="k">else</span><span class="p">:</span>
@@ -555,13 +516,13 @@
         <span class="c1"># -1.0 to get the largest eigenvalue</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">inverse</span> <span class="o">=</span> <span class="mf">1.0</span>
 
-<div class="viewcode-block" id="OptimizeConfig.copy"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.OptimizeConfig.copy">[docs]</a>    <span class="k">def</span> <span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<div class="viewcode-block" id="OptimizeConfig.copy"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.OptimizeConfig.copy">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">new</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="fm">__new__</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="p">)</span>
         <span class="n">new</span><span class="o">.</span><span class="vm">__dict__</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
         <span class="n">new</span><span class="o">.</span><span class="n">procedure</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">procedure</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">new</span></div></div>
 
-<div class="viewcode-block" id="EvolveMethod"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.EvolveMethod">[docs]</a><span class="k">class</span> <span class="nc">EvolveMethod</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+<div class="viewcode-block" id="EvolveMethod"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.EvolveMethod">[docs]</a><span class="k">class</span><span class="w"> </span><span class="nc">EvolveMethod</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Time evolution methods.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
@@ -583,7 +544,7 @@
     <span class="n">tdvp_mu_vmf</span> <span class="o">=</span> <span class="s2">&quot;TDVP Matrix Unfolding Variable Mean Field&quot;</span></div>
 
 
-<div class="viewcode-block" id="parse_memory_limit"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.parse_memory_limit">[docs]</a><span class="k">def</span> <span class="nf">parse_memory_limit</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+<div class="viewcode-block" id="parse_memory_limit"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.parse_memory_limit">[docs]</a><span class="k">def</span><span class="w"> </span><span class="nf">parse_memory_limit</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
     <span class="k">if</span> <span class="n">x</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="s2">&quot;inf&quot;</span><span class="p">)</span>
     <span class="k">try</span><span class="p">:</span>
@@ -601,8 +562,8 @@
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;invalid input for memory: </span><span class="si">{</span><span class="n">x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="EvolveConfig"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.EvolveConfig">[docs]</a><span class="k">class</span> <span class="nc">EvolveConfig</span><span class="p">:</span>
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+<div class="viewcode-block" id="EvolveConfig"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.EvolveConfig">[docs]</a><span class="k">class</span><span class="w"> </span><span class="nc">EvolveConfig</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">method</span><span class="p">:</span> <span class="n">EvolveMethod</span> <span class="o">=</span> <span class="n">EvolveMethod</span><span class="o">.</span><span class="n">prop_and_compress</span><span class="p">,</span>
         <span class="n">adaptive</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -645,12 +606,12 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">vmf_auto_switch</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">is_tdvp</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_tdvp</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">method</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="n">EvolveMethod</span><span class="o">.</span><span class="n">prop_and_compress</span><span class="p">,</span>
                 <span class="n">EvolveMethod</span><span class="o">.</span><span class="n">prop_and_compress_tdrk4</span><span class="p">,</span>
                 <span class="n">EvolveMethod</span><span class="o">.</span><span class="n">prop_and_compress_tdrk</span><span class="p">]</span>
 
-<div class="viewcode-block" id="EvolveConfig.check_valid_dt"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.EvolveConfig.check_valid_dt">[docs]</a>    <span class="k">def</span> <span class="nf">check_valid_dt</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">evolve_dt</span><span class="p">:</span> <span class="nb">complex</span><span class="p">):</span>
+<div class="viewcode-block" id="EvolveConfig.check_valid_dt"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.EvolveConfig.check_valid_dt">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">check_valid_dt</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">evolve_dt</span><span class="p">:</span> <span class="nb">complex</span><span class="p">):</span>
         <span class="n">info_str</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;in config: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">guess_dt</span><span class="si">}</span><span class="s2">, in arg: </span><span class="si">{</span><span class="n">evolve_dt</span><span class="si">}</span><span class="s2">&quot;</span>
 
         <span class="k">if</span> <span class="n">np</span><span class="o">.</span><span class="n">iscomplex</span><span class="p">(</span><span class="n">evolve_dt</span><span class="p">)</span> <span class="o">^</span> <span class="n">np</span><span class="o">.</span><span class="n">iscomplex</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">guess_dt</span><span class="p">):</span>
@@ -661,12 +622,12 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;evolve into wrong direction. &quot;</span> <span class="o">+</span> <span class="n">info_str</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="EvolveConfig.copy"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.EvolveConfig.copy">[docs]</a>    <span class="k">def</span> <span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<div class="viewcode-block" id="EvolveConfig.copy"><a class="viewcode-back" href="../../../configs.html#renormalizer.utils.configs.EvolveConfig.copy">[docs]</a>    <span class="k">def</span><span class="w"> </span><span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">new</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="fm">__new__</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="p">)</span>
         <span class="n">new</span><span class="o">.</span><span class="vm">__dict__</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">new</span></div>
 
-    <span class="k">def</span> <span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">attrs</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
         <span class="n">lines</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">attr</span> <span class="ow">in</span> <span class="n">attrs</span><span class="p">:</span>
