@@ -24,10 +24,10 @@ GPU_KEY = "RENO_GPU"
 USE_GPU = False
 
 GPU_ID = os.environ.get(GPU_KEY, None)
-
+xp = np
 
 def try_import_cupy():
-    global GPU_ID
+    global GPU_ID, xp
 
     try:
         import cupy as cp
@@ -35,7 +35,8 @@ def try_import_cupy():
         if GPU_ID is not None:
             logger.warning(f"CuPy is not installed. Setting {GPU_KEY} to {GPU_ID} has no effect.")
             logger.exception(e)
-        return False, np
+            xp = np
+        return False
 
     if GPU_ID is None:
         GPU_ID = 0
@@ -45,10 +46,12 @@ def try_import_cupy():
     except cp.cuda.runtime.CUDARuntimeError as e:
         logger.warning("Failed to initialize CuPy.")
         logger.exception(e)
-        return False, np
+        xp = np
+        return False
 
     logger.info(f"Using GPU: {GPU_ID}")
-    return True, cp
+    xp = cp
+    return True
 
 def get_git_commit_hash():
     try:
@@ -59,7 +62,7 @@ def get_git_commit_hash():
         return "Unknown"
 
 
-USE_GPU, xp = try_import_cupy()
+USE_GPU = try_import_cupy()
 
 
 # USE_GPU = False
