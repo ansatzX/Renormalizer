@@ -26,6 +26,7 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
     Args:
 
     table: an operator table with shape (operator nterm, nsite). Each entry contains elementary operators on each site.
+    primary_ops: a list contain all elem_ops
     factor (np.ndarray): one prefactor vector (dim: operator nterm)
     algo: the algorithm used to select local ops, "Hopcroft-Karp"(default), "Hungarian".
           They are both global optimal and have only minor performance difference.
@@ -46,6 +47,7 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
     for example: H = 2.0 * a_1 a_2^dagger   + 3.0 * a_2^\dagger a_3 + 4.0*a_0^\dagger a_3
     The column names are the site indices with 0 and 4 imaginary (see the note below)
     and the content of the table is the index of primary operators.
+    (the shape of table is nterm x nsite, the content of table is index of elem_op in primary_ops input parm)
                         s0   s1   s2   s3  s4  factor
     a_1 a_2^dagger      0    1    2    0   0   2.0
     a_2^\dagger a_3     0    0    2    1   0   3.0
@@ -60,6 +62,12 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
 
      The content of the table below means matrix elements with basis explained in the notes.
      In the matrix elements, 1 means combination and 0 means no combination.
+     so, the ori table is divided into R- and L - 
+     each block have same num of row
+     construct the new table to represent what ?
+     may be it the graph
+     use L-block's each row to act as the column indice
+            1st row, 2nd row, 3rd row,....same for R-block as the row indice
           (2,0,0) (2,1,0) (0,1,0)  -> right side of the above table
      (0,1)   1       0       0
      (0,0)   0       1       0
@@ -68,6 +76,7 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
        v
      left side of the above table
      In this case all operators are independent so the content of the matrix is diagonal
+     looks like diagonal is a natural results, well, it is from independent; maybe need some cases.
 
     and select the terms and rearrange the table
     The selection rule is to find the minimal number of rows+cols that can eliminate the
@@ -77,10 +86,12 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
     a_2^\dagger a_3   1'   2  |  1  0  3.0
     a_1^\dagger a_3   2'   0  |  1  0  4.0
     0'/1'/2' are three new operators(could be non-elementary)
+    where is 0'/1'/2' from ? what is 'eliminate'?
     The local mpo is the transformation matrix between 0,0,0 to 0',1',2'.
-    In this case, the local mpo is simply (1, 0, 2)
+    In this case, the local mpo is simply (1, 0, 2) # (a, I, a^dagger) why?
 
     cut the string and find the duplicated/independent terms
+    do you mean that 3rd one, the (1,0) is removed?
             (0,0), (1,0)
      (0',2)   1      0
      (1',2)   0      1
@@ -102,26 +113,28 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
     The local mpo is the transformation matrix between 0'',1'' to 0'''
     """
 
-    qn_size = len(primary_ops[0].qn)
+    qn_size = len(primary_ops[0].qn) # did all elem_op share same qn size? maybe that's right, if not set only 0, 1,-1 so len is 1
 
     # Simplest case. Cut to the chase
     if table.shape[0] == 1:
+        # only one term
+        # what is layer mentioned here?
         # The first layer: number of sites. The middle array: in and out virtual bond
         # the 4th layer: operator sums
-        mpo: List[np.ndarray[List[Op]]] = []
+        mpo: List[np.ndarray[List[Op]]] = [] # from the loop code, it hints that len of this list is the num of sites. 
         mpoqn = [np.zeros((1, qn_size), dtype=int)]
-        op2idx = dict(zip(primary_ops, range(len(primary_ops))))
-        out_ops_list: List[List[OpTuple]] = [[OpTuple([0], qn=0, factor=1)]]
-        for idx in table[0]:
+        op2idx = dict(zip(primary_ops, range(len(primary_ops)))) # a dict with elem_op: index
+        out_ops_list: List[List[OpTuple]] = [[OpTuple([0], qn=0, factor=1)]]# length is num of sites +1 
+        for idx in table[0]: # for sites
             op = primary_ops[idx]
-            mo = np.full((1, 1), None)
-            mo[0][0] = [op]
+            mo = np.full((1, 1), None) # a 1x1 matrix with none as matrix content 
+            mo[0][0] = [op] # because 1x1 so the mo is [op]
             mpo.append(mo)
-            qn = mpoqn[-1][0] + op.qn
-            mpoqn.append(np.array([qn]))
+            qn = mpoqn[-1][0] + op.qn # this two line means qn is getting bigger? actually is qn = qn + op.qn
+            mpoqn.append(np.array([qn])) # why ???
             out_ops_list.append([OpTuple([0, op2idx[op]], qn=qn, factor=1)])
 
-        mpo[-1][0][0][0] = factor[0] * mpo[-1][0][0][0]
+        mpo[-1][0][0][0] = factor[0] * mpo[-1][0][0][0] # actually access op: op = fator * op
         last_optuple = out_ops_list[-1][0]
         out_ops_list[-1][0] = OpTuple(last_optuple.symbol, qn=last_optuple.qn, factor=factor[0]*last_optuple.factor)
         qntot = qn
@@ -134,20 +147,21 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
 
     # add the first and last column for convenience
     ta = np.zeros((table.shape[0], 1), dtype=np.uint16)
-    table = np.concatenate((ta, table, ta), axis=1)
+    table = np.concatenate((ta, table, ta), axis=1) # why add two site?
 
     # 0 represents the identity symbol. Identity might not present
     # in `primary_ops` but the algorithm still works.
 
     in_ops = [[OpTuple([0], qn=np.zeros(qn_size, dtype=int), factor=1)]]
 
-    out_ops_list = _construct_symbolic_mpo(table, in_ops, factor, primary_ops, algo)
+    out_ops_list = _construct_symbolic_mpo(table, in_ops, factor, primary_ops, algo) # with the order of sites
     # number of sites + 1. Note that the table was expanded for convenience
-    assert len(out_ops_list) == len(table[0]) - 1
+    assert len(out_ops_list) == len(table[0]) - 1 # n_sites + 1
     mpo = []
-    for i in range(len(out_ops_list)-1):
-        mo = compose_symbolic_mo(out_ops_list[i], out_ops_list[i+1], primary_ops)
-        mpo.append(mo)
+    for i in range(len(out_ops_list)-1):# loop n times of sites
+        # here give it ops_list next to sites
+        mo = compose_symbolic_mo(out_ops_list[i], out_ops_list[i+1], primary_ops) # not understand
+        mpo.append(mo) # along sites
 
     mpoqn = []
     for out_ops in out_ops_list:
@@ -163,13 +177,13 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
 
 def _construct_symbolic_mpo(table, in_ops, factor, primary_ops, algo="qr"):
     assert len(np.unique(table, axis=0)) == len(table)
-    nsite = table.shape[1] - 2
+    nsite = table.shape[1] - 2 # because np.concatenate((ta, table, ta), axis=1)
 
     out_ops_list = [in_ops]
 
     for isite in range(nsite):
-        table_row = table[:, :2]
-        table_col = table[:, 2:]
+        table_row = table[:, :2] # first two column or first two sites
+        table_col = table[:, 2:] # rest 
         out_ops, table, factor = _construct_symbolic_mpo_one_site(table_row, table_col, [in_ops], factor, primary_ops, algo)
 
         # debug
@@ -376,27 +390,33 @@ def _terms_to_table(model: Model, terms: List[Op], const: float):
         op = Op.identity(dof, qn_size=model.qn_size)
 
         primary_ops_eachsite.append({op:index})
-        primary_ops.append(op)
+        primary_ops.append(op) # add I op with all dofs 
         dummy_table_entry.append(index)
         index += 1
 
     for op in terms:
         elem_ops, factor = op.split_elementary(model.dof_to_siteidx)
-        table_entry = dummy_table_entry.copy()
+        # actually, it split char from one Op's symbol
+        table_entry = dummy_table_entry.copy() #list with site index
         
         for elem_op in elem_ops:
             # it is ensured in `elem_op` every symbol is on the same site
-            site_idx = model.dof_to_siteidx[elem_op.dofs[0]]
-            if elem_op not in primary_ops_eachsite[site_idx].keys():
-                primary_ops_eachsite[site_idx][elem_op] = index
-                primary_ops.append(elem_op)
+            site_idx = model.dof_to_siteidx[elem_op.dofs[0]] # a number which is site idx
+            if elem_op not in primary_ops_eachsite[site_idx].keys():# it is {op:index}, so keys is op, which is identity
+                # if elem_op is not identity
+                primary_ops_eachsite[site_idx][elem_op] = index # add elem_op: index key:value, the index as the n-th loop index, 
+                primary_ops.append(elem_op) # add elem_op to pool
                 index += 1
-            table_entry[site_idx] = primary_ops_eachsite[site_idx][elem_op]
-
+            # here the index elem_op is a I Op with dof
+            # so that's a mapping: site_index (inner index of list):  n-th loop index or index of elem_ops from `op.split_elementary`
+            table_entry[site_idx] = primary_ops_eachsite[site_idx][elem_op] # use elem_op to index it with elem_op, so get primmary index
+        # one op term one table_entry which is a index mapping  
         table.append(table_entry)
         factor_list.append(factor)
 
     # const
+    # what is `const`'s function?
+    # in Mpo class, it is -self.offset, confussing 
     if const != 0:
         table_entry = dummy_table_entry.copy()
         factor_list.append(const)
@@ -409,6 +429,7 @@ def _terms_to_table(model: Model, terms: List[Op], const: float):
     max_uint16 = np.iinfo(np.uint16).max
     assert len(primary_ops) < max_uint16
     
+    # from here we can find that, num of elem_op on each site is same 
     table = np.array(table, dtype=np.uint16)
     logger.debug(f"Input operator terms: {table.shape[0]}")
     table, factor = _deduplicate_table(table, factor)
@@ -441,15 +462,15 @@ def _deduplicate_table(table, factor):
 
 # translate the numbers into symbolic Matrix Operator
 def compose_symbolic_mo(in_ops, out_ops, primary_ops):
-    shape = [len(in_ops), len(out_ops)]
+    shape = [len(in_ops), len(out_ops)] # what's the meaning of shape? or what is mo
     mo = np.full(shape, None, dtype=object)
     for i, _ in np.ndenumerate(mo):
-        mo[i] = []
+        mo[i] = [] # make array's each element to be empty list
     for iop, out_op in enumerate(out_ops):
         for composed_op in out_op:
             in_idx = composed_op.symbol[0]
             op = primary_ops[composed_op.symbol[1]]
-            mo[in_idx][iop].append(composed_op.factor * op)
+            mo[in_idx][iop].append(composed_op.factor * op) # make the empty list have something , but what ?  wh
     return mo
 
 
