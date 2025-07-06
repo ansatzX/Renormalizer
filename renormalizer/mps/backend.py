@@ -4,6 +4,7 @@ import os
 import logging
 import random
 import subprocess
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -61,6 +62,8 @@ def get_git_commit_hash():
 
 USE_GPU, xp = try_import_cupy()
 
+if TYPE_CHECKING:
+    xp = np
 
 # USE_GPU = False
 # xp = np
