@@ -198,11 +198,12 @@ class Mps(MatrixProduct):
                 Note:
                     If there are bases that contain multiple dofs in the model, the value of the dict
                     is the state of all dofs of the basis. For example,
-                    if a basis contains ``"e_1"``, ``"e_2"`` and ``"e_3"``,
+                    if a basis contains ``"e_1"``, ``"e_2"`` and ``"e_3"``, such as in :class:`renormalizer.BasisMultiElectron`,
                     ``{"e_1": 2}`` (``{"e_1": [0, 0, 1]}``) means ``"e_3"`` is occupied and
                     ``{"e_1": 1}`` (``{"e_1": [0, 1, 0]}``) means ``"e_2"`` is occupied.
                     Be aware that in :class:`renormalizer.BasisMultiElectronVac` the vacuum state
                     is added to the ``0`` index.
+
             qn_idx (int): the site index of the quantum number center.
 
         Returns:

@@ -21,7 +21,8 @@ class BasisSet:
             For basis containing multiple DoFs, the type should be a ``list`` or ``tuple``
             of anything that can be hashed.
         nbas (int): number of dimension of the basis set
-        sigmaqn (List): the quantum number of each basis. Could be an integer or tuple of integers
+        sigmaqn (List): the quantum number of each basis. The length of the list should be the same as ``nbas``.
+            Each element of the list should be an integer or a tuple of integers
 
     """
 
@@ -403,6 +404,8 @@ class BasisSineDVR(BasisSet):
         .. math::
             I, x, x^1, x^2, x^\textrm{moment}, dx, dx^2, p, p^2,
             x dx, x^2 p^2, x^2 dx, x p^2, x^3 p^2
+
+    Useful attributes include ``self.L`` (the box length), ``self.dvr_x`` (the grid points).
 
     Parameters
     ----------

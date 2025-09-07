@@ -15,6 +15,9 @@ default_formatter = logging.Formatter("%(asctime)s[%(levelname)s] %(message)s")
 def getLogger(*args):
     return package_logger
 
+# alias for the Python convention
+get_logger = getLogger
+
 
 def init_log(level=logging.DEBUG):
     package_logger.setLevel(level)

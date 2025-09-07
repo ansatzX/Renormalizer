@@ -144,7 +144,7 @@ def test_pyr_4mode(multi_e, dvr):
     model = Model(basis, ham_terms)
     mpo = Mpo(model)
     logger.info(f"mpo_bond_dims:{mpo.bond_dims}")
-    # same form whether multi_e is True or False
+    # same for whether multi_e is True or False
     init_condition = {"s2": 1}
     if dvr:
         for dof in model.v_dofs:

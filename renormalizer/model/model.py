@@ -63,6 +63,8 @@ class Model:
         self.dof_to_siteidx = self.order = {}
         self.dof_to_basis = {}
         for siteidx, ba in enumerate(basis):
+            self.dof_to_siteidx[ba.dofs] = siteidx
+            self.dof_to_basis[ba.dofs] = ba
             for dof_name in ba.dofs:
                 self.dof_to_siteidx[dof_name] = siteidx
                 self.dof_to_basis[dof_name] = ba

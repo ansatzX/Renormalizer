@@ -402,6 +402,8 @@ class Op:
         else:
             raise TypeError(f"Unknwon type {type(other)}")
 
+    def __truediv__(self, other):
+        return self * (1/other)
 
 class OpSum(list):
     r"""
