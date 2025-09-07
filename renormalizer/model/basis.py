@@ -142,6 +142,13 @@ class BasisSHO(BasisSet):
         if dvr:
             self.dvr_x, self.dvr_v = scipy.linalg.eigh(self.op_mat("x"))
             self.dvr = True
+            # make sure dvr_v has the correct phase
+            evals, evecs = scipy.linalg.eigh(self.op_mat("H"))
+            phase = (evecs[:, 0] > 0) * 2 - 1
+            self.dvr_v = self.dvr_v * phase.reshape(1, -1)
+            # this is the purpose: the ground state wavefunction is all positive or negative
+            evals, evecs = scipy.linalg.eigh(self.op_mat("H"))
+            assert np.all(evecs[:, 0] > -1e-7) or np.all(evecs[:, 0] < 1e-7)
 
     def __str__(self):
         return f"BasisSHO(dof: {self.dof}, x0: {self.x0}, omega: {self.omega}, nbas: {self.nbas})"
@@ -328,6 +335,12 @@ class BasisSHO(BasisSet):
             # since b^\dagger b is not allowed to shift the origin,
             # n is designed for occupation number of the SHO basis
             mat = np.diag(np.arange(self.nbas))
+        elif op_symbol == "H":
+            # harmonic oscillator Hamiltonian
+            if self.dvr:
+                mat = self.op_mat("p^2") / 2 + self.op_mat("x") ** 2 * 1 / 2 * self.omega ** 2
+            else:
+                mat = self.omega * (self.op_mat(r"b^\dagger b") + 0.5)
         else:
             raise ValueError(f"op_symbol:{op_symbol} is not supported. ")
 
