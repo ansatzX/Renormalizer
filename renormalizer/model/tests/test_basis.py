@@ -1,3 +1,4 @@
+from renormalizer import BasisSHO, BasisSineDVR
 from renormalizer.model import Model, Op, basis as Ba
 from renormalizer.mps import Mpo, Mps, gs
 
@@ -137,3 +138,15 @@ def test_SineDVR_quadrature():
     mat2 = basis2.op_mat("dx*x*dx")
     assert np.allclose(mat1, mat2)
 
+
+def test_scale_omega():
+    omega = 0.3
+    b = BasisSHO("v", omega, 32, dvr=True, scale_omega=True)
+    h = b.op_mat("H")
+    evals, evecs = np.linalg.eigh(h)
+    np.testing.assert_allclose(evals[:2], omega * (np.arange(2) + 0.5), atol=1e-10)
+
+    b = BasisSineDVR("v", nbas=64, xi=-10, xf=10, dvr=True, omega=omega, scale_omega=True)
+    h = omega / 2 * (b.op_mat("p^2") + b.op_mat("x^2"))
+    evals, evecs = np.linalg.eigh(h)
+    np.testing.assert_allclose(evals[:2], omega * (np.arange(2) + 0.5), atol=1e-10)

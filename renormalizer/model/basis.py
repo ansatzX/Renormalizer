@@ -109,8 +109,8 @@ class BasisSet:
 
 
 class BasisSHO(BasisSet):
-    """
-    simple harmonic oscillator basis set
+    r"""
+    Simple harmonic oscillator basis set
 
     Args:
         dof: The name of the DoF contained in the basis set. The type could be anything that can be hashed.
@@ -122,33 +122,38 @@ class BasisSHO(BasisSet):
             through general expression for :math:`x`power or :math:`p` power. This is not efficient because
             :math:`x` and :math:`x^2` (or :math:`p` and :math:`p^2`) have been hard-coded already.
             The option is only used for testing.
+        scale_omega (bool): whether scale the frequency into :math:`x` and :math:`x^2` (or :math:`p` and :math:`p^2`).
+            If not scaled, the SHO Hamiltonian is written as :math:`p^2/2 + 1/2\omega^2 x^2`.
+            If scaled, the SHO Hamiltonian becomes :math:`\omega/2(p^2 + x^2)`.
     """
 
     is_phonon = True
 
-    def __init__(self, dof, omega, nbas, x0=0., dvr=False, general_xp_power=False):
+    def __init__(self, dof, omega, nbas, x0=0., dvr=False, general_xp_power=False, scale_omega: bool=False):
         self.omega = omega
         self.x0 = x0  # origin = x0
         super().__init__(dof, nbas, [0] * nbas)
 
+        self.dvr = dvr
         self.general_xp_power = general_xp_power
+        self.scale_omega = scale_omega
 
         # whether under recursion
         self._recursion_flag = 0
 
-        self.dvr = False
-        self.dvr_x = None  # the expectation value of x on SHO_dvr
-        self.dvr_v = None  # the rotation matrix between SHO to SHO_dvr
-        if dvr:
-            self.dvr_x, self.dvr_v = scipy.linalg.eigh(self.op_mat("x"))
-            self.dvr = True
+        if self.dvr:
+            b = BasisSHO("dvr", self.omega, self.nbas, self.x0)
+            self.dvr_x, self.dvr_v = scipy.linalg.eigh(b.op_mat("x"))
             # make sure dvr_v has the correct phase
             evals, evecs = scipy.linalg.eigh(self.op_mat("H"))
             phase = (evecs[:, 0] > 0) * 2 - 1
             self.dvr_v = self.dvr_v * phase.reshape(1, -1)
-            # this is the purpose: the ground state wavefunction is all positive or negative
+            # this is the purpose: the ground state wavefunction amplitudes are all positive or negative
             evals, evecs = scipy.linalg.eigh(self.op_mat("H"))
             assert np.all(evecs[:, 0] > -1e-7) or np.all(evecs[:, 0] < 1e-7)
+        else:
+            self.dvr_x = None  # the expectation value of x on SHO_dvr
+            self.dvr_v = None  # the rotation matrix between SHO to SHO_dvr
 
     def __str__(self):
         return f"BasisSHO(dof: {self.dof}, x0: {self.x0}, omega: {self.omega}, nbas: {self.nbas})"
@@ -335,16 +340,21 @@ class BasisSHO(BasisSet):
             # since b^\dagger b is not allowed to shift the origin,
             # n is designed for occupation number of the SHO basis
             mat = np.diag(np.arange(self.nbas))
-        elif op_symbol == "H":
+        elif op_symbol in ["H", "h"]:
             # harmonic oscillator Hamiltonian
             if self.dvr:
                 mat = self.op_mat("p^2") / 2 + self.op_mat("x") ** 2 * 1 / 2 * self.omega ** 2
+                # don't have to care about self.scale_omega, because the option is ignored under recursion
             else:
-                mat = self.omega * (self.op_mat(r"b^\dagger b") + 0.5)
+                mat = self.omega * (self.op_mat(r"b^\dagger b") + self.op_mat("I") * 0.5)
         else:
             raise ValueError(f"op_symbol:{op_symbol} is not supported. ")
 
         self._recursion_flag -= 1
+
+        if self.scale_omega and self._recursion_flag == 0:
+            x_power, p_power = count_powers(op_symbol)
+            mat = mat * np.sqrt(self.omega) ** (x_power - p_power)
         return mat * op_factor
 
     def copy(self, new_dof):
@@ -433,12 +443,19 @@ class BasisSineDVR(BasisSet):
     endpoint: bool, optional
         If ``endpoint=False``, :math:`x_0=x_i, x_{N+1}=x_f`; otherwise
         :math:`x_1=x_i, x_{N}=x_f`.
-
+    quadrature: bool, optional.
+        Whether calculate unimplemented operators numerically. Experimental. Defaults to False.
+    dvr: bool, optional.
+        Whether enable DVR (:math:`x` eigenbasis). Defaults to False.
+    omega: float, optional
+        The vibrational basis energy (:math:`\omega`) if harmonic oscillator is involved in the model.
+    scale_omega (bool): whether scale the :math:`\omega` into :math:`x` and :math:`p`: multiple :math:`x`
+        by :math:`\sqrt{\omega}` and divide :math:`p` by :math:`\sqrt{\omega}`.
     """
     is_phonon = True
     
     def __init__(self, dof, nbas, xi, xf, endpoint=False, quadrature=False,
-            dvr=False):
+            dvr=False, omega=None, scale_omega=False):
 
         assert xi < xf
         if endpoint:
@@ -461,6 +478,10 @@ class BasisSineDVR(BasisSet):
             np.sin(np.tensordot(tmp, tmp, axes=0)*np.pi/(nbas+1))
         self.quadrature = quadrature
         self.dvr = dvr
+        if scale_omega and (omega is None):
+            raise ValueError("Must provide the frequency to scale x and p")
+        self.omega = omega
+        self.scale_omega = scale_omega
 
     def __str__(self):
         return f"BasisSineDVR(xi: {self.xi}, xf: {self.xf}, nbas: {self.nbas})"
@@ -625,12 +646,16 @@ class BasisSineDVR(BasisSet):
                     mat = self.quad(op_symbol)
                 else:
                     raise ValueError(f"op_symbol:{op_symbol} is not supported. You can try explicit quadrature")
-        
+
         self._recursion_flag -= 1
 
-        if self.dvr and self._recursion_flag == 0:
-            mat = self.dvr_v.T @ mat @ self.dvr_v
-        
+        if self._recursion_flag == 0:
+            if self.dvr:
+                mat = self.dvr_v.T @ mat @ self.dvr_v
+            if self.scale_omega:
+                x_power, p_power = count_powers(op_symbol)
+                mat = mat * np.sqrt(self.omega) ** (x_power - p_power)
+
         return mat * op_factor
     
     @property
@@ -1062,3 +1087,60 @@ def x_power_k(k, m, n):
 def p_power_k(k,m,n):
 # <m|p^k|n>
     return x_power_k(k,m,n) * (1j)**(m-n)
+
+
+def count_powers(expr: str):
+    """
+    Count powers of x and p in a given string expression.
+    - 'dx' is treated as 'p'
+    - Terms are separated by spaces
+    - '^n' means raised to power n
+    - Implicit power is 1 if no exponent is given
+    - Invalid tokens raise ValueError
+    """
+    # Normalize string
+    expr = expr.strip().lower()
+
+    # Map tokens
+    tokens = expr.split()
+    x_power = 0
+    p_power = 0
+
+    for token in tokens:
+        # Normalize dx -> p
+        if token.startswith("dx"):
+            token = token.replace("dx", "p", 1)
+
+        # Parse variable and power
+        if token.startswith("x"):
+            var = "x"
+            rest = token[1:]
+        elif token.startswith("p"):
+            var = "p"
+            rest = token[1:]
+        elif token.startswith("h") or token.startswith("b"):
+            # b^\dagger and b should be ignored
+            continue
+        else:
+            raise ValueError(f"Invalid expr: '{expr}'")
+
+        # Handle power
+        if rest == "":
+            power = 1
+        elif rest.startswith("^"):
+            try:
+                power = int(rest[1:])
+            except ValueError:
+                raise ValueError(f"Invalid power in expr: '{expr}'")
+        else:
+            raise ValueError(f"Invalid format in expr: '{expr}'")
+
+        # Add to total
+        if var == "x":
+            x_power += power
+        elif var == "p":
+            p_power += power
+        else:
+            assert False
+
+    return x_power, p_power
