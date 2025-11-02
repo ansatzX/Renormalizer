@@ -170,6 +170,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/nuclear_basis.html">Nuclear Basis Set</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/quantum_number.html">Quantum Numbers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/compress_mps.html">Compressing MPS</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../tutorials/time_evolution.html">Time Evolution using Renormalizer</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../tutorials/ttn_basic.html">Basics of Tree Tensor Networks</a></li>
 </ul>
 </li>
@@ -385,6 +386,9 @@
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">&quot;the second quantization doesn&#39;t support nonzero x0&quot;</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_recursion_flag</span> <span class="o">+=</span> <span class="mi">1</span>
+
+        <span class="c1"># prevent side effect of split(&quot; &quot;)</span>
+        <span class="n">op_symbol</span> <span class="o">=</span> <span class="n">op_symbol</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;b^\dagger + b&quot;</span><span class="p">,</span> <span class="sa">r</span><span class="s2">&quot;b^\dagger+b&quot;</span><span class="p">)</span>
 
         <span class="c1"># so many if-else might be a potential performance problem in the future</span>
         <span class="c1"># changing to lazy-evaluation dict should be better</span>
