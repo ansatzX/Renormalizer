@@ -22,11 +22,11 @@ requires-python = ">=3.6"
 dependencies = [
     "numpy==1.24.*",
     "scipy==1.10.*",
-    "h5py==3.1.*",
+    "h5py",
     "opt_einsum==3.3.*",
     "sympy==1.11.*",
-    "print-tree2==0.9.10",
-    "PyYAML==5.4.*",
+    "print-tree2",
+    "PyYAML",
     "qutip==4.6.*"
 ]
 
