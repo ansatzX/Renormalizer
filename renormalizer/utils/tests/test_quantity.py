@@ -48,6 +48,10 @@ def test_quantity_unit_conversion():
     assert q_array_ev.values[0] == approx(27.2114, rel=1e-4)
     assert q_array_ev.values[1] == approx(54.4228, rel=1e-4)
 
+    # test time conversion
+    q3 = Quantity(1, "ps")
+    np.testing.assert_allclose(q3.as_au(), 41341.37333518)
+
 
 def test_quantity_arithmetic_operations():
     """Test arithmetic operations with Quantity objects"""
@@ -269,4 +273,3 @@ if __name__ == "__main__":
     test_quantity_string_representation()
     test_quantity_backward_compatibility()
     test_quantity_mixed_operations()
-    

@@ -84,6 +84,41 @@ class BasisSet:
         -------
         dof names : tuple
             A tuple of DoF names.
+
+        Examples
+        --------
+        >>> # Single DoF basis
+        >>> basis_sho = BasisSHO("v", 1.0, 10)
+        >>> basis_sho.dofs
+        ('v',)
+
+        >>> # Multi-electron basis
+        >>> basis_me = BasisMultiElectron(["S0", "S1", "S2"], sigmaqn=[0, 0, 0])
+        >>> basis_me.dofs
+        ('S0', 'S1', 'S2')
+
+        >>> # Multi-electron vacuum basis
+        >>> basis_me_vac = BasisMultiElectronVac(["S0", "S1"])
+        >>> basis_me_vac.dofs
+        ('S0', 'S1')
+
+        >>> # Simple electron basis
+        >>> basis_se = BasisSimpleElectron("e")
+        >>> basis_se.dofs
+        ('e',)
+
+        >>> # Half-spin basis
+        >>> basis_spin = BasisHalfSpin("spin")
+        >>> basis_spin.dofs
+        ('spin',)
+
+        Notes
+        -----
+        - For single DoF bases (BasisSHO, BasisSineDVR, BasisSimpleElectron, BasisHalfSpin),
+          this returns a 1-element tuple containing the DoF name
+        - For multi-DoF bases (BasisMultiElectron, BasisMultiElectronVac), this returns a tuple
+          of all electronic state names
+        - The returned tuple can be used as keys in condition dictionaries for Mps.hartree_product_state
         """
         if self.multi_dof:
             return tuple(self.dof)
@@ -122,9 +157,10 @@ class BasisSHO(BasisSet):
             through general expression for :math:`x`power or :math:`p` power. This is not efficient because
             :math:`x` and :math:`x^2` (or :math:`p` and :math:`p^2`) have been hard-coded already.
             The option is only used for testing.
-        scale_omega (bool): whether scale the frequency into :math:`x` and :math:`x^2` (or :math:`p` and :math:`p^2`).
+        scale_omega (bool): whether scale the frequency into :math:`x` and :math:`p`.
             If not scaled, the SHO Hamiltonian is written as :math:`p^2/2 + 1/2\omega^2 x^2`.
-            If scaled, the SHO Hamiltonian becomes :math:`\omega/2(p^2 + x^2)`.
+            If scaled, :math:`x` and :math:`p` become dimensionless,
+            and the SHO Hamiltonian becomes :math:`\omega/2(p^2 + x^2)`.
     """
 
     is_phonon = True
@@ -410,8 +446,13 @@ class BasisHopsBoson(BasisSet):
 
 class BasisSineDVR(BasisSet):
     r"""
-    Sine DVR basis (particle-in-a-box) for vibrational, angular, and
-    dissociative modes.
+    Sine DVR basis (particle-in-a-box) for vibrational and dissociative modes with fixed boundary conditions.
+    The wavefunction is zero at the boundaries, making it suitable for systems where the particle is confined
+    to a finite region. For torsional modes or angular motion with periodic boundary conditions, use exponential DVR.
+
+    Important: This basis uses fixed boundary conditions (wavefunction goes to zero at boundaries) and is NOT
+    suitable for periodic systems like torsional modes. For periodic boundary conditions, use a different basis.
+
     See Phys. Rep. 324, 1–105 (2000).
 
         .. math::
@@ -447,15 +488,10 @@ class BasisSineDVR(BasisSet):
         Whether calculate unimplemented operators numerically. Experimental. Defaults to False.
     dvr: bool, optional.
         Whether enable DVR (:math:`x` eigenbasis). Defaults to False.
-    omega: float, optional
-        The vibrational basis energy (:math:`\omega`) if harmonic oscillator is involved in the model.
-    scale_omega (bool): whether scale the :math:`\omega` into :math:`x` and :math:`p`: multiple :math:`x`
-        by :math:`\sqrt{\omega}` and divide :math:`p` by :math:`\sqrt{\omega}`.
     """
     is_phonon = True
     
-    def __init__(self, dof, nbas, xi, xf, endpoint=False, quadrature=False,
-            dvr=False, omega=None, scale_omega=False):
+    def __init__(self, dof, nbas, xi, xf, endpoint=False, quadrature=False, dvr=False):
 
         assert xi < xf
         if endpoint:
@@ -478,10 +514,6 @@ class BasisSineDVR(BasisSet):
             np.sin(np.tensordot(tmp, tmp, axes=0)*np.pi/(nbas+1))
         self.quadrature = quadrature
         self.dvr = dvr
-        if scale_omega and (omega is None):
-            raise ValueError("Must provide the frequency to scale x and p")
-        self.omega = omega
-        self.scale_omega = scale_omega
 
     def __str__(self):
         return f"BasisSineDVR(xi: {self.xi}, xf: {self.xf}, nbas: {self.nbas})"
@@ -649,12 +681,8 @@ class BasisSineDVR(BasisSet):
 
         self._recursion_flag -= 1
 
-        if self._recursion_flag == 0:
-            if self.dvr:
-                mat = self.dvr_v.T @ mat @ self.dvr_v
-            if self.scale_omega:
-                x_power, p_power = count_powers(op_symbol)
-                mat = mat * np.sqrt(self.omega) ** (x_power - p_power)
+        if self._recursion_flag == 0 and self.dvr:
+            mat = self.dvr_v.T @ mat @ self.dvr_v
 
         return mat * op_factor
     
@@ -794,16 +822,52 @@ class BasisSineDVR(BasisSet):
 
 
 class BasisMultiElectron(BasisSet):
-    r"""
-    The basis set for multi electronic state on one single site,
+    """
+    The basis set for multiple electronic states on a single site.
     The basis order is [dof_names[0], dof_names[1], dof_names[2], ...].
 
     Parameters
     ----------
-    dof : a :class:`list` or :class:`tuple` of hashable objects.
-        The names of the DoFs contained in the basis set.
-    sigmaqn : :class:`list` of :class:`int` or :class:`list` of containers of :class:`int`
-        The quantum number of each basis
+    dof : list or tuple of hashable objects
+        The names of the electronic states. Each element represents a different electronic state
+        (e.g., ground state, first excited state, etc.) on the same site.
+    sigmaqn : list of int or list of containers of int
+        The quantum number(s) for each basis state. The length must match the number of electronic states.
+        Each element can be an integer or a tuple of integers representing the quantum numbers.
+        Set all to 0 if quantum numbers are not needed.
+
+    Notes
+    -----
+    The parameter name ``dof`` can be misleading. In this context, it refers to different electronic
+    states within the same physical degree of freedom (site), not different physical degrees of freedom.
+
+    Important: When using with :meth:`~renormalizer.mps.Mps.hartree_product_state`, the condition
+    dictionary should use ANY ONE of the DoF names as the key to specify the state of the entire basis.
+    For example, for a basis with dof_names = ["S0", "S1", "S2"], you can use:
+    - ``{"S0": 0}`` to put the system in the S0 state
+    - ``{"S1": 1}`` to put the system in the S1 state
+    - ``{"S2": 2}`` to put the system in the S2 state
+    The key can be ANY of the DoF names: "S0", "S1", or "S2" - they all refer to the same basis
+
+    Examples
+    --------
+    >>> # Create a basis with three electronic states (S0, S1, S2) with quantum numbers disabled
+    >>> b = BasisMultiElectron(["S0", "S1", "S2"], sigmaqn=[0, 0, 0])
+    >>> b
+    BasisMultiElectron(dof: ['S0', 'S1', 'S2'], nbas: 3)
+    >>> b.dofs
+    ('S0', 'S1', 'S2')
+    >>> from renormalizer import Op
+    >>> # Create an operator that transfers from S0 to S1
+    >>> b.op_mat(Op("a^\\dagger a", ["S0", "S1"]))
+    array([[0., 1., 0.],
+           [0., 0., 0.],
+           [0., 0., 0.]])
+    >>> # Create an operator for the number operator on S2
+    >>> b.op_mat(Op("a^\\dagger a", "S2"))
+    array([[0., 0., 0.],
+           [0., 0., 0.],
+           [0., 0., 1.]])
     """
 
     is_electron = True
@@ -862,6 +926,16 @@ class BasisMultiElectronVac(BasisSet):
     ----------
     dof : a :class:`list` or :class:`tuple` of hashable objects.
         The names of the DoFs contained in the basis set.
+
+    Notes
+    -----
+    Important: When using with :meth:`~renormalizer.mps.Mps.hartree_product_state`, the condition
+    dictionary should use ANY ONE of the DoF names as the key to specify the state of the entire basis.
+    For example, for a basis with dof_names = ["S0", "S1"], you can use:
+    - ``{"S0": 0}`` to put the system in the vacuum state
+    - ``{"S1": 1}`` to put the system in the S0 state
+    - ``{"S0": 2}`` to put the system in the S1 state
+    The key can be ANY of the DoF names: "S0", "S1", or "S2" - they all refer to the same basis.
     """
 
     is_electron = True
@@ -1118,8 +1192,8 @@ def count_powers(expr: str):
         elif token.startswith("p"):
             var = "p"
             rest = token[1:]
-        elif token.startswith("h") or token.startswith("b"):
-            # b^\dagger and b should be ignored
+        elif token.startswith("h") or token.startswith("b") or token == "i":
+            # h, b^\dagger, b, and i should be ignored
             continue
         else:
             raise ValueError(f"Invalid expr: '{expr}'")

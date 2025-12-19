@@ -21,6 +21,7 @@ au_ratio_dict = {
     "a.u.": 1,
     "au": 1,
     "fs": constant.au2fs,
+    "ps": constant.au2ps
 }
 
 au_ratio_dict.update({k.lower(): v for k, v in au_ratio_dict.items()})

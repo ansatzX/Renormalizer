@@ -49,7 +49,7 @@ class MatrixProduct:
 
         mp.qn = []
         for i in range(nsites+1):
-            subqn = npload[f"subqn_{i}"].astype(int).tolist()
+            subqn = npload[f"subqn_{i}"].astype(int)
             mp.qn.append(subqn)
 
         mp.qnidx = int(npload["qnidx"])
@@ -58,7 +58,7 @@ class MatrixProduct:
         return mp
 
     def __init__(self):
-        # XXX: when modify theses codes, keep in mind to update `metacopy` method
+        # XXX: when modify these codes, keep in mind to update `metacopy` method
         # set to a list of None upon metacopy. String is used when the matrix is
         # stored in disks
         self._mp: List[Union[Matrix, None, str]] = []
@@ -916,6 +916,8 @@ class MatrixProduct:
 
         for idx in self.iter_idx_list(full=False, stop_idx=stop_idx):
             self._push_cano(idx)
+        if len(self) == 1:
+            return self
         # can't iter to idx == 0 or idx == self.site_num - 1
         if (not self.to_right and idx == 1) or (self.to_right and idx == self.site_num - 2):
             self._switch_direction()

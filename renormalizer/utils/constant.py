@@ -29,6 +29,9 @@ ev2cm = 1./cm2ev
 fs2au = 1.0e-15 / c["atomic unit of time"][0]
 au2fs = 1. / fs2au
 
+ps2au = fs2au * 1000
+au2ps = 1. / ps2au
+
 ################ temperature energy ###############
 K2au = c["kelvin-hartree relationship"][0]
 au2K = c["hartree-kelvin relationship"][0]

@@ -192,17 +192,28 @@ class Mps(MatrixProduct):
         Args:
             model (:class:`~renormalizer.model.Model`): Model information.
             condition (Dict): Dict with format ``{dof:local_state}``.
-                The default local state for dofs not specified is the "0" state.
+                The default local state for dofs not contained in the condition dict is the "0" state.
                 An example is ``{"e_1":1, "v_0":2, "v_3":[0, 0.707, 0.707]}``.
 
-                Note:
-                    If there are bases that contain multiple dofs in the model, the value of the dict
-                    is the state of all dofs of the basis. For example,
-                    if a basis contains ``"e_1"``, ``"e_2"`` and ``"e_3"``, such as in :class:`renormalizer.BasisMultiElectron`,
-                    ``{"e_1": 2}`` (``{"e_1": [0, 0, 1]}``) means ``"e_3"`` is occupied and
-                    ``{"e_1": 1}`` (``{"e_1": [0, 1, 0]}``) means ``"e_2"`` is occupied.
-                    Be aware that in :class:`renormalizer.BasisMultiElectronVac` the vacuum state
-                    is added to the ``0`` index.
+            Note:
+                For basis sets containing multiple DoFs (like :class:`~renormalizer.model.BasisMultiElectron`
+                and :class:`~renormalizer.model.BasisMultiElectronVac`), the key in the condition dict must be
+                ONE OF THE ACTUAL DOF NAMES or ALL OF THE ACTUAL DOF NAMES from the basis set.
+                In both cases, the value specifies the state for ALL DoFs in that basis.
+
+                For :class:`~renormalizer.model.BasisMultiElectron` with dof_names = ["S0", "S1", "S2"]:
+                - The basis order is [S0, S1, S2]
+                - ``{"S0": 0}`` or ``{"S0": [1, 0, 0]}`` means S0 is occupied
+                - ``{"S1": 1}`` or ``{"S1": [0, 1, 0]}`` means S1 is occupied
+                - ``{"S2": 2}`` or ``{"S2": [0, 0, 1]}`` means S2 is occupied
+                - The key can be ANY of the DoF names: "S0", "S1", or "S2" - they all refer to the same basis
+                - Alternatively, ``{("S0", "S1", "S2"): 1}`` means S1 is occupied.
+
+                For :class:`~renormalizer.model.BasisMultiElectronVac` with dof_names = ["S0", "S1"]:
+                - The basis order is [vacuum, S0, S1]
+                - ``{"S0": 0}`` or ``{"S0": [1, 0, 0]}`` means vacuum state
+                - ``{"S1": 1}`` or ``{"S1": [0, 1, 0]}`` means S0 is occupied
+                - ``{"S0": 2}`` or ``{"S0": [0, 0, 1]}`` means S1 is occupied
 
             qn_idx (int): the site index of the quantum number center.
 
@@ -222,7 +233,8 @@ class Mps(MatrixProduct):
         # check that the condition is not duplicated
         # each site has at most 1 single key to assign the occupation  
         index = [model.dof_to_siteidx[key] for key in condition.keys()]
-        assert len(index) == len(set(index))
+        if len(index) != len(set(index)):
+            raise ValueError("Each site has at most 1 single key to assign the occupation")
         # replace the dof_name key to site_index key
         condition = {model.dof_to_siteidx[key]:value for key, value in
                 condition.items()}

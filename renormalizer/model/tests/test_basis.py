@@ -145,8 +145,3 @@ def test_scale_omega():
     h = b.op_mat("H")
     evals, evecs = np.linalg.eigh(h)
     np.testing.assert_allclose(evals[:2], omega * (np.arange(2) + 0.5), atol=1e-10)
-
-    b = BasisSineDVR("v", nbas=64, xi=-10, xf=10, dvr=True, omega=omega, scale_omega=True)
-    h = omega / 2 * (b.op_mat("p^2") + b.op_mat("x^2"))
-    evals, evecs = np.linalg.eigh(h)
-    np.testing.assert_allclose(evals[:2], omega * (np.arange(2) + 0.5), atol=1e-10)

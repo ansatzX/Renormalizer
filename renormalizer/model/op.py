@@ -56,8 +56,6 @@ class Op:
     Examples
     --------
     >>> from renormalizer.model import Op
-    >>> Op(r"a^\dagger a", ['site0', "site1"], 2., qn=[1, -1])
-    Op('a^\\dagger a', ['site0', 'site1'], 2.0, [[1], [-1]])
     >>> x = Op("X", 0, 0.5)
     >>> 3 * x
     Op('X', [0], 1.5)
@@ -74,6 +72,10 @@ class Op:
     [Op('Y X', [1, 0], 0.1), Op('X X', [0, 0], 0.25)]
     >>> (y + x) * (x + y)
     [Op('Y X', [1, 0], 0.1), Op('Y Y', [1, 1], 0.04000000000000001), Op('X X', [0, 0], 0.25), Op('X Y', [0, 1], 0.1)]
+    >>> Op(r"a^\dagger a", ['site0', "site1"], 2., qn=[1, -1])  # off-diagonal hopping operator
+    Op('a^\\dagger a', ['site0', 'site1'], 2.0, [[1], [-1]])
+    >>> Op(r"a^\dagger a", 'site0', 2., qn=[1, -1])  # diagonal occupation operator
+    Op('a^\\dagger a', ['site0', 'site0'], 2.0, [[1], [-1]])
     """
 
     @classmethod
