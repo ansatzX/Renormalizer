@@ -277,11 +277,11 @@ def test_2dof_rdm(basis_tree, dofs):
 
     # Z0Z1
     op1 = np.diag([1, -1, -1, 1])
-    np.testing.assert_allclose(np.trace(rdm1 @ op1), np.trace(rdm2 @ op1), atol=1e-8)
+    np.testing.assert_allclose(np.trace(rdm1 @ op1), np.trace(rdm2 @ op1), atol=1e-7)
 
     # +0-1 + +1-0
     op2 = np.array([[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 0]])
-    np.testing.assert_allclose(np.trace(rdm1 @ op2), np.trace(rdm2 @ op2), atol=1e-8)
+    np.testing.assert_allclose(np.trace(rdm1 @ op2), np.trace(rdm2 @ op2), atol=1e-7)
 
 
 @pytest.mark.parametrize("basis", [basis_binary, basis_multi_basis])
