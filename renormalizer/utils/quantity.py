@@ -220,13 +220,13 @@ class Quantity:
         if self._data.size == 1:
             return f"{float(self._data[0])} {self.unit}"
         else:
-            return f"{list(self._data)} {self.unit}"
+            return f"{[float(x) for x in self._data]} {self.unit}"
 
     def __repr__(self):
         if self._data.size == 1:
             return f"Quantity({float(self._data[0])}, '{self.unit}')"
         else:
-            return f"Quantity({list(self._data)}, '{self.unit}')"
+            return f"Quantity({[float(x) for x in self._data]}, '{self.unit}')"
 
     # TODO: magic methods such as `__lt__` and so on
 

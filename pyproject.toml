@@ -17,7 +17,7 @@ maintainers = [{ name = "Weitang Li", email = "liwt31@gmail.com" }]
 
 license = "Apache-2.0" 
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.6,<=3.10"
 
 dependencies = [
     "numpy>=1.24",
@@ -26,7 +26,7 @@ dependencies = [
     "opt_einsum>=3.4",
     "sympy>=1.11",
     "print-tree2",
-    "pyyaml",
+    "PyYAML",
     "qutip==4.6.*",
 ]
 

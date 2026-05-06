@@ -181,7 +181,11 @@ class Op:
         self.dofs: List = dofs
         if isinstance(factor, Quantity):
             factor = factor.as_au()
-        self._factor: float = factor + 0.0 # convert to float. Note this works for complex number
+        # convert numpy scalar to native Python type
+        if hasattr(factor, 'imag') and factor.imag != 0:
+            self._factor: complex = complex(factor)
+        else:
+            self._factor: float = float(factor)
         self.qn_list: List[np.ndarray] = [np.array(qn).reshape(-1) for qn in qn_list]
 
     def split_elementary(self, dof_to_siteidx) -> Tuple[List["Op"], Union[float, complex]]:

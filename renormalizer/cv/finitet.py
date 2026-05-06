@@ -5,6 +5,7 @@
 import copy
 import os
 import logging
+import inspect
 import scipy
 from itertools import product
 
@@ -305,9 +306,11 @@ class SpectraFtCV(SpectraCv):
         # Matrix A
         mat_a = scipy.sparse.linalg.LinearOperator((nonzeros, nonzeros), matvec=hop)
 
+        _cg_params = inspect.signature(scipy.sparse.linalg.cg).parameters
+        _tol_kw = {'rtol': 1.e-5} if 'rtol' in _cg_params else {'tol': 1.e-5}
         x, info = scipy.sparse.linalg.cg(
-            mat_a, asnumpy(vecb), tol=1.e-5, x0=asnumpy(guess), maxiter=500,
-            M=pre_M, atol=0)
+            mat_a, asnumpy(vecb), x0=asnumpy(guess), maxiter=500,
+            M=pre_M, atol=0, **_tol_kw)
         # logger.info(f"linear eq dim: {nonzeros}")
         # logger.info(f'times for hop:{count}')
         self.hop_time.append(count)

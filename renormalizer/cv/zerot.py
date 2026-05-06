@@ -15,6 +15,7 @@ from renormalizer.mps.matrix import (
 from renormalizer.mps.oe_contract_wrap import oe_contract_expression
 from renormalizer.utils import OptimizeConfig
 import logging
+import inspect
 import scipy
 
 import opt_einsum as oe
@@ -285,9 +286,12 @@ class SpectraZtCV(SpectraCv):
         mat_a = scipy.sparse.linalg.LinearOperator((nonzeros, nonzeros),
                                                    matvec=hop)
 
-        x, info = scipy.sparse.linalg.cg(mat_a, asnumpy(vec_b), rtol=1.e-5,
+        # scipy 1.10 uses 'tol', scipy >=1.12 uses 'rtol'
+        _cg_params = inspect.signature(scipy.sparse.linalg.cg).parameters
+        _tol_kw = {'rtol': 1.e-5} if 'rtol' in _cg_params else {'tol': 1.e-5}
+        x, info = scipy.sparse.linalg.cg(mat_a, asnumpy(vec_b),
                                          x0=asnumpy(guess),
-                                         M=pre_M, atol=0)
+                                         M=pre_M, atol=0, **_tol_kw)
 
         self.hop_time.append(count)
         if info != 0:

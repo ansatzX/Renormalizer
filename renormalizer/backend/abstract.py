@@ -71,6 +71,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @canonical_atol.setter
     def canonical_atol(self, value):
+        if not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f'canonical_atol must be a non-negative number, got {value!r}')
         self._canonical_atol = value
 
     @property
@@ -79,6 +81,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @canonical_rtol.setter
     def canonical_rtol(self, value):
+        if not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f'canonical_rtol must be a non-negative number, got {value!r}')
         self._canonical_rtol = value
 
     def numpy(self, x: Any):
