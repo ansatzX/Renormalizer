@@ -18,7 +18,7 @@ import scipy
 from renormalizer.lib import davidson
 from renormalizer.model.h_qc import qc_model, int_to_h, generate_ladder_operator, simplify_op
 from renormalizer.model import Model, Op
-from renormalizer.mps.backend import xp, OE_BACKEND, primme, IMPORT_PRIMME_EXCEPTION
+from renormalizer.mps.backend import backend, xp, primme, IMPORT_PRIMME_EXCEPTION
 from renormalizer.mps.matrix import multi_tensor_contract, tensordot, asnumpy, asxp
 from renormalizer.mps.hop_expr import  hop_expr
 from renormalizer.mps.svd_qn import get_qn_mask
@@ -325,7 +325,7 @@ def get_ham_direct(
             ham = oe_contract(
                 "abc,bdef,lfk->adlcek",
                 ltensor, cmo[0], rtensor,
-                backend=OE_BACKEND
+                backend=backend.opt_einsum_name
             )
             ham = ham[:, :, :, qn_mask][qn_mask, :]
         else:
@@ -337,7 +337,7 @@ def get_ham_direct(
             ham = oe_contract(
                 "abc,bdef,fghj,ljk->adglcehk",
                 ltensor, cmo[0], cmo[1], rtensor,
-                backend=OE_BACKEND,
+                backend=backend.opt_einsum_name,
             )
             ham = ham[:, :, :, :, qn_mask][qn_mask, :]
     else:
@@ -350,7 +350,7 @@ def get_ham_direct(
             ham = oe_contract(
                 "abcd, befg, cfhi, jgik -> aejdhk",
                 ltensor, cmo[0], cmo[0], rtensor,
-                backend=OE_BACKEND,
+                backend=backend.opt_einsum_name,
             )
             ham = ham[:, :, :, qn_mask][qn_mask, :]
         else:
@@ -362,7 +362,7 @@ def get_ham_direct(
             ham = oe_contract(
                 "abcd, befg, cfhi, gjkl, ikmn, olnp -> aejodhmp",
                 ltensor, cmo[0], cmo[0], cmo[1], cmo[1], rtensor,
-                backend=OE_BACKEND,
+                backend=backend.opt_einsum_name,
             )
             ham = ham[:, :, :, :, qn_mask][qn_mask, :]
 
@@ -453,7 +453,7 @@ def get_ham_iterative(
             hdiag = oe_contract(
                 "abca, bdef, cedg, hfgh -> adh",
                 ltensor, cmo[0], cmo[0], rtensor,
-                backend=OE_BACKEND,
+                backend=backend.opt_einsum_name,
             )
         else:
             #   S-a d   h l-S
@@ -464,7 +464,7 @@ def get_ham_iterative(
             hdiag = oe_contract(
                 "abca, bdef, cedg, fhij, gihk, ljkl -> adhl",
                 ltensor, cmo[0], cmo[0], cmo[1], cmo[1], rtensor,
-                backend=OE_BACKEND,
+                backend=backend.opt_einsum_name,
             )
 
     hdiag = asnumpy(hdiag[qn_mask] * inverse)

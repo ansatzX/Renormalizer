@@ -285,7 +285,7 @@ class SpectraZtCV(SpectraCv):
         mat_a = scipy.sparse.linalg.LinearOperator((nonzeros, nonzeros),
                                                    matvec=hop)
 
-        x, info = scipy.sparse.linalg.cg(mat_a, asnumpy(vec_b), tol=1.e-5,
+        x, info = scipy.sparse.linalg.cg(mat_a, asnumpy(vec_b), rtol=1.e-5,
                                          x0=asnumpy(guess),
                                          M=pre_M, atol=0)
 

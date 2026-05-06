@@ -7,7 +7,7 @@ import numpy as np
 import scipy
 
 from renormalizer.mps.matrix import tensordot, multi_tensor_contract, asnumpy, asxp
-from renormalizer.mps.backend import xp, USE_GPU, primme, IMPORT_PRIMME_EXCEPTION
+from renormalizer.mps.backend import backend, xp, primme, IMPORT_PRIMME_EXCEPTION
 from renormalizer.mps import Mps
 from renormalizer.mps.lib import Environ, compressed_sum
 from renormalizer.mps.oe_contract_wrap import oe_contract
@@ -143,12 +143,9 @@ class TDA(object):
                 xsize += np.prod(xshape[-1])
         
         logger.debug(f"DMRG-TDA H dimension: {xsize}")
-        
-        if USE_GPU:
-            oe_backend = "cupy"
-        else:
-            oe_backend = "numpy"
-        
+
+        oe_backend = backend.opt_einsum_name
+
         mps_tangent = mps_r_cano.copy()
         environ = Environ(mps_tangent, mpo, "R")
         hdiag = []

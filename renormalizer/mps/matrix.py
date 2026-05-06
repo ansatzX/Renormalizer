@@ -5,7 +5,7 @@ import weakref
 import logging
 from typing import List, Union
 
-from renormalizer.mps.backend import np, backend, xp, USE_GPU
+from renormalizer.mps.backend import np, backend, xp
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class Matrix:
         self.array: np.ndarray = np.asarray(array, dtype=dtype)
         self.original_shape = self.array.shape
         self.sigmaqn = None
-        backend.running = True
+        pass  # backend.running removed
 
     def __getattr__(self, item):
         # use this way to obtain ``array`` to prevent infinite recursion during multi-processing
@@ -295,31 +295,24 @@ def pair_tensor_contract(
     return tensordot(view_left, view_right, axes=(left_pos, right_pos))
 
 
-def asnumpy(array: Union[np.ndarray, xp.ndarray, Matrix, List]) -> np.ndarray:
+def asnumpy(array):
     if array is None:
         return None
     if isinstance(array, Matrix):
         return array.array
-    if isinstance(array, List):
+    if isinstance(array, list):
         return np.array(array)
-    if not USE_GPU:
-        assert isinstance(array, np.ndarray)
-        return array
-    if isinstance(array, np.ndarray):
-        return array
-    stream = xp.cuda.get_current_stream()
-    return xp.asnumpy(array, stream=stream)
+    return backend.numpy(array)
 
 
-def asxp(array: Union[np.ndarray, xp.ndarray, Matrix]) -> xp.ndarray:
+def asxp(array):
     if array is None:
         return None
     if isinstance(array, Matrix):
         array = array.array
-    if not USE_GPU:
-        assert isinstance(array, np.ndarray)
-        return array
-    return xp.asarray(array)
+    if isinstance(array, np.ndarray):
+        return backend.from_numpy(array)
+    return backend.asarray(array)
 
 
 def asxp_oe_args(oe_args):
