@@ -33,7 +33,15 @@ init_log(log_level)
 
 del os, log_level, init_log
  
-from renormalizer.cons import backend, get_backend, runtime_backend, set_backend
+from renormalizer.cons import (
+    SUPPORTED_BACKENDS,
+    available_backends,
+    backend,
+    get_backend,
+    is_backend_available,
+    runtime_backend,
+    set_backend,
+)
 
 
 # user interfaces
@@ -50,4 +58,3 @@ from renormalizer.utils.configs import (
     EvolveConfig,
     EvolveMethod,
 )
-

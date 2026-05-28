@@ -1,17 +1,34 @@
 # -*- coding: utf-8 -*-
 
 from renormalizer.backend.factory import create_backend
+from renormalizer.backend.protocol import BackendProtocol
+
+
+def _delegate_backend_property(name):
+    def getter(self):
+        return getattr(self.current, name)
+
+    return property(getter)
+
+
+def _delegate_backend_method(name):
+    def method(self, *args, **kwargs):
+        return getattr(self.current, name)(*args, **kwargs)
+
+    method.__name__ = name
+    method.__qualname__ = "BackendProxy.{0}".format(name)
+    return method
 
 
 class BackendManager:
     def __init__(self, initial_backend=None):
-        self.current = create_backend(initial_backend, explicit=False)
+        self.current: BackendProtocol = create_backend(initial_backend, explicit=False)
 
-    def set_backend(self, name, *, explicit=True):
+    def set_backend(self, name, *, explicit=True) -> BackendProtocol:
         self.current = create_backend(name, explicit=explicit)
         return self.current
 
-    def get_backend(self):
+    def get_backend(self) -> BackendProtocol:
         return self.current
 
 
@@ -22,6 +39,56 @@ class BackendProxy:
     @property
     def current(self):
         return self._manager.current
+
+    name = _delegate_backend_property("name")
+    array_namespace = _delegate_backend_property("array_namespace")
+    opt_einsum_name = _delegate_backend_property("opt_einsum_name")
+    supports_gpu = _delegate_backend_property("supports_gpu")
+    supports_autodiff = _delegate_backend_property("supports_autodiff")
+    supports_jit = _delegate_backend_property("supports_jit")
+    supports_sparse = _delegate_backend_property("supports_sparse")
+    supports_functional_update = _delegate_backend_property("supports_functional_update")
+    host_array_types = _delegate_backend_property("host_array_types")
+    device_array_types = _delegate_backend_property("device_array_types")
+    ndarray = _delegate_backend_property("ndarray")
+    memory_errors = _delegate_backend_property("memory_errors")
+    transforms = _delegate_backend_property("transforms")
+    random = _delegate_backend_property("random")
+    linalg = _delegate_backend_property("linalg")
+    rank = _delegate_backend_property("rank")
+    size = _delegate_backend_property("size")
+    is_distributed = _delegate_backend_property("is_distributed")
+    is_32bits = _delegate_backend_property("is_32bits")
+    real_dtype = _delegate_backend_property("real_dtype")
+    complex_dtype = _delegate_backend_property("complex_dtype")
+    dtypes = _delegate_backend_property("dtypes")
+    canonical_atol = _delegate_backend_property("canonical_atol")
+    canonical_rtol = _delegate_backend_property("canonical_rtol")
+
+    use_32bits = _delegate_backend_method("use_32bits")
+    use_64bits = _delegate_backend_method("use_64bits")
+    array = _delegate_backend_method("array")
+    asarray = _delegate_backend_method("asarray")
+    from_numpy = _delegate_backend_method("from_numpy")
+    to_numpy = _delegate_backend_method("to_numpy")
+    numpy = _delegate_backend_method("numpy")
+    to_host = _delegate_backend_method("to_host")
+    to_backend = _delegate_backend_method("to_backend")
+    is_array = _delegate_backend_method("is_array")
+    is_host_array = _delegate_backend_method("is_host_array")
+    is_device_array = _delegate_backend_method("is_device_array")
+    sync = _delegate_backend_method("sync")
+    free_all_blocks = _delegate_backend_method("free_all_blocks")
+    log_memory_usage = _delegate_backend_method("log_memory_usage")
+    at_set = _delegate_backend_method("at_set")
+    at_add = _delegate_backend_method("at_add")
+    at_sub = _delegate_backend_method("at_sub")
+    at_mul = _delegate_backend_method("at_mul")
+    barrier = _delegate_backend_method("barrier")
+    allreduce = _delegate_backend_method("allreduce")
+    broadcast = _delegate_backend_method("broadcast")
+    gather = _delegate_backend_method("gather")
+    allgather = _delegate_backend_method("allgather")
 
     def __getattr__(self, name):
         return getattr(self.current, name)

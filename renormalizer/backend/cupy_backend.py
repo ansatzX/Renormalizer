@@ -33,6 +33,8 @@ class CupyBackend(AbstractBackend):
     ndarray = (np.ndarray,)  # will be extended in __init__ if cupy available
     memory_errors = (MemoryError,)
     opt_einsum_name = "cupy"
+    supports_gpu = True
+    host_array_types = (np.ndarray,)
 
     def __init__(self):
         if not _cupy_available:
@@ -42,6 +44,7 @@ class CupyBackend(AbstractBackend):
         super().__init__()
         self.array_namespace = _cupy
         self.ndarray = (np.ndarray, _cupy.ndarray)
+        self.device_array_types = (_cupy.ndarray,)
         self.memory_errors = (MemoryError, _cupy.cuda.memory.OutOfMemoryError)
 
         self.linalg = _cupy.linalg
@@ -63,11 +66,23 @@ class CupyBackend(AbstractBackend):
         return _cupy.asarray(x)
 
     def numpy(self, x):
+        return self.to_numpy(x)
+
+    def to_numpy(self, x):
+        """Convert ``x`` to a NumPy array on the host."""
         if x is None:
             return None
         if isinstance(x, np.ndarray):
             return x
         return _cupy.asnumpy(x)
+
+    def to_host(self, x):
+        """Convert ``x`` to a host NumPy array."""
+        return self.to_numpy(x)
+
+    def to_backend(self, x):
+        """Convert ``x`` to a CuPy array on the active device."""
+        return _cupy.asarray(x)
 
     def free_all_blocks(self):
         mempool = _cupy.get_default_memory_pool()

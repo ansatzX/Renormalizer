@@ -6,6 +6,7 @@ import subprocess
 
 import numpy as np
 
+from renormalizer.backend.factory import SUPPORTED_BACKENDS, available_backends, is_backend_available
 from renormalizer.backend.proxy import BackendManager, BackendProxy
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,9 @@ def get_git_commit_hash():
 
 _manager = BackendManager()
 backend = BackendProxy(_manager)
+object.__setattr__(backend, "available_backends", available_backends)
+object.__setattr__(backend, "is_backend_available", is_backend_available)
+object.__setattr__(backend, "SUPPORTED_BACKENDS", SUPPORTED_BACKENDS)
 xp = backend
 
 

@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
-
 from typing import Any
 
 import numpy as _np
@@ -16,9 +14,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
     ndarray = ()
     memory_errors = (MemoryError,)
     opt_einsum_name = "numpy"
+    supports_gpu = False
     supports_autodiff = False
     supports_jit = False
+    supports_sparse = False
     supports_functional_update = True
+    host_array_types = (_np.ndarray,)
+    device_array_types = ()
 
     def __init__(self):
         self.first_mp = False
@@ -91,8 +93,25 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def from_numpy(self, x: _np.ndarray):
         raise NotImplementedError
 
+    def to_numpy(self, x: Any):
+        return self.numpy(x)
+
+    def to_host(self, x: Any):
+        return self.to_numpy(x)
+
+    def to_backend(self, x: Any):
+        if self.is_host_array(x):
+            return self.from_numpy(x)
+        return self.asarray(x)
+
     def is_array(self, x: Any) -> bool:
         return isinstance(x, self.ndarray)
+
+    def is_host_array(self, x: Any) -> bool:
+        return isinstance(x, self.host_array_types)
+
+    def is_device_array(self, x: Any) -> bool:
+        return isinstance(x, self.device_array_types)
 
     def sync(self):
         return None

@@ -302,7 +302,7 @@ def asnumpy(array):
         return array.array
     if isinstance(array, list):
         return np.array(array)
-    return backend.numpy(array)
+    return backend.to_host(array)
 
 
 def asxp(array):
@@ -310,9 +310,7 @@ def asxp(array):
         return None
     if isinstance(array, Matrix):
         array = array.array
-    if isinstance(array, np.ndarray):
-        return backend.from_numpy(array)
-    return backend.asarray(array)
+    return backend.to_backend(array)
 
 
 def asxp_oe_args(oe_args):

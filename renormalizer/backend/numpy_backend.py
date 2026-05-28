@@ -14,6 +14,8 @@ class NumpyBackend(AbstractBackend):
     name = "numpy"
     array_namespace = np
     ndarray = np.ndarray
+    host_array_types = (np.ndarray,)
+    device_array_types = ()
     memory_errors = (MemoryError,)
     opt_einsum_name = "numpy"
 
@@ -29,11 +31,10 @@ class NumpyBackend(AbstractBackend):
         return getattr(np, name)
 
     def array(self, *args, **kwargs):
-        copy = kwargs.pop("copy", None)
-        result = np.array(*args, **kwargs)
-        if copy:
-            result = result.copy()
-        return result
+        if kwargs.get("copy", True) is None:
+            kwargs = dict(kwargs)
+            kwargs.pop("copy")
+        return np.array(*args, **kwargs)
 
     def asarray(self, *args, **kwargs):
         return np.asarray(*args, **kwargs)
@@ -42,6 +43,18 @@ class NumpyBackend(AbstractBackend):
         return np.asarray(x)
 
     def numpy(self, x):
+        return self.to_numpy(x)
+
+    def to_numpy(self, x):
+        """Convert ``x`` to a NumPy array on the host."""
         if x is None:
             return None
+        return np.asarray(x)
+
+    def to_host(self, x):
+        """Convert ``x`` to a host NumPy array."""
+        return self.to_numpy(x)
+
+    def to_backend(self, x):
+        """Convert ``x`` to the NumPy backend representation."""
         return np.asarray(x)

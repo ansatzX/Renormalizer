@@ -4,7 +4,16 @@ import logging
 
 import numpy as np
 
-from renormalizer.cons import backend, get_backend, runtime_backend, set_backend, xp
+from renormalizer.cons import (
+    SUPPORTED_BACKENDS,
+    available_backends,
+    backend,
+    get_backend,
+    is_backend_available,
+    runtime_backend,
+    set_backend,
+    xp,
+)
 
 try:
     import primme
@@ -35,6 +44,9 @@ __all__ = [
     "set_backend",
     "get_backend",
     "runtime_backend",
+    "SUPPORTED_BACKENDS",
+    "available_backends",
+    "is_backend_available",
     "USE_GPU",
     "OE_BACKEND",
     "MEMORY_ERRORS",
