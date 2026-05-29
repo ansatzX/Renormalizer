@@ -10,19 +10,40 @@ from renormalizer.mps.backend import np, backend, xp
 logger = logging.getLogger(__name__)
 
 
+def _to_numpy_dtype(dtype):
+    """Convert a backend-specific dtype (e.g. torch.float64) to a numpy dtype."""
+    if dtype is None:
+        return None
+    if isinstance(dtype, np.dtype):
+        return dtype
+    try:
+        return np.dtype(dtype)
+    except TypeError:
+        pass
+    # Fallback: convert via dtype name (works for torch dtypes like torch.float64)
+    try:
+        name = str(dtype).rsplit(".", 1)[-1]  # "torch.float64" -> "float64"
+        return np.dtype(name)
+    except (TypeError, ValueError, AttributeError):
+        raise TypeError("Cannot convert {0!r} to a numpy dtype".format(dtype))
+
+
 class Matrix:
 
     def __init__(self, array, dtype=None):
         assert array is not None
         array = asnumpy(array)
-        if dtype == backend.real_dtype:
+        dtype = _to_numpy_dtype(dtype)
+        np_real = _to_numpy_dtype(backend.real_dtype)
+        np_complex = _to_numpy_dtype(backend.complex_dtype)
+        if dtype is not None and dtype == np_real:
             # forbid unchecked casting
             assert not np.iscomplexobj(array)
         if dtype is None:
             if np.iscomplexobj(array):
-                dtype = backend.complex_dtype
+                dtype = np_complex
             else:
-                dtype = backend.real_dtype
+                dtype = np_real
         self.array: np.ndarray = np.asarray(array, dtype=dtype)
         self.original_shape = self.array.shape
         self.sigmaqn = None
@@ -53,8 +74,11 @@ class Matrix:
         return self.array.dtype
 
     def astype(self, dtype):
-        assert not (self.dtype == backend.complex_dtype and dtype == backend.real_dtype)
-        self.array = np.asarray(self.array, dtype=dtype)
+        np_dtype = _to_numpy_dtype(dtype)
+        np_real = _to_numpy_dtype(backend.real_dtype)
+        np_complex = _to_numpy_dtype(backend.complex_dtype)
+        assert not (self.dtype == np_complex and np_dtype == np_real)
+        self.array = np.asarray(self.array, dtype=np_dtype)
         return self
 
     def abs(self):
@@ -117,7 +141,7 @@ class Matrix:
     def to_complex(self):
         # `xp.array` always creates new array, so to_complex means copy, which is
         # in accordance with NumPy
-        return np.array(self.array, dtype=backend.complex_dtype)
+        return np.array(self.array, dtype=_to_numpy_dtype(backend.complex_dtype))
 
     def copy(self):
         new = self.__class__(self.array.copy(), self.array.dtype)
@@ -208,7 +232,17 @@ def einsum(subscripts, *operands):
 
 
 def tensordot(a: Union[Matrix, np.ndarray], b: Union[Matrix, np.ndarray, xp.ndarray], axes) -> xp.ndarray:
-    return xp.tensordot(asxp(a), asxp(b), axes)
+    a_arr = asxp(a)
+    b_arr = asxp(b)
+    # Promote dtypes when they differ (torch requires matching dtypes for tensordot)
+    if hasattr(a_arr, 'dtype') and hasattr(b_arr, 'dtype') and a_arr.dtype != b_arr.dtype:
+        if hasattr(xp, 'promote_types'):
+            target = xp.promote_types(a_arr.dtype, b_arr.dtype)
+        else:
+            target = np.result_type(a_arr.dtype, b_arr.dtype)
+        a_arr = xp.asarray(a_arr, dtype=target)
+        b_arr = xp.asarray(b_arr, dtype=target)
+    return xp.tensordot(a_arr, b_arr, axes)
 
 
 def moveaxis(a: Matrix, source, destination):

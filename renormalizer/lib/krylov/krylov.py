@@ -47,39 +47,40 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
     alpha = np.zeros(block_size)
     beta  = np.zeros(block_size - 1)
 
-    V = xp.empty((block_size, len(vstart)), dtype=vstart.dtype)
-    V[0] = vstart
+    # Use a list to collect Krylov vectors for JAX/torch compatibility
+    # (immutable array backends do not support in-place item assignment).
+    V_list = [vstart]
     res = None
 
 
     for j in range(len(vstart)):
 
-        w = Afunc(V[j])
-        alpha[j] = xp.vdot(w, V[j]).real
+        w = Afunc(V_list[j])
+        alpha[j] = xp.vdot(w, V_list[j]).real
 
         if j == len(vstart)-1:
             #logger.debug("the krylov subspace is equal to the full space")
-            return _expm_krylov(alpha[:j+1], beta[:j], V[:j+1, :].T, nrmv, dt), j+1
+            V = xp.stack(V_list[:j+1])
+            return _expm_krylov(alpha[:j+1], beta[:j], V.T, nrmv, dt), j+1
 
-        if len(V) == j+1:
-            V, old_V = xp.empty((len(V) + block_size, len(vstart)), dtype=vstart.dtype), V
-            V[:len(old_V)] = old_V
-            del old_V
+        if len(V_list) == j+1:
+            # V_list grows dynamically; no pre-allocation needed
             alpha = np.concatenate([alpha, np.zeros(block_size)])
             beta = np.concatenate([beta, np.zeros(block_size)])
 
-        w -= alpha[j]*V[j] + (beta[j-1]*V[j-1] if j > 0 else 0)
+        w -= alpha[j]*V_list[j] + (beta[j-1]*V_list[j-1] if j > 0 else 0)
         beta[j] = xp.linalg.norm(w)
         if beta[j] < 100*len(vstart)*np.finfo(float).eps:
             # logger.warning(f'beta[{j}] ~= 0 encountered during Lanczos iteration.')
-            return _expm_krylov(alpha[:j+1], beta[:j], V[:j+1, :].T, nrmv, dt), j+1
+            V = xp.stack(V_list[:j+1])
+            return _expm_krylov(alpha[:j+1], beta[:j], V.T, nrmv, dt), j+1
 
         if 3 < j and j % 2 == 0:
-            new_res = _expm_krylov(alpha[:j+1], beta[:j], V[:j+1].T, nrmv, dt)
+            V_sub = xp.stack(V_list[:j+1])
+            new_res = _expm_krylov(alpha[:j+1], beta[:j], V_sub.T, nrmv, dt)
             if res is not None and xp.allclose(res, new_res):
                 return new_res, j+1
             else:
                 res = new_res
-        V[j + 1] = w / beta[j]
-
+        V_list.append(w / beta[j])
 

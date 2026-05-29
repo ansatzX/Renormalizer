@@ -50,6 +50,23 @@ class TorchBackend(AbstractBackend):
         torch_oom_error = getattr(torch, "OutOfMemoryError", None)
         if torch_oom_error is not None:
             self.memory_errors = (MemoryError, torch_oom_error)
+        # Monkey-patch torch.tensordot to auto-promote mixed dtypes (e.g. float64 + complex128)
+        if hasattr(torch, 'tensordot') and not getattr(torch.tensordot, "_renormalizer_patched", False):
+            _original_tensordot = torch.tensordot
+            def _tensordot_with_promote(a, b, dims=2, *args, **kwargs):
+                if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor) and a.dtype != b.dtype:
+                    target = torch.promote_types(a.dtype, b.dtype)
+                    a = a.to(dtype=target)
+                    b = b.to(dtype=target)
+                # Convert numpy-style axes=(i, j) to torch-style dims=([i], [j])
+                if isinstance(dims, tuple) and len(dims) == 2:
+                    if isinstance(dims[0], int):
+                        dims = ([dims[0]], [dims[1]])
+                    elif isinstance(dims[0], range):
+                        dims = (list(dims[0]), list(dims[1]))
+                return _original_tensordot(a, b, dims, *args, **kwargs)
+            _tensordot_with_promote._renormalizer_patched = True
+            torch.tensordot = _tensordot_with_promote
 
     def __getattr__(self, name):
         return getattr(torch, name)
@@ -191,3 +208,14 @@ class _TorchRandomProxy:
 
     def __getattr__(self, name):
         return getattr(self._random, name)
+        # Monkey-patch torch.tensordot to auto-promote mixed dtypes (e.g. float64 + complex128)
+        if not getattr(torch.tensordot, "_renormalizer_patched", False):
+            _original_tensordot = torch.tensordot
+            def _tensordot_with_promote(a, b, *args, **kwargs):
+                if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor) and a.dtype != b.dtype:
+                    target = torch.promote_types(a.dtype, b.dtype)
+                    a = a.to(dtype=target)
+                    b = b.to(dtype=target)
+                return _original_tensordot(a, b, *args, **kwargs)
+            _tensordot_with_promote._renormalizer_patched = True
+            torch.tensordot = _tensordot_with_promote
