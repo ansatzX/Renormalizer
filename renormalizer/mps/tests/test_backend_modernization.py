@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+import os
+
 import numpy as np
 import pytest
 
@@ -99,8 +101,12 @@ def test_backend_protocol_and_conversion_surface():
     from renormalizer.backend import BackendProtocol
 
     assert isinstance(r.backend, BackendProtocol)
+    assert r.backend.supports_cpu is True
     assert r.backend.supports_gpu is False
     assert r.backend.supports_sparse is False
+    assert r.backend.device == "cpu"
+    assert r.backend.supported_device_kinds == ("cpu",)
+    assert r.backend.available_device_kinds == ("cpu",)
     assert r.backend.host_array_types
     assert r.backend.device_array_types == ()
 
@@ -140,6 +146,36 @@ def test_numpy_backend_array_preserves_copy_false_semantics():
 
     assert np.shares_memory(x, y)
     assert not np.shares_memory(x, z)
+
+
+def test_backend_factory_accepts_explicit_backend_config():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.factory import create_backend
+
+    backend = create_backend("numpy", config=BackendConfig(device="cpu", precision=32))
+
+    assert backend.device == "cpu"
+    assert backend.config.device == "cpu"
+    assert backend.real_dtype == np.float32
+
+    backend = create_backend("numpy", device="cpu", precision="64")
+    assert backend.real_dtype == np.float64
+
+    with pytest.raises(ValueError, match="numpy backend does not support device 'gpu'"):
+        create_backend("numpy", device="gpu")
+
+
+def test_public_set_backend_accepts_explicit_backend_config():
+    import renormalizer as r
+
+    try:
+        selected = r.set_backend("numpy", device="cpu", precision=32)
+
+        assert selected is r.backend.current
+        assert r.backend.device == "cpu"
+        assert r.backend.real_dtype == np.float32
+    finally:
+        r.set_backend("numpy", precision=64)
 
 
 def test_cupy_backend_explicit_conversion_methods_when_available():
@@ -195,6 +231,35 @@ def test_task4_backend_modules_are_import_safe_without_optional_deps():
     importlib.import_module("renormalizer.backend.jax_backend")
 
 
+def test_cupynumeric_backend_module_import_is_lazy(monkeypatch):
+    import builtins
+    import importlib.util
+    from pathlib import Path
+
+    backend_path = Path(__file__).resolve().parents[2] / "backend" / "cupynumeric_backend.py"
+    real_import = builtins.__import__
+    cupynumeric_imports = []
+
+    def blocked_cupynumeric_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "cupynumeric":
+            cupynumeric_imports.append(name)
+            raise AssertionError("cupynumeric should not be imported at module import time")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_cupynumeric_import)
+
+    spec = importlib.util.spec_from_file_location(
+        "renormalizer.backend._cupynumeric_backend_lazy_import_test",
+        str(backend_path),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert cupynumeric_imports == []
+    assert module.cnp is None
+    assert module._IMPORT_ERROR is None
+
+
 def test_task4_optional_backend_modules_are_import_safe_with_broken_binary_deps(monkeypatch):
     import builtins
     import importlib.util
@@ -221,9 +286,10 @@ def test_task4_optional_backend_modules_are_import_safe_with_broken_binary_deps(
         modules[module_name] = module
 
     assert modules["cupynumeric_backend"].cnp is None
-    assert isinstance(modules["cupynumeric_backend"]._IMPORT_ERROR, OSError)
+    assert modules["cupynumeric_backend"]._IMPORT_ERROR is None
     with pytest.raises(ImportError, match="cupynumeric is not installed") as cupynumeric_exc:
         modules["cupynumeric_backend"].CupynumericBackend()
+    assert isinstance(modules["cupynumeric_backend"]._IMPORT_ERROR, OSError)
     assert cupynumeric_exc.value.__cause__ is modules["cupynumeric_backend"]._IMPORT_ERROR
 
     assert modules["torch_backend"].torch is None
@@ -231,6 +297,41 @@ def test_task4_optional_backend_modules_are_import_safe_with_broken_binary_deps(
     with pytest.raises(ImportError, match="torch is not installed") as torch_exc:
         modules["torch_backend"].TorchBackend()
     assert torch_exc.value.__cause__ is modules["torch_backend"]._IMPORT_ERROR
+
+
+def test_cupynumeric_backend_defaults_legate_auto_config_and_catches_runtime_error(monkeypatch):
+    import builtins
+    import importlib.util
+    from pathlib import Path
+
+    backend_path = Path(__file__).resolve().parents[2] / "backend" / "cupynumeric_backend.py"
+    real_import = builtins.__import__
+    observed_env = {}
+
+    def blocked_cupynumeric_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "cupynumeric":
+            observed_env["LEGATE_AUTO_CONFIG"] = os.environ.get("LEGATE_AUTO_CONFIG")
+            raise RuntimeError("Legate auto-configuration failed")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.delenv("LEGATE_AUTO_CONFIG", raising=False)
+    monkeypatch.delenv("LEGATE_CONFIG", raising=False)
+    monkeypatch.setattr(builtins, "__import__", blocked_cupynumeric_import)
+
+    spec = importlib.util.spec_from_file_location(
+        "renormalizer.backend._cupynumeric_backend_legate_runtime_error_test",
+        str(backend_path),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with pytest.raises(ImportError, match="cupynumeric is not installed") as excinfo:
+        module.CupynumericBackend()
+
+    assert observed_env["LEGATE_AUTO_CONFIG"] == "0"
+    assert module.cnp is None
+    assert isinstance(module._IMPORT_ERROR, RuntimeError)
+    assert excinfo.value.__cause__ is module._IMPORT_ERROR
 
 
 def test_cupynumeric_backend_constructor_reports_missing_dependency(monkeypatch):
@@ -290,14 +391,11 @@ def test_jax_backend_module_is_import_safe_with_missing_dependency(monkeypatch):
 
 def test_cupynumeric_backend_explicit_conversion_methods_when_available():
     try:
-        __import__("cupynumeric")
+        from renormalizer.backend.cupynumeric_backend import CupynumericBackend
+        backend = CupynumericBackend()
     except ImportError as exc:
-        pytest.skip("could not import 'cupynumeric': {0}".format(exc))
-    except OSError as exc:
-        pytest.skip("cupynumeric is installed but failed to load: {0}".format(exc))
-    from renormalizer.backend.cupynumeric_backend import CupynumericBackend
+        pytest.skip("could not initialize 'cupynumeric': {0}".format(exc))
 
-    backend = CupynumericBackend()
     x = np.array([1.0, 2.0])
     y = backend.to_backend(x)
 
@@ -322,6 +420,113 @@ def test_torch_backend_explicit_conversion_methods_when_available():
     assert backend.is_array(y)
     assert backend.to_host(y).tolist() == [1.0, 2.0]
     assert backend.to_numpy(y).tolist() == [1.0, 2.0]
+
+
+def test_torch_backend_honors_explicit_device_config_with_fake_module(monkeypatch):
+    from renormalizer.backend import BackendConfig, torch_backend
+
+    class FakeTorchTensor:
+        def __init__(self, value, dtype=None, device=None):
+            self.value = value
+            self.dtype = dtype
+            self.device = device
+
+        def clone(self):
+            value = self.value.copy() if hasattr(self.value, "copy") else self.value
+            return FakeTorchTensor(value, dtype=self.dtype, device=self.device)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.asarray(self.value)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+    class FakeTorch:
+        Tensor = FakeTorchTensor
+        float32 = object()
+        float64 = object()
+        complex64 = object()
+        complex128 = object()
+        cuda = FakeCuda()
+        linalg = object()
+        random = object()
+        device_calls = []
+
+        @staticmethod
+        def device(name):
+            FakeTorch.device_calls.append(name)
+            return ("device", name)
+
+        @staticmethod
+        def tensor(*args, **kwargs):
+            dtype = kwargs.pop("dtype", None)
+            device = kwargs.pop("device", None)
+            return FakeTorchTensor(np.array(*args, **kwargs), dtype=dtype, device=device)
+
+        @staticmethod
+        def as_tensor(*args, **kwargs):
+            dtype = kwargs.pop("dtype", None)
+            device = kwargs.pop("device", None)
+            return FakeTorchTensor(np.asarray(*args, **kwargs), dtype=dtype, device=device)
+
+        @staticmethod
+        def rand(*shape, dtype=None, device=None):
+            return FakeTorchTensor(("rand", shape), dtype=dtype, device=device)
+
+        @staticmethod
+        def randn(*shape, dtype=None, device=None):
+            return FakeTorchTensor(("randn", shape), dtype=dtype, device=device)
+
+        @staticmethod
+        def randint(low, high, size, dtype=None, device=None):
+            return FakeTorchTensor(("randint", low, high, size), dtype=dtype, device=device)
+
+    monkeypatch.setattr(torch_backend, "torch", FakeTorch)
+
+    backend = torch_backend.TorchBackend(config=BackendConfig(device="gpu", precision=32))
+
+    assert backend.device == "gpu"
+    assert backend.available_device_kinds == ("cpu", "gpu")
+    assert FakeTorch.device_calls == ["cuda"]
+    assert backend.array([1.0]).device == ("device", "cuda")
+    assert backend.asarray([1.0]).device == ("device", "cuda")
+    assert backend.from_numpy(np.array([1.0])).device == ("device", "cuda")
+    assert backend.to_backend(np.array([1.0])).device == ("device", "cuda")
+    assert backend.random.random([2]).device == ("device", "cuda")
+    assert backend.random.randn(2).device == ("device", "cuda")
+    assert backend.random.randint(10).device == ("device", "cuda")
+
+
+def test_torch_backend_reports_unavailable_explicit_gpu(monkeypatch):
+    from renormalizer.backend import BackendConfig, torch_backend
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return False
+
+    class FakeTorch:
+        Tensor = object
+        float32 = object()
+        float64 = object()
+        complex64 = object()
+        complex128 = object()
+        cuda = FakeCuda()
+        linalg = object()
+        random = object()
+
+    monkeypatch.setattr(torch_backend, "torch", FakeTorch)
+
+    with pytest.raises(ValueError, match="torch backend device 'gpu' was requested"):
+        torch_backend.TorchBackend(config=BackendConfig(device="gpu"))
 
 
 def test_task4_backend_conversion_methods_with_fake_optional_modules(monkeypatch):
@@ -616,6 +821,135 @@ def test_jax_backend_configures_x64_and_random_proxy_with_fake_modules(monkeypat
     assert FakeJr.calls[2][0] == "normal"
     assert FakeJr.calls[2][2] == (6,)
     assert FakeJr.calls[3] == ("randint", FakeJr.calls[3][1], (3,), 2, 9, int)
+
+
+def test_jax_backend_can_be_explicitly_configured_for_cpu_or_gpu(monkeypatch):
+    from renormalizer.backend import BackendConfig, jax_backend
+
+    class FakeJaxArray:
+        pass
+
+    class FakeDevice:
+        def __init__(self, platform, ident):
+            self.platform = platform
+            self.id = ident
+
+    class FakeJaxConfig:
+        updates = []
+
+        @staticmethod
+        def update(name, value):
+            FakeJaxConfig.updates.append((name, value))
+
+    class FakeJax:
+        config = FakeJaxConfig
+        lax = object()
+        devices_calls = []
+        device_put_calls = []
+        _devices = [FakeDevice("cpu", 0), FakeDevice("gpu", 0)]
+
+        @staticmethod
+        def devices(kind=None):
+            FakeJax.devices_calls.append(kind)
+            if kind is None:
+                return list(FakeJax._devices)
+            return [device for device in FakeJax._devices if device.platform == kind]
+
+        @staticmethod
+        def default_backend():
+            return "cpu"
+
+        @staticmethod
+        def device_put(x, device=None):
+            FakeJax.device_put_calls.append((x, device))
+            return x
+
+    class FakeJnp:
+        ndarray = FakeJaxArray
+        linalg = object()
+        float32 = object()
+        float64 = object()
+        complex64 = object()
+        complex128 = object()
+
+        @staticmethod
+        def asarray(x, dtype=None):
+            return FakeJaxArray()
+
+        @staticmethod
+        def array(x, dtype=None):
+            return FakeJaxArray()
+
+    class FakeJr:
+        @staticmethod
+        def PRNGKey(seed):
+            return ("key", seed)
+
+    monkeypatch.setattr(jax_backend, "jax", FakeJax)
+    monkeypatch.setattr(jax_backend, "jnp", FakeJnp)
+    monkeypatch.setattr(jax_backend, "jr", FakeJr)
+
+    gpu_backend = jax_backend.JaxBackend(config=BackendConfig(device="gpu", precision=32))
+    gpu_backend.to_backend([1.0])
+
+    assert gpu_backend.supports_cpu is True
+    assert gpu_backend.supports_gpu is True
+    assert gpu_backend.supported_device_kinds == ("cpu", "gpu")
+    assert gpu_backend.available_device_kinds == ("cpu", "gpu")
+    assert gpu_backend.device == "gpu"
+    assert gpu_backend.real_dtype is FakeJnp.float32
+    assert FakeJax.device_put_calls[-1][1].platform == "gpu"
+
+    cpu_backend = jax_backend.JaxBackend(config=BackendConfig(device="cpu"))
+    cpu_backend.to_backend([1.0])
+
+    assert cpu_backend.device == "cpu"
+    assert FakeJax.device_put_calls[-1][1].platform == "cpu"
+
+
+def test_jax_backend_reports_unavailable_explicit_gpu(monkeypatch):
+    from renormalizer.backend import BackendConfig, jax_backend
+
+    class FakeDevice:
+        platform = "cpu"
+
+    class FakeJaxConfig:
+        @staticmethod
+        def update(name, value):
+            return None
+
+    class FakeJax:
+        config = FakeJaxConfig
+
+        @staticmethod
+        def devices(kind=None):
+            if kind in (None, "cpu"):
+                return [FakeDevice()]
+            return []
+
+        @staticmethod
+        def default_backend():
+            return "cpu"
+
+    class FakeJnp:
+        ndarray = object
+        linalg = object()
+        float32 = object()
+        float64 = object()
+        complex64 = object()
+        complex128 = object()
+
+    class FakeJr:
+        @staticmethod
+        def PRNGKey(seed):
+            return ("key", seed)
+
+    monkeypatch.setattr(jax_backend, "jax", FakeJax)
+    monkeypatch.setattr(jax_backend, "jnp", FakeJnp)
+    monkeypatch.setattr(jax_backend, "jr", FakeJr)
+
+    with pytest.raises(ValueError, match="JAX GPU device was requested"):
+        jax_backend.JaxBackend(config=BackendConfig(device="gpu"))
 
 
 def test_torch_backend_public_selection_seeds_and_uses_default_float_dtype(monkeypatch):

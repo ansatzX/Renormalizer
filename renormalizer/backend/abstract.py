@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
 
+import os
 from typing import Any
 
 import numpy as _np
 
+from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
 from renormalizer.backend.transforms import UnavailableTransforms
 
 
 class AbstractBackend(SingleProcessDistributedMixin):
     name = "abstract"
+    supported_device_kinds = ("cpu",)
+    available_device_kinds = ("cpu",)
+    supports_cpu = True
     array_namespace = None
     ndarray = ()
     memory_errors = (MemoryError,)
@@ -22,12 +27,46 @@ class AbstractBackend(SingleProcessDistributedMixin):
     host_array_types = (_np.ndarray,)
     device_array_types = ()
 
-    def __init__(self):
+    def __init__(self, config=None):
+        self.config = BackendConfig.from_config(config)
+        self.device = None
         self.first_mp = False
         self._real_dtype = None
         self._complex_dtype = None
         self.transforms = UnavailableTransforms(self.name)
         self.use_64bits()
+        self._set_configured_device(self.supported_device_kinds, default="cpu")
+        self._apply_precision_config()
+
+    def _apply_precision_config(self):
+        if self.config.precision == 32:
+            self.use_32bits()
+        elif self.config.precision == 64:
+            self.use_64bits()
+        elif os.environ.get("RENO_FP32") is not None:
+            self.use_32bits()
+
+    def _set_configured_device(self, supported, default=None, available=None):
+        supported = tuple(supported)
+        available = tuple(available or supported)
+        self.supported_device_kinds = supported
+        self.available_device_kinds = available
+        requested = self.config.device
+        if requested is None:
+            self.device = default or (available[0] if available else None)
+            return
+        if requested not in supported:
+            raise ValueError(
+                "{0} backend does not support device '{1}'. Supported devices: {2}."
+                .format(self.name, requested, ", ".join(supported) or "none")
+            )
+        if requested not in available:
+            raise ValueError(
+                "{0} backend device '{1}' was requested but is not available. "
+                "Available devices: {2}."
+                .format(self.name, requested, ", ".join(available) or "none")
+            )
+        self.device = requested
 
     def use_32bits(self):
         self.dtypes = (_np.float32, _np.complex64)

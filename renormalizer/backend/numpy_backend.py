@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import os
-
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
@@ -19,11 +17,8 @@ class NumpyBackend(AbstractBackend):
     memory_errors = (MemoryError,)
     opt_einsum_name = "numpy"
 
-    def __init__(self):
-        super().__init__()
-        if os.environ.get("RENO_FP32") is not None:
-            self.use_32bits()
-
+    def __init__(self, config=None):
+        super().__init__(config=config)
         self.linalg = np.linalg
         self.random = np.random
 

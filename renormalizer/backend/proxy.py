@@ -21,11 +21,11 @@ def _delegate_backend_method(name):
 
 
 class BackendManager:
-    def __init__(self, initial_backend=None):
-        self.current: BackendProtocol = create_backend(initial_backend, explicit=False)
+    def __init__(self, initial_backend=None, config=None, **options):
+        self.current: BackendProtocol = create_backend(initial_backend, explicit=False, config=config, **options)
 
-    def set_backend(self, name, *, explicit=True) -> BackendProtocol:
-        self.current = create_backend(name, explicit=explicit)
+    def set_backend(self, name, *, explicit=True, config=None, **options) -> BackendProtocol:
+        self.current = create_backend(name, explicit=explicit, config=config, **options)
         return self.current
 
     def get_backend(self) -> BackendProtocol:
@@ -41,6 +41,11 @@ class BackendProxy:
         return self._manager.current
 
     name = _delegate_backend_property("name")
+    config = _delegate_backend_property("config")
+    device = _delegate_backend_property("device")
+    supported_device_kinds = _delegate_backend_property("supported_device_kinds")
+    available_device_kinds = _delegate_backend_property("available_device_kinds")
+    supports_cpu = _delegate_backend_property("supports_cpu")
     array_namespace = _delegate_backend_property("array_namespace")
     opt_einsum_name = _delegate_backend_property("opt_einsum_name")
     supports_gpu = _delegate_backend_property("supports_gpu")

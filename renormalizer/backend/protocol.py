@@ -5,6 +5,11 @@ from typing import Any, Tuple, Type, Union
 
 _BACKEND_PROTOCOL_RUNTIME_ATTRS = (
     "name",
+    "config",
+    "device",
+    "supported_device_kinds",
+    "available_device_kinds",
+    "supports_cpu",
     "array_namespace",
     "opt_einsum_name",
     "supports_gpu",
@@ -90,6 +95,21 @@ class BackendProtocol(Protocol):
 
     name: str
     """Short backend identifier, such as ``"numpy"``, ``"cupy"``, or ``"jax"``."""
+
+    config: Any
+    """Explicit backend configuration used to construct this backend."""
+
+    device: str
+    """Configured compute device kind, such as ``"cpu"`` or ``"gpu"``."""
+
+    supported_device_kinds: Tuple[str, ...]
+    """Device kinds supported by this backend implementation."""
+
+    available_device_kinds: Tuple[str, ...]
+    """Device kinds available in the current runtime."""
+
+    supports_cpu: bool
+    """Whether this backend implementation can execute on CPU devices."""
 
     array_namespace: Any
     """Array API namespace used by this backend."""

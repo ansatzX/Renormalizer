@@ -3,7 +3,6 @@
 """JAX backend — delegates array operations to jax.numpy, exposes autodiff transforms."""
 
 import logging
-import os
 
 import numpy as np
 
@@ -19,6 +18,7 @@ except (ImportError, OSError) as exc:
     _IMPORT_ERROR = exc
 
 from renormalizer.backend.abstract import AbstractBackend
+from renormalizer.backend.config import BackendConfig
 
 logger = logging.getLogger(__name__)
 
@@ -49,24 +49,39 @@ class JaxTransforms:
 
 class JaxBackend(AbstractBackend):
     name = "jax"
+    supported_device_kinds = ("cpu", "gpu")
     array_namespace = None
     ndarray = (np.ndarray,)
     host_array_types = (np.ndarray,)
     device_array_types = ()
     memory_errors = (MemoryError,)
     opt_einsum_name = "jax"
+    supports_cpu = True
+    supports_gpu = True
     supports_autodiff = True
     supports_jit = True
     supports_functional_update = True
 
-    def __init__(self):
+    def __init__(self, config=None):
         if jax is None:
             raise ImportError(
                 "jax is not installed. Install jax or select another backend."
             ) from _IMPORT_ERROR
-        super().__init__()
-        if os.environ.get("RENO_FP32") is not None:
-            self.use_32bits()
+        self._jax_device = None
+        self._jax_devices_by_kind = {}
+        backend_config = BackendConfig.from_config(config)
+        super().__init__(config=backend_config)
+        available = self._detect_available_device_kinds()
+        default = self._default_device_kind(available)
+        self.supported_device_kinds = ("cpu", "gpu")
+        self.available_device_kinds = available
+        self.device = self.config.device or default
+        if self.device not in self.supported_device_kinds:
+            raise ValueError(
+                "jax backend does not support device '{0}'. Supported devices: cpu, gpu."
+                .format(self.device)
+            )
+        self._jax_device = self._select_jax_device(self.device)
 
         self.array_namespace = jnp
         self.ndarray = (jnp.ndarray, np.ndarray)
@@ -74,6 +89,70 @@ class JaxBackend(AbstractBackend):
         self.linalg = jnp.linalg
         self._rng_key = jr.PRNGKey(2019)
         self.transforms = JaxTransforms()
+
+    def _device_kind(self, device):
+        platform = getattr(device, "platform", None)
+        if platform in ("gpu", "cuda", "rocm"):
+            return "gpu"
+        if platform == "cpu":
+            return "cpu"
+        return platform
+
+    def _detect_available_device_kinds(self):
+        devices_by_kind = {}
+        for kind in self.supported_device_kinds:
+            query_kind = "gpu" if kind == "gpu" else kind
+            try:
+                devices = jax.devices(query_kind)
+            except Exception:
+                devices = []
+            if devices:
+                devices_by_kind[kind] = devices[0]
+        try:
+            devices = jax.devices()
+        except Exception:
+            devices = []
+        for device in devices:
+            kind = self._device_kind(device)
+            if kind in self.supported_device_kinds and kind not in devices_by_kind:
+                devices_by_kind[kind] = device
+        self._jax_devices_by_kind = devices_by_kind
+        available = tuple(kind for kind in self.supported_device_kinds if kind in devices_by_kind)
+        return available or ("cpu",)
+
+    def _default_device_kind(self, available):
+        try:
+            default = jax.default_backend()
+        except Exception:
+            default = None
+        if default in ("cuda", "rocm"):
+            default = "gpu"
+        if default in available:
+            return default
+        return available[0] if available else "cpu"
+
+    def _select_jax_device(self, kind):
+        if kind not in self._jax_devices_by_kind:
+            if kind == "gpu":
+                raise ValueError(
+                    "JAX GPU device was requested but no JAX GPU device is available. "
+                    "Install a CUDA-enabled jaxlib or select device='cpu'."
+                )
+            if kind == "cpu":
+                return None
+            raise ValueError(
+                "JAX device '{0}' was requested but is not available. Available devices: {1}."
+                .format(kind, ", ".join(self.available_device_kinds) or "none")
+            )
+        return self._jax_devices_by_kind[kind]
+
+    def _place_on_configured_device(self, x):
+        if self._jax_device is None:
+            return x
+        device_put = getattr(jax, "device_put", None)
+        if device_put is None:
+            return x
+        return device_put(x, device=self._jax_device)
 
     def __getattr__(self, name):
         return getattr(jnp, name)
@@ -103,13 +182,13 @@ class JaxBackend(AbstractBackend):
         self._rng_key = jr.PRNGKey(seedval)
 
     def array(self, *args, **kwargs):
-        return jnp.array(*args, **kwargs)
+        return self._place_on_configured_device(jnp.array(*args, **kwargs))
 
     def asarray(self, *args, **kwargs):
-        return jnp.asarray(*args, **kwargs)
+        return self._place_on_configured_device(jnp.asarray(*args, **kwargs))
 
     def from_numpy(self, x):
-        return jnp.asarray(x)
+        return self._place_on_configured_device(jnp.asarray(x))
 
     def numpy(self, x):
         return self.to_numpy(x)
@@ -126,7 +205,7 @@ class JaxBackend(AbstractBackend):
 
     def to_backend(self, x):
         """Convert ``x`` to the JAX backend array representation."""
-        return jnp.asarray(x)
+        return self._place_on_configured_device(jnp.asarray(x))
 
     def sync(self):
         return None
@@ -165,8 +244,8 @@ class _JaxRandomProxy:
         fn = getattr(jr, name)
         key = self._backend._consume_key()
         if size is not None:
-            return fn(key, shape=self._shape(size), **kwargs)
-        return fn(key, **kwargs)
+            return self._backend._place_on_configured_device(fn(key, shape=self._shape(size), **kwargs))
+        return self._backend._place_on_configured_device(fn(key, **kwargs))
 
     def _shape(self, size):
         if size is None:
@@ -184,7 +263,7 @@ class _JaxRandomProxy:
             x = jr.uniform(key, shape=self._shape(size), minval=low, maxval=high, dtype=dtype)
         else:
             x = jr.uniform(key, shape=(), minval=low, maxval=high, dtype=dtype)
-        return x
+        return self._backend._place_on_configured_device(x)
 
     def normal(self, loc=0.0, scale=1.0, size=None, dtype=None):
         key = self._backend._consume_key()
@@ -192,7 +271,7 @@ class _JaxRandomProxy:
             x = jr.normal(key, shape=self._shape(size), dtype=dtype) * scale + loc
         else:
             x = jr.normal(key, shape=(), dtype=dtype) * scale + loc
-        return x
+        return self._backend._place_on_configured_device(x)
 
     def randint(self, low, high=None, size=None, dtype=int):
         if high is None:
@@ -202,12 +281,12 @@ class _JaxRandomProxy:
             x = jr.randint(key, shape=self._shape(size), minval=low, maxval=high, dtype=dtype)
         else:
             x = jr.randint(key, shape=(), minval=low, maxval=high, dtype=dtype)
-        return x
+        return self._backend._place_on_configured_device(x)
 
     def randn(self, *dims):
         key = self._backend._consume_key()
-        return jr.normal(key, shape=dims if dims else ())
+        return self._backend._place_on_configured_device(jr.normal(key, shape=dims if dims else ()))
 
     def rand(self, *dims):
         key = self._backend._consume_key()
-        return jr.uniform(key, shape=dims if dims else ())
+        return self._backend._place_on_configured_device(jr.uniform(key, shape=dims if dims else ()))

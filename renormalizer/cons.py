@@ -6,6 +6,7 @@ import subprocess
 
 import numpy as np
 
+from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.factory import SUPPORTED_BACKENDS, available_backends, is_backend_available
 from renormalizer.backend.proxy import BackendManager, BackendProxy
 
@@ -28,9 +29,10 @@ object.__setattr__(backend, "SUPPORTED_BACKENDS", SUPPORTED_BACKENDS)
 xp = backend
 
 
-def set_backend(name):
-    selected = _manager.set_backend(name, explicit=True)
-    selected.random.seed(2019)
+def set_backend(name, config=None, **options):
+    selected = _manager.set_backend(name, explicit=True, config=config, **options)
+    seed = selected.config.seed if selected.config.seed is not None else 2019
+    selected.random.seed(seed)
     return selected
 
 

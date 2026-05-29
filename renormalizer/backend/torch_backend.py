@@ -2,8 +2,6 @@
 
 """Optional PyTorch backend extension point."""
 
-import os
-
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
@@ -18,6 +16,7 @@ except (ImportError, OSError) as exc:
 
 class TorchBackend(AbstractBackend):
     name = "torch"
+    supported_device_kinds = ("cpu", "gpu")
     array_namespace = None
     ndarray = (np.ndarray,)
     host_array_types = (np.ndarray,)
@@ -26,14 +25,22 @@ class TorchBackend(AbstractBackend):
     opt_einsum_name = "torch"
     supports_gpu = True
 
-    def __init__(self):
+    def __init__(self, config=None):
         if torch is None:
             raise ImportError(
                 "torch is not installed. Install torch or select another backend."
             ) from _IMPORT_ERROR
-        super().__init__()
-        if os.environ.get("RENO_FP32") is not None:
-            self.use_32bits()
+        self._torch_device = None
+        super().__init__(config=config)
+        available = ["cpu"]
+        cuda = getattr(torch, "cuda", None)
+        if cuda is not None and cuda.is_available():
+            available.append("gpu")
+        self.supports_gpu = True
+        self._set_configured_device(("cpu", "gpu"), default="cpu", available=tuple(available))
+        torch_device = getattr(torch, "device", None)
+        if torch_device is not None:
+            self._torch_device = torch_device("cuda" if self.device == "gpu" else "cpu")
 
         self.array_namespace = torch
         self.linalg = torch.linalg
@@ -71,13 +78,18 @@ class TorchBackend(AbstractBackend):
         return None
 
     def _kwargs_with_default_dtype(self, args, kwargs):
-        if "dtype" in kwargs or not args:
-            return kwargs
-        dtype = self._default_dtype_for(args[0])
-        if dtype is None:
-            return kwargs
         kwargs = dict(kwargs)
-        kwargs["dtype"] = dtype
+        if "dtype" not in kwargs and args:
+            dtype = self._default_dtype_for(args[0])
+            if dtype is not None:
+                kwargs["dtype"] = dtype
+        kwargs = self._kwargs_with_configured_device(kwargs)
+        return kwargs
+
+    def _kwargs_with_configured_device(self, kwargs):
+        kwargs = dict(kwargs)
+        if "device" not in kwargs and self._torch_device is not None:
+            kwargs["device"] = self._torch_device
         return kwargs
 
     def array(self, *args, **kwargs):
@@ -96,7 +108,9 @@ class TorchBackend(AbstractBackend):
         return torch.as_tensor(*args, **kwargs)
 
     def from_numpy(self, x):
-        return torch.as_tensor(x, dtype=self._default_dtype_for(x))
+        kwargs = {"dtype": self._default_dtype_for(x)}
+        kwargs = self._kwargs_with_configured_device(kwargs)
+        return torch.as_tensor(x, **kwargs)
 
     def numpy(self, x):
         return self.to_numpy(x)
@@ -139,7 +153,8 @@ class _TorchRandomProxy:
     def random(self, size=None, dtype=None):
         if dtype is None:
             dtype = self._backend.real_dtype
-        return self._torch.rand(self._shape(size), dtype=dtype)
+        kwargs = self._backend._kwargs_with_configured_device({"dtype": dtype})
+        return self._torch.rand(self._shape(size), **kwargs)
 
     def rand(self, *dims, **kwargs):
         dtype = kwargs.pop("dtype", None)
@@ -148,8 +163,10 @@ class _TorchRandomProxy:
         if dtype is None:
             dtype = self._backend.real_dtype
         if not dims:
-            return self._torch.rand((), dtype=dtype)
-        return self._torch.rand(*dims, dtype=dtype)
+            kwargs = self._backend._kwargs_with_configured_device({"dtype": dtype})
+            return self._torch.rand((), **kwargs)
+        kwargs = self._backend._kwargs_with_configured_device({"dtype": dtype})
+        return self._torch.rand(*dims, **kwargs)
 
     def randn(self, *dims, **kwargs):
         dtype = kwargs.pop("dtype", None)
@@ -158,15 +175,19 @@ class _TorchRandomProxy:
         if dtype is None:
             dtype = self._backend.real_dtype
         if not dims:
-            return self._torch.randn((), dtype=dtype)
-        return self._torch.randn(*dims, dtype=dtype)
+            kwargs = self._backend._kwargs_with_configured_device({"dtype": dtype})
+            return self._torch.randn((), **kwargs)
+        kwargs = self._backend._kwargs_with_configured_device({"dtype": dtype})
+        return self._torch.randn(*dims, **kwargs)
 
     def randint(self, low, high=None, size=None, dtype=None):
         if high is None:
             low, high = 0, low
-        if dtype is None:
-            return self._torch.randint(low, high, self._shape(size))
-        return self._torch.randint(low, high, self._shape(size), dtype=dtype)
+        kwargs = {}
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        kwargs = self._backend._kwargs_with_configured_device(kwargs)
+        return self._torch.randint(low, high, self._shape(size), **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._random, name)

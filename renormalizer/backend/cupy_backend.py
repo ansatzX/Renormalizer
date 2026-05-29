@@ -3,7 +3,6 @@
 """CuPy backend — delegates to cupy if installed, raises clear error if not."""
 
 import logging
-import os
 
 import numpy as np
 
@@ -30,18 +29,22 @@ _try_import_cupy()
 
 class CupyBackend(AbstractBackend):
     name = "cupy"
+    supported_device_kinds = ("gpu",)
+    available_device_kinds = ("gpu",)
+    supports_cpu = False
     ndarray = (np.ndarray,)  # will be extended in __init__ if cupy available
     memory_errors = (MemoryError,)
     opt_einsum_name = "cupy"
     supports_gpu = True
     host_array_types = (np.ndarray,)
 
-    def __init__(self):
+    def __init__(self, config=None):
         if not _cupy_available:
             raise ImportError(
                 "CuPy is not installed. Install cupy or select another backend."
             )
-        super().__init__()
+        super().__init__(config=config)
+        self._set_configured_device(("gpu",), default="gpu", available=("gpu",))
         self.array_namespace = _cupy
         self.ndarray = (np.ndarray, _cupy.ndarray)
         self.device_array_types = (_cupy.ndarray,)
@@ -49,9 +52,6 @@ class CupyBackend(AbstractBackend):
 
         self.linalg = _cupy.linalg
         self.random = _cupy.random
-
-        if os.environ.get("RENO_FP32") is not None:
-            self.use_32bits()
 
     def __getattr__(self, name):
         return getattr(_cupy, name)

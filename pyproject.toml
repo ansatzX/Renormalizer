@@ -17,7 +17,7 @@ maintainers = [{ name = "Weitang Li", email = "liwt31@gmail.com" }]
 
 license = "Apache-2.0" 
 readme = "README.md"
-requires-python = ">=3.6,<=3.10"
+requires-python = ">=3.6,<3.12"
 
 dependencies = [
     "numpy>=1.24",
@@ -43,7 +43,12 @@ docs = [
     "sphinxcontrib-googleanalytics",
 ]
 cupy = ["cupy>=13"]
-jax = ["jax>=0.5,<1", "jaxlib>=0.5,<1"]
+cupynumeric = [
+    "nvidia-cupynumeric>=25.3,<25.4; python_version == '3.10'",
+    "nvidia-cupynumeric>=25.8; python_version >= '3.11'",
+]
+jax = ["jax>=0.5,<0.6", "jaxlib>=0.5,<0.6"]
+jax-cuda12 = ["jax[cuda12]>=0.5,<0.6"]
 primme = ["primme>=3.2,<4"]
 pyscf = ["pyscf>=2.13,<3"]
 

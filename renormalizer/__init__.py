@@ -34,6 +34,7 @@ init_log(log_level)
 del os, log_level, init_log
  
 from renormalizer.cons import (
+    BackendConfig,
     SUPPORTED_BACKENDS,
     available_backends,
     backend,

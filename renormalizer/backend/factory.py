@@ -2,6 +2,7 @@
 
 import importlib.util
 
+from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.numpy_backend import NumpyBackend
 
 
@@ -85,24 +86,25 @@ def _require_backend_package_and_adapter(normalized):
         _raise_missing_adapter(normalized)
 
 
-def create_backend(name=None, *, explicit=True):
+def create_backend(name=None, *, explicit=True, config=None, **options):
+    backend_config = BackendConfig.from_config(config, **options)
     normalized = normalize_backend_name(name)
     if normalized == "numpy":
-        return NumpyBackend()
+        return NumpyBackend(config=backend_config)
     if normalized == "cupy":
         from renormalizer.backend.cupy_backend import CupyBackend
-        return CupyBackend()
+        return CupyBackend(config=backend_config)
     if normalized == "jax":
         from renormalizer.backend.jax_backend import JaxBackend
-        return JaxBackend()
+        return JaxBackend(config=backend_config)
     if normalized == "cupynumeric":
         _require_backend_package_and_adapter(normalized)
         from renormalizer.backend.cupynumeric_backend import CupynumericBackend
-        return CupynumericBackend()
+        return CupynumericBackend(config=backend_config)
     if normalized == "torch":
         _require_backend_package_and_adapter(normalized)
         from renormalizer.backend.torch_backend import TorchBackend
-        return TorchBackend()
+        return TorchBackend(config=backend_config)
     raise ValueError(
         f"Unknown backend '{name}'. Supported backends: {', '.join(SUPPORTED_BACKENDS)}"
     )

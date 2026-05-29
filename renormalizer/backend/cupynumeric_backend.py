@@ -7,17 +7,39 @@ import os
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
+from renormalizer.backend.config import BackendConfig
 
-try:
-    import cupynumeric as cnp
-    _IMPORT_ERROR = None
-except (ImportError, OSError) as exc:
-    cnp = None
-    _IMPORT_ERROR = exc
+
+def _prepare_legate_import_env(config=None):
+    device = None if config is None else config.device
+    if device != "gpu" and "LEGATE_CONFIG" not in os.environ and "LEGATE_AUTO_CONFIG" not in os.environ:
+        os.environ["LEGATE_AUTO_CONFIG"] = "0"
+
+
+cnp = None
+_IMPORT_ERROR = None
+
+
+def _load_cupynumeric(config=None):
+    global cnp, _IMPORT_ERROR
+    if cnp is not None:
+        return cnp
+    if _IMPORT_ERROR is not None:
+        return None
+    try:
+        _prepare_legate_import_env(config=config)
+        import cupynumeric as cupynumeric_module
+    except (ImportError, OSError, RuntimeError) as exc:
+        _IMPORT_ERROR = exc
+        return None
+    cnp = cupynumeric_module
+    return cnp
 
 
 class CupynumericBackend(AbstractBackend):
     name = "cupynumeric"
+    supported_device_kinds = ("cpu", "gpu")
+    available_device_kinds = ("cpu", "gpu")
     array_namespace = None
     ndarray = (np.ndarray,)
     host_array_types = (np.ndarray,)
@@ -26,20 +48,22 @@ class CupynumericBackend(AbstractBackend):
     opt_einsum_name = "numpy"
     supports_gpu = True
 
-    def __init__(self):
-        if cnp is None:
+    def __init__(self, config=None):
+        backend_config = BackendConfig.from_config(config)
+        cupynumeric_module = _load_cupynumeric(config=backend_config)
+        if cupynumeric_module is None:
             raise ImportError(
-                "cupynumeric is not installed. Install cupynumeric or select another backend."
+                "cupynumeric is not installed or failed to initialize. "
+                "Install cupynumeric, configure Legate, or select another backend."
             ) from _IMPORT_ERROR
-        super().__init__()
-        if os.environ.get("RENO_FP32") is not None:
-            self.use_32bits()
+        super().__init__(config=backend_config)
+        self._set_configured_device(("cpu", "gpu"), default="cpu", available=("cpu", "gpu"))
 
-        self.array_namespace = cnp
-        self.linalg = cnp.linalg
-        self.random = cnp.random
+        self.array_namespace = cupynumeric_module
+        self.linalg = cupynumeric_module.linalg
+        self.random = cupynumeric_module.random
 
-        cnp_ndarray = getattr(cnp, "ndarray", None)
+        cnp_ndarray = getattr(cupynumeric_module, "ndarray", None)
         if cnp_ndarray is not None:
             self.device_array_types = (cnp_ndarray,)
             self.ndarray = (np.ndarray, cnp_ndarray)
