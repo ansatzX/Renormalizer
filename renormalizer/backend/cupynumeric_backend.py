@@ -100,4 +100,12 @@ class CupynumericBackend(AbstractBackend):
 
     def to_backend(self, x):
         """Convert ``x`` to the cupynumeric backend representation."""
-        return cnp.asarray(x)
+        if self.is_array(x):
+            return x
+        try:
+            return cnp.asarray(x)
+        except NotImplementedError as exc:
+            message = str(exc)
+            if "attach to array views" not in message:
+                raise
+            return cnp.asarray(np.array(x, copy=True))

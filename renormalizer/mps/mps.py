@@ -11,6 +11,7 @@ import scipy
 from scipy import stats
 
 from renormalizer.lib import solve_ivp, expm_krylov
+from renormalizer.backend.boundary import flatten_backend, scalar_to_python
 from renormalizer.model import Model, Op, OpSum, basis as ba
 from renormalizer.mps import svd_qn
 from renormalizer.mps.svd_qn import add_outer, get_qn_mask
@@ -530,10 +531,7 @@ class Mps(MatrixProduct):
         r = environ.read("R", 1)
         path = self._expectation_path()
         val = multi_tensor_contract(path, l, self[0], mpo[0], self_conj[0], r)
-        if np.isclose(float(val.imag), 0):
-            return float(val.real)
-        else:
-            return complex(val)
+        return scalar_to_python(val, backend)
         # This is time and memory consuming
         # return self_conj.dot(mpo.apply(self)).real
 
@@ -579,7 +577,9 @@ class Mps(MatrixProduct):
             r_environ, r_idx = _get_freq_environ(r_environ_dict, mpo, "R", len(mpo)-l_idx-1)
             for i in range(l_idx+1, r_idx):
                 l_environ = contract_one_site(l_environ, self[i], mpo[i], "L", self_conj[i])
-            results.append(complex(l_environ.flatten() @ r_environ.flatten()))  # cast to python type
+            l_flat = flatten_backend(l_environ, backend)
+            r_flat = flatten_backend(r_environ, backend)
+            results.append(complex(scalar_to_python(l_flat @ r_flat, backend)))
 
         results = np.array(results)
         if np.allclose(results.imag, 0):

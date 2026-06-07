@@ -80,6 +80,45 @@ def test_asnumpy_handles_backend_array_and_list():
     assert asnumpy([1.0, 2.0]).tolist() == [1.0, 2.0]
 
 
+def test_scalar_to_python_handles_real_and_complex_numpy_scalars():
+    from renormalizer.mps.matrix import scalar_to_python
+
+    assert scalar_to_python(np.array(1.5)) == 1.5
+    assert scalar_to_python(np.array(1.5 + 0j)) == 1.5
+    assert scalar_to_python(np.array(1.5 + 2j)) == complex(1.5 + 2j)
+
+
+def test_scalar_to_python_handles_torch_real_scalar_when_available():
+    try:
+        import torch
+    except ImportError as exc:
+        pytest.skip("could not import 'torch': {0}".format(exc))
+    except OSError as exc:
+        pytest.skip("torch is installed but failed to load: {0}".format(exc))
+
+    from renormalizer.mps.matrix import scalar_to_python
+
+    scalar = torch.tensor(1.25)
+    assert scalar_to_python(scalar) == 1.25
+
+
+def test_matrix_orthogonality_checks_use_tensor_dtype_for_identity():
+    from renormalizer.mps.matrix import Matrix
+    import renormalizer as r
+
+    try:
+        r.set_backend("torch", device="cpu", precision=64)
+    except Exception as exc:
+        pytest.skip("torch backend unavailable: {0}".format(exc))
+
+    try:
+        mat = Matrix(np.eye(2))
+        assert mat.check_lortho()
+        assert mat.check_rortho()
+    finally:
+        r.set_backend("numpy", precision=64)
+
+
 def test_legacy_backend_constants_are_not_used_in_core_call_sites():
     from pathlib import Path
 
@@ -402,6 +441,61 @@ def test_cupynumeric_backend_explicit_conversion_methods_when_available():
     assert backend.is_array(y)
     assert backend.to_host(y).tolist() == [1.0, 2.0]
     assert backend.to_numpy(y).tolist() == [1.0, 2.0]
+
+
+def test_cupynumeric_backend_copies_view_when_backend_rejects_non_affine_attach(monkeypatch):
+    from renormalizer.backend import cupynumeric_backend
+
+    class FakeCupynumericArray:
+        def __init__(self, value):
+            self.value = np.asarray(value)
+
+    class FakeCupynumeric:
+        ndarray = FakeCupynumericArray
+        linalg = np.linalg
+        random = np.random
+
+        @staticmethod
+        def asarray(x):
+            arr = np.asarray(x)
+            if not arr.flags["C_CONTIGUOUS"]:
+                raise NotImplementedError(
+                    "cuPyNumeric does not currently know how to attach to array views "
+                    "that are not affine transforms of their parent array."
+                )
+            return FakeCupynumericArray(arr)
+
+        @staticmethod
+        def asnumpy(x):
+            return x.value
+
+    monkeypatch.setattr(cupynumeric_backend, "cnp", FakeCupynumeric)
+    monkeypatch.setattr(cupynumeric_backend, "_IMPORT_ERROR", None)
+
+    backend = cupynumeric_backend.CupynumericBackend()
+    view = np.arange(12).reshape(3, 4)[:, ::2]
+    converted = backend.to_backend(view)
+
+    assert backend.is_array(converted)
+    assert backend.to_numpy(converted).tolist() == view.tolist()
+
+
+def test_cupynumeric_backend_fails_fast_on_rank_gt_4_tensordot(monkeypatch):
+    import renormalizer as r
+    from renormalizer.mps.matrix import tensordot
+
+    try:
+        r.set_backend("cupynumeric")
+    except Exception as exc:
+        pytest.skip("cupynumeric backend unavailable: {0}".format(exc))
+
+    try:
+        a = np.zeros((2, 2, 2))
+        b = np.zeros((2, 2, 2, 2))
+        with pytest.raises(NotImplementedError, match="rank > 4"):
+            tensordot(a, b, axes=([1], [1]))
+    finally:
+        r.set_backend("numpy", precision=64)
 
 
 def test_torch_backend_explicit_conversion_methods_when_available():
