@@ -4,6 +4,7 @@ import logging
 import scipy
 
 from renormalizer import Op, Mps, Model, OpSum
+from renormalizer.backend.boundary import scalar_to_python
 from renormalizer.model.basis import BasisSet, BasisDummy
 from renormalizer.mps.backend import np, backend, xp
 from renormalizer.mps.matrix import asnumpy, asxp_oe_args, tensordot
@@ -862,10 +863,7 @@ class TTNS(TTNBase):
         args.extend(ttno.to_contract_args("up", "down"))
         val = oe_contract(*asxp_oe_args(args), optimize="greedy").ravel()[0]
 
-        if np.isclose(float(val.imag), 0):
-            return float(val.real)
-        else:
-            return complex(val)
+        return scalar_to_python(val, backend)
 
     def expectation(self, ttno: Union[TTNO, Op, OpSum], bra: "TTNS" = None) -> Union[float, complex]:
         r"""
@@ -934,10 +932,7 @@ class TTNS(TTNBase):
         for node in [self.basis.root, self.root, ttno.root]:
             node.parent = None
 
-        if np.isclose(float(val.imag), 0):
-            return float(val.real)
-        else:
-            return complex(val)
+        return scalar_to_python(val, backend)
 
     def calc_1site_rdm(self, idx: Union[int, List]=None) -> Dict[int, np.ndarray]:
         r""" Calculate 1-site reduced density matrix

@@ -5,6 +5,7 @@ import weakref
 import logging
 from typing import List, Union
 
+from renormalizer.backend.boundary import eye_like, scalar_to_python as _scalar_to_python
 from renormalizer.mps.backend import np, backend, xp
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ class Matrix:
             rtol = backend.canonical_rtol
         tensm = asxp(self.array.reshape([np.prod(self.shape[:-1]), self.shape[-1]]))
         s = tensm.T.conj() @ tensm
-        return xp.allclose(s, xp.eye(s.shape[0]), rtol=rtol, atol=atol)
+        return xp.allclose(s, eye_like(s.shape[0], s, xp), rtol=rtol, atol=atol)
 
     def check_rortho(self, rtol: float = None, atol: float = None):
         """
@@ -136,7 +137,7 @@ class Matrix:
             rtol = backend.canonical_rtol
         tensm = asxp(self.array.reshape([self.shape[0], np.prod(self.shape[1:])]))
         s = tensm @ tensm.T.conj()
-        return xp.allclose(s, xp.eye(s.shape[0]), rtol=rtol, atol=atol)
+        return xp.allclose(s, eye_like(s.shape[0], s, xp), rtol=rtol, atol=atol)
 
     def to_complex(self):
         # `xp.array` always creates new array, so to_complex means copy, which is
@@ -231,9 +232,32 @@ def einsum(subscripts, *operands):
     return Matrix(np.einsum(subscripts, *[o.array for o in operands]))
 
 
+def _normalized_tensordot_axes(axes, a_ndim, b_ndim):
+    if isinstance(axes, int):
+        return list(range(a_ndim - axes, a_ndim)), list(range(axes))
+    left_axes, right_axes = axes
+    if isinstance(left_axes, int):
+        left_axes = [left_axes]
+    else:
+        left_axes = list(left_axes)
+    if isinstance(right_axes, int):
+        right_axes = [right_axes]
+    else:
+        right_axes = list(right_axes)
+    return left_axes, right_axes
+
+
 def tensordot(a: Union[Matrix, np.ndarray], b: Union[Matrix, np.ndarray, xp.ndarray], axes) -> xp.ndarray:
     a_arr = asxp(a)
     b_arr = asxp(b)
+    left_axes, right_axes = _normalized_tensordot_axes(axes, a_arr.ndim, b_arr.ndim)
+    result_ndim = (a_arr.ndim - len(left_axes)) + (b_arr.ndim - len(right_axes))
+    if backend.name == "cupynumeric" and result_ndim > 4:
+        raise NotImplementedError(
+            "cupynumeric backend does not support tensor contractions producing rank > 4 "
+            "for the current FMO workload. Legate raises a lower-level runtime error here; "
+            "Renormalizer now fails fast at the backend boundary."
+        )
     # Promote dtypes when they differ (torch requires matching dtypes for tensordot)
     if hasattr(a_arr, 'dtype') and hasattr(b_arr, 'dtype') and a_arr.dtype != b_arr.dtype:
         if hasattr(xp, 'promote_types'):
@@ -345,6 +369,10 @@ def asxp(array):
     if isinstance(array, Matrix):
         array = array.array
     return backend.to_backend(array)
+
+
+def scalar_to_python(array):
+    return _scalar_to_python(array, backend)
 
 
 def asxp_oe_args(oe_args):
