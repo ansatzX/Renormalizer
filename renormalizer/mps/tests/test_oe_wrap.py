@@ -1,4 +1,7 @@
+import json
+import logging
 from unittest.mock import patch
+
 import pytest
 
 from renormalizer.mps.oe_contract_wrap import oe_contract, oe_contract_expression
@@ -68,3 +71,63 @@ def test_oe_contract_wrap_metadata_helpers_follow_runtime_backend(monkeypatch):
 
     assert oe_contract_wrap.active_memory_errors() == (SentinelMemoryError,)
     assert oe_contract_wrap.active_array_types() == (SentinelArray,)
+
+
+def _jsonl_payloads(path):
+    return [
+        json.loads(line)
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_oe_contract_profiling_records_operand_array_backends(caplog, monkeypatch, tmp_path):
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import PROFILING
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    a = np.ones((2, 2))
+    b = np.ones((2, 2))
+    try:
+        oe_contract("ij,jk->ik", a, b)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    messages = [
+        record.getMessage() for record in caplog.records
+        if record.levelno == PROFILING and record.getMessage().startswith(profiling.LOG_PREFIX)
+    ]
+    payloads = [json.loads(message[len(profiling.LOG_PREFIX):]) for message in messages]
+    assert not [payload for payload in payloads if payload["event"] == "oe_contract"]
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "oe_contract")
+    assert event["operand_array_types"] == ["numpy.ndarray", "numpy.ndarray"]
+    assert event["operand_array_backends"] == ["numpy", "numpy"]
+
+
+def test_oe_contract_expression_profiling_records_operand_array_backends(caplog, monkeypatch, tmp_path):
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import PROFILING
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    a = np.ones((2, 2))
+    try:
+        expr = oe_contract_expression("ij,jk->ik", a, (2, 2), constants=[0])
+        expr(a)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    messages = [
+        record.getMessage() for record in caplog.records
+        if record.levelno == PROFILING and record.getMessage().startswith(profiling.LOG_PREFIX)
+    ]
+    payloads = [json.loads(message[len(profiling.LOG_PREFIX):]) for message in messages]
+    assert not [payload for payload in payloads if payload["event"] == "oe_contract_expression"]
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "oe_contract_expression")
+    assert event["operand_array_types"] == ["numpy.ndarray", "numpy.ndarray"]
+    assert event["operand_array_backends"] == ["numpy", "numpy"]

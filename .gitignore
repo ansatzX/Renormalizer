@@ -25,9 +25,9 @@ example/.ipynb_checkpoints/
 doc/html
 doc/doctrees
 doc/build
+docs/
 
 build/
 dist/
 *egg-info/
 .coverage*
-.worktrees/

@@ -1,10 +1,12 @@
 import opt_einsum as oe
+import time
 
 from renormalizer.mps.backend import np
 from renormalizer.mps.matrix import asxp
 from renormalizer.mps.oe_contract_wrap import oe_contract, oe_contract_expression
 from renormalizer.tn.node import TreeNodeTensor
 from renormalizer.tn.tree import TTNS, TTNO, TTNEnviron
+from renormalizer.utils import profiling
 
 
 def hop_expr0(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron):
@@ -12,6 +14,8 @@ def hop_expr0(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron):
     # assuming the first index connects child and the second index connects parent
     # #--------o---------#
     # child--coeff--parent
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     enode = ttne.node_list[ttns.node_idx[snode]]
 
     args = []
@@ -39,12 +43,25 @@ def hop_expr0(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron):
     args.append(indices)
 
     expr = _contract_expression(args, shape, input_indices, output_indices)
+    if profile_enabled:
+        profiling.record(
+            "tn_hop_expr0",
+            node_idx=ttns.node_idx[snode],
+            node_shape=tuple(snode.shape),
+            operand_shapes=profiling.array_shapes(args),
+            input_shape=tuple(shape),
+            output_index_count=len(output_indices),
+            expression_operand_count=len(profiling.array_shapes(args)) + 1,
+            wall_s=time.perf_counter() - started,
+        )
 
     return expr
 
 
 def hop_expr1(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, return_hdiag=False):
     # build one site effective hamiltonian operator as an opt_einsum expression
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     enode = ttne.node_list[ttns.node_idx[snode]]
     onode = ttno.node_list[ttns.node_idx[snode]]
 
@@ -66,6 +83,17 @@ def hop_expr1(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, r
     shape = snode.shape
     # cache the contraction path
     expr = _contract_expression(args, shape, input_indices, output_indices)
+    if profile_enabled:
+        profiling.record(
+            "tn_hop_expr1",
+            node_idx=ttns.node_idx[snode],
+            node_shape=tuple(snode.shape),
+            operand_shapes=profiling.array_shapes(args),
+            input_shape=tuple(shape),
+            output_index_count=len(output_indices),
+            expression_operand_count=len(profiling.array_shapes(args)) + 1,
+            wall_s=time.perf_counter() - started,
+        )
     if not return_hdiag:
         return expr
     else:
@@ -75,6 +103,8 @@ def hop_expr1(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, r
 
 def hop_expr2(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron):
     # build two-site effective hamiltonian operator as an opt_einsum expression
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     sparent = snode.parent
     enode = ttne.node_list[ttns.node_idx[snode]]
     eparent = ttne.node_list[ttns.node_idx[sparent]]
@@ -114,6 +144,19 @@ def hop_expr2(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron):
     # cache the contraction path
     expr = _contract_expression(args, shape, input_indices, output_indices)
     hdiag = _get_hdiag(args, input_indices)
+    if profile_enabled:
+        profiling.record(
+            "tn_hop_expr2",
+            node_idx=ttns.node_idx[snode],
+            parent_idx=ttns.node_idx[sparent],
+            node_shape=tuple(snode.shape),
+            parent_shape=tuple(sparent.shape),
+            operand_shapes=profiling.array_shapes(args),
+            input_shape=tuple(shape),
+            output_index_count=len(output_indices),
+            expression_operand_count=len(profiling.array_shapes(args)) + 1,
+            wall_s=time.perf_counter() - started,
+        )
     return expr, hdiag
 
 

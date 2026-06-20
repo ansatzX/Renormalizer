@@ -14,6 +14,14 @@ from renormalizer.utils.qutip_utils import get_clist, get_blist, get_holstein_ha
     get_peierls_hamiltonian
 
 
+def _extract_states(qobj, state_indices):
+    if hasattr(qobj, "extract_states"):
+        return qobj.extract_states(state_indices)
+    state_indices = np.asarray(state_indices)
+    data = qobj.data.as_scipy().tocsr()
+    return qutip.Qobj(data[state_indices, :][:, state_indices])
+
+
 @pytest.mark.parametrize("scheme", (
         3,
         4,
@@ -45,14 +53,14 @@ def get_qutip_holstein_kubo(model, temperature, time_series):
     blist = get_blist(nsites, ph_levels)
 
     qn_idx = get_qnidx(ph_levels, nsites)
-    H = get_holstein_hamiltonian(nsites, J, omega, g, clist, blist).extract_states(qn_idx)
+    H = _extract_states(get_holstein_hamiltonian(nsites, J, omega, g, clist, blist), qn_idx)
     init_state = (-temperature.to_beta() * H).expm().unit()
 
     terms = []
     for i in range(nsites - 1):
         terms.append(J * clist[i].dag() * clist[i + 1])
         terms.append(-J * clist[i] * clist[i + 1].dag())
-    j_oper = sum(terms).extract_states(qn_idx)
+    j_oper = _extract_states(sum(terms), qn_idx)
 
     # Add the negative sign because j is taken to be real
     return -qutip.correlation_2op_2t(H, init_state, [0], time_series, [], j_oper, j_oper)[0]
@@ -114,7 +122,7 @@ def get_qutip_peierls_kubo(J, nsites, ph_levels, omega, g, temperature, time_ser
     blist = get_blist(nsites, ph_levels)
 
     qn_idx = get_qnidx(ph_levels, nsites)
-    H = get_peierls_hamiltonian(nsites, J, omega, g, clist, blist).extract_states(qn_idx)
+    H = _extract_states(get_peierls_hamiltonian(nsites, J, omega, g, clist, blist), qn_idx)
     init_state = (-temperature.to_beta() * H).expm().unit()
 
     holstein_terms = []
@@ -125,8 +133,8 @@ def get_qutip_peierls_kubo(J, nsites, ph_levels, omega, g, temperature, time_ser
         holstein_terms.append(-J * clist[i] * clist[next_i].dag())
         peierls_terms.append( g * omega * clist[i].dag() * clist[next_i] * (blist[i].dag() + blist[i]))
         peierls_terms.append(-g * omega * clist[i] * clist[next_i].dag() * (blist[i].dag() + blist[i]))
-    j_oper1 = sum(holstein_terms).extract_states(qn_idx)
-    j_oper2 = sum(peierls_terms).extract_states(qn_idx)
+    j_oper1 = _extract_states(sum(holstein_terms), qn_idx)
+    j_oper2 = _extract_states(sum(peierls_terms), qn_idx)
 
     # Add negative signs because j is taken to be real
     corr1 = -qutip.correlation_2op_2t(H, init_state, [0], time_series, [], j_oper1, j_oper1)[0]

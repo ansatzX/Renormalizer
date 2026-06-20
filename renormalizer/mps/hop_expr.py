@@ -1,14 +1,35 @@
 # -*- coding: utf-8 -*-
 
+import time
+
 from renormalizer.mps.matrix import asxp
 from renormalizer.mps.oe_contract_wrap import oe_contract_expression
+from renormalizer.utils import profiling
+
+
+def _record_hop_expr(expr, nsite, ancilla, twolayer, ltensor, rtensor, cmo, cshape, started):
+    profiling.record(
+        "hop_expr",
+        nsite=nsite,
+        ancilla=ancilla if nsite != 0 else None,
+        twolayer=twolayer,
+        l_shape=tuple(ltensor.shape),
+        r_shape=tuple(rtensor.shape),
+        mpo_shapes=[tuple(item.shape) for item in cmo],
+        cshape=tuple(cshape),
+        wall_s=time.perf_counter() - started,
+    )
+    return expr
 
 
 def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
 
+    profile_enabled = profiling.should_record_op()
+    started = time.perf_counter() if profile_enabled else None
     nsite = len(cmo)
     # whether have the ancilla
     ancilla = 2 * nsite + 2 == len(cshape)
+    ancilla_for_profile = ancilla if nsite != 0 else None
     if not ancilla:
         assert nsite + 2 == len(cshape)
 
@@ -49,6 +70,8 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
                 constants=[0, 1, 2, 3, 4, 5],
             )
         # early return
+        if profile_enabled:
+            return _record_hop_expr(expr, nsite, ancilla_for_profile, twolayer, ltensor, rtensor, cmo, cshape, started)
         return expr
 
     # Single layer, the most common case
@@ -114,4 +137,6 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
                 constants=[0, 1, 2, 3],
             )
 
+    if profile_enabled:
+        return _record_hop_expr(expr, nsite, ancilla_for_profile, twolayer, ltensor, rtensor, cmo, cshape, started)
     return expr

@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 # Author: Jiajun Ren <jiajunren0522@gmail.com>
 import logging
+import time
 
 import scipy.linalg
 
 from renormalizer.mps.backend import np, backend
+from renormalizer.utils import profiling
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +155,8 @@ def svd_qn(
     new_qnr: list
         New quantum number for V (super-R-block).
     """
+    profile_enabled = profiling.should_record_op()
+    started = time.perf_counter() if profile_enabled else None
     SVD = not QR
     coef_matrix = coef_array.reshape((np.prod(qnbigl.shape[:-1]), np.prod(qnbigr.shape[:-1])))
 
@@ -172,6 +176,8 @@ def svd_qn(
     qnl_list0 = []
     qnr_list = []
     qnr_list0 = []
+    block_count = 0 if profile_enabled else None
+    blocks = [] if profile_enabled else None
 
     # loop through each set of valid quantum numbers
     for nl in set([tuple(t) for t in localqnl]):
@@ -179,11 +185,15 @@ def svd_qn(
         rset = np.where(get_qn_mask(localqnr, nr))[0]
         if len(rset) == 0:
             continue
+        if profile_enabled:
+            block_count += 1
         lset = np.where(get_qn_mask(localqnl, nl))[0]
         block = coef_matrix.ravel().take(
             (lset * coef_matrix.shape[1]).reshape(-1, 1) + rset
         )
         dim = min(block.shape)
+        if profile_enabled:
+            blocks.append(profiling.svd_qn_block_payload(nl, nr, lset, rset, block, dim))
         if SVD:
             block_u, block_s, block_vt = optimized_svd(
                 block,
@@ -224,6 +234,20 @@ def svd_qn(
     new_qnl = qnl_list + qnl_list0
     new_qnr = qnr_list + qnr_list0
     if QR:
+        if profile_enabled:
+            profiling.record(
+                "svd_qn",
+                mode="QR",
+                system=system,
+                coef_shape=tuple(coef_array.shape),
+                matrix_shape=tuple(coef_matrix.shape),
+                qn_size=qn_size,
+                block_count=block_count,
+                blocks=blocks,
+                output_rank=int(u.shape[1]),
+                full_matrices=full_matrices,
+                wall_s=time.perf_counter() - started,
+            )
         return u, new_qnl, v, new_qnr
 
     su = np.concatenate(block_s_list + block_su_list0)
@@ -237,6 +261,21 @@ def svd_qn(
         su = sv = su[s_order]
         new_qnl = np.array(new_qnl)[s_order].tolist()
         new_qnr = np.array(new_qnr)[s_order].tolist()
+    if profile_enabled:
+        profiling.record(
+            "svd_qn",
+            mode="SVD",
+            system=system,
+            coef_shape=tuple(coef_array.shape),
+            matrix_shape=tuple(coef_matrix.shape),
+            qn_size=qn_size,
+            block_count=block_count,
+            blocks=blocks,
+            output_rank=int(u.shape[1]),
+            singular_value_count=int(len(su)),
+            full_matrices=full_matrices,
+            wall_s=time.perf_counter() - started,
+        )
     return u, su, new_qnl, v, sv, new_qnr
 
 

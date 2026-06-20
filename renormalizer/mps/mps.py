@@ -1,6 +1,7 @@
 # -*- encoding: utf-8 -*-
 
 import logging
+import time
 from collections import Counter, deque
 from functools import wraps, reduce
 from typing import Union, List, Dict
@@ -39,6 +40,7 @@ from renormalizer.utils import (
     EvolveConfig,
     EvolveMethod
 )
+from renormalizer.utils import profiling
 from renormalizer.utils.utils import calc_vn_entropy, calc_vn_entropy_dm
 
 logger = logging.getLogger(__name__)
@@ -666,7 +668,17 @@ class Mps(MatrixProduct):
             EvolveMethod.tdvp_ps: self._evolve_tdvp_ps,
             EvolveMethod.tdvp_ps2: self._evolve_tdvp_ps2
         }[self.evolve_config.method]
-        new_mps = method(mpo, evolve_dt)
+        if profiling.enabled():
+            with profiling.scope(
+                stage="mps_evolve",
+                method=str(self.evolve_config.method),
+                site_num=self.site_num,
+                normalize=normalize,
+            ):
+                with profiling.timed("mps_evolve", evolve_dt=complex(evolve_dt) if np.iscomplex(evolve_dt) else float(evolve_dt)):
+                    new_mps = method(mpo, evolve_dt)
+        else:
+            new_mps = method(mpo, evolve_dt)
         if normalize:
             if np.iscomplex(evolve_dt):
                 new_mps.normalize("mps_and_coeff")
@@ -1299,10 +1311,19 @@ class Mps(MatrixProduct):
 
         # statistics for debug output
         local_steps = []
+        profile_enabled = profiling.enabled()
         # sweep for 2 rounds
         for i in range(2):
             for imps in mps.iter_idx_list(full=True):
                 system = "L" if mps.to_right else "R"
+                site_started = time.perf_counter() if profile_enabled else None
+                scope_token = profiling.push_scope(
+                    local_role="tdvp_ps_site",
+                    sweep_round=i,
+                    site=imps,
+                    direction=system,
+                    ivp_solver=self.evolve_config.ivp_solver,
+                ) if profile_enabled else None
                 l_array = environ.read("L", imps - 1)
                 r_array = environ.read("R", imps + 1)
 
@@ -1408,6 +1429,12 @@ class Mps(MatrixProduct):
 
                 else:
                     mps[imps] = mps_t
+                if profile_enabled:
+                    profiling.record(
+                        "tdvp_site",
+                        wall_s=time.perf_counter() - site_started,
+                    )
+                    profiling.pop_scope(scope_token)
             mps._switch_direction()
 
         steps_stat = stats.describe(local_steps)
@@ -1438,19 +1465,30 @@ class Mps(MatrixProduct):
 
         # statistics for debug output
         local_steps = []
+        profile_enabled = profiling.enabled()
         # sweep for 2 rounds
         for i in range(2):
             for imps in mps.iter_idx_list(full=False):
+                site_started = time.perf_counter() if profile_enabled else None
                 if mps.to_right:
+                    direction = "L"
                     lidx, cidx0, cidx1, ridx = range(imps - 1, imps + 3)
                     # the idx of the next site
                     cidx2 = cidx1
                     # the idx of the last site
                     last_idx = len(mps) - 2
                 else:
+                    direction = "R"
                     lidx, cidx0, cidx1, ridx = range(imps - 2, imps + 2)
                     cidx2 = cidx0
                     last_idx = 1
+                scope_token = profiling.push_scope(
+                    local_role="tdvp_ps2_site",
+                    sweep_round=i,
+                    site=imps,
+                    direction=direction,
+                    ivp_solver=self.evolve_config.ivp_solver,
+                ) if profile_enabled else None
 
                 l_array = environ.read("L", lidx)
                 r_array = environ.read("R", ridx)
@@ -1484,6 +1522,12 @@ class Mps(MatrixProduct):
                 if mps.compress_config.ofs is not None:
                     mpo.try_swap_site(mps.model, mps.compress_config.ofs_swap_jw)
                 if imps == last_idx:
+                    if profile_enabled:
+                        profiling.record(
+                            "tdvp_site",
+                            wall_s=time.perf_counter() - site_started,
+                        )
+                        profiling.pop_scope(scope_token)
                     continue
 
                 if mps.to_right:
@@ -1520,6 +1564,12 @@ class Mps(MatrixProduct):
                 mps_t = mps_t.reshape(ms1.shape)
                 mps[cidx2] = mps_t
                 mps._push_cano(cidx2)
+                if profile_enabled:
+                    profiling.record(
+                        "tdvp_site",
+                        wall_s=time.perf_counter() - site_started,
+                    )
+                    profiling.pop_scope(scope_token)
 
             mps._switch_direction()
 
@@ -1948,6 +1998,18 @@ def expand_bond_dimension(mps, hint_mpo=None, coef=1e-10, include_ex=True):
     """
     expand bond dimension as required in compress_config
     """
+    if profiling.enabled():
+        with profiling.scope(
+            stage="expand_bond_dimension",
+            site_num=getattr(mps, "site_num", None),
+            include_ex=include_ex,
+            has_hint_mpo=hint_mpo is not None,
+        ):
+            return _expand_bond_dimension_profiled(mps, hint_mpo, coef, include_ex)
+    return _expand_bond_dimension_profiled(mps, hint_mpo, coef, include_ex)
+
+
+def _expand_bond_dimension_profiled(mps, hint_mpo=None, coef=1e-10, include_ex=True):
     if hint_mpo is not None and include_ex:
         # fill states related to `hint_mpo`
         logger.debug(
@@ -1970,6 +2032,9 @@ def expand_bond_dimension(mps, hint_mpo=None, coef=1e-10, include_ex=True):
         ex_state.to_right = mps.to_right
     else:
         ex_state = None
+    if profiling.enabled():
+        with profiling.timed("expand_bond_dimension"):
+            return expand_bond_dimension_general(mps, hint_mpo, coef, ex_state)
     return expand_bond_dimension_general(mps, hint_mpo, coef, ex_state)
 
 
@@ -1978,6 +2043,19 @@ def expand_bond_dimension_general(mps, hint_mpo=None, coef=1e-10, ex_mps=None):
     expand bond dimension as required in compress_config. works for both mps and ttns
     """
 
+    if profiling.enabled():
+        with profiling.scope(
+            stage="expand_bond_dimension_general",
+            site_num=getattr(mps, "site_num", None),
+            has_hint_mpo=hint_mpo is not None,
+            has_ex_mps=ex_mps is not None,
+        ):
+            with profiling.timed("expand_bond_dimension_general"):
+                return _expand_bond_dimension_general_profiled(mps, hint_mpo, coef, ex_mps)
+    return _expand_bond_dimension_general_profiled(mps, hint_mpo, coef, ex_mps)
+
+
+def _expand_bond_dimension_general_profiled(mps, hint_mpo=None, coef=1e-10, ex_mps=None):
     if hasattr(mps, "model"):
         # MPS
         random_first_arg = mps.model

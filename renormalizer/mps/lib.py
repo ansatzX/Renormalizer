@@ -3,14 +3,18 @@
 
 from functools import reduce
 from collections import deque
+import time
 
 from renormalizer.mps.backend import np, backend, xp
 from renormalizer.mps.matrix import (Matrix, multi_tensor_contract, asxp,
     asnumpy, tensordot)
+from renormalizer.utils import profiling
 
 
 class Environ:
     def __init__(self, mps, mpo, domain=None, mps_conj=None):
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         # todo: real disk and other backend
         # todo: contract_one_site_multi_mpo could generalize contract_one_site,
         # we could unify them in the future.
@@ -24,6 +28,17 @@ class Environ:
             ndim = 3
         self.sentinel = xp.ones([1,]*ndim, dtype=backend.real_dtype)
         self._construct(mps, mpo, domain, mps_conj)
+        if profile_enabled:
+            profiling.record(
+                "environ_build",
+                mp_type=mps.__class__.__name__,
+                mpo_type="list" if type(mpo) is list else mpo.__class__.__name__,
+                site_num=len(mps),
+                domain=domain,
+                multi_mpo=type(mpo) is list,
+                tensor_count=len(self._virtual_disk),
+                wall_s=time.perf_counter() - started,
+            )
 
     def _construct(self, mps, mpo, domain=None, mps_conj=None):
 
@@ -77,8 +92,22 @@ class Environ:
             # since the operation is actually rather expensive.
             mps_conj = [None] * len(mps)
 
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
+
         if siteidx not in range(len(mps)):
-            return self.sentinel
+            result = self.sentinel
+            if profile_enabled:
+                profiling.record(
+                    "environ_getlr",
+                    mp_type=mps.__class__.__name__,
+                    domain=domain,
+                    site=siteidx,
+                    method=method,
+                    output_shape=tuple(result.shape),
+                    wall_s=time.perf_counter() - started,
+                )
+            return result
 
         if method == "Scratch":
             itensor = self.sentinel
@@ -109,6 +138,16 @@ class Environ:
                         domain, mps_conj[siteidx])
             self.write(domain, siteidx, itensor)
 
+        if profile_enabled:
+            profiling.record(
+                "environ_getlr",
+                mp_type=mps.__class__.__name__,
+                domain=domain,
+                site=siteidx,
+                method=method,
+                output_shape=tuple(itensor.shape),
+                wall_s=time.perf_counter() - started,
+            )
         return itensor
 
     def write(self, domain, siteidx, tensor):
@@ -130,6 +169,8 @@ def contract_one_site_multi_mpo(environ, ms, mos, domain, ms_conj=None):
             |_| |_|
     """
     assert domain in ["L", "R"]
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     if ms_conj is None:
         ms_conj = ms.conj()
     if domain == "L":
@@ -163,6 +204,19 @@ def contract_one_site_multi_mpo(environ, ms, mos, domain, ms_conj=None):
                 f"MPS ndim is not 3 or 4, got {ms.ndim}"
             )
 
+    if profile_enabled:
+        profiling.record(
+            "environ_contract_site",
+            mp_type="Mps",
+            domain=domain,
+            multi_mpo=True,
+            environ_shape=tuple(environ.shape),
+            mps_shape=tuple(ms.shape),
+            mps_conj_shape=tuple(ms_conj.shape),
+            mpo_shapes=[tuple(mo.shape) for mo in mos],
+            output_shape=tuple(outtensor.shape),
+            wall_s=time.perf_counter() - started,
+        )
     return outtensor
 
 
@@ -177,6 +231,8 @@ def contract_one_site(environ, ms, mo, domain, ms_conj=None):
             |_| |_|
     """
     assert domain in ["L", "R"]
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     if isinstance(ms, Matrix):
         ms = ms.array
     if isinstance(mo, Matrix):
@@ -247,6 +303,19 @@ def contract_one_site(environ, ms, mo, domain, ms_conj=None):
             )
         outtensor = multi_tensor_contract(path, ms_conj, environ, mo, ms)
 
+    if profile_enabled:
+        profiling.record(
+            "environ_contract_site",
+            mp_type="Mps",
+            domain=domain,
+            multi_mpo=False,
+            environ_shape=tuple(environ.shape),
+            mps_shape=tuple(ms.shape),
+            mps_conj_shape=tuple(ms_conj.shape),
+            mpo_shape=tuple(mo.shape),
+            output_shape=tuple(outtensor.shape),
+            wall_s=time.perf_counter() - started,
+        )
     return outtensor
 
 

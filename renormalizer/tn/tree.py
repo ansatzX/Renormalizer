@@ -1,5 +1,6 @@
-from typing import List, Dict, Tuple, Union, Callable, Any
 import logging
+import time
+from typing import List, Dict, Tuple, Union, Callable, Any
 
 import scipy
 
@@ -13,7 +14,7 @@ from renormalizer.mps.lib import select_basis
 from renormalizer.mps.mps import normalize
 from renormalizer.mps.oe_contract_wrap import oe_contract
 from renormalizer.utils.configs import CompressConfig, OptimizeConfig, EvolveConfig, EvolveMethod
-from renormalizer.utils import calc_vn_entropy, calc_vn_entropy_dm
+from renormalizer.utils import calc_vn_entropy, calc_vn_entropy_dm, profiling
 from renormalizer.tn.node import TreeNodeTensor, TreeNodeBasis, copy_connection, TreeNodeEnviron
 from renormalizer.tn.treebase import Tree, BasisTree, print_as_tree
 from renormalizer.tn.symbolic_ttno import construct_symbolic_ttno, symbolic_mo_to_numeric_mo_general
@@ -134,6 +135,9 @@ class TTNO(TTNBase):
         return basis.dummy_ttno
 
     def __init__(self, basis: BasisTree, terms: Union[List[Op], Op], root: TreeNodeTensor = None, algo: str = "Hopcroft-Karp"):
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
+        root_provided = root is not None
         self.basis: BasisTree = basis
         if isinstance(terms, Op):
             terms = [terms]
@@ -151,6 +155,18 @@ class TTNO(TTNBase):
                 node_list_op.append(TreeNodeTensor(mo_mat, qn))
             root: TreeNodeTensor = copy_connection(node_list_basis, node_list_op)
         super().__init__(basis, root)
+        if profile_enabled:
+            profiling.record(
+                "ttno_build_summary",
+                term_count=len(self.terms),
+                node_count=len(self),
+                edge_count=profiling.tree_edge_count(self),
+                node_shapes=profiling.tree_node_shapes(self),
+                total_bytes=profiling.tree_total_bytes(self),
+                algo=algo,
+                root_provided=root_provided,
+                wall_s=time.perf_counter() - started,
+            )
 
     def apply(self, ttns: "TTNS", canonicalise: bool = False) -> "TTNS":
         """
@@ -1408,10 +1424,21 @@ class TTNS(TTNBase):
         return new
 
     def copy(self):
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         new = self.metacopy()
         for node1, node2 in zip(new, self):
             node1.tensor = node2.tensor.copy()
             node1.qn = node2.qn.copy()
+        if profile_enabled:
+            profiling.record(
+                "ttns_copy",
+                node_count=len(self),
+                edge_count=profiling.tree_edge_count(self),
+                node_shapes=profiling.tree_node_shapes(self),
+                total_bytes=profiling.tree_total_bytes(self),
+                wall_s=time.perf_counter() - started,
+            )
         return new
 
     def to_complex(self, inplace: bool = False) -> "TTNS":
@@ -1426,6 +1453,8 @@ class TTNS(TTNBase):
         -------
         The new TTNS
         """
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         if inplace:
             new = self
         else:
@@ -1433,6 +1462,16 @@ class TTNS(TTNBase):
         for node1, node2 in zip(self, new):
             node2.tensor = np.array(node1.tensor, dtype=complex)
             node2.qn = node1.qn.copy()
+        if profile_enabled:
+            profiling.record(
+                "ttns_to_complex",
+                node_count=len(self),
+                edge_count=profiling.tree_edge_count(self),
+                node_shapes=profiling.tree_node_shapes(self),
+                total_bytes=profiling.tree_total_bytes(self),
+                inplace=inplace,
+                wall_s=time.perf_counter() - started,
+            )
         return new
 
     def todense(self, order: List[BasisSet] = None) -> np.ndarray:
@@ -1574,6 +1613,8 @@ class TTNEnviron(Tree):
     A tree whose tree node is ``TreeNodeEnviron``.
     """
     def __init__(self, ttns: TTNS, ttno: TTNO, build_environ=True):
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         self.basis_ttns = ttns.basis
         self.basis_ttno = ttno.basis
         enodes: List[TreeNodeEnviron] = [TreeNodeEnviron() for _ in range(ttns.size)]
@@ -1587,6 +1628,14 @@ class TTNEnviron(Tree):
         if build_environ:
             self.build_children_environ(ttns, ttno)
             self.build_parent_environ(ttns, ttno)
+        if profile_enabled:
+            profiling.record(
+                "ttn_environ_build",
+                node_count=ttns.size,
+                edge_count=profiling.tree_edge_count(ttns),
+                build_environ=build_environ,
+                wall_s=time.perf_counter() - started,
+            )
 
     def build_children_environ(self, ttns, ttno):
         # first run, children environment to the parent.
@@ -1605,28 +1654,62 @@ class TTNEnviron(Tree):
 
     def update_1bond(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO):
         # update environ for the bond between snode and snode.parent
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         self.build_children_environ_node(snode, ttns, ttno)
         self.build_parent_environ_node(snode.parent, snode.idx_as_child, ttns, ttno)
+        if profile_enabled:
+            profiling.record(
+                "ttn_environ_update",
+                update_kind="1bond",
+                node_idx=ttns.node_idx[snode],
+                parent_idx=ttns.node_idx[snode.parent] if snode.parent is not None else None,
+                child_idx=snode.idx_as_child,
+                wall_s=time.perf_counter() - started,
+            )
 
     def update_1site(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO):
         # update environ based on snode
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         self.build_children_environ_node(snode, ttns, ttno)
         for ichild in range(len(snode.children)):
             self.build_parent_environ_node(snode, ichild, ttns, ttno)
+        if profile_enabled:
+            profiling.record(
+                "ttn_environ_update",
+                update_kind="1site",
+                node_idx=ttns.node_idx[snode],
+                node_degree=len(snode.children),
+                wall_s=time.perf_counter() - started,
+            )
 
     def update_2site(self, snode, ttns, ttno):
         # update environ based on snode and its parent
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         self.build_children_environ_node(snode, ttns, ttno)
         self.build_children_environ_node(snode.parent, ttns, ttno)
         for ichild in range(len(snode.parent.children)):
             self.build_parent_environ_node(snode.parent, ichild, ttns, ttno)
         for ichild in range(len(snode.children)):
             self.build_parent_environ_node(snode, ichild, ttns, ttno)
+        if profile_enabled:
+            profiling.record(
+                "ttn_environ_update",
+                update_kind="2site",
+                node_idx=ttns.node_idx[snode],
+                parent_idx=ttns.node_idx[snode.parent] if snode.parent is not None else None,
+                node_degree=len(snode.children),
+                wall_s=time.perf_counter() - started,
+            )
 
     def build_children_environ_node(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO):
         # build the environment from snode to its parent and store the environment in its parent
         if snode.parent is None:
             return
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         enode = self.node_list[ttns.node_idx[snode]]
         onode = ttno.node_list[ttns.node_idx[snode]]
         args = []
@@ -1654,9 +1737,23 @@ class TTNEnviron(Tree):
             # updating
             ichild = snode.parent.children.index(snode)
             enode.parent.environ_children[ichild] = asnumpy(res)
+        if profile_enabled:
+            profiling.record(
+                "ttn_environ_build_children_node",
+                node_idx=ttns.node_idx[snode],
+                parent_idx=ttns.node_idx[snode.parent],
+                child_idx=snode.idx_as_child,
+                node_degree=len(snode.children),
+                input_shapes=profiling.array_shapes(args),
+                output_shape=tuple(res.shape),
+                output_bytes=int(getattr(res, "nbytes", 0)),
+                wall_s=time.perf_counter() - started,
+            )
 
     def build_parent_environ_node(self, snode: TreeNodeTensor, ichild: int, ttns: TTNS, ttno: TTNO):
         # build the environment from snode to the ith child of snode and store the environment in the child
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         enode = self.node_list[ttns.node_idx[snode]]
         onode = ttno.node_list[ttns.node_idx[snode]]
         args = []
@@ -1686,6 +1783,18 @@ class TTNEnviron(Tree):
         args.append(indices)
         res = oe_contract(*asxp_oe_args(args))
         enode.children[ichild].environ_parent = asnumpy(res)
+        if profile_enabled:
+            profiling.record(
+                "ttn_environ_build_parent_node",
+                node_idx=ttns.node_idx[snode],
+                child_node_idx=ttns.node_idx[snode.children[ichild]],
+                child_idx=ichild,
+                node_degree=len(snode.children),
+                input_shapes=profiling.array_shapes(args),
+                output_shape=tuple(res.shape),
+                output_bytes=int(getattr(res, "nbytes", 0)),
+                wall_s=time.perf_counter() - started,
+            )
 
     def get_child_indices(self, enode, i, ttns, ttno):
         dofs_ttns = self.tn2dofs_ttns[enode]

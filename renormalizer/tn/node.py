@@ -1,8 +1,10 @@
+import time
 from typing import List, Dict, Union, Sequence
 
 from renormalizer.mps.backend import np, backend
 from renormalizer.mps.matrix import asnumpy
 from renormalizer.model.basis import BasisSet, BasisDummy
+from renormalizer.utils import profiling
 
 
 class TreeNode:
@@ -231,6 +233,8 @@ def copy_connection(source_node_list: List[NodeUnion], target_node_list: List[No
     NodeUnion
         The root node of the target tree.
     """
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     node2idx: Dict[NodeUnion, int] = {n: i for i, n in enumerate(source_node_list)}
     root = None
     for source_node, target_node in zip(source_node_list, target_node_list):
@@ -240,6 +244,15 @@ def copy_connection(source_node_list: List[NodeUnion], target_node_list: List[No
         if source_node.parent is None:
             root = target_node
     assert root is not None
+    if profile_enabled:
+        profiling.record(
+            "tree_copy_connection",
+            node_count=len(source_node_list),
+            edge_count=sum(len(node.children) for node in source_node_list),
+            source_node_type=source_node_list[0].__class__.__name__ if source_node_list else None,
+            target_node_type=target_node_list[0].__class__.__name__ if target_node_list else None,
+            wall_s=time.perf_counter() - started,
+        )
     return root
 
 
