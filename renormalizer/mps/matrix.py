@@ -3,12 +3,15 @@
 
 import weakref
 import logging
+import time
 from typing import List, Union
 
 from renormalizer.backend.boundary import eye_like, scalar_to_python as _scalar_to_python
 from renormalizer.mps.backend import np, backend, xp
+from renormalizer.utils import profiling
 
 logger = logging.getLogger(__name__)
+
 
 
 def _to_numpy_dtype(dtype):
@@ -266,7 +269,21 @@ def tensordot(a: Union[Matrix, np.ndarray], b: Union[Matrix, np.ndarray, xp.ndar
             target = np.result_type(a_arr.dtype, b_arr.dtype)
         a_arr = xp.asarray(a_arr, dtype=target)
         b_arr = xp.asarray(b_arr, dtype=target)
-    return xp.tensordot(a_arr, b_arr, axes)
+    if not profiling.should_record_op():
+        return xp.tensordot(a_arr, b_arr, axes)
+    started = time.perf_counter()
+    result = xp.tensordot(a_arr, b_arr, axes)
+    profiling.record(
+        "tensordot",
+        backend=backend.name,
+        input_shapes=[tuple(a_arr.shape), tuple(b_arr.shape)],
+        input_dtypes=[str(getattr(a_arr, "dtype", None)), str(getattr(b_arr, "dtype", None))],
+        axes=(left_axes, right_axes),
+        output_shape=tuple(result.shape),
+        output_dtype=str(getattr(result, "dtype", None)),
+        wall_s=time.perf_counter() - started,
+    )
+    return result
 
 
 def moveaxis(a: Matrix, source, destination):

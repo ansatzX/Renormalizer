@@ -1,0 +1,660 @@
+import json
+import logging
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_profiling_runtime():
+    from renormalizer.utils import profiling
+
+    profiling.close_event_output()
+    profiling.flush_summaries()
+    yield
+    profiling.close_event_output()
+    profiling.flush_summaries()
+
+
+def test_profiling_log_level_is_registered():
+    from renormalizer.utils.log import PROFILING, parse_log_level
+
+    assert PROFILING < logging.DEBUG
+    assert logging.getLevelName(PROFILING) == "PROFILING"
+    assert parse_log_level("PROFILING") == PROFILING
+    assert parse_log_level("5") == PROFILING
+    assert hasattr(logging.getLogger("renormalizer"), "profiling")
+
+
+def test_init_log_allows_profiling_records_through_default_stream_handler():
+    from renormalizer.utils.log import DEBUG, PROFILING, default_stream_handler, init_log
+
+    old_level = logging.getLogger("renormalizer").level
+    old_handler_level = default_stream_handler.level
+    try:
+        init_log(PROFILING)
+        assert logging.getLogger("renormalizer").level == PROFILING
+        assert default_stream_handler.level <= PROFILING
+    finally:
+        init_log(old_level)
+        default_stream_handler.setLevel(old_handler_level or DEBUG)
+
+
+def test_register_file_output_allows_profiling_records_when_package_level_is_profiling(tmp_path):
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger, register_file_output
+    from renormalizer.utils import profiling
+
+    old_level = package_logger.level
+    handler = None
+    log_path = tmp_path / "reno.log"
+    try:
+        init_log(PROFILING)
+        handler = register_file_output(log_path)
+        profiling.record("file_event", value=7)
+    finally:
+        if handler is not None:
+            package_logger.removeHandler(handler)
+            handler.close()
+        init_log(old_level or DEBUG)
+
+    text = log_path.read_text()
+    assert "[PROFILING]" in text
+    assert "RENORMALIZER_PROFILING" in text
+    assert '"event":"file_event"' in text
+
+
+def test_profiling_event_is_suppressed_at_debug_level(caplog):
+    from renormalizer.utils import profiling
+
+    caplog.set_level(logging.DEBUG, logger="renormalizer")
+
+    profiling.record("unit_test", value=1)
+
+    assert not [
+        record for record in caplog.records
+        if record.getMessage().startswith(profiling.LOG_PREFIX)
+    ]
+
+
+def test_profiling_boundary_does_not_initialize_runtime_when_disabled(monkeypatch):
+
+    from renormalizer.utils import profiling
+
+    monkeypatch.setattr(profiling, "_runtime", None)
+    assert profiling.enabled() is False
+    assert profiling.should_record_op() is False
+    profiling.record("suppressed")
+    profiling.flush_summaries()
+    assert profiling._runtime is None
+
+
+def test_profiling_boundary_records_when_enabled(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    profiling.record("boundary_event", value=2)
+
+    messages = [
+        record.getMessage() for record in caplog.records
+        if record.levelno == PROFILING and record.getMessage().startswith(profiling.LOG_PREFIX)
+    ]
+    assert len(messages) == 1
+    payload = json.loads(messages[0][len(profiling.LOG_PREFIX):])
+    assert payload["event"] == "boundary_event"
+    assert payload["value"] == 2
+
+
+def test_mps_import_does_not_eagerly_initialize_profiling_runtime():
+    code = """
+import renormalizer.mps.matrix
+from renormalizer.utils import profiling
+assert profiling._runtime is None
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_profiling_event_logs_structured_json_at_profiling_level(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    profiling.record("unit_test", shape=(2, 3), value=1)
+
+    messages = [
+        record.getMessage() for record in caplog.records
+        if record.levelno == PROFILING and record.getMessage().startswith(profiling.LOG_PREFIX)
+    ]
+    assert len(messages) == 1
+    payload = json.loads(messages[0][len(profiling.LOG_PREFIX):])
+    assert payload["event"] == "unit_test"
+    assert payload["shape"] == [2, 3]
+    assert payload["value"] == 1
+    assert "wall_time" not in payload
+
+
+def test_profiling_scope_context_is_added_to_events(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    with profiling.scope(stage="tdvp_ps", site=4, direction="L"):
+        profiling.record("unit_test_scope", input_shape=(8, 2, 8))
+
+    messages = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith(profiling.LOG_PREFIX)
+    ]
+    assert len(messages) == 1
+    payload = json.loads(messages[0][len(profiling.LOG_PREFIX):])
+    assert payload["event"] == "unit_test_scope"
+    assert payload["stage"] == "tdvp_ps"
+    assert payload["site"] == 4
+    assert payload["direction"] == "L"
+    assert payload["input_shape"] == [8, 2, 8]
+
+
+def test_push_scope_and_pop_scope_add_context_without_context_manager(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    token = profiling.push_scope(stage="tdvp_ps", site=3)
+    try:
+        profiling.record("unit_test_push", value=9)
+    finally:
+        profiling.pop_scope(token)
+    profiling.record("unit_test_after_pop", value=10)
+
+    payloads = _profiling_payloads(caplog, profiling)
+    first = next(payload for payload in payloads if payload["event"] == "unit_test_push")
+    second = next(payload for payload in payloads if payload["event"] == "unit_test_after_pop")
+    assert first["stage"] == "tdvp_ps"
+    assert first["site"] == 3
+    assert "site" not in second
+
+
+def test_profiling_event_serializes_complex_values(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    profiling.record("complex_dt", evolve_dt=1.5 + 2.5j)
+
+    payloads = _profiling_payloads(caplog, profiling)
+    assert payloads[0]["evolve_dt"] == {"real": 1.5, "imag": 2.5}
+
+
+def _profiling_payloads(caplog, profiling):
+    payloads = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if message.startswith(profiling.LOG_PREFIX):
+            payloads.append(json.loads(message[len(profiling.LOG_PREFIX):]))
+    return payloads
+
+
+def _jsonl_payloads(path):
+    return [
+        json.loads(line)
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_profiling_helpers_summarize_contract_expression_path():
+    import numpy as np
+    import opt_einsum as oe
+
+    from renormalizer.utils import profiling
+
+    a = np.ones((2, 3))
+    args = ("ab,bc,cd->ad", a, (3, 4), (4, 5))
+    kwargs = {"constants": [0], "optimize": "greedy"}
+    expr = oe.contract_expression(*args, **kwargs)
+
+    summary = profiling.contract_expression_path_summary(oe.contract_path, args, kwargs, expr)
+
+    assert summary["path"] == [[1, 2], [0, 1]]
+    assert summary["contraction_count"] == 2
+    assert summary["flop_count"] >= 1
+    assert summary["largest_intermediate"] >= 1
+    assert summary["contraction_types"] == ["GEMM", "GEMM"]
+
+
+def test_profiling_helpers_build_svd_qn_block_payload():
+    import numpy as np
+
+    from renormalizer.utils import profiling
+
+    payload = profiling.svd_qn_block_payload(
+        nl=(0,),
+        nr=np.array([1]),
+        lset=np.array([0, 2]),
+        rset=np.array([1, 3, 5]),
+        block=np.ones((2, 3)),
+        rank=2,
+    )
+
+    assert payload == {
+        "left_qn": [0],
+        "right_qn": [1],
+        "left_size": 2,
+        "right_size": 3,
+        "block_shape": (2, 3),
+        "rank": 2,
+    }
+
+
+def test_profiling_helpers_summarize_mp_and_tree_payloads():
+    import numpy as np
+
+    from renormalizer.utils import profiling
+
+    class FakeMps(list):
+        is_mps = True
+        is_mpo = False
+        is_mpdm = False
+
+    mp = FakeMps([np.ones((2, 3)), None, np.zeros((4,))])
+    assert profiling.mp_event_name(mp, "copy") == "mps_copy"
+    assert profiling.mp_tensor_shapes(mp) == [(2, 3), (4,)]
+    assert profiling.array_total_bytes(mp) == 2 * 3 * 8 + 4 * 8
+
+    leaf = SimpleNamespace(children=[], shape=(2,), tensor=np.ones((2,)))
+    root = SimpleNamespace(children=[leaf], shape=(1, 2), tensor=np.ones((1, 2)))
+    class FakeTree(list):
+        pass
+    tree = FakeTree([root, leaf])
+    tree.node_list = tree
+
+    assert profiling.tree_edge_count(tree) == 1
+    assert profiling.tree_node_shapes(tree) == [(1, 2), (2,)]
+    assert profiling.tree_total_bytes(tree) == 1 * 2 * 8 + 2 * 8
+
+
+def test_tensordot_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.matrix import tensordot
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    try:
+        result = tensordot(np.ones((2, 3)), np.ones((3, 4)), axes=1)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert result.shape == (2, 4)
+    log_payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in log_payloads if payload["event"] == "tensordot"]
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "tensordot")
+    assert event["input_shapes"] == [[2, 3], [3, 4]]
+    assert event["axes"] == [[1], [0]]
+    assert event["output_shape"] == [2, 4]
+    assert event["backend"] == "numpy"
+    assert event["wall_s"] >= 0
+
+
+def test_operation_jsonl_events_include_active_stage_scope_in_trace_mode(caplog, monkeypatch, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.matrix import tensordot
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    try:
+        with profiling.scope(stage="mps_evolve", method="tdvp_ps"):
+            tensordot(np.ones((2, 3)), np.ones((3, 4)), axes=1)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    log_payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in log_payloads if payload["event"] == "tensordot"]
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "tensordot")
+    assert event["stage"] == "mps_evolve"
+    assert event["method"] == "tdvp_ps"
+
+
+def test_jsonl_events_include_timeline_and_span_context(caplog, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.matrix import tensordot
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    try:
+        with profiling.span("outer", stage="outer") as outer_span:
+            with profiling.span("inner", stage="inner") as inner_span:
+                tensordot(np.ones((2, 3)), np.ones((3, 4)), axes=1)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "tensordot")
+    assert isinstance(event["event_id"], int)
+    assert event["event_id"] > 0
+    assert isinstance(event["timestamp_ns"], int)
+    assert event["timestamp_ns"] > 0
+    assert event["span_id"] == inner_span
+    assert event["parent_span_id"] == outer_span
+    assert event["span_name"] == "inner"
+    assert event["stage"] == "inner"
+
+
+def test_trace_mode_keeps_log_concise_with_summary(caplog, monkeypatch, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.matrix import tensordot
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    try:
+        tensordot(np.ones((2, 3)), np.ones((3, 4)), axes=1)
+        profiling.flush_summaries()
+    finally:
+        profiling.close_event_output()
+
+    log_payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in log_payloads if payload["event"] == "tensordot"]
+    summary = next(payload for payload in log_payloads if payload["event"] == "profile_summary")
+    assert summary["source_event"] == "tensordot"
+    assert summary["call_count"] == 1
+    overhead = next(payload for payload in log_payloads if payload["event"] == "profile_overhead")
+    assert overhead["events_written"] == 1
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "tensordot")
+    assert event["input_shapes"] == [[2, 3], [3, 4]]
+
+
+def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.oe_contract_wrap import oe_contract
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    try:
+        result = oe_contract("ab,bc->ac", np.ones((2, 3)), np.ones((3, 4)), optimize="greedy")
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert result.shape == (2, 4)
+    log_payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in log_payloads if payload["event"] == "oe_contract"]
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "oe_contract")
+    assert event["equation"] == "ab,bc->ac"
+    assert event["input_shapes"] == [[2, 3], [3, 4]]
+    assert event["output_shape"] == [2, 4]
+    assert event["optimize"] == "greedy"
+    assert event["wall_s"] >= 0
+
+
+def test_oe_contract_expression_records_path_summary_in_jsonl(caplog, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.oe_contract_wrap import oe_contract_expression
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    a = np.ones((2, 3))
+    try:
+        expr = oe_contract_expression("ab,bc,cd->ad", a, (3, 4), (4, 5), constants=[0], optimize="greedy")
+        result = expr(np.ones((3, 4)), np.ones((4, 5)))
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert result.shape == (2, 5)
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "oe_contract_expression")
+    assert event["path"] == [[1, 2], [0, 1]]
+    assert event["contraction_count"] == 2
+    assert event["flop_count"] >= 1
+    assert event["largest_intermediate"] >= 1
+    assert event["contraction_types"] == ["GEMM", "GEMM"]
+
+
+def test_hop_expr_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.hop_expr import hop_expr
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    try:
+        expr = hop_expr(np.ones((2, 3, 4)), np.ones((5, 3, 7)), [], (4, 7))
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert callable(expr)
+    log_payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in log_payloads if payload["event"] == "hop_expr"]
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "hop_expr")
+    assert event["nsite"] == 0
+    assert event["l_shape"] == [2, 3, 4]
+    assert event["r_shape"] == [5, 3, 7]
+    assert event["cshape"] == [4, 7]
+    assert event["wall_s"] >= 0
+
+
+def test_svd_qn_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.svd_qn import svd_qn
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    qn = np.zeros((2, 1), dtype=int)
+    try:
+        u, qnl, v, qnr = svd_qn(np.eye(2), qn, qn, np.array([0]), QR=True, system="L", full_matrices=False)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert u.shape == (2, 2)
+    assert v.shape == (2, 2)
+    assert len(qnl) == 2
+    assert len(qnr) == 2
+    log_payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in log_payloads if payload["event"] == "svd_qn"]
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "svd_qn")
+    assert event["mode"] == "QR"
+    assert event["system"] == "L"
+    assert event["coef_shape"] == [2, 2]
+    assert event["matrix_shape"] == [2, 2]
+    assert event["block_count"] == 1
+    assert event["blocks"] == [
+        {
+            "left_qn": [0],
+            "right_qn": [0],
+            "left_size": 2,
+            "right_size": 2,
+            "block_shape": [2, 2],
+            "rank": 2,
+        }
+    ]
+    assert event["output_rank"] == 2
+    assert event["wall_s"] >= 0
+
+
+def test_mps_copy_to_complex_and_environ_events_write_jsonl(caplog, tmp_path):
+    from renormalizer import BasisHalfSpin, Model, Mpo, Mps, Op
+    from renormalizer.mps.lib import Environ
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    model = Model([BasisHalfSpin(0), BasisHalfSpin(1)], [])
+    mps = Mps.hartree_product_state(model, condition={})
+    mpo = Mpo(model, Op("X", 0))
+
+    try:
+        mps.copy()
+        mps.to_complex()
+        environ = Environ(mps, mpo)
+        environ.GetLR("L", 0, mps, mpo, method="System")
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    payloads = _jsonl_payloads(event_path)
+    events = [payload["event"] for payload in payloads]
+    assert "mps_copy" in events
+    assert "mps_to_complex" in events
+    assert "environ_build" in events
+    assert "environ_contract_site" in events
+    assert "environ_getlr" in events
+    environ_event = next(payload for payload in payloads if payload["event"] == "environ_contract_site")
+    assert environ_event["mp_type"] == "Mps"
+    assert environ_event["domain"] in ["L", "R"]
+    assert environ_event["output_shape"]
+    assert environ_event["wall_s"] >= 0
+
+
+def test_op_events_are_summarized_by_default(caplog, monkeypatch):
+    import numpy as np
+
+    from renormalizer.mps.matrix import tensordot
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+    profiling.flush_summaries()
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    tensordot(np.ones((2, 3)), np.ones((3, 4)), axes=1)
+
+    payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in payloads if payload["event"] == "tensordot"]
+
+    profiling.flush_summaries()
+    payloads = _profiling_payloads(caplog, profiling)
+    summary = next(payload for payload in payloads if payload["event"] == "profile_summary")
+    assert summary["source_event"] == "tensordot"
+    assert summary["call_count"] == 1
+    assert summary["total_wall_s"] >= 0
+    assert summary["signature"]["input_shapes"] == [[2, 3], [3, 4]]
+    assert summary["signature"]["output_shape"] == [2, 4]
+
+
+def test_operation_events_are_not_written_to_jsonl_without_registered_output(caplog):
+    import numpy as np
+
+    from renormalizer.mps.matrix import tensordot
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    profiling.flush_summaries()
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    tensordot(np.ones((2, 3)), np.ones((3, 4)), axes=1)
+    profiling.flush_summaries()
+
+    payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in payloads if payload["event"] == "tensordot"]
+    summary = next(payload for payload in payloads if payload["event"] == "profile_summary")
+    assert summary["source_event"] == "tensordot"
+    overhead = next(payload for payload in payloads if payload["event"] == "profile_overhead")
+    assert overhead["events_written"] == 0
+
+
+def test_register_event_output_uses_default_timestamped_jsonl_name(tmp_path, monkeypatch):
+    from renormalizer.utils import profiling
+
+    monkeypatch.chdir(tmp_path)
+
+    path = profiling.register_event_output()
+    try:
+        assert path.parent == tmp_path
+        assert path.name.startswith("profiling-")
+        assert path.suffix == ".jsonl"
+        assert path.exists()
+    finally:
+        profiling.close_event_output()
+
+
+def test_flush_summaries_emits_profile_overhead_event(caplog, monkeypatch):
+    import numpy as np
+
+    from renormalizer.mps.matrix import tensordot
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+    profiling.flush_summaries()
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    tensordot(np.ones((2, 3)), np.ones((3, 4)), axes=1)
+    profiling.flush_summaries()
+
+    payloads = _profiling_payloads(caplog, profiling)
+    overhead = next(payload for payload in payloads if payload["event"] == "profile_overhead")
+    assert overhead["events_seen"] >= 1
+    assert overhead["events_summarized"] >= 1
+    assert overhead["record_overhead_s"] >= 0
+    assert overhead["flush_overhead_s"] >= 0
+
+
+def test_empty_flush_does_not_emit_profile_overhead_event(caplog, monkeypatch):
+    import numpy as np
+
+    from renormalizer.mps.matrix import tensordot
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    tensordot(np.ones((2, 3)), np.ones((3, 4)), axes=1)
+    profiling.flush_summaries()
+    caplog.clear()
+
+    profiling.flush_summaries()
+
+    payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in payloads if payload["event"] == "profile_overhead"]

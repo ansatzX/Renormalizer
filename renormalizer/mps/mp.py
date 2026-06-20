@@ -4,6 +4,7 @@
 import logging
 import os
 import shutil
+import time
 from typing import List, Union
 
 from renormalizer.model import Model, HolsteinModel
@@ -26,7 +27,7 @@ from renormalizer.mps.lib import (
     select_basis,
     )
 from renormalizer.mps.hop_expr import hop_expr
-from renormalizer.utils import sizeof_fmt, CompressConfig, CompressCriteria, OFS, calc_vn_entropy
+from renormalizer.utils import sizeof_fmt, CompressConfig, CompressCriteria, OFS, calc_vn_entropy, profiling
 
 logger = logging.getLogger(__name__)
 
@@ -996,6 +997,8 @@ class MatrixProduct:
         return new_mp
 
     def to_complex(self, inplace=False):
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         if inplace:
             new_mp = self
         else:
@@ -1006,6 +1009,16 @@ class MatrixProduct:
                 # dummy mt after metacopy. Bad idea. Remove the dummy thing when feasible
                 continue
             new_mp[i] = mt.to_complex()
+        if profile_enabled:
+            profiling.record(
+                profiling.mp_event_name(self, "to_complex"),
+                mp_type=self.__class__.__name__,
+                site_num=self.site_num,
+                tensor_shapes=profiling.mp_tensor_shapes(self),
+                total_bytes=profiling.array_total_bytes(self),
+                inplace=inplace,
+                wall_s=time.perf_counter() - started,
+            )
         return new_mp
 
     def distance(self, other) -> float:
@@ -1025,10 +1038,21 @@ class MatrixProduct:
         return float(res)
 
     def copy(self):
+        profile_enabled = profiling.enabled()
+        started = time.perf_counter() if profile_enabled else None
         new = self.metacopy()
         # use getitem/setitem to handle strings
         for i in range(self.site_num):
             new[i] = self[i].copy()
+        if profile_enabled:
+            profiling.record(
+                profiling.mp_event_name(self, "copy"),
+                mp_type=self.__class__.__name__,
+                site_num=self.site_num,
+                tensor_shapes=profiling.mp_tensor_shapes(self),
+                total_bytes=profiling.array_total_bytes(self),
+                wall_s=time.perf_counter() - started,
+            )
         return new
 
     # only (shallow) copy metadata because usually after been copied the real data is overwritten

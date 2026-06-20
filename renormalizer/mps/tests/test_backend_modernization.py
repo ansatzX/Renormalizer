@@ -808,6 +808,73 @@ def test_torch_backend_random_scalar_methods_when_available():
     assert backend.random.randint(10).shape == ()
 
 
+def test_torch_backend_real_expectation_returns_python_float():
+    try:
+        __import__("torch")
+    except ImportError as exc:
+        pytest.skip("could not import 'torch': {0}".format(exc))
+    except OSError as exc:
+        pytest.skip("torch is installed but failed to load: {0}".format(exc))
+
+    import renormalizer as r
+    from renormalizer import BasisHalfSpin, Model, Mpo, Mps, Op
+
+    try:
+        r.set_backend("torch", device="cpu")
+        model = Model([BasisHalfSpin(0)], [])
+        mps = Mps.hartree_product_state(model, condition={})
+        mpo = Mpo(model, Op("X", 0))
+
+        assert mps.expectation(mpo) == 0.0
+    finally:
+        r.set_backend("numpy")
+
+
+def test_torch_backend_matrix_orthogonality_checks_preserve_dtype():
+    try:
+        __import__("torch")
+    except ImportError as exc:
+        pytest.skip("could not import 'torch': {0}".format(exc))
+    except OSError as exc:
+        pytest.skip("torch is installed but failed to load: {0}".format(exc))
+
+    import renormalizer as r
+    from renormalizer.mps.matrix import Matrix
+
+    try:
+        r.set_backend("torch", device="cpu")
+        mat = Matrix(np.eye(2))
+
+        assert mat.check_lortho()
+        assert mat.check_rortho()
+    finally:
+        r.set_backend("numpy")
+
+
+def test_torch_gpu_backend_expectations_keep_operands_on_one_device():
+    try:
+        import torch
+    except ImportError as exc:
+        pytest.skip("could not import 'torch': {0}".format(exc))
+    except OSError as exc:
+        pytest.skip("torch is installed but failed to load: {0}".format(exc))
+    if not torch.cuda.is_available():
+        pytest.skip("torch is installed but CUDA is not available")
+
+    import renormalizer as r
+    from renormalizer import BasisHalfSpin, Model, Mpo, Mps, Op
+
+    try:
+        r.set_backend("torch", device="gpu")
+        model = Model([BasisHalfSpin(0)], [])
+        mps = Mps.hartree_product_state(model, condition={})
+        mpo = Mpo(model, Op("X", 0))
+
+        assert r.backend.numpy(mps.expectations([mpo])).tolist() == [0.0]
+    finally:
+        r.set_backend("numpy")
+
+
 def test_jax_backend_configures_x64_and_random_proxy_with_fake_modules(monkeypatch):
     from renormalizer.backend import jax_backend
 

@@ -1,6 +1,7 @@
 from math import factorial
 from typing import Union, List, Tuple
 import logging
+import time
 
 import scipy
 from scipy import stats
@@ -11,6 +12,7 @@ from renormalizer.mps.matrix import asxp
 from renormalizer.mps.oe_contract_wrap import oe_contract
 from renormalizer.lib import solve_ivp, expm_krylov
 from renormalizer.utils.configs import EvolveMethod
+from renormalizer.utils import profiling
 from renormalizer.tn.node import TreeNodeTensor
 from renormalizer.tn.tree import TTNO, TTNS, TTNEnviron, EVOLVE_METHODS
 from renormalizer.tn.hop_expr import hop_expr0, hop_expr1, hop_expr2
@@ -263,18 +265,47 @@ def evolve_2site(
     snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, coeff: Union[complex, float], tau: float
 ):
     # evolve snode and parent
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     ms2 = ttns.merge_with_parent(snode)
     hop, _ = hop_expr2(snode, ttns, ttno, ttne)
     ms2_t, j = expm_krylov(lambda y: hop(y.reshape(ms2.shape)).ravel(), coeff * tau, ms2.ravel())
+    if profile_enabled:
+        profiling.record(
+            "ttn_evolve_2site",
+            node_idx=ttns.node_idx[snode],
+            parent_idx=ttns.node_idx[snode.parent],
+            node_shape=tuple(snode.shape),
+            parent_shape=tuple(snode.parent.shape),
+            merged_shape=tuple(ms2.shape),
+            coeff=coeff,
+            tau=float(tau),
+            krylov_steps=int(j),
+            wall_s=time.perf_counter() - started,
+        )
     return ms2_t, j
 
 
 def evolve_1site(
     snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, coeff: Union[complex, float], tau: float
 ):
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     ms = snode.tensor
     hop = hop_expr1(snode, ttns, ttno, ttne)
     ms_t, j = expm_krylov(lambda y: hop(y.reshape(ms.shape)).ravel(), coeff * tau, ms.ravel())
+    if profile_enabled:
+        profiling.record(
+            "ttn_evolve_1site",
+            node_idx=ttns.node_idx[snode],
+            parent_idx=ttns.node_idx[snode.parent] if snode.parent is not None else None,
+            node_degree=len(snode.children),
+            node_shape=tuple(ms.shape),
+            coeff=coeff,
+            tau=float(tau),
+            krylov_steps=int(j),
+            wall_s=time.perf_counter() - started,
+        )
     return ms_t, j
 
 
@@ -287,8 +318,22 @@ def evolve_0site(
     coeff: Union[complex, float],
     tau: float,
 ):
+    profile_enabled = profiling.enabled()
+    started = time.perf_counter() if profile_enabled else None
     hop = hop_expr0(snode, ttns, ttno, ttne)
     ms_t, j = expm_krylov(lambda y: hop(y.reshape(ms.shape)).ravel(), coeff * tau, ms.ravel())
+    if profile_enabled:
+        profiling.record(
+            "ttn_evolve_0site",
+            node_idx=ttns.node_idx[snode],
+            parent_idx=ttns.node_idx[snode.parent] if snode.parent is not None else None,
+            node_shape=tuple(snode.shape),
+            merged_shape=tuple(ms.shape),
+            coeff=coeff,
+            tau=float(tau),
+            krylov_steps=int(j),
+            wall_s=time.perf_counter() - started,
+        )
     return ms_t, j
 
 

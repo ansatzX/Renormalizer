@@ -23,15 +23,15 @@ if reno_num_threads is not None:
 
 del sys, warnings
 
-from renormalizer.utils.log import init_log
+from renormalizer.utils.log import init_log, parse_log_level
 
 
 # logging.DEBUG == 10, logging.INFO == 20. See the logging built-in package for more
-log_level = int(os.environ.get("RENO_LOG_LEVEL", logging.DEBUG))
+log_level = parse_log_level(os.environ.get("RENO_LOG_LEVEL", logging.DEBUG))
 
 init_log(log_level)
 
-del os, log_level, init_log
+del os, log_level, init_log, parse_log_level
  
 from renormalizer.cons import (
     BackendConfig,

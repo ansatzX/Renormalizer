@@ -1,9 +1,11 @@
 # wraps opt_einsum contraction to show memory errors
 import logging
+import time
 
 import opt_einsum as oe
 
 from renormalizer.mps.backend import backend, xp
+from renormalizer.utils import profiling
 
 
 logger = logging.getLogger(__name__)
@@ -42,25 +44,63 @@ def update_kwargs(args, kwargs):
         # modify in-place
         kwargs["optimize"] = algo
 
+
 def oe_contract(*args, **kwargs):
     update_kwargs(args, kwargs)
+    profile_enabled = profiling.should_record_op()
+    started = time.perf_counter() if profile_enabled else None
     try:
-        return oe.contract(*args, **kwargs)
+        result = oe.contract(*args, **kwargs)
     except active_memory_errors() as e:
         logger.fatal("Out of memory error calling oe.contract")
         log_error(e, args, kwargs)
         raise e
+    if profile_enabled:
+        profiling.record(
+            "oe_contract",
+            backend=backend.name,
+            equation=profiling.first_string(args),
+            input_shapes=profiling.array_shapes(args),
+            operand_array_types=profiling.array_type_names(args),
+            operand_array_backends=profiling.array_backend_names(args),
+            output_shape=profiling.array_shape(result),
+            optimize=kwargs.get("optimize"),
+            wall_s=time.perf_counter() - started,
+        )
+    return result
 
 
 def oe_contract_expression(*args, **kwargs):
     update_kwargs(args, kwargs)
     expr = oe.contract_expression(*args, **kwargs)
+    path_summary = None
+
     def expr_wrapped(matrix: xp.ndarray, *args2, **kwargs2):
+        nonlocal path_summary
+        profile_enabled = profiling.should_record_op()
+        started = time.perf_counter() if profile_enabled else None
         try:
-            return expr(matrix, *args2, **kwargs2)
+            result = expr(matrix, *args2, **kwargs2)
         except active_memory_errors() as e:
             logger.fatal("Out of memory error calling oe contract expression")
             log_error(e, args, kwargs)
             logger.fatal(f"Input matrix type: {type(matrix)}, shape: {matrix.shape}")
             raise e
+        if profile_enabled:
+            if path_summary is None:
+                path_summary = profiling.contract_expression_path_summary(oe.contract_path, args, kwargs, expr)
+            profile_operands = (matrix, *args2, *args[1:])
+            profiling.record(
+                "oe_contract_expression",
+                backend=backend.name,
+                equation=profiling.first_string(args),
+                input_shapes=[tuple(matrix.shape)] + profiling.array_shapes(args2),
+                operand_array_types=profiling.array_type_names(profile_operands),
+                operand_array_backends=profiling.array_backend_names(profile_operands),
+                output_shape=profiling.array_shape(result),
+                optimize=kwargs.get("optimize"),
+                **path_summary,
+                wall_s=time.perf_counter() - started,
+            )
+        return result
     return expr_wrapped
