@@ -2282,6 +2282,60 @@ def test_auto_distributed_dense_plan_reports_local_step_costs():
     assert step.estimated_total_s == pytest.approx(step.estimated_compute_s + step.estimated_comm_s)
 
 
+def test_auto_distributed_execution_profile_reports_local_work_metrics(tmp_path):
+    from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=tuple(DeviceSpec("cpu", global_rank=rank) for rank in range(4)),
+        shape=(2, 2),
+        axis_names=("row", "col"),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(32, dtype=np.float64).reshape(8, 4)
+    right = np.arange(24, dtype=np.float64).reshape(4, 6)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    distributed_path = backend.plan_distributed_contraction_path(
+        dense_path,
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=HardwareModel(flop_per_s=48.0, network_bandwidth_Bps=80.0, latency_s=0.25),
+    )
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+        result = backend.execute(distributed_path)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+    events = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    execute = next(event for event in events if event["event"] == "contraction_execute")
+
+    assert execute["flops"] == 384
+    assert execute["read_bytes"] == left.nbytes + right.nbytes
+    assert execute["write_bytes"] == 8 * 6 * left.itemsize
+    assert execute["local_flops"] == 96
+    assert execute["local_read_bytes"] == (4 * 4 + 4 * 3) * left.itemsize
+    assert execute["local_write_bytes"] == 4 * 3 * left.itemsize
+    assert execute["local_copy_bytes"] == 0
+    assert execute["local_workspace_bytes"] == 0
+    assert execute["local_peak_bytes"] == 4 * 3 * left.itemsize
+
+
 def test_workspace_stream_and_unified_execute_api_are_explicit():
     from renormalizer.backend import StreamEvent, Workspace
     from renormalizer.backend.execution import DeviceSpec

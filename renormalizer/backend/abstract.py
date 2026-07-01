@@ -748,12 +748,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     self._distribution_state_for_operand(index, operand, modes)
                     for index, (operand, modes) in enumerate(zip(spec.operands, input_modes))
                 )
+                local_step = self._local_step_for_activate_distribution(plan, output_sharding)
                 step_plan = DistributedStepPlan(
-                    local_step=plan.steps[0],
+                    local_step=local_step,
                     input_states=states,
                     output_sharding=output_sharding,
                     output_state=self._distribution_state_for_output(
-                        plan.steps[0].output,
+                        local_step.output,
                         output_modes,
                         output_shape,
                         output_sharding,
@@ -979,6 +980,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return self._local_shape_for_slices(sharding.global_shape, local_slices)
 
     def _local_shape_for_activate_distribution_operand(self, operand, output_sharding):
+        if isinstance(operand.array, DistributedTensor):
+            return tuple(operand.array.local_shape)
         sharding = self._placement_sharding_for_operand(operand, output_sharding)
         if sharding is None:
             return tuple(int(dim) for dim in getattr(operand.array, "shape", ()))
@@ -1650,7 +1653,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return tuple(output_modes).index(target_mode)
 
     @staticmethod
-    def _local_contraction_profile(plan):
+    def _local_contraction_profile(plan, step=None):
+        def step_metric(name, default=0):
+            if step is None:
+                return int(default or 0)
+            return int(getattr(step, name, default) or 0)
+
         if plan is None:
             return {
                 "local_lowering": None,
@@ -1659,9 +1667,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 "num_grouped_tasks": 0,
                 "num_blocks": 0,
                 "num_shape_buckets": 0,
+                "local_flops": step_metric("estimated_flops"),
+                "local_read_bytes": step_metric("estimated_read_bytes"),
+                "local_write_bytes": step_metric("estimated_write_bytes"),
+                "local_copy_bytes": step_metric("estimated_copy_bytes"),
+                "local_workspace_bytes": step_metric("required_workspace_bytes"),
+                "local_peak_bytes": step_metric("estimated_peak_bytes"),
                 "fallback_reason": None,
             }
         if isinstance(plan, MatmulPlan):
+            read_bytes = sum(int(desc.estimated_read_bytes) for desc in plan.descs)
+            write_bytes = sum(int(desc.estimated_write_bytes) for desc in plan.descs)
+            workspace_bytes = int(plan.workspace_bytes)
             return {
                 "local_lowering": plan.kind,
                 "num_gemm": 1 if plan.kind == "gemm" else 0,
@@ -1669,6 +1686,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 "num_grouped_tasks": len(plan.descs) if plan.kind == "grouped_gemm" else 0,
                 "num_blocks": 0,
                 "num_shape_buckets": 0,
+                "local_flops": step_metric("estimated_flops", plan.estimated_flops),
+                "local_read_bytes": step_metric("estimated_read_bytes", read_bytes),
+                "local_write_bytes": step_metric("estimated_write_bytes", write_bytes),
+                "local_copy_bytes": step_metric("estimated_copy_bytes", plan.copy_bytes),
+                "local_workspace_bytes": step_metric("required_workspace_bytes", workspace_bytes),
+                "local_peak_bytes": step_metric("estimated_peak_bytes", max(write_bytes, workspace_bytes)),
                 "fallback_reason": plan.fallback_reason,
             }
         if isinstance(plan, GroupedGemmPlan):
@@ -1679,6 +1702,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 "num_grouped_tasks": len(plan.tasks),
                 "num_blocks": len(plan.output_blocks),
                 "num_shape_buckets": len(plan.bucketed_by_shape),
+                "local_flops": step_metric("estimated_flops", plan.estimated_flops),
+                "local_read_bytes": step_metric("estimated_read_bytes", plan.estimated_read_bytes),
+                "local_write_bytes": step_metric("estimated_write_bytes", plan.estimated_write_bytes),
+                "local_copy_bytes": step_metric("estimated_copy_bytes"),
+                "local_workspace_bytes": step_metric("required_workspace_bytes", plan.estimated_workspace_bytes),
+                "local_peak_bytes": step_metric(
+                    "estimated_peak_bytes",
+                    plan.estimated_write_bytes + plan.estimated_workspace_bytes,
+                ),
                 "fallback_reason": None,
             }
         return {
@@ -1688,6 +1720,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "num_grouped_tasks": 0,
             "num_blocks": 0,
             "num_shape_buckets": 0,
+            "local_flops": step_metric("estimated_flops"),
+            "local_read_bytes": step_metric("estimated_read_bytes"),
+            "local_write_bytes": step_metric("estimated_write_bytes"),
+            "local_copy_bytes": step_metric("estimated_copy_bytes"),
+            "local_workspace_bytes": step_metric("required_workspace_bytes"),
+            "local_peak_bytes": step_metric("estimated_peak_bytes"),
             "fallback_reason": None,
         }
 
@@ -1703,7 +1741,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
             if distributed_plan is not None and distributed_plan.steps:
                 distributed_step = distributed_plan.steps[0]
                 communication = distributed_step.communication
-                local_profile = self._local_contraction_profile(distributed_step.local_contraction_plan)
+                local_profile = self._local_contraction_profile(
+                    distributed_step.local_contraction_plan,
+                    distributed_step.local_step,
+                )
             step = plan.steps[0] if isinstance(plan, ContractionPlan) and plan.steps else None
             flops = 0
             if distributed_plan is not None:
@@ -1747,6 +1788,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 num_grouped_tasks=local_profile["num_grouped_tasks"],
                 num_blocks=local_profile["num_blocks"],
                 num_shape_buckets=local_profile["num_shape_buckets"],
+                local_flops=local_profile["local_flops"],
+                local_read_bytes=local_profile["local_read_bytes"],
+                local_write_bytes=local_profile["local_write_bytes"],
+                local_copy_bytes=local_profile["local_copy_bytes"],
+                local_workspace_bytes=local_profile["local_workspace_bytes"],
+                local_peak_bytes=local_profile["local_peak_bytes"],
                 fallback_reason=local_profile["fallback_reason"],
                 distributed_modes=[str(mode) for mode in getattr(plan, "distributed_modes", ())],
                 rank=int(result.mesh.global_rank),
