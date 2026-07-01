@@ -24,7 +24,7 @@ from renormalizer.backend.execution import (
     lower_pair_contraction_to_matmul,
     parse_einsum,
 )
-from renormalizer.backend.gemm import GemmTask, array_nbytes, grouped_gemm_fallback, grouped_gemm_stats, run_gemm_task
+from renormalizer.backend.gemm import GemmTask, array_nbytes, grouped_gemm_bucketed, grouped_gemm_stats, run_gemm_task
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
 from renormalizer.backend.transforms import UnavailableTransforms
 
@@ -880,7 +880,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             import time
 
             started = time.perf_counter()
-            result = grouped_gemm_fallback(converted, xp=xp, pack_threshold=pack_threshold)
+            result = grouped_gemm_bucketed(converted, xp=xp, pack_threshold=pack_threshold)
             wall_s = time.perf_counter() - started
             try:
                 from renormalizer.utils import profiling
@@ -920,7 +920,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             except Exception:
                 pass
             return result
-        return grouped_gemm_fallback(converted, xp=xp, pack_threshold=pack_threshold)
+        return grouped_gemm_bucketed(converted, xp=xp, pack_threshold=pack_threshold)
 
     def _handle_grouped_gemm_fallback(self):
         if self.supports_grouped_gemm:

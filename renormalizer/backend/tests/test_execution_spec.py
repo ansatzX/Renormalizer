@@ -375,6 +375,59 @@ def test_grouped_gemm_warn_policy_emits_warning_and_returns_result():
     assert np.allclose(results[0], task.A @ task.B)
 
 
+def test_torch_grouped_gemm_is_backend_primitive_when_available():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.factory import create_backend, is_backend_available
+    from renormalizer.backend.gemm import GemmTask
+
+    if not is_backend_available("torch"):
+        pytest.skip("torch unavailable")
+
+    backend = create_backend("torch", config=BackendConfig(device="cpu", fallback_policy="forbid"))
+    a_np = np.arange(2 * 4 * 4, dtype=np.float64).reshape(2, 4, 4)
+    b_np = np.arange(2 * 4 * 4, dtype=np.float64).reshape(2, 4, 4)
+    tasks = [
+        GemmTask(backend.to_backend(a_np[index]), backend.to_backend(b_np[index]), tag=index)
+        for index in range(2)
+    ]
+
+    results = backend.grouped_gemm(tasks, pack_threshold=2)
+
+    assert backend.supports_grouped_gemm is True
+    assert backend.capabilities.grouped_gemm is True
+    assert [tuple(result.shape) for result in results] == [(4, 4), (4, 4)]
+    assert np.allclose(backend.to_numpy(results[0]), a_np[0] @ b_np[0])
+    assert np.allclose(backend.to_numpy(results[1]), a_np[1] @ b_np[1])
+
+
+def test_cupy_grouped_gemm_is_backend_primitive_when_available():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.factory import create_backend, is_backend_available
+    from renormalizer.backend.gemm import GemmTask
+
+    if not is_backend_available("cupy"):
+        pytest.skip("cupy unavailable")
+
+    try:
+        backend = create_backend("cupy", config=BackendConfig(device="gpu", fallback_policy="forbid"))
+    except (ImportError, ValueError, RuntimeError) as exc:
+        pytest.skip("cupy backend unavailable: {0}".format(exc))
+    a_np = np.arange(2 * 4 * 4, dtype=np.float64).reshape(2, 4, 4)
+    b_np = np.arange(2 * 4 * 4, dtype=np.float64).reshape(2, 4, 4)
+    tasks = [
+        GemmTask(backend.to_backend(a_np[index]), backend.to_backend(b_np[index]), tag=index)
+        for index in range(2)
+    ]
+
+    results = backend.grouped_gemm(tasks, pack_threshold=2)
+
+    assert backend.supports_grouped_gemm is True
+    assert backend.capabilities.grouped_gemm is True
+    assert [tuple(result.shape) for result in results] == [(4, 4), (4, 4)]
+    assert np.allclose(backend.to_numpy(results[0]), a_np[0] @ b_np[0])
+    assert np.allclose(backend.to_numpy(results[1]), a_np[1] @ b_np[1])
+
+
 def test_should_batch_uses_copy_to_flop_heuristic():
     from renormalizer.backend.gemm import GemmTask, should_batch
 

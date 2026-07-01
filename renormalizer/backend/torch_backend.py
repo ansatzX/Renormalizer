@@ -24,6 +24,7 @@ class TorchBackend(AbstractBackend):
     memory_errors = (MemoryError,)
     opt_einsum_name = "torch"
     supports_gpu = True
+    supports_grouped_gemm = True
 
     def __init__(self, config=None):
         if torch is None:

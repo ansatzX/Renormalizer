@@ -181,7 +181,7 @@ def run_gemm_task(task: GemmTask, *, xp=None):
     return result
 
 
-def grouped_gemm_fallback(tasks, *, xp=None, pack_threshold=4):
+def grouped_gemm_bucketed(tasks, *, xp=None, pack_threshold=4):
     if xp is None:
         import numpy as xp
 
@@ -216,3 +216,7 @@ def grouped_gemm_fallback(tasks, *, xp=None, pack_threshold=4):
             else:
                 results_by_task[id(task)] = result
     return [results_by_task[id(task)] for task in tasks]
+
+
+def grouped_gemm_fallback(tasks, *, xp=None, pack_threshold=4):
+    return grouped_gemm_bucketed(tasks, xp=xp, pack_threshold=pack_threshold)

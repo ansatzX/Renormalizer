@@ -13,7 +13,7 @@ import numpy as np
 
 from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.factory import create_backend, is_backend_available, normalize_backend_name
-from renormalizer.backend.gemm import GemmTask, grouped_gemm_stats
+from renormalizer.backend.gemm import GemmTask, grouped_gemm_stats, run_gemm_task
 
 
 DEFAULT_BACKENDS = ("numpy", "cupy", "torch", "jax")
@@ -165,6 +165,11 @@ def _grouped_gemm_smoke(backend, backend_name, device, gpu_count, repeat, batch,
         for index, (a_np, b_np) in enumerate(tasks_np)
     ]
     stats = grouped_gemm_stats(tasks, xp=backend.array_namespace, pack_threshold=pack_threshold)
+    _, loop_wall_s = _time_call(
+        backend,
+        repeat,
+        lambda: [run_gemm_task(task, xp=backend.array_namespace) for task in tasks],
+    )
     result, wall_s = _time_call(
         backend,
         repeat,
@@ -188,6 +193,9 @@ def _grouped_gemm_smoke(backend, backend_name, device, gpu_count, repeat, batch,
         "read_bytes": stats.read_bytes,
         "write_bytes": stats.write_bytes,
         "wall_s": float(wall_s),
+        "grouped_wall_s": float(wall_s),
+        "loop_wall_s": float(loop_wall_s),
+        "speedup_vs_loop": float(loop_wall_s / wall_s) if wall_s > 0.0 else None,
         "max_abs_error": float(max_error),
     })
     return record

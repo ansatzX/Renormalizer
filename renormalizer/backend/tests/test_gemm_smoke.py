@@ -41,3 +41,8 @@ def test_numpy_gemm_smoke_records_json_serializable_correctness():
     assert "num_batched_gemm" in grouped
     assert "num_gemm" in grouped
     assert "copy_bytes" in grouped
+    assert "loop_wall_s" in grouped
+    assert "grouped_wall_s" in grouped
+    assert "speedup_vs_loop" in grouped
+    assert grouped["loop_wall_s"] >= 0.0
+    assert grouped["grouped_wall_s"] >= 0.0
