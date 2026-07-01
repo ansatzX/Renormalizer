@@ -190,6 +190,56 @@ def test_numpy_shard_gather_and_redistribute_roundtrip():
     assert np.array_equal(backend.gather_tensor(redistributed), x)
 
 
+def test_real_distributed_shard_and_gather_use_rank_local_collectives():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class CollectiveNumpyBackend(NumpyBackend):
+        @property
+        def rank(self):
+            return 1
+
+        @property
+        def size(self):
+            return 2
+
+        @property
+        def is_distributed(self):
+            return True
+
+        def allgather(self, x):
+            return [
+                np.arange(20, dtype=np.float64).reshape(5, 4)[:3, :],
+                x,
+            ]
+
+    backend = CollectiveNumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=1,
+        global_rank=1,
+    )
+    x = np.arange(20, dtype=np.float64).reshape(5, 4)
+    spec = ShardingSpec(
+        global_shape=x.shape,
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"row": 2},
+        mode_to_mesh_axis={"row": "rank"},
+    )
+
+    distributed = backend.shard_tensor(x, spec)
+    gathered = backend.gather_tensor(distributed)
+
+    assert distributed.rank_local_arrays is None
+    assert distributed.local_shape == (2, 4)
+    assert np.array_equal(distributed.local_array, x[3:, :])
+    assert np.array_equal(gathered, x)
+
+
 def test_replicate_tensor_and_single_process_collectives():
     from renormalizer.backend import DeviceMesh, DeviceSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

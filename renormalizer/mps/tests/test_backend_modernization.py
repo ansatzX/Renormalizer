@@ -1251,6 +1251,85 @@ def test_torch_matrix_tensordot_promotes_dtype_without_global_patch():
         r.set_backend("numpy", precision=64)
 
 
+def test_torch_backend_initializes_distributed_collectives_from_environment(monkeypatch):
+    from renormalizer.backend import BackendConfig, torch_backend
+
+    class FakeTorchRandom:
+        @staticmethod
+        def seed(seed):
+            return seed
+
+    class FakeTensor:
+        def __init__(self, value):
+            self.value = value
+
+    class FakeDistributedReduceOp:
+        SUM = "sum"
+        MAX = "max"
+        MIN = "min"
+        PRODUCT = "product"
+
+    class FakeDistributed:
+        ReduceOp = FakeDistributedReduceOp
+        init_calls = []
+        all_reduce_calls = []
+        initialized = False
+
+        @classmethod
+        def is_available(cls):
+            return True
+
+        @classmethod
+        def is_initialized(cls):
+            return cls.initialized
+
+        @classmethod
+        def init_process_group(cls, backend, init_method):
+            cls.init_calls.append((backend, init_method))
+            cls.initialized = True
+
+        @staticmethod
+        def get_rank():
+            return 1
+
+        @staticmethod
+        def get_world_size():
+            return 2
+
+        @classmethod
+        def all_reduce(cls, x, op=None):
+            cls.all_reduce_calls.append((x, op))
+
+    class FakeTorch:
+        Tensor = FakeTensor
+        float32 = object()
+        float64 = object()
+        complex64 = object()
+        complex128 = object()
+        linalg = object()
+        random = FakeTorchRandom()
+        distributed = FakeDistributed
+
+    monkeypatch.setattr(torch_backend, "torch", FakeTorch)
+    monkeypatch.setattr(torch_backend, "_IMPORT_ERROR", None)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29591")
+
+    backend = torch_backend.TorchBackend(config=BackendConfig(device="cpu", precision=64))
+    value = FakeTensor(3)
+
+    result = backend.allreduce(value, op="sum")
+
+    assert FakeDistributed.init_calls == [("gloo", "env://")]
+    assert backend.rank == 1
+    assert backend.size == 2
+    assert backend.is_distributed is True
+    assert result is value
+    assert FakeDistributed.all_reduce_calls == [(value, FakeDistributedReduceOp.SUM)]
+
+
 def test_backend_protocol_source_stays_python36_import_compatible():
     import importlib
     import inspect

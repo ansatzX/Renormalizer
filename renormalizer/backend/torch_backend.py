@@ -5,6 +5,7 @@
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
+from renormalizer.backend.mpi import TorchDistributedMixin
 
 try:
     import torch
@@ -14,7 +15,7 @@ except (ImportError, OSError) as exc:
     _IMPORT_ERROR = exc
 
 
-class TorchBackend(AbstractBackend):
+class TorchBackend(TorchDistributedMixin, AbstractBackend):
     name = "torch"
     supported_device_kinds = ("cpu", "gpu")
     array_namespace = None
@@ -51,6 +52,7 @@ class TorchBackend(AbstractBackend):
         torch_oom_error = getattr(torch, "OutOfMemoryError", None)
         if torch_oom_error is not None:
             self.memory_errors = (MemoryError, torch_oom_error)
+        self._init_distributed_runtime()
 
     def __getattr__(self, name):
         return getattr(torch, name)

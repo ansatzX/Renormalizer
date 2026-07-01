@@ -1073,6 +1073,21 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def shard_tensor(self, x, spec: ShardingSpec):
         if self.is_distributed_array(x):
             x = self.gather_tensor(x)
+        if self.is_distributed and int(spec.mesh.world_size) == int(self.size):
+            rank = int(self.rank)
+            local_slice = spec.local_slices[rank]
+            local_array = x[tuple(local_slice)]
+            return DistributedTensor(
+                local_array=local_array,
+                global_shape=spec.global_shape,
+                modes=spec.modes,
+                sharding=spec,
+                mesh=spec.mesh,
+                dtype=getattr(local_array, "dtype", None),
+                local_shape=tuple(getattr(local_array, "shape", ())),
+                local_nbytes=self._array_nbytes(local_array),
+                rank_local_arrays=None,
+            )
         rank_local_arrays = {
             int(rank): x[tuple(local_slice)]
             for rank, local_slice in spec.local_slices.items()
@@ -1094,6 +1109,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if not self.is_distributed_array(x):
             return x
         if x.rank_local_arrays is None:
+            if self.is_distributed and int(x.mesh.world_size) == int(self.size):
+                gathered = self.allgather(x.local_array)
+                result = self._zeros_backend(x.global_shape, x.dtype)
+                for rank, value in enumerate(gathered):
+                    result = self._slice_set(result, x.sharding.local_slices[rank], value)
+                return result
             if x.sharding.local_slices.get(x.mesh.local_rank) == tuple(slice(None) for _ in x.global_shape):
                 return x.local_array
             raise BackendFeatureError("cannot gather distributed tensor without rank-local arrays")
@@ -1117,6 +1138,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
             replicated_modes=modes,
             sharded_modes=(),
         )
+        if self.is_distributed and int(mesh.world_size) == int(self.size):
+            return DistributedTensor(
+                local_array=x,
+                global_shape=spec.global_shape,
+                modes=modes,
+                sharding=spec,
+                mesh=mesh,
+                dtype=getattr(x, "dtype", None),
+                local_shape=tuple(getattr(x, "shape", ())),
+                local_nbytes=self._array_nbytes(x),
+                rank_local_arrays=None,
+            )
         rank_local_arrays = {rank: x for rank in spec.local_slices}
         return DistributedTensor(
             local_array=rank_local_arrays[mesh.local_rank],
@@ -1249,6 +1282,28 @@ class AbstractBackend(SingleProcessDistributedMixin):
             execution_sharding,
             reduced_distributed_modes,
         )
+        if self.is_distributed and int(mesh.world_size) == int(self.size):
+            local_operands = tuple(
+                operand.local_array if self.is_distributed_array(operand) else operand
+                for operand in operands
+            )
+            local_array = self._execute_einsum(spec.equation, local_operands)
+            if reduced_distributed_modes:
+                local_array = self.allreduce(local_array, op="sum")
+            result = DistributedTensor(
+                local_array=local_array,
+                global_shape=output_shape,
+                modes=output_modes,
+                sharding=execution_sharding,
+                mesh=mesh,
+                dtype=getattr(local_array, "dtype", None),
+                local_shape=tuple(getattr(local_array, "shape", ())),
+                local_nbytes=self._array_nbytes(local_array),
+                rank_local_arrays=None,
+            )
+            if output_sharding != execution_sharding:
+                return self.redistribute(result, output_sharding)
+            return result
         rank_local_arrays = {}
         for rank in range(mesh.world_size):
             local_operands = tuple(self._local_operand_for_rank(operand, rank) for operand in operands)
