@@ -1461,7 +1461,49 @@ class AbstractBackend(SingleProcessDistributedMixin):
             result = self._slice_set(result, x.sharding.local_slices[rank], x.rank_local_arrays[rank])
         return result
 
+    def _redistribute_same_mesh_alltoall(self, x, new_spec: ShardingSpec):
+        if not self.is_distributed_array(x):
+            return None
+        if x.rank_local_arrays is not None:
+            return None
+        if not self.is_distributed or int(x.mesh.world_size) != int(self.size):
+            return None
+        old_spec = x.sharding
+        if old_spec.mesh != new_spec.mesh:
+            return None
+        if tuple(old_spec.modes) != tuple(new_spec.modes):
+            return None
+        if tuple(old_spec.global_shape) != tuple(new_spec.global_shape):
+            return None
+        if len(old_spec.sharded_modes) != 1 or len(new_spec.sharded_modes) != 1:
+            return None
+        source_mode = old_spec.sharded_modes[0]
+        target_mode = new_spec.sharded_modes[0]
+        if source_mode == target_mode:
+            return None
+        source_mesh_axis = old_spec.mode_to_mesh_axis.get(source_mode)
+        target_mesh_axis = new_spec.mode_to_mesh_axis.get(target_mode)
+        if source_mesh_axis is None or target_mesh_axis is None or source_mesh_axis != target_mesh_axis:
+            return None
+        split_axis = old_spec.modes.index(target_mode)
+        concat_axis = old_spec.modes.index(source_mode)
+        local_array = self.alltoall(x.local_array, split_axis=split_axis, concat_axis=concat_axis)
+        return DistributedTensor(
+            local_array=local_array,
+            global_shape=new_spec.global_shape,
+            modes=new_spec.modes,
+            sharding=new_spec,
+            mesh=new_spec.mesh,
+            dtype=getattr(local_array, "dtype", None),
+            local_shape=tuple(getattr(local_array, "shape", ())),
+            local_nbytes=self._array_nbytes(local_array),
+            rank_local_arrays=None,
+        )
+
     def redistribute(self, x, new_spec: ShardingSpec):
+        redistributed = self._redistribute_same_mesh_alltoall(x, new_spec)
+        if redistributed is not None:
+            return redistributed
         dense = self.gather_tensor(x)
         return self.shard_tensor(dense, new_spec)
 

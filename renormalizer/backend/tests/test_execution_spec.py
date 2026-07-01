@@ -240,6 +240,70 @@ def test_real_distributed_shard_and_gather_use_rank_local_collectives():
     assert np.array_equal(gathered, x)
 
 
+def test_real_distributed_redistribute_same_mesh_axes_uses_alltoall():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class CollectiveNumpyBackend(NumpyBackend):
+        def __init__(self):
+            super().__init__()
+            self.alltoall_calls = []
+
+        @property
+        def rank(self):
+            return 1
+
+        @property
+        def size(self):
+            return 2
+
+        @property
+        def is_distributed(self):
+            return True
+
+        def allgather(self, x):
+            raise AssertionError("redistribute should not gather the full tensor")
+
+        def alltoall(self, x, split_axis=0, concat_axis=0):
+            self.alltoall_calls.append((tuple(x.shape), split_axis, concat_axis))
+            assert np.array_equal(x, np.arange(20, dtype=np.float64).reshape(5, 4)[3:, :])
+            return np.arange(20, dtype=np.float64).reshape(5, 4)[:, 2:]
+
+    backend = CollectiveNumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=1,
+        global_rank=1,
+    )
+    x = np.arange(20, dtype=np.float64).reshape(5, 4)
+    row_spec = ShardingSpec(
+        global_shape=x.shape,
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"row": 2},
+        mode_to_mesh_axis={"row": "rank"},
+    )
+    col_spec = ShardingSpec(
+        global_shape=x.shape,
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"col": 2},
+        mode_to_mesh_axis={"col": "rank"},
+    )
+    distributed = backend.shard_tensor(x, row_spec)
+
+    redistributed = backend.redistribute(distributed, col_spec)
+
+    assert backend.alltoall_calls == [((2, 4), 1, 0)]
+    assert redistributed.rank_local_arrays is None
+    assert redistributed.sharding == col_spec
+    assert redistributed.local_shape == (5, 2)
+    assert np.array_equal(redistributed.local_array, x[:, 2:])
+
+
 def test_replicate_tensor_and_single_process_collectives():
     from renormalizer.backend import DeviceMesh, DeviceSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

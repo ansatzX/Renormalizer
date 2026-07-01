@@ -223,4 +223,26 @@ class TorchDistributedMixin:
         moved = torch_module.movedim(x, split_axis, 0).contiguous()
         output = torch_module.empty_like(moved)
         self._distributed.all_to_all_single(output, moved)
-        return torch_module.movedim(output, 0, concat_axis)
+        if split_axis == concat_axis:
+            return torch_module.movedim(output, 0, concat_axis)
+        local_split = moved.shape[0] // self.size
+        # all_to_all_single concatenates received chunks in source-rank order.
+        staged = output.reshape((self.size, local_split) + tuple(moved.shape[1:]))
+        remaining_axes = [axis for axis in range(x.ndim) if axis != split_axis]
+        axis_to_staged_dim = {
+            axis: 2 + index
+            for index, axis in enumerate(remaining_axes)
+        }
+        perm = []
+        final_shape = []
+        for axis, dim in enumerate(x.shape):
+            if axis == split_axis:
+                perm.append(1)
+                final_shape.append(local_split)
+            elif axis == concat_axis:
+                perm.extend((0, axis_to_staged_dim[axis]))
+                final_shape.append(int(dim) * int(self.size))
+            else:
+                perm.append(axis_to_staged_dim[axis])
+                final_shape.append(int(dim))
+        return staged.permute(tuple(perm)).contiguous().reshape(tuple(final_shape))
