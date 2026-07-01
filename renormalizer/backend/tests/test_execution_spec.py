@@ -1587,6 +1587,13 @@ def test_distributed_contract_records_communication_profile(tmp_path):
     assert event["backend"] == "numpy"
     assert event["equation"] == "ik,kj->ij"
     assert event["lowering"] == "distributed"
+    assert event["local_lowering"] == "gemm"
+    assert event["num_gemm"] == 1
+    assert event["num_batched_gemm"] == 0
+    assert event["num_grouped_tasks"] == 0
+    assert event["num_blocks"] == 0
+    assert event["num_shape_buckets"] == 0
+    assert event["fallback_reason"] is None
     assert event["distributed_modes"] == ["i"]
     assert event["rank"] == 0
     assert event["world_size"] == 2

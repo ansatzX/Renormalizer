@@ -1649,6 +1649,48 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return None
         return tuple(output_modes).index(target_mode)
 
+    @staticmethod
+    def _local_contraction_profile(plan):
+        if plan is None:
+            return {
+                "local_lowering": None,
+                "num_gemm": 0,
+                "num_batched_gemm": 0,
+                "num_grouped_tasks": 0,
+                "num_blocks": 0,
+                "num_shape_buckets": 0,
+                "fallback_reason": None,
+            }
+        if isinstance(plan, MatmulPlan):
+            return {
+                "local_lowering": plan.kind,
+                "num_gemm": 1 if plan.kind == "gemm" else 0,
+                "num_batched_gemm": 1 if plan.kind in ("batched_gemm", "strided_batched_gemm") else 0,
+                "num_grouped_tasks": len(plan.descs) if plan.kind == "grouped_gemm" else 0,
+                "num_blocks": 0,
+                "num_shape_buckets": 0,
+                "fallback_reason": plan.fallback_reason,
+            }
+        if isinstance(plan, GroupedGemmPlan):
+            return {
+                "local_lowering": "grouped_gemm",
+                "num_gemm": 0,
+                "num_batched_gemm": 0,
+                "num_grouped_tasks": len(plan.tasks),
+                "num_blocks": len(plan.output_blocks),
+                "num_shape_buckets": len(plan.bucketed_by_shape),
+                "fallback_reason": None,
+            }
+        return {
+            "local_lowering": type(plan).__name__,
+            "num_gemm": 0,
+            "num_batched_gemm": 0,
+            "num_grouped_tasks": 0,
+            "num_blocks": 0,
+            "num_shape_buckets": 0,
+            "fallback_reason": None,
+        }
+
     def _record_distributed_contraction_execute(self, spec, plan, result, wall_s, communication_timings=None):
         try:
             from renormalizer.utils import profiling
@@ -1657,8 +1699,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 return
             distributed_plan = self._distributed_plan_from_contraction_plan(plan)
             communication = ()
+            local_profile = self._local_contraction_profile(None)
             if distributed_plan is not None and distributed_plan.steps:
-                communication = distributed_plan.steps[0].communication
+                distributed_step = distributed_plan.steps[0]
+                communication = distributed_step.communication
+                local_profile = self._local_contraction_profile(distributed_step.local_contraction_plan)
             step = plan.steps[0] if isinstance(plan, ContractionPlan) and plan.steps else None
             flops = 0
             if distributed_plan is not None:
@@ -1696,12 +1741,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 copy_bytes=int(getattr(step, "estimated_copy_bytes", 0)),
                 workspace_bytes=int(getattr(step, "required_workspace_bytes", 0)),
                 largest_intermediate=int(result.local_nbytes),
-                num_gemm=0,
-                num_batched_gemm=0,
-                num_grouped_tasks=0,
-                num_blocks=0,
-                num_shape_buckets=0,
-                fallback_reason=None,
+                local_lowering=local_profile["local_lowering"],
+                num_gemm=local_profile["num_gemm"],
+                num_batched_gemm=local_profile["num_batched_gemm"],
+                num_grouped_tasks=local_profile["num_grouped_tasks"],
+                num_blocks=local_profile["num_blocks"],
+                num_shape_buckets=local_profile["num_shape_buckets"],
+                fallback_reason=local_profile["fallback_reason"],
                 distributed_modes=[str(mode) for mode in getattr(plan, "distributed_modes", ())],
                 rank=int(result.mesh.global_rank),
                 world_size=int(result.mesh.world_size),
