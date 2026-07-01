@@ -1118,6 +1118,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return plan.steps[0].plan
         return None
 
+    def _execute_activate_distribution_plan(self, plan, *, stream=None, workspace=None):
+        if plan.output_sharding is None:
+            raise BackendFeatureError("activate_distribution plan requires output_sharding")
+        dense_output = self.execute(plan.path, stream=stream, workspace=workspace)
+        return self.shard_tensor(dense_output, plan.output_sharding)
+
     def execute(self, plan, *, stream=None, workspace=None):
         if isinstance(plan, ContractionPlan):
             if len(plan.steps) != 1:
@@ -1128,6 +1134,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if isinstance(plan, GroupedGemmPlan):
             return self.execute_grouped_gemm_plan(plan, stream=stream, workspace=workspace)
         if isinstance(plan, DistributedContractionPlan):
+            if plan.steps and plan.steps[0].kind == "activate_distribution":
+                return self._execute_activate_distribution_plan(plan, stream=stream, workspace=workspace)
             spec = self._distributed_spec_from_plan(plan)
             return self.distributed_contract(spec, plan=plan, stream=stream, workspace=workspace)
         raise BackendFeatureError("Unknown backend execution plan {0!r}".format(type(plan).__name__))

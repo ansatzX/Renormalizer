@@ -1665,6 +1665,38 @@ def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan
     assert distributed_path.steps[0].estimated_comm_s == pytest.approx((left.nbytes + right.nbytes) / 80.0 + 0.25)
 
 
+def test_execute_auto_distributed_dense_plan_shards_output():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(64, dtype=np.float64).reshape(16, 4)
+    right = np.arange(12, dtype=np.float64).reshape(4, 3)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    distributed_path = backend.plan_distributed_contraction_path(
+        dense_path,
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=HardwareModel(network_bandwidth_Bps=80.0, latency_s=0.25),
+    )
+
+    result = backend.execute(distributed_path)
+
+    assert backend.is_distributed_array(result)
+    assert result.sharding == distributed_path.output_sharding
+    assert result.local_shape == (8, 3)
+    assert np.allclose(result.local_array, (left @ right)[:8, :])
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend
