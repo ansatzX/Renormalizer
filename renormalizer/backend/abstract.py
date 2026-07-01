@@ -1584,7 +1584,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return None
         return tuple(output_modes).index(target_mode)
 
-    def _record_distributed_contraction_execute(self, spec, plan, result, wall_s):
+    def _record_distributed_contraction_execute(self, spec, plan, result, wall_s, communication_timings=None):
         try:
             from renormalizer.utils import profiling
 
@@ -1603,6 +1603,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
             comm_bytes = 0
             if distributed_plan is not None:
                 comm_bytes = int(distributed_plan.total_comm_bytes or distributed_plan.estimated_comm_bytes)
+            communication_wall_s = {}
+            for timing in communication_timings or ():
+                collective = timing.get("collective")
+                if collective is None:
+                    continue
+                communication_wall_s.setdefault(collective, []).append(float(timing.get("wall_s", 0.0)))
+
+            def pop_communication_wall_s(kind):
+                timings = communication_wall_s.get(kind)
+                if not timings:
+                    return 0.0
+                return timings.pop(0)
+
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
@@ -1636,7 +1649,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         "modes": [str(mode) for mode in item.modes],
                         "num_messages": 1,
                         "block_size": int(item.bytes),
-                        "wall_s": 0.0,
+                        "wall_s": pop_communication_wall_s(item.kind),
                     }
                     for item in communication
                 ],
@@ -1646,7 +1659,23 @@ class AbstractBackend(SingleProcessDistributedMixin):
         except Exception:
             pass
 
-    def _distributed_contract_impl(self, spec, *, plan=None, stream=None, workspace=None):
+    def _time_distributed_communication(self, collective, communication_timings, fn, *args, **kwargs):
+        if communication_timings is None:
+            return fn(*args, **kwargs)
+        import time
+
+        started = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            communication_timings.append(
+                {
+                    "collective": collective,
+                    "wall_s": time.perf_counter() - started,
+                }
+            )
+
+    def _distributed_contract_impl(self, spec, *, plan=None, stream=None, workspace=None, communication_timings=None):
         del stream, workspace
         if not isinstance(spec, DistributedContractionSpec):
             raise TypeError("distributed_contract expects a DistributedContractionSpec")
@@ -1696,10 +1725,23 @@ class AbstractBackend(SingleProcessDistributedMixin):
             result_sharding = execution_sharding
             if reduced_distributed_modes:
                 if reduce_scatter_axis is not None:
-                    local_array = self.reduce_scatter(local_array, op="sum", axis=reduce_scatter_axis)
+                    local_array = self._time_distributed_communication(
+                        "reduce_scatter",
+                        communication_timings,
+                        self.reduce_scatter,
+                        local_array,
+                        op="sum",
+                        axis=reduce_scatter_axis,
+                    )
                     result_sharding = output_sharding
                 else:
-                    local_array = self.allreduce(local_array, op="sum")
+                    local_array = self._time_distributed_communication(
+                        "allreduce",
+                        communication_timings,
+                        self.allreduce,
+                        local_array,
+                        op="sum",
+                    )
             result = DistributedTensor(
                 local_array=local_array,
                 global_shape=output_shape,
@@ -1712,7 +1754,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 rank_local_arrays=None,
             )
             if not self._sharding_specs_equivalent(output_sharding, result_sharding):
-                return self.redistribute(result, output_sharding)
+                return self._time_distributed_communication(
+                    "alltoall",
+                    communication_timings,
+                    self.redistribute,
+                    result,
+                    output_sharding,
+                )
             return result
         rank_local_arrays = {}
         for rank in range(mesh.world_size):
@@ -1720,7 +1768,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
             rank_local_arrays[rank] = self._execute_einsum(spec.equation, local_operands)
         result_sharding = execution_sharding
         if reduced_distributed_modes:
-            reduced = self.allreduce(self._sum_rank_local_arrays(rank_local_arrays), op="sum")
+            reduced = self._time_distributed_communication(
+                "allreduce",
+                communication_timings,
+                self.allreduce,
+                self._sum_rank_local_arrays(rank_local_arrays),
+                op="sum",
+            )
             if reduce_scatter_axis is not None:
                 result_sharding = output_sharding
                 rank_local_arrays = {
@@ -1742,7 +1796,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
             rank_local_arrays=rank_local_arrays,
         )
         if not self._sharding_specs_equivalent(output_sharding, result_sharding):
-            return self.redistribute(result, output_sharding)
+            return self._time_distributed_communication(
+                "alltoall",
+                communication_timings,
+                self.redistribute,
+                result,
+                output_sharding,
+            )
         return result
 
     def distributed_contract(self, spec, *, plan=None, stream=None, workspace=None):
@@ -1759,10 +1819,23 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
         import time
 
+        communication_timings = []
         started = time.perf_counter()
-        result = self._distributed_contract_impl(spec, plan=plan, stream=stream, workspace=workspace)
+        result = self._distributed_contract_impl(
+            spec,
+            plan=plan,
+            stream=stream,
+            workspace=workspace,
+            communication_timings=communication_timings,
+        )
         wall_s = time.perf_counter() - started
-        self._record_distributed_contraction_execute(spec, plan, result, wall_s)
+        self._record_distributed_contraction_execute(
+            spec,
+            plan,
+            result,
+            wall_s,
+            communication_timings=communication_timings,
+        )
         return result
 
     def lower_pair_contraction_to_matmul(self, spec):

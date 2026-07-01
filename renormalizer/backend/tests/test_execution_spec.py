@@ -1610,6 +1610,101 @@ def test_distributed_contract_records_communication_profile(tmp_path):
     assert event["wall_s"] >= 0.0
 
 
+def test_distributed_contract_profile_measures_reduce_scatter_wall_time(tmp_path):
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    class TimedCollectiveNumpyBackend(NumpyBackend):
+        @property
+        def rank(self):
+            return 0
+
+        @property
+        def size(self):
+            return 2
+
+        @property
+        def is_distributed(self):
+            return True
+
+        def allreduce(self, x, op="sum"):
+            raise AssertionError("requested output shard should use reduce_scatter, not allreduce")
+
+        def reduce_scatter(self, x, op="sum", axis=0):
+            import time
+
+            assert axis == 1
+            time.sleep(0.002)
+            return self._expected[:, :3]
+
+        def allgather(self, x):
+            return [self._expected[:, :3], self._expected[:, 3:]]
+
+    backend = TimedCollectiveNumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(24, dtype=np.float64).reshape(4, 6)
+    right = np.arange(30, dtype=np.float64).reshape(6, 5)
+    backend._expected = left @ right
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"k": 2},
+        mode_to_mesh_axis={"k": "rank"},
+    )
+    right_spec = ShardingSpec(
+        global_shape=right.shape,
+        modes=("k", "j"),
+        mesh=mesh,
+        ranks_per_mode={"k": 2},
+        mode_to_mesh_axis={"k": "rank"},
+    )
+    output_spec = ShardingSpec(
+        global_shape=(4, 5),
+        modes=("i", "j"),
+        mesh=mesh,
+        ranks_per_mode={"j": 2},
+        mode_to_mesh_axis={"j": "rank"},
+    )
+    contract_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(backend.shard_tensor(left, left_spec), backend.shard_tensor(right, right_spec)),
+        output_sharding=output_spec,
+    )
+    plan = backend.plan_contraction(contract_spec, allow_distribution=True)
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = backend.distributed_contract(contract_spec, plan=plan)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(result.local_array, backend._expected[:, :3])
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(payload for payload in payloads if payload["event"] == "contraction_execute")
+
+    assert event["communication"][0]["collective"] == "reduce_scatter"
+    assert event["communication"][0]["wall_s"] > 0.0
+
+
 def test_distributed_contract_redistributes_when_output_sharding_changes():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend
