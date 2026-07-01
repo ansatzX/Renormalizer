@@ -744,8 +744,22 @@ class DistributionState:
     operand_index: int
     modes: tuple[Hashable, ...]
     sharding: ShardingSpec | None
+    tensor_id: int | None = None
+    shape: tuple[int, ...] = ()
     distributed_modes: tuple[Hashable, ...] = ()
     replicated_modes: tuple[Hashable, ...] = ()
+    local_shape: tuple[int, ...] = ()
+    local_nbytes: int = 0
+
+    def __post_init__(self):
+        object.__setattr__(self, "operand_index", int(self.operand_index))
+        object.__setattr__(self, "tensor_id", int(self.operand_index) if self.tensor_id is None else int(self.tensor_id))
+        object.__setattr__(self, "modes", tuple(self.modes))
+        object.__setattr__(self, "shape", tuple(int(dim) for dim in self.shape))
+        object.__setattr__(self, "distributed_modes", tuple(self.distributed_modes))
+        object.__setattr__(self, "replicated_modes", tuple(self.replicated_modes))
+        object.__setattr__(self, "local_shape", tuple(int(dim) for dim in self.local_shape))
+        object.__setattr__(self, "local_nbytes", int(self.local_nbytes))
 
 
 @dataclass(frozen=True)

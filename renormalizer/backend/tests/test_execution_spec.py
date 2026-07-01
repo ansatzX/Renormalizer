@@ -1900,6 +1900,15 @@ def test_plan_distributed_contraction_path_reports_communication_totals():
     assert [item.kind for item in distributed_path.steps[0].communication] == ["redistribute", "gather"]
     assert distributed_path.steps[0].estimated_comm_s == pytest.approx(3.7)
     assert distributed_path.steps[0].estimated_total_s == pytest.approx(3.7)
+    left_state, right_state = distributed_path.steps[0].input_states
+    assert left_state.tensor_id == 0
+    assert left_state.shape == left.shape
+    assert left_state.local_shape == (3, 3)
+    assert left_state.local_nbytes == 3 * 3 * left.itemsize
+    assert right_state.tensor_id == 1
+    assert right_state.shape == right.shape
+    assert right_state.local_shape == (3, 2)
+    assert right_state.local_nbytes == 3 * 2 * right.itemsize
 
     left_reduced = np.arange(24, dtype=np.float64).reshape(4, 6)
     right_reduced = np.arange(30, dtype=np.float64).reshape(6, 5)
@@ -1973,6 +1982,15 @@ def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan
     assert distributed_path.total_comm_bytes == left.nbytes + right.nbytes
     assert distributed_path.total_redistribute_bytes == left.nbytes + right.nbytes
     assert distributed_path.steps[0].estimated_comm_s == pytest.approx((left.nbytes + right.nbytes) / 80.0 + 0.25)
+    left_state, right_state = distributed_path.steps[0].input_states
+    assert left_state.tensor_id == 0
+    assert left_state.shape == left.shape
+    assert left_state.local_shape == left.shape
+    assert left_state.local_nbytes == left.nbytes
+    assert right_state.tensor_id == 1
+    assert right_state.shape == right.shape
+    assert right_state.local_shape == right.shape
+    assert right_state.local_nbytes == right.nbytes
 
 
 def test_execute_auto_distributed_dense_plan_shards_output():

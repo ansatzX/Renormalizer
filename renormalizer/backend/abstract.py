@@ -467,6 +467,35 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return int(self._array_nbytes(operand) // size)
         return int(getattr(getattr(operand, "dtype", None), "itemsize", 0) or 0)
 
+    def _distribution_state_for_operand(self, index, operand, modes):
+        modes = tuple(modes)
+        if isinstance(operand, DistributedTensor):
+            distributed_modes = tuple(mode for mode in modes if mode in operand.sharding.sharded_modes)
+            replicated_modes = tuple(mode for mode in modes if mode not in operand.sharding.sharded_modes)
+            return DistributionState(
+                operand_index=index,
+                tensor_id=index,
+                modes=modes,
+                sharding=operand.sharding,
+                shape=tuple(operand.global_shape),
+                distributed_modes=distributed_modes,
+                replicated_modes=replicated_modes,
+                local_shape=tuple(operand.local_shape),
+                local_nbytes=int(operand.local_nbytes),
+            )
+        shape = self._operand_global_shape(operand)
+        return DistributionState(
+            operand_index=index,
+            tensor_id=index,
+            modes=modes,
+            sharding=None,
+            shape=shape,
+            distributed_modes=(),
+            replicated_modes=modes,
+            local_shape=shape,
+            local_nbytes=self._array_nbytes(operand),
+        )
+
     @staticmethod
     def _mode_sizes_from_equation(input_modes, operands):
         sizes = {}
@@ -693,13 +722,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 output_comm_bytes = plan.estimated_comm_bytes
                 total_comm_bytes = output_comm_bytes + input_redistribution_bytes
                 states = tuple(
-                    DistributionState(
-                        operand_index=index,
-                        modes=tuple(modes),
-                        sharding=operand.sharding if isinstance(operand, DistributedTensor) else None,
-                        distributed_modes=tuple(mode for mode in modes if isinstance(operand, DistributedTensor) and mode in operand.sharding.sharded_modes),
-                        replicated_modes=tuple(mode for mode in modes if not isinstance(operand, DistributedTensor) or mode not in operand.sharding.sharded_modes),
-                    )
+                    self._distribution_state_for_operand(index, operand, modes)
                     for index, (operand, modes) in enumerate(zip(spec.operands, input_modes))
                 )
                 step_plan = DistributedStepPlan(
@@ -1157,13 +1180,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             for operand in path.input_specs
         ))
         states = tuple(
-            DistributionState(
-                operand_index=index,
-                modes=operand.modes,
-                sharding=None,
-                distributed_modes=(),
-                replicated_modes=operand.modes,
-            )
+            self._distribution_state_for_operand(index, operand.array, operand.modes)
             for index, operand in enumerate(path.input_specs)
         )
         step_plan = DistributedStepPlan(
