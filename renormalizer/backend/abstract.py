@@ -1636,6 +1636,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         "modes": [str(mode) for mode in item.modes],
                         "num_messages": 1,
                         "block_size": int(item.bytes),
+                        "wall_s": 0.0,
                     }
                     for item in communication
                 ],

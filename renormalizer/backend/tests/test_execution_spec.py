@@ -1595,6 +1595,7 @@ def test_distributed_contract_records_communication_profile(tmp_path):
             "modes": ["j"],
             "num_messages": 1,
             "block_size": 96,
+            "wall_s": 0.0,
         },
         {
             "collective": "gather",
@@ -1602,6 +1603,7 @@ def test_distributed_contract_records_communication_profile(tmp_path):
             "modes": ["i"],
             "num_messages": 1,
             "block_size": 160,
+            "wall_s": 0.0,
         },
     ]
     assert event["comm_bytes"] == 256
