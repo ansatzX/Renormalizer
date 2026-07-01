@@ -1729,6 +1729,54 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "fallback_reason": None,
         }
 
+    @staticmethod
+    def _profile_slice(local_slice):
+        return [
+            [
+                item.start,
+                item.stop,
+                item.step,
+            ]
+            for item in tuple(local_slice)
+        ]
+
+    @classmethod
+    def _profile_sharding(cls, sharding):
+        if sharding is None:
+            return None
+        local_slice = sharding.local_slices.get(sharding.mesh.global_rank)
+        return {
+            "global_shape": list(sharding.global_shape),
+            "modes": [str(mode) for mode in sharding.modes],
+            "sharded_modes": [str(mode) for mode in sharding.sharded_modes],
+            "replicated_modes": [str(mode) for mode in sharding.replicated_modes],
+            "ranks_per_mode": {str(mode): int(count) for mode, count in sharding.ranks_per_mode.items()},
+            "mode_to_mesh_axis": {str(mode): str(axis) for mode, axis in sharding.mode_to_mesh_axis.items()},
+            "mesh_shape": list(sharding.mesh.shape),
+            "mesh_axis_names": [str(axis) for axis in sharding.mesh.axis_names],
+            "mesh_backend": sharding.mesh.backend,
+            "mesh_world_size": int(sharding.mesh.world_size),
+            "mesh_local_rank": int(sharding.mesh.local_rank),
+            "mesh_global_rank": int(sharding.mesh.global_rank),
+            "local_slice": cls._profile_slice(local_slice) if local_slice is not None else None,
+        }
+
+    @classmethod
+    def _profile_distribution_state(cls, state):
+        if state is None:
+            return None
+        return {
+            "operand_index": int(state.operand_index),
+            "tensor_id": int(state.tensor_id),
+            "modes": [str(mode) for mode in state.modes],
+            "shape": list(state.shape),
+            "distributed_modes": [str(mode) for mode in state.distributed_modes],
+            "replicated_modes": [str(mode) for mode in state.replicated_modes],
+            "local_shape": list(state.local_shape),
+            "local_nbytes": int(state.local_nbytes),
+            "sharding": cls._profile_sharding(state.sharding),
+        }
+
     def _record_distributed_contraction_execute(self, spec, plan, result, wall_s, communication_timings=None):
         try:
             from renormalizer.utils import profiling
@@ -1737,10 +1785,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 return
             distributed_plan = self._distributed_plan_from_contraction_plan(plan)
             communication = ()
+            input_states = ()
+            output_state = None
             local_profile = self._local_contraction_profile(None)
             if distributed_plan is not None and distributed_plan.steps:
                 distributed_step = distributed_plan.steps[0]
                 communication = distributed_step.communication
+                input_states = distributed_step.input_states
+                output_state = distributed_step.output_state
                 local_profile = self._local_contraction_profile(
                     distributed_step.local_contraction_plan,
                     distributed_step.local_step,
@@ -1800,6 +1852,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 world_size=int(result.mesh.world_size),
                 local_shape=tuple(result.local_shape),
                 global_shape=tuple(result.global_shape),
+                input_states=[
+                    self._profile_distribution_state(state)
+                    for state in input_states
+                ],
+                output_state=self._profile_distribution_state(output_state),
                 communication=[
                     {
                         "collective": item.kind,
