@@ -96,6 +96,7 @@ class BackendProxy:
     make_contiguous = _delegate_backend_method("make_contiguous")
     parse_einsum = _delegate_backend_method("parse_einsum")
     plan_contraction = _delegate_backend_method("plan_contraction")
+    plan_distributed_contraction_path = _delegate_backend_method("plan_distributed_contraction_path")
     estimate_matmul = _delegate_backend_method("estimate_matmul")
     estimate_contraction = _delegate_backend_method("estimate_contraction")
     estimate_redistribute = _delegate_backend_method("estimate_redistribute")

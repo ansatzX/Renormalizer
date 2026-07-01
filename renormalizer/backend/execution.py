@@ -723,6 +723,12 @@ class DistributedContractionPlan:
     output_sharding: ShardingSpec | None
     estimated_comm_bytes: int = 0
     equation: str | None = None
+    peak_local_bytes: int = 0
+    total_flops: int = 0
+    total_comm_bytes: int = 0
+    total_redistribute_bytes: int = 0
+    total_allreduce_bytes: int = 0
+    total_gather_bytes: int = 0
 
 
 @dataclass(frozen=True)

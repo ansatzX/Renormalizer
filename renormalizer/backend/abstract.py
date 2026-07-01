@@ -677,13 +677,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         ),
                     ),
                 )
-                distributed_plan = DistributedContractionPlan(
+                distributed_plan = self._with_distributed_plan_totals(DistributedContractionPlan(
                     path=plan,
                     steps=(step_plan,),
                     output_sharding=output_sharding,
                     estimated_comm_bytes=total_comm_bytes,
                     equation=spec.equation,
-                )
+                ))
                 step = plan.steps[0]
                 step = ContractionStep(
                     kind=step.kind,
@@ -832,6 +832,96 @@ class AbstractBackend(SingleProcessDistributedMixin):
             comm_bytes=movement_bytes,
             peak_bytes=movement_bytes,
         )
+
+    def _local_nbytes_for_sharding(self, sharding, itemsize):
+        if sharding is None:
+            return 0
+        local_slices = sharding.local_slices.get(sharding.mesh.local_rank)
+        if local_slices is None:
+            return 0
+        local_shape = []
+        for local_slice, dim in zip(local_slices, sharding.global_shape):
+            start, stop, step = local_slice.indices(dim)
+            if step != 1:
+                local_shape.append(len(range(start, stop, step)))
+            else:
+                local_shape.append(max(0, stop - start))
+        return self._prod_shape(local_shape) * int(itemsize)
+
+    def _peak_local_bytes_for_distributed_plan(self, plan):
+        itemsize = max(
+            (self._operand_itemsize(operand.array) for operand in plan.path.input_specs),
+            default=1,
+        )
+        operand_peak = max(
+            (
+                operand.array.local_nbytes
+                if isinstance(operand.array, DistributedTensor)
+                else self._array_nbytes(operand.array)
+                for operand in plan.path.input_specs
+            ),
+            default=0,
+        )
+        output_peak = self._local_nbytes_for_sharding(plan.output_sharding, itemsize)
+        return max(operand_peak, output_peak, int(plan.path.required_workspace_bytes))
+
+    @staticmethod
+    def _communication_totals(steps):
+        total_comm_bytes = 0
+        total_redistribute_bytes = 0
+        total_allreduce_bytes = 0
+        total_gather_bytes = 0
+        for step in steps:
+            for communication in step.communication:
+                nbytes = int(communication.bytes)
+                total_comm_bytes += nbytes
+                if communication.kind in ("redistribute", "alltoall"):
+                    total_redistribute_bytes += nbytes
+                elif communication.kind in ("allreduce", "reduce_scatter"):
+                    total_allreduce_bytes += nbytes
+                elif communication.kind in ("gather", "allgather"):
+                    total_gather_bytes += nbytes
+        return total_comm_bytes, total_redistribute_bytes, total_allreduce_bytes, total_gather_bytes
+
+    def _with_distributed_plan_totals(self, plan):
+        total_comm_bytes, total_redistribute_bytes, total_allreduce_bytes, total_gather_bytes = (
+            self._communication_totals(plan.steps)
+        )
+        return DistributedContractionPlan(
+            path=plan.path,
+            steps=plan.steps,
+            output_sharding=plan.output_sharding,
+            estimated_comm_bytes=total_comm_bytes,
+            equation=plan.equation,
+            peak_local_bytes=self._peak_local_bytes_for_distributed_plan(plan),
+            total_flops=int(plan.path.estimated_flops),
+            total_comm_bytes=total_comm_bytes,
+            total_redistribute_bytes=total_redistribute_bytes,
+            total_allreduce_bytes=total_allreduce_bytes,
+            total_gather_bytes=total_gather_bytes,
+        )
+
+    def plan_distributed_contraction_path(
+        self,
+        path,
+        mesh,
+        memory_limit_per_device=None,
+        cost_model=None,
+    ):
+        del mesh, cost_model
+        if isinstance(path, DistributedContractionPlan):
+            distributed_plan = path
+        elif isinstance(path, ContractionPlan) and len(path.steps) == 1 and isinstance(path.steps[0].plan, DistributedContractionPlan):
+            distributed_plan = path.steps[0].plan
+        else:
+            raise BackendFeatureError("plan_distributed_contraction_path requires a distributed ContractionPlan")
+        result = self._with_distributed_plan_totals(distributed_plan)
+        if memory_limit_per_device is not None and result.peak_local_bytes > int(memory_limit_per_device):
+            raise BackendFeatureError(
+                "distributed contraction peak local bytes {0} exceeds memory limit {1}"
+                .format(result.peak_local_bytes, int(memory_limit_per_device))
+            )
+        return result
 
     def default_stream(self):
         return None

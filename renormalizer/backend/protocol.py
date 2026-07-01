@@ -344,6 +344,10 @@ class BackendProtocol(Protocol):
         """Plan an explicit contraction into backend execution steps."""
         ...
 
+    def plan_distributed_contraction_path(self, path: Any, mesh: Any, memory_limit_per_device: Any = None, cost_model: Any = None) -> Any:
+        """Plan distributed placement/communication for a contraction path."""
+        ...
+
     def estimate_matmul(self, desc: Any, hw: Any = None) -> Any:
         """Estimate cost for one matmul descriptor or matmul plan."""
         ...

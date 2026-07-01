@@ -1344,6 +1344,97 @@ def test_execute_runs_distributed_contraction_plan():
     assert np.allclose(backend.gather_tensor(wrapped_result), left @ right)
 
 
+def test_plan_distributed_contraction_path_reports_communication_totals():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionPlan, DistributedContractionSpec, HardwareModel, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(15, dtype=np.float64).reshape(5, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    right_spec = ShardingSpec(
+        global_shape=right.shape,
+        modes=("k", "j"),
+        mesh=mesh,
+        ranks_per_mode={"j": 2},
+        mode_to_mesh_axis={"j": "rank"},
+    )
+    redistribute_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(backend.shard_tensor(left, left_spec), backend.shard_tensor(right, right_spec)),
+    )
+    hw = HardwareModel(network_bandwidth_Bps=80.0, latency_s=0.25)
+
+    path = backend.plan_contraction(redistribute_spec, allow_distribution=True)
+    distributed_path = backend.plan_distributed_contraction_path(
+        path,
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=hw,
+    )
+
+    assert isinstance(distributed_path, DistributedContractionPlan)
+    assert distributed_path.total_flops == path.estimated_flops
+    assert distributed_path.total_comm_bytes == 256
+    assert distributed_path.total_redistribute_bytes == 96
+    assert distributed_path.total_allreduce_bytes == 0
+    assert distributed_path.total_gather_bytes == 160
+    assert distributed_path.peak_local_bytes == 96
+    assert distributed_path.estimated_comm_bytes == 256
+    assert [item.kind for item in distributed_path.steps[0].communication] == ["redistribute", "gather"]
+
+    left_reduced = np.arange(24, dtype=np.float64).reshape(4, 6)
+    right_reduced = np.arange(30, dtype=np.float64).reshape(6, 5)
+    reduced_left_spec = ShardingSpec(
+        global_shape=left_reduced.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"k": 2},
+        mode_to_mesh_axis={"k": "rank"},
+    )
+    reduced_right_spec = ShardingSpec(
+        global_shape=right_reduced.shape,
+        modes=("k", "j"),
+        mesh=mesh,
+        ranks_per_mode={"k": 2},
+        mode_to_mesh_axis={"k": "rank"},
+    )
+    allreduce_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(
+            backend.shard_tensor(left_reduced, reduced_left_spec),
+            backend.shard_tensor(right_reduced, reduced_right_spec),
+        ),
+    )
+
+    allreduce_path = backend.plan_distributed_contraction_path(
+        backend.plan_contraction(allreduce_spec, allow_distribution=True),
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=hw,
+    )
+
+    assert allreduce_path.total_comm_bytes == 160
+    assert allreduce_path.total_redistribute_bytes == 0
+    assert allreduce_path.total_allreduce_bytes == 160
+    assert allreduce_path.total_gather_bytes == 0
+    assert [item.kind for item in allreduce_path.steps[0].communication] == ["allreduce"]
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend
