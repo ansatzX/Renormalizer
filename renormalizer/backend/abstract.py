@@ -1566,6 +1566,22 @@ class AbstractBackend(SingleProcessDistributedMixin):
             total = value if total is None else total + value
         return total
 
+    def _reduce_scatter_axis_for_output(self, reduced_distributed_modes, output_sharding, execution_sharding, output_modes):
+        if not reduced_distributed_modes:
+            return None
+        if output_sharding is None or execution_sharding is None:
+            return None
+        if self._sharding_specs_equivalent(output_sharding, execution_sharding):
+            return None
+        if len(output_sharding.sharded_modes) != 1:
+            return None
+        target_mode = output_sharding.sharded_modes[0]
+        if target_mode not in output_modes:
+            return None
+        if target_mode in execution_sharding.sharded_modes:
+            return None
+        return tuple(output_modes).index(target_mode)
+
     def _record_distributed_contraction_execute(self, spec, plan, result, wall_s):
         try:
             from renormalizer.utils import profiling
@@ -1662,48 +1678,67 @@ class AbstractBackend(SingleProcessDistributedMixin):
             execution_sharding,
             reduced_distributed_modes,
         )
+        reduce_scatter_axis = self._reduce_scatter_axis_for_output(
+            reduced_distributed_modes,
+            output_sharding,
+            execution_sharding,
+            output_modes,
+        )
         if self.is_distributed and int(mesh.world_size) == int(self.size):
             local_operands = tuple(
                 operand.local_array if self.is_distributed_array(operand) else operand
                 for operand in operands
             )
             local_array = self._execute_einsum(spec.equation, local_operands)
+            result_sharding = execution_sharding
             if reduced_distributed_modes:
-                local_array = self.allreduce(local_array, op="sum")
+                if reduce_scatter_axis is not None:
+                    local_array = self.reduce_scatter(local_array, op="sum", axis=reduce_scatter_axis)
+                    result_sharding = output_sharding
+                else:
+                    local_array = self.allreduce(local_array, op="sum")
             result = DistributedTensor(
                 local_array=local_array,
                 global_shape=output_shape,
                 modes=output_modes,
-                sharding=execution_sharding,
-                mesh=mesh,
+                sharding=result_sharding,
+                mesh=result_sharding.mesh,
                 dtype=getattr(local_array, "dtype", None),
                 local_shape=tuple(getattr(local_array, "shape", ())),
                 local_nbytes=self._array_nbytes(local_array),
                 rank_local_arrays=None,
             )
-            if not self._sharding_specs_equivalent(output_sharding, execution_sharding):
+            if not self._sharding_specs_equivalent(output_sharding, result_sharding):
                 return self.redistribute(result, output_sharding)
             return result
         rank_local_arrays = {}
         for rank in range(mesh.world_size):
             local_operands = tuple(self._local_operand_for_rank(operand, rank) for operand in operands)
             rank_local_arrays[rank] = self._execute_einsum(spec.equation, local_operands)
+        result_sharding = execution_sharding
         if reduced_distributed_modes:
             reduced = self.allreduce(self._sum_rank_local_arrays(rank_local_arrays), op="sum")
-            rank_local_arrays = {rank: reduced for rank in range(mesh.world_size)}
+            if reduce_scatter_axis is not None:
+                result_sharding = output_sharding
+                rank_local_arrays = {
+                    rank: reduced[tuple(output_sharding.local_slices[rank])]
+                    for rank in range(mesh.world_size)
+                }
+            else:
+                rank_local_arrays = {rank: reduced for rank in range(mesh.world_size)}
         local_array = rank_local_arrays[mesh.local_rank]
         result = DistributedTensor(
             local_array=local_array,
             global_shape=output_shape,
             modes=output_modes,
-            sharding=execution_sharding,
-            mesh=mesh,
+            sharding=result_sharding,
+            mesh=result_sharding.mesh,
             dtype=getattr(local_array, "dtype", None),
             local_shape=tuple(getattr(local_array, "shape", ())),
             local_nbytes=self._array_nbytes(local_array),
             rank_local_arrays=rank_local_arrays,
         )
-        if not self._sharding_specs_equivalent(output_sharding, execution_sharding):
+        if not self._sharding_specs_equivalent(output_sharding, result_sharding):
             return self.redistribute(result, output_sharding)
         return result
 
