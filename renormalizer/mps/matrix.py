@@ -266,18 +266,10 @@ def tensordot(a: Union[Matrix, np.ndarray], b: Union[Matrix, np.ndarray, xp.ndar
             "for the current FMO workload. Legate raises a lower-level runtime error here; "
             "Renormalizer now fails fast at the backend boundary."
         )
-    # Promote dtypes when they differ (torch requires matching dtypes for tensordot)
-    if hasattr(a_arr, 'dtype') and hasattr(b_arr, 'dtype') and a_arr.dtype != b_arr.dtype:
-        if hasattr(xp, 'promote_types'):
-            target = xp.promote_types(a_arr.dtype, b_arr.dtype)
-        else:
-            target = np.result_type(a_arr.dtype, b_arr.dtype)
-        a_arr = xp.asarray(a_arr, dtype=target)
-        b_arr = xp.asarray(b_arr, dtype=target)
     if not profiling.should_record_op():
-        return xp.tensordot(a_arr, b_arr, axes)
+        return backend.tensordot(a_arr, b_arr, axes)
     started = time.perf_counter()
-    result = xp.tensordot(a_arr, b_arr, axes)
+    result = backend.tensordot(a_arr, b_arr, axes)
     profiling.record(
         "tensordot",
         backend=backend.name,

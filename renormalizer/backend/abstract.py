@@ -247,6 +247,24 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return self.from_numpy(x)
         return self.asarray(x)
 
+    def _promote_tensordot_operands(self, a, b):
+        if not (hasattr(a, "dtype") and hasattr(b, "dtype")):
+            return a, b
+        if a.dtype == b.dtype:
+            return a, b
+        xp = self.array_namespace or _np
+        promote_types = getattr(xp, "promote_types", None)
+        if promote_types is not None:
+            target = promote_types(a.dtype, b.dtype)
+        else:
+            target = _np.result_type(a.dtype, b.dtype)
+        return xp.asarray(a, dtype=target), xp.asarray(b, dtype=target)
+
+    def tensordot(self, a, b, axes=2):
+        xp = self.array_namespace or _np
+        a, b = self._promote_tensordot_operands(a, b)
+        return xp.tensordot(a, b, axes)
+
     def astype(self, x: Any, dtype, *, copy=CopyPolicy.IF_NEEDED):
         copy = CopyPolicy.from_value(copy)
         if copy is CopyPolicy.NEVER and getattr(x, "dtype", None) != dtype:

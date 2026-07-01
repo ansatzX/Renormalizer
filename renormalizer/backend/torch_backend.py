@@ -51,23 +51,6 @@ class TorchBackend(AbstractBackend):
         torch_oom_error = getattr(torch, "OutOfMemoryError", None)
         if torch_oom_error is not None:
             self.memory_errors = (MemoryError, torch_oom_error)
-        # Monkey-patch torch.tensordot to auto-promote mixed dtypes (e.g. float64 + complex128)
-        if hasattr(torch, 'tensordot') and not getattr(torch.tensordot, "_renormalizer_patched", False):
-            _original_tensordot = torch.tensordot
-            def _tensordot_with_promote(a, b, dims=2, *args, **kwargs):
-                if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor) and a.dtype != b.dtype:
-                    target = torch.promote_types(a.dtype, b.dtype)
-                    a = a.to(dtype=target)
-                    b = b.to(dtype=target)
-                # Convert numpy-style axes=(i, j) to torch-style dims=([i], [j])
-                if isinstance(dims, tuple) and len(dims) == 2:
-                    if isinstance(dims[0], int):
-                        dims = ([dims[0]], [dims[1]])
-                    elif isinstance(dims[0], range):
-                        dims = (list(dims[0]), list(dims[1]))
-                return _original_tensordot(a, b, dims, *args, **kwargs)
-            _tensordot_with_promote._renormalizer_patched = True
-            torch.tensordot = _tensordot_with_promote
 
     def __getattr__(self, name):
         return getattr(torch, name)
@@ -151,6 +134,31 @@ class TorchBackend(AbstractBackend):
         """Convert ``x`` to a PyTorch tensor."""
         return self.asarray(x)
 
+    @staticmethod
+    def _normalize_tensordot_dims(axes):
+        if isinstance(axes, int):
+            return axes
+        if not (isinstance(axes, tuple) and len(axes) == 2):
+            return axes
+        left_axes, right_axes = axes
+        if isinstance(left_axes, int):
+            left_axes = (left_axes,)
+        elif isinstance(left_axes, range):
+            left_axes = tuple(left_axes)
+        else:
+            left_axes = tuple(left_axes)
+        if isinstance(right_axes, int):
+            right_axes = (right_axes,)
+        elif isinstance(right_axes, range):
+            right_axes = tuple(right_axes)
+        else:
+            right_axes = tuple(right_axes)
+        return (left_axes, right_axes)
+
+    def tensordot(self, a, b, axes=2):
+        a, b = self._promote_tensordot_operands(a, b)
+        return torch.tensordot(a, b, dims=self._normalize_tensordot_dims(axes))
+
 
 class _TorchRandomProxy:
     def __init__(self, backend):
@@ -209,14 +217,3 @@ class _TorchRandomProxy:
 
     def __getattr__(self, name):
         return getattr(self._random, name)
-        # Monkey-patch torch.tensordot to auto-promote mixed dtypes (e.g. float64 + complex128)
-        if not getattr(torch.tensordot, "_renormalizer_patched", False):
-            _original_tensordot = torch.tensordot
-            def _tensordot_with_promote(a, b, *args, **kwargs):
-                if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor) and a.dtype != b.dtype:
-                    target = torch.promote_types(a.dtype, b.dtype)
-                    a = a.to(dtype=target)
-                    b = b.to(dtype=target)
-                return _original_tensordot(a, b, *args, **kwargs)
-            _tensordot_with_promote._renormalizer_patched = True
-            torch.tensordot = _tensordot_with_promote

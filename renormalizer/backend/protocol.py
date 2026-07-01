@@ -50,6 +50,7 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "numpy",
     "to_host",
     "to_backend",
+    "tensordot",
     "is_array",
     "is_host_array",
     "is_device_array",
@@ -286,6 +287,10 @@ class BackendProtocol(Protocol):
 
     def to_backend(self, x: Any) -> Any:
         """Convert an array-like object to this backend's representation."""
+        ...
+
+    def tensordot(self, a: Any, b: Any, axes: Any = 2) -> Any:
+        """Contract two tensors through the backend boundary."""
         ...
 
     def astype(self, x: Any, dtype: Any, **kwargs: Any) -> Any:

@@ -1187,6 +1187,70 @@ def test_torch_backend_public_selection_seeds_and_uses_default_float_dtype(monke
         r.set_backend("numpy")
 
 
+def test_torch_backend_does_not_patch_global_torch_tensordot(monkeypatch):
+    from renormalizer.backend import BackendConfig, torch_backend
+
+    def original_tensordot(*args, **kwargs):
+        return ("original", args, kwargs)
+
+    class FakeTorchRandom:
+        @staticmethod
+        def seed(seed):
+            return seed
+
+    class FakeTorchTensor:
+        pass
+
+    class FakeTorch:
+        Tensor = FakeTorchTensor
+        float32 = object()
+        float64 = object()
+        complex64 = object()
+        complex128 = object()
+        linalg = object()
+        random = FakeTorchRandom()
+        tensordot = staticmethod(original_tensordot)
+
+    monkeypatch.setattr(torch_backend, "torch", FakeTorch)
+    monkeypatch.setattr(torch_backend, "_IMPORT_ERROR", None)
+
+    backend = torch_backend.TorchBackend(config=BackendConfig(device="cpu", precision=64))
+
+    assert FakeTorch.tensordot is original_tensordot
+    assert backend.array_namespace is FakeTorch
+
+
+def test_torch_matrix_tensordot_promotes_dtype_without_global_patch():
+    try:
+        import torch
+    except ImportError as exc:
+        pytest.skip("could not import 'torch': {0}".format(exc))
+    except OSError as exc:
+        pytest.skip("torch is installed but failed to load: {0}".format(exc))
+
+    import renormalizer as r
+    from renormalizer.mps.matrix import asnumpy, tensordot
+
+    original_tensordot = torch.tensordot
+    try:
+        r.set_backend("torch", device="cpu", precision=64)
+        left = torch.arange(6, dtype=torch.float64).reshape(2, 3)
+        right = torch.arange(12, dtype=torch.float64).reshape(3, 4).to(torch.complex128)
+
+        result = tensordot(left, right, axes=(-1, 0))
+
+        assert torch.tensordot is original_tensordot
+        assert result.dtype is torch.complex128
+        expected = np.tensordot(
+            left.numpy(),
+            right.numpy(),
+            axes=([-1], [0]),
+        )
+        assert np.allclose(asnumpy(result), expected)
+    finally:
+        r.set_backend("numpy", precision=64)
+
+
 def test_backend_protocol_source_stays_python36_import_compatible():
     import importlib
     import inspect
