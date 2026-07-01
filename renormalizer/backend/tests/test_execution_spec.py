@@ -40,6 +40,9 @@ def test_numpy_backend_capabilities_and_array_info_are_explicit():
     assert backend.capabilities.matmul is True
     assert backend.capabilities.batched_matmul is True
     assert backend.capabilities.grouped_gemm is False
+    assert backend.capabilities.block_sparse is True
+    assert backend.capabilities.packed_blocks is False
+    assert backend.capabilities.scatter_add is True
     assert backend.capabilities.distributed_array is True
     assert backend.supports_batched_matmul is True
     assert backend.supports_grouped_gemm is False

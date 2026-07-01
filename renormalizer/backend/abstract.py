@@ -64,6 +64,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_functional_update = True
     supports_batched_matmul = True
     supports_grouped_gemm = False
+    supports_block_sparse = True
+    supports_packed_blocks = False
+    supports_scatter_add = True
     host_array_types = (_np.ndarray,)
     device_array_types = ()
 
@@ -139,6 +142,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
             contract_expression=True,
             contraction_path=True,
             custom_contraction_plan=True,
+            block_sparse=self.supports_block_sparse,
+            packed_blocks=self.supports_packed_blocks,
+            scatter_add=self.supports_scatter_add,
             distributed=self.is_distributed,
             distributed_array=True,
             allreduce=self.size > 1,
