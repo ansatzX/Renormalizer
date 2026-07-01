@@ -1254,6 +1254,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if current_modes == target_modes:
             return array
         perm = tuple(current_modes.index(mode) for mode in target_modes)
+        if self.name == "torch" and hasattr(array, "permute"):
+            return array.permute(*perm)
         xp = self.array_namespace or _np
         return xp.transpose(array, perm)
 

@@ -499,6 +499,26 @@ def test_torch_grouped_gemm_is_backend_primitive_when_available():
     assert np.allclose(backend.to_numpy(results[1]), a_np[1] @ b_np[1])
 
 
+def test_torch_contraction_execute_supports_full_axis_permutation_when_available():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available("torch"):
+        pytest.skip("torch unavailable")
+
+    backend = create_backend("torch", config=BackendConfig(device="cpu"))
+    left_np = np.arange(2 * 3 * 4 * 5, dtype=np.float64).reshape(2, 3, 4, 5)
+    right_np = np.arange(5 * 6, dtype=np.float64).reshape(5, 6)
+    left = backend.to_backend(left_np)
+    right = backend.to_backend(right_np)
+    spec = backend.parse_einsum("abfh,hc->ahbfc", left, right)
+    plan = backend.plan_contraction(spec)
+
+    result = backend.execute(plan)
+
+    assert np.allclose(backend.to_numpy(result), np.einsum("abfh,hc->ahbfc", left_np, right_np))
+
+
 def test_cupy_grouped_gemm_is_backend_primitive_when_available():
     from renormalizer.backend import BackendConfig
     from renormalizer.backend.factory import create_backend, is_backend_available
@@ -1008,6 +1028,28 @@ def test_pair_tensor_contract_records_generic_contraction_plan(tmp_path):
     assert execute["num_gemm"] == 1
     assert execute["fallback_reason"] is None
     assert execute["wall_s"] >= 0.0
+
+
+def test_pair_tensor_contract_uses_backend_execute_without_profiling(monkeypatch):
+    from renormalizer.mps import matrix
+
+    calls = []
+    current_backend = matrix.backend.current
+    original_execute = current_backend.execute
+
+    def counting_execute(plan, **kwargs):
+        calls.append(plan)
+        return original_execute(plan, **kwargs)
+
+    monkeypatch.setattr(current_backend, "execute", counting_execute)
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+
+    result = matrix.pair_tensor_contract(left, "ik", right, "kj", {"k"})
+
+    assert len(calls) >= 1
+    assert calls[0].steps[0].kind == "gemm"
+    assert np.allclose(matrix.asnumpy(result), left @ right)
 
 
 def test_plan_contraction_returns_dense_gemm_step_for_pair_einsum():

@@ -7,7 +7,6 @@ import time
 from typing import List, Union
 
 from renormalizer.backend.boundary import eye_like, scalar_to_python as _scalar_to_python
-from renormalizer.backend.execution import PairContractionSpec, TensorOperand
 from renormalizer.mps.backend import np, backend, xp
 from renormalizer.utils import profiling
 
@@ -363,25 +362,15 @@ def pair_tensor_contract(
     input_right,
     idx_removed,
 ):
-    # Find indices to contract over
-    left_pos, right_pos = (), ()
-    for s in idx_removed:
-        left_pos += (input_left.find(s),)
-        right_pos += (input_right.find(s),)
-    if profiling.should_record_op():
-        left_array = asxp(view_left)
-        right_array = asxp(view_right)
-        removed = set(idx_removed)
-        output_modes = tuple(mode for mode in input_left if mode not in removed)
-        output_modes += tuple(mode for mode in input_right if mode not in removed)
-        spec = PairContractionSpec.from_operands(
-            TensorOperand(left_array, tuple(input_left), name="left"),
-            TensorOperand(right_array, tuple(input_right), name="right"),
-            output_modes=output_modes,
-        )
-        plan = backend.lower_pair_contraction_to_matmul(spec)
-        return backend.execute_matmul_plan(plan)
-    return tensordot(view_left, view_right, axes=(left_pos, right_pos))
+    left_array = asxp(view_left)
+    right_array = asxp(view_right)
+    removed = set(idx_removed)
+    output_modes = tuple(mode for mode in input_left if mode not in removed)
+    output_modes += tuple(mode for mode in input_right if mode not in removed)
+    equation = "{0},{1}->{2}".format(input_left, input_right, "".join(output_modes))
+    spec = backend.parse_einsum(equation, left_array, right_array)
+    plan = backend.plan_contraction(spec)
+    return backend.execute(plan)
 
 
 def asnumpy(array):
