@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import json
+
 import numpy as np
 import pytest
-import json
 
 
 def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
@@ -116,6 +117,80 @@ def test_pair_contraction_lowering_records_batched_fallback_reason():
     assert plan.kind == "fallback_tensordot"
     assert plan.descs[0].batch_shape == (5,)
     assert "batched_matmul" in plan.fallback_reason
+
+
+def test_backend_contraction_plan_event_records_generic_operands(tmp_path):
+    from renormalizer.backend.execution import PairContractionSpec, TensorOperand
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    event_path = tmp_path / "events.jsonl"
+    left = np.ones((2, 3, 4), dtype=np.float32)
+    right = np.ones((2, 4, 5), dtype=np.float32)
+    spec = PairContractionSpec.from_operands(
+        TensorOperand(left, ("batch", ("left", "site"), "bond"), name="left_tensor"),
+        TensorOperand(right, ("batch", "bond", ("right", "site")), name="right_tensor"),
+        output_modes=("batch", ("left", "site"), ("right", "site")),
+    )
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        backend.lower_pair_contraction_to_matmul(spec)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    plan = next(payload for payload in payloads if payload["event"] == "contraction_plan")
+
+    assert plan["lowering"] == "fallback_tensordot"
+    assert plan["batch_modes"] == ["batch"]
+    assert plan["output_modes"] == ["batch", "('left', 'site')", "('right', 'site')"]
+    assert plan["operands"] == [
+        {
+            "name": "left_tensor",
+            "modes": ["batch", "('left', 'site')", "bond"],
+            "shape": [2, 3, 4],
+            "dtype": "float32",
+            "nbytes": 96,
+            "ndim": 3,
+            "strides": [48, 16, 4],
+            "order": "C",
+            "contiguous": True,
+            "backend": "numpy",
+            "device": "DeviceSpec(kind='cpu', index=None, local_rank=None, global_rank=None, visible_id=None)",
+            "device_kind": "cpu",
+            "device_index": None,
+            "is_host": True,
+            "is_device": False,
+        },
+        {
+            "name": "right_tensor",
+            "modes": ["batch", "bond", "('right', 'site')"],
+            "shape": [2, 4, 5],
+            "dtype": "float32",
+            "nbytes": 160,
+            "ndim": 3,
+            "strides": [80, 20, 4],
+            "order": "C",
+            "contiguous": True,
+            "backend": "numpy",
+            "device": "DeviceSpec(kind='cpu', index=None, local_rank=None, global_rank=None, visible_id=None)",
+            "device_kind": "cpu",
+            "device_index": None,
+            "is_host": True,
+            "is_device": False,
+        },
+    ]
 
 
 def test_pair_tensor_contract_records_generic_contraction_plan(tmp_path):

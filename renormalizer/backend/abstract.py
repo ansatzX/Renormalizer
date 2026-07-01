@@ -252,10 +252,31 @@ class AbstractBackend(SingleProcessDistributedMixin):
             from renormalizer.utils import profiling
 
             if profiling.should_record_op():
+                def operand_payload(operand):
+                    info = self.array_info(operand.array)
+                    return {
+                        "name": operand.name,
+                        "modes": [str(mode) for mode in operand.modes],
+                        "shape": info.shape,
+                        "dtype": str(info.dtype),
+                        "nbytes": info.nbytes,
+                        "ndim": info.ndim,
+                        "strides": info.strides,
+                        "order": info.order,
+                        "contiguous": info.contiguous,
+                        "backend": info.backend_name,
+                        "device": str(info.device),
+                        "device_kind": info.device.kind,
+                        "device_index": info.device.index,
+                        "is_host": info.is_host,
+                        "is_device": info.is_device,
+                    }
+
                 profiling.record(
                     "contraction_plan",
                     backend=self.name,
                     lowering=plan.kind,
+                    operands=[operand_payload(spec.left), operand_payload(spec.right)],
                     left_modes=[str(mode) for mode in spec.left.modes],
                     right_modes=[str(mode) for mode in spec.right.modes],
                     output_modes=[str(mode) for mode in spec.output_modes],
