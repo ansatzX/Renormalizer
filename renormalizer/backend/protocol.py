@@ -344,6 +344,46 @@ class BackendProtocol(Protocol):
         """Plan an explicit contraction into backend execution steps."""
         ...
 
+    def estimate_matmul(self, desc: Any, hw: Any = None) -> Any:
+        """Estimate cost for one matmul descriptor or matmul plan."""
+        ...
+
+    def estimate_contraction(self, plan: Any, hw: Any = None) -> Any:
+        """Estimate cost for a contraction plan."""
+        ...
+
+    def estimate_redistribute(self, src: Any, dst: Any, tensor_shape: Any, hw: Any = None, **kwargs: Any) -> Any:
+        """Estimate communication/copy cost for a redistribution."""
+        ...
+
+    def default_stream(self) -> Any:
+        """Return the backend default stream token, or None for synchronous backends."""
+        ...
+
+    def new_stream(self) -> Any:
+        """Create a new backend stream token, or None when streams are unavailable."""
+        ...
+
+    def record_event(self, stream: Any = None) -> Any:
+        """Record a backend event on the given stream."""
+        ...
+
+    def wait_event(self, event: Any, stream: Any = None) -> Any:
+        """Wait for a backend event from the given stream."""
+        ...
+
+    def allocate_workspace(self, nbytes: int, **kwargs: Any) -> Any:
+        """Allocate a backend-resident workspace buffer."""
+        ...
+
+    def release_workspace(self, workspace: Any) -> Any:
+        """Release a workspace buffer."""
+        ...
+
+    def execute(self, plan: Any, **kwargs: Any) -> Any:
+        """Execute a backend plan through the unified plan executor."""
+        ...
+
     def unpack_masked_vectors(self, x: Any, spec: Any) -> Any:
         """Unpack one or more packed masked vectors into a structured center tensor."""
         ...

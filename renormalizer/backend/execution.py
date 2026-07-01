@@ -649,6 +649,7 @@ class ContractionPlan:
     input_specs: tuple[TensorOperand, ...]
     output_modes: tuple[Hashable, ...]
     estimated_flops: int = 0
+    estimated_peak_bytes: int = 0
     estimated_read_bytes: int = 0
     estimated_write_bytes: int = 0
     estimated_copy_bytes: int = 0
@@ -724,12 +725,34 @@ class DistributedContractionPlan:
 
 
 @dataclass(frozen=True)
+class StreamEvent:
+    device: DeviceSpec
+    stream: Any = None
+    token: Any = None
+
+
+@dataclass
+class Workspace:
+    device: DeviceSpec
+    nbytes: int
+    buffer: Any
+
+
+@dataclass(frozen=True)
 class HardwareModel:
+    flop_per_s: float | None = None
+    memory_bandwidth_Bps: float | None = None
+    h2d_bandwidth_Bps: float | None = None
+    d2h_bandwidth_Bps: float | None = None
+    p2p_bandwidth_Bps: float | None = None
+    network_bandwidth_Bps: float | None = None
+    latency_s: float = 0.0
+    max_memory_bytes: int | None = None
+    workspace_limit_bytes: int | None = None
     device_flop_s: float | None = None
     host_bandwidth_bytes_s: float | None = None
     device_bandwidth_bytes_s: float | None = None
     interconnect_bandwidth_bytes_s: float | None = None
-    workspace_limit_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -740,7 +763,17 @@ class CostEstimate:
     copy_bytes: int = 0
     comm_bytes: int = 0
     workspace_bytes: int = 0
+    peak_bytes: int = 0
+    compute_s: float = 0.0
+    memory_s: float = 0.0
+    copy_s: float = 0.0
+    comm_s: float = 0.0
+    total_s: float = 0.0
     estimated_time_s: float | None = None
+
+    def __post_init__(self):
+        if self.estimated_time_s is None:
+            object.__setattr__(self, "estimated_time_s", self.total_s)
 
 
 def _contraction_plan_hash(plan: ContractionPlan) -> str:
@@ -753,6 +786,7 @@ def _contraction_plan_hash(plan: ContractionPlan) -> str:
                 step.input_modes,
                 step.output_modes,
                 step.estimated_flops,
+                step.estimated_peak_bytes,
                 step.estimated_read_bytes,
                 step.estimated_write_bytes,
                 step.estimated_copy_bytes,
@@ -762,6 +796,7 @@ def _contraction_plan_hash(plan: ContractionPlan) -> str:
         ),
         tuple((operand.modes, _shape_of(operand.array), str(getattr(operand.array, "dtype", None))) for operand in plan.input_specs),
         plan.output_modes,
+        plan.estimated_peak_bytes,
         plan.sliced_modes,
         plan.distributed_modes,
     )

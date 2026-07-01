@@ -1085,3 +1085,102 @@ def test_distributed_contract_matches_dense_for_row_sharded_matmul():
     assert result.sharding.sharded_modes == ("i",)
     assert result.local_shape == (3, 4)
     assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
+def test_contraction_cost_model_reports_peak_and_timing_estimates():
+    from renormalizer.backend import HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    plan = backend.plan_contraction(spec)
+    hw = HardwareModel(
+        flop_per_s=24.0,
+        memory_bandwidth_Bps=208.0,
+        p2p_bandwidth_Bps=100.0,
+        network_bandwidth_Bps=10.0,
+        latency_s=0.5,
+        max_memory_bytes=1024,
+        workspace_limit_bytes=256,
+    )
+    estimate = backend.estimate_contraction(plan, hw)
+
+    assert plan.estimated_peak_bytes == 64
+    assert estimate.flops == 48
+    assert estimate.read_bytes == left.nbytes + right.nbytes
+    assert estimate.write_bytes == 64
+    assert estimate.peak_bytes == 64
+    assert estimate.compute_s == pytest.approx(2.0)
+    assert estimate.memory_s == pytest.approx(1.0)
+    assert estimate.copy_s == 0.0
+    assert estimate.comm_s == 0.0
+    assert estimate.total_s == pytest.approx(3.0)
+    assert estimate.estimated_time_s == pytest.approx(3.0)
+
+
+def test_estimate_redistribute_records_communication_cost():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    row_spec = ShardingSpec(
+        global_shape=(5, 4),
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"row": 2},
+        mode_to_mesh_axis={"row": "rank"},
+    )
+    col_spec = ShardingSpec(
+        global_shape=(5, 4),
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"col": 2},
+        mode_to_mesh_axis={"col": "rank"},
+    )
+    hw = HardwareModel(network_bandwidth_Bps=80.0, latency_s=0.25)
+
+    estimate = backend.estimate_redistribute(row_spec, col_spec, (5, 4), hw, itemsize=8)
+
+    assert estimate.comm_bytes == 160
+    assert estimate.copy_bytes == 160
+    assert estimate.peak_bytes == 160
+    assert estimate.comm_s == pytest.approx(2.25)
+    assert estimate.total_s == pytest.approx(2.25)
+
+
+def test_workspace_stream_and_unified_execute_api_are_explicit():
+    from renormalizer.backend import StreamEvent, Workspace
+    from renormalizer.backend.execution import DeviceSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+
+    workspace = backend.allocate_workspace(32)
+    stream = backend.default_stream()
+    event = backend.record_event(stream=stream)
+    result = backend.execute(plan, stream=stream, workspace=workspace)
+
+    assert isinstance(workspace, Workspace)
+    assert workspace.device == DeviceSpec(kind="cpu")
+    assert workspace.nbytes == 32
+    assert workspace.buffer.nbytes >= 32
+    assert backend.new_stream() is None
+    assert isinstance(event, StreamEvent)
+    assert event.device == DeviceSpec(kind="cpu")
+    assert backend.wait_event(event, stream=stream) is None
+    assert backend.release_workspace(workspace) is None
+    assert np.allclose(result, left @ right)

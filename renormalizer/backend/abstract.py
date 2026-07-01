@@ -16,6 +16,7 @@ from renormalizer.backend.execution import (
     ContractionPlan,
     ContractionStep,
     CopyPolicy,
+    CostEstimate,
     DeviceSpec,
     DistributedContractionPlan,
     DistributedContractionSpec,
@@ -26,14 +27,19 @@ from renormalizer.backend.execution import (
     FallbackPolicy,
     DenseBlock,
     GroupedGemmPlan,
+    HardwareModel,
+    MatmulPlan,
     PairContractionSpec,
     ShardingSpec,
+    StreamEvent,
     TensorOperand,
+    Workspace,
     array_info_for_backend,
     layout_from_array,
     legacy_device_kind,
     lower_pair_contraction_to_matmul,
     parse_einsum,
+    parse_device_spec,
     parse_einsum_equation,
 )
 from renormalizer.backend.gemm import GemmTask, array_nbytes, grouped_gemm_bucketed, grouped_gemm_stats, run_gemm_task
@@ -406,6 +412,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             input_specs=spec.operands,
             output_modes=spec.output_modes,
             estimated_flops=step.estimated_flops,
+            estimated_peak_bytes=step.estimated_peak_bytes,
             estimated_read_bytes=step.estimated_read_bytes,
             estimated_write_bytes=step.estimated_write_bytes,
             estimated_copy_bytes=step.estimated_copy_bytes,
@@ -578,6 +585,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     input_specs=plan.input_specs,
                     output_modes=plan.output_modes,
                     estimated_flops=plan.estimated_flops,
+                    estimated_peak_bytes=plan.estimated_peak_bytes,
                     estimated_read_bytes=plan.estimated_read_bytes,
                     estimated_write_bytes=plan.estimated_write_bytes,
                     estimated_copy_bytes=plan.estimated_copy_bytes,
@@ -588,6 +596,158 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 )
             return plan
         return self._plan_einsum_contraction(spec)
+
+    @staticmethod
+    def _rate_seconds(amount, rate):
+        if not amount or not rate:
+            return 0.0
+        return float(amount) / float(rate)
+
+    @staticmethod
+    def _hardware_flop_rate(hw):
+        return hw.flop_per_s or hw.device_flop_s
+
+    @staticmethod
+    def _hardware_memory_bandwidth(hw):
+        return hw.memory_bandwidth_Bps or hw.device_bandwidth_bytes_s or hw.host_bandwidth_bytes_s
+
+    @staticmethod
+    def _hardware_copy_bandwidth(hw):
+        return (
+            hw.p2p_bandwidth_Bps
+            or hw.device_bandwidth_bytes_s
+            or hw.h2d_bandwidth_Bps
+            or hw.d2h_bandwidth_Bps
+            or hw.host_bandwidth_bytes_s
+        )
+
+    @staticmethod
+    def _hardware_comm_bandwidth(hw):
+        return hw.network_bandwidth_Bps or hw.interconnect_bandwidth_bytes_s or hw.p2p_bandwidth_Bps
+
+    def _make_cost_estimate(
+        self,
+        hw,
+        *,
+        flops=0,
+        read_bytes=0,
+        write_bytes=0,
+        copy_bytes=0,
+        comm_bytes=0,
+        workspace_bytes=0,
+        peak_bytes=0,
+    ):
+        hw = HardwareModel() if hw is None else hw
+        compute_s = self._rate_seconds(flops, self._hardware_flop_rate(hw))
+        memory_s = self._rate_seconds(read_bytes + write_bytes, self._hardware_memory_bandwidth(hw))
+        copy_s = self._rate_seconds(copy_bytes, self._hardware_copy_bandwidth(hw))
+        comm_s = self._rate_seconds(comm_bytes, self._hardware_comm_bandwidth(hw))
+        if comm_bytes and hw.latency_s:
+            comm_s += float(hw.latency_s)
+        total_s = compute_s + memory_s + copy_s + comm_s
+        return CostEstimate(
+            flops=int(flops),
+            read_bytes=int(read_bytes),
+            write_bytes=int(write_bytes),
+            copy_bytes=int(copy_bytes),
+            comm_bytes=int(comm_bytes),
+            workspace_bytes=int(workspace_bytes),
+            peak_bytes=int(peak_bytes),
+            compute_s=compute_s,
+            memory_s=memory_s,
+            copy_s=copy_s,
+            comm_s=comm_s,
+            total_s=total_s,
+        )
+
+    def estimate_matmul(self, desc, hw=None):
+        if isinstance(desc, MatmulPlan):
+            return self._make_cost_estimate(
+                hw,
+                flops=desc.estimated_flops,
+                read_bytes=sum(item.estimated_read_bytes for item in desc.descs),
+                write_bytes=sum(item.estimated_write_bytes for item in desc.descs),
+                copy_bytes=desc.copy_bytes,
+                workspace_bytes=desc.workspace_bytes,
+                peak_bytes=max((item.estimated_write_bytes for item in desc.descs), default=0) + desc.workspace_bytes,
+            )
+        batch = self._prod_shape(desc.batch_shape)
+        flops = desc.estimated_flops or int(2 * batch * desc.m * desc.n * desc.k)
+        read_bytes = desc.estimated_read_bytes or (self._array_nbytes(desc.A) + self._array_nbytes(desc.B))
+        itemsize = max(self._operand_itemsize(desc.A), self._operand_itemsize(desc.B), 1)
+        write_bytes = desc.estimated_write_bytes or int(batch * desc.m * desc.n * itemsize)
+        workspace_bytes = int(desc.estimated_workspace_bytes)
+        return self._make_cost_estimate(
+            hw,
+            flops=flops,
+            read_bytes=read_bytes,
+            write_bytes=write_bytes,
+            workspace_bytes=workspace_bytes,
+            peak_bytes=write_bytes + workspace_bytes,
+        )
+
+    def estimate_contraction(self, plan, hw=None):
+        if isinstance(plan, MatmulPlan):
+            return self.estimate_matmul(plan, hw)
+        peak_bytes = int(plan.estimated_peak_bytes or max((step.estimated_peak_bytes for step in plan.steps), default=0))
+        return self._make_cost_estimate(
+            hw,
+            flops=plan.estimated_flops,
+            read_bytes=plan.estimated_read_bytes,
+            write_bytes=plan.estimated_write_bytes,
+            copy_bytes=plan.estimated_copy_bytes,
+            comm_bytes=plan.estimated_comm_bytes,
+            workspace_bytes=plan.required_workspace_bytes,
+            peak_bytes=peak_bytes,
+        )
+
+    def estimate_redistribute(self, src, dst, tensor_shape, hw=None, *, itemsize=8):
+        nbytes = self._prod_shape(tensor_shape) * int(itemsize)
+        movement_bytes = 0 if src == dst else nbytes
+        return self._make_cost_estimate(
+            hw,
+            copy_bytes=movement_bytes,
+            comm_bytes=movement_bytes,
+            peak_bytes=movement_bytes,
+        )
+
+    def default_stream(self):
+        return None
+
+    def new_stream(self):
+        return None
+
+    def record_event(self, stream=None):
+        return StreamEvent(device=self.current_device(), stream=stream)
+
+    def wait_event(self, event, stream=None):
+        return None
+
+    def allocate_workspace(self, nbytes, *, device=None):
+        nbytes = int(nbytes)
+        if nbytes < 0:
+            raise ValueError("workspace nbytes must be non-negative")
+        spec = parse_device_spec(device) if device is not None else self.current_device()
+        if spec is None:
+            spec = self.current_device()
+        buffer = self.to_backend(_np.empty((nbytes,), dtype=_np.uint8))
+        return Workspace(device=spec, nbytes=nbytes, buffer=buffer)
+
+    def release_workspace(self, workspace):
+        return None
+
+    def execute(self, plan, *, stream=None, workspace=None):
+        if isinstance(plan, ContractionPlan):
+            if len(plan.steps) != 1:
+                raise BackendFeatureError("execute currently supports single-step ContractionPlan objects")
+            return self.execute(plan.steps[0].plan, stream=stream, workspace=workspace)
+        if isinstance(plan, MatmulPlan):
+            return self.execute_matmul_plan(plan, stream=stream, workspace=workspace)
+        if isinstance(plan, GroupedGemmPlan):
+            return self.execute_grouped_gemm_plan(plan, stream=stream, workspace=workspace)
+        if isinstance(plan, DistributedContractionPlan):
+            raise BackendFeatureError("execute requires a DistributedContractionSpec for distributed plans")
+        raise BackendFeatureError("Unknown backend execution plan {0!r}".format(type(plan).__name__))
 
     def synchronize(self, device=None, stream=None):
         return self.sync()

@@ -35,7 +35,9 @@ from renormalizer.backend.execution import (
     PackedVectorSpec,
     PairContractionSpec,
     ShardingSpec,
+    StreamEvent,
     TensorOperand,
+    Workspace,
     parse_device_spec,
 )
 from renormalizer.backend.factory import SUPPORTED_BACKENDS, available_backends, is_backend_available
@@ -89,8 +91,10 @@ __all__ = [
     "PairContractionSpec",
     "SUPPORTED_BACKENDS",
     "ShardingSpec",
+    "StreamEvent",
     "TensorOperand",
     "UnavailableTransforms",
+    "Workspace",
     "available_backends",
     "eye_like",
     "flatten_backend",
