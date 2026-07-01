@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import json
 
 
 def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
@@ -115,3 +116,46 @@ def test_pair_contraction_lowering_records_batched_fallback_reason():
     assert plan.kind == "fallback_tensordot"
     assert plan.descs[0].batch_shape == (5,)
     assert "batched_matmul" in plan.fallback_reason
+
+
+def test_pair_tensor_contract_records_generic_contraction_plan(tmp_path):
+    from renormalizer.mps.matrix import pair_tensor_contract
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    old_level = package_logger.level
+    event_path = tmp_path / "events.jsonl"
+    left = np.ones((2, 3))
+    right = np.ones((3, 4))
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = pair_tensor_contract(left, "ik", right, "kj", {"k"})
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(result, np.tensordot(left, right, axes=((1,), (0,))))
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    plans = [payload for payload in payloads if payload["event"] == "contraction_plan"]
+
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan["backend"] == "numpy"
+    assert plan["lowering"] == "gemm"
+    assert plan["left_modes"] == ["i", "k"]
+    assert plan["right_modes"] == ["k", "j"]
+    assert plan["output_modes"] == ["i", "j"]
+    assert plan["contracted_modes"] == ["k"]
+    assert plan["input_shapes"] == [[2, 3], [3, 4]]
+    assert plan["output_shape"] == [2, 4]
+    assert plan["flops"] == 48
+    assert plan["num_gemm"] == 1
+    assert plan["fallback_reason"] is None
