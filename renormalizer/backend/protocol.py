@@ -340,6 +340,10 @@ class BackendProtocol(Protocol):
         """Parse an explicit einsum equation into backend contraction IR."""
         ...
 
+    def plan_contraction(self, spec: Any, **kwargs: Any) -> Any:
+        """Plan an explicit contraction into backend execution steps."""
+        ...
+
     def unpack_masked_vectors(self, x: Any, spec: Any) -> Any:
         """Unpack one or more packed masked vectors into a structured center tensor."""
         ...
@@ -362,6 +366,10 @@ class BackendProtocol(Protocol):
 
     def replicate_tensor(self, x: Any, mesh: Any, **kwargs: Any) -> Any:
         """Replicate a dense tensor across a device mesh."""
+        ...
+
+    def distributed_contract(self, spec: Any, **kwargs: Any) -> Any:
+        """Execute a distributed contraction spec and return dense or distributed output."""
         ...
 
     def current_device(self) -> Any:

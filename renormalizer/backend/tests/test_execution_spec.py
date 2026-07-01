@@ -1008,3 +1008,80 @@ def test_pair_tensor_contract_records_generic_contraction_plan(tmp_path):
     assert execute["num_gemm"] == 1
     assert execute["fallback_reason"] is None
     assert execute["wall_s"] >= 0.0
+
+
+def test_plan_contraction_returns_dense_gemm_step_for_pair_einsum():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    plan = backend.plan_contraction(spec, allow_distribution=False)
+
+    assert plan.output_modes == ("i", "j")
+    assert plan.estimated_flops == 48
+    assert plan.estimated_read_bytes == left.nbytes + right.nbytes
+    assert plan.estimated_write_bytes == 2 * 4 * left.itemsize
+    assert plan.required_workspace_bytes == 0
+    assert plan.sliced_modes == ()
+    assert plan.distributed_modes == ()
+    assert isinstance(plan.plan_hash, str)
+    assert plan.plan_hash
+    assert len(plan.steps) == 1
+
+    step = plan.steps[0]
+    assert step.kind == "gemm"
+    assert step.inputs == (0, 1)
+    assert step.output == 2
+    assert step.input_modes == (("i", "k"), ("k", "j"))
+    assert step.output_modes == ("i", "j")
+    assert step.plan.kind == "gemm"
+    assert step.estimated_flops == 48
+    assert step.estimated_read_bytes == left.nbytes + right.nbytes
+    assert step.estimated_write_bytes == 2 * 4 * left.itemsize
+    assert step.estimated_comm_bytes == 0
+
+
+def test_distributed_contract_matches_dense_for_row_sharded_matmul():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(15, dtype=np.float64).reshape(5, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    sharded_left = backend.shard_tensor(left, left_spec)
+    contract_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(sharded_left, right),
+    )
+
+    plan = backend.plan_contraction(contract_spec, allow_distribution=True)
+    result = backend.distributed_contract(contract_spec)
+
+    assert plan.distributed_modes == ("i",)
+    assert len(plan.steps) == 1
+    assert plan.steps[0].kind == "distributed_contract"
+    assert plan.steps[0].estimated_comm_bytes == 5 * 4 * left.itemsize
+    assert backend.is_distributed_array(result) is True
+    assert result.global_shape == (5, 4)
+    assert result.modes == ("i", "j")
+    assert result.sharding.sharded_modes == ("i",)
+    assert result.local_shape == (3, 4)
+    assert np.allclose(backend.gather_tensor(result), left @ right)

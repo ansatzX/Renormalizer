@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from functools import reduce
+import hashlib
 from operator import mul
 from typing import Any, Callable, Hashable, Mapping, Sequence, Tuple
 
@@ -319,6 +320,19 @@ class DistributedTensor:
         if self.rank_local_arrays is not None:
             self.rank_local_arrays = {int(rank): array for rank, array in self.rank_local_arrays.items()}
 
+    @property
+    def shape(self):
+        return self.global_shape
+
+    @property
+    def ndim(self):
+        return len(self.global_shape)
+
+    @property
+    def nbytes(self):
+        itemsize = int(getattr(self.dtype, "itemsize", 0) or 0)
+        return _prod(self.global_shape) * itemsize
+
 
 def _shape_of(array) -> tuple[int, ...]:
     return tuple(int(dim) for dim in getattr(array, "shape", ()))
@@ -445,18 +459,25 @@ def _parse_einsum_modes(modes, *, context):
     return tuple(modes)
 
 
-def parse_einsum(equation, *operands, constants=(), optimize=None) -> EinsumSpec:
+def parse_einsum_equation(equation) -> tuple[tuple[tuple[Hashable, ...], ...], tuple[Hashable, ...]]:
     normalized = "".join(str(equation).split())
     if normalized.count("->") != 1:
-        raise ValueError("backend.parse_einsum requires an explicit output using '->'")
+        raise ValueError("einsum equation requires an explicit output using '->'")
     lhs, rhs = normalized.split("->", 1)
     if not lhs:
-        raise ValueError("backend.parse_einsum requires at least one input operand")
-    input_terms = tuple(lhs.split(","))
-    if len(input_terms) != len(operands):
+        raise ValueError("einsum equation requires at least one input operand")
+    return (
+        tuple(_parse_einsum_modes(term, context="operand") for term in lhs.split(",")),
+        _parse_einsum_modes(rhs, context="output"),
+    )
+
+
+def parse_einsum(equation, *operands, constants=(), optimize=None) -> EinsumSpec:
+    input_modes, output_modes = parse_einsum_equation(equation)
+    if len(input_modes) != len(operands):
         raise ValueError(
             "einsum operand count mismatch: equation has {0} operands but {1} arrays were provided"
-            .format(len(input_terms), len(operands))
+            .format(len(input_modes), len(operands))
         )
 
     constants = tuple(int(index) for index in constants)
@@ -466,8 +487,7 @@ def parse_einsum(equation, *operands, constants=(), optimize=None) -> EinsumSpec
 
     tensor_operands = []
     input_mode_set = set()
-    for index, (modes_text, array) in enumerate(zip(input_terms, operands)):
-        modes = _parse_einsum_modes(modes_text, context="operand {0}".format(index))
+    for index, (modes, array) in enumerate(zip(input_modes, operands)):
         shape = _shape_of(array)
         if len(modes) != len(shape):
             raise ValueError(
@@ -477,7 +497,6 @@ def parse_einsum(equation, *operands, constants=(), optimize=None) -> EinsumSpec
         input_mode_set.update(modes)
         tensor_operands.append(TensorOperand(array, modes, name="operand{0}".format(index)))
 
-    output_modes = _parse_einsum_modes(rhs, context="output")
     if len(output_modes) != len(set(output_modes)):
         raise ValueError("einsum output modes must be unique")
     missing = [mode for mode in output_modes if mode not in input_mode_set]
@@ -598,6 +617,155 @@ class MatmulPlan:
     estimated_time_s: float | None
     reason: str
     fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ContractionStep:
+    kind: str
+    inputs: tuple[int, ...]
+    output: int
+    input_modes: tuple[tuple[Hashable, ...], ...]
+    output_modes: tuple[Hashable, ...]
+    plan: Any = None
+    estimated_flops: int = 0
+    estimated_read_bytes: int = 0
+    estimated_write_bytes: int = 0
+    estimated_copy_bytes: int = 0
+    estimated_peak_bytes: int = 0
+    estimated_comm_bytes: int = 0
+    required_workspace_bytes: int = 0
+    reason: str | None = None
+    fallback_reason: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "inputs", tuple(int(index) for index in self.inputs))
+        object.__setattr__(self, "input_modes", tuple(tuple(modes) for modes in self.input_modes))
+        object.__setattr__(self, "output_modes", tuple(self.output_modes))
+
+
+@dataclass(frozen=True)
+class ContractionPlan:
+    steps: tuple[ContractionStep, ...]
+    input_specs: tuple[TensorOperand, ...]
+    output_modes: tuple[Hashable, ...]
+    estimated_flops: int = 0
+    estimated_read_bytes: int = 0
+    estimated_write_bytes: int = 0
+    estimated_copy_bytes: int = 0
+    estimated_comm_bytes: int = 0
+    required_workspace_bytes: int = 0
+    sliced_modes: tuple[Hashable, ...] = ()
+    distributed_modes: tuple[Hashable, ...] = ()
+    plan_hash: str = ""
+
+    def __post_init__(self):
+        object.__setattr__(self, "steps", tuple(self.steps))
+        object.__setattr__(self, "input_specs", tuple(self.input_specs))
+        object.__setattr__(self, "output_modes", tuple(self.output_modes))
+        object.__setattr__(self, "sliced_modes", tuple(self.sliced_modes))
+        object.__setattr__(self, "distributed_modes", tuple(self.distributed_modes))
+        if not self.plan_hash:
+            object.__setattr__(self, "plan_hash", _contraction_plan_hash(self))
+
+
+@dataclass(frozen=True)
+class DistributedContractionSpec:
+    equation: str
+    operands: tuple[Any, ...]
+    output_modes: tuple[Hashable, ...] | None = None
+    output_sharding: ShardingSpec | None = None
+    optimize: str | Any | None = None
+
+    def __post_init__(self):
+        input_modes, parsed_output_modes = parse_einsum_equation(self.equation)
+        if len(input_modes) != len(self.operands):
+            raise ValueError(
+                "einsum operand count mismatch: equation has {0} operands but {1} arrays were provided"
+                .format(len(input_modes), len(self.operands))
+            )
+        output_modes = parsed_output_modes if self.output_modes is None else tuple(self.output_modes)
+        if output_modes != parsed_output_modes:
+            raise ValueError("DistributedContractionSpec output_modes must match equation output")
+        object.__setattr__(self, "operands", tuple(self.operands))
+        object.__setattr__(self, "output_modes", output_modes)
+
+
+@dataclass(frozen=True)
+class DistributionState:
+    operand_index: int
+    modes: tuple[Hashable, ...]
+    sharding: ShardingSpec | None
+    distributed_modes: tuple[Hashable, ...] = ()
+    replicated_modes: tuple[Hashable, ...] = ()
+
+
+@dataclass(frozen=True)
+class CommunicationPlan:
+    kind: str
+    bytes: int
+    modes: tuple[Hashable, ...] = ()
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DistributedStepPlan:
+    local_step: ContractionStep
+    input_states: tuple[DistributionState, ...]
+    output_sharding: ShardingSpec | None
+    communication: tuple[CommunicationPlan, ...] = ()
+
+
+@dataclass(frozen=True)
+class DistributedContractionPlan:
+    path: ContractionPlan
+    steps: tuple[DistributedStepPlan, ...]
+    output_sharding: ShardingSpec | None
+    estimated_comm_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class HardwareModel:
+    device_flop_s: float | None = None
+    host_bandwidth_bytes_s: float | None = None
+    device_bandwidth_bytes_s: float | None = None
+    interconnect_bandwidth_bytes_s: float | None = None
+    workspace_limit_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    flops: int = 0
+    read_bytes: int = 0
+    write_bytes: int = 0
+    copy_bytes: int = 0
+    comm_bytes: int = 0
+    workspace_bytes: int = 0
+    estimated_time_s: float | None = None
+
+
+def _contraction_plan_hash(plan: ContractionPlan) -> str:
+    payload = (
+        tuple(
+            (
+                step.kind,
+                step.inputs,
+                step.output,
+                step.input_modes,
+                step.output_modes,
+                step.estimated_flops,
+                step.estimated_read_bytes,
+                step.estimated_write_bytes,
+                step.estimated_copy_bytes,
+                step.estimated_comm_bytes,
+            )
+            for step in plan.steps
+        ),
+        tuple((operand.modes, _shape_of(operand.array), str(getattr(operand.array, "dtype", None))) for operand in plan.input_specs),
+        plan.output_modes,
+        plan.sliced_modes,
+        plan.distributed_modes,
+    )
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass(frozen=True)

@@ -12,9 +12,17 @@ from renormalizer.backend.execution import (
     BackendCopyError,
     BackendFeatureError,
     BlockTensor,
+    CommunicationPlan,
+    ContractionPlan,
+    ContractionStep,
     CopyPolicy,
     DeviceSpec,
+    DistributedContractionPlan,
+    DistributedContractionSpec,
+    DistributedStepPlan,
     DistributedTensor,
+    DistributionState,
+    EinsumSpec,
     FallbackPolicy,
     DenseBlock,
     GroupedGemmPlan,
@@ -26,6 +34,7 @@ from renormalizer.backend.execution import (
     legacy_device_kind,
     lower_pair_contraction_to_matmul,
     parse_einsum,
+    parse_einsum_equation,
 )
 from renormalizer.backend.gemm import GemmTask, array_nbytes, grouped_gemm_bucketed, grouped_gemm_stats, run_gemm_task
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
@@ -344,6 +353,242 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def parse_einsum(self, equation, *operands, constants=(), optimize=None):
         return parse_einsum(equation, *operands, constants=constants, optimize=optimize)
 
+    @staticmethod
+    def _contraction_step_from_matmul_plan(plan, input_modes, output_modes):
+        return ContractionStep(
+            kind=plan.kind,
+            inputs=(0, 1),
+            output=2,
+            input_modes=tuple(tuple(modes) for modes in input_modes),
+            output_modes=tuple(output_modes),
+            plan=plan,
+            estimated_flops=plan.estimated_flops,
+            estimated_read_bytes=sum(desc.estimated_read_bytes for desc in plan.descs),
+            estimated_write_bytes=sum(desc.estimated_write_bytes for desc in plan.descs),
+            estimated_copy_bytes=plan.copy_bytes,
+            estimated_peak_bytes=max((desc.estimated_write_bytes for desc in plan.descs), default=0),
+            estimated_comm_bytes=0,
+            required_workspace_bytes=plan.workspace_bytes,
+            reason=plan.reason,
+            fallback_reason=plan.fallback_reason,
+        )
+
+    def _plan_einsum_contraction(self, spec, *, sliced_modes=(), distributed_modes=(), comm_bytes=0):
+        if len(spec.operands) != 2:
+            raise BackendFeatureError("plan_contraction currently supports two-operand explicit einsum specs")
+        pair_spec = PairContractionSpec.from_operands(spec.operands[0], spec.operands[1], spec.output_modes)
+        matmul_plan = self.lower_pair_contraction_to_matmul(pair_spec)
+        step = self._contraction_step_from_matmul_plan(
+            matmul_plan,
+            input_modes=(spec.operands[0].modes, spec.operands[1].modes),
+            output_modes=spec.output_modes,
+        )
+        if comm_bytes:
+            step = ContractionStep(
+                kind="distributed_contract",
+                inputs=step.inputs,
+                output=step.output,
+                input_modes=step.input_modes,
+                output_modes=step.output_modes,
+                plan=step.plan,
+                estimated_flops=step.estimated_flops,
+                estimated_read_bytes=step.estimated_read_bytes,
+                estimated_write_bytes=step.estimated_write_bytes,
+                estimated_copy_bytes=step.estimated_copy_bytes,
+                estimated_peak_bytes=step.estimated_peak_bytes,
+                estimated_comm_bytes=comm_bytes,
+                required_workspace_bytes=step.required_workspace_bytes,
+                reason="distributed contraction with local matmul plan",
+                fallback_reason=step.fallback_reason,
+            )
+        return ContractionPlan(
+            steps=(step,),
+            input_specs=spec.operands,
+            output_modes=spec.output_modes,
+            estimated_flops=step.estimated_flops,
+            estimated_read_bytes=step.estimated_read_bytes,
+            estimated_write_bytes=step.estimated_write_bytes,
+            estimated_copy_bytes=step.estimated_copy_bytes,
+            estimated_comm_bytes=step.estimated_comm_bytes,
+            required_workspace_bytes=step.required_workspace_bytes,
+            sliced_modes=tuple(sliced_modes),
+            distributed_modes=tuple(distributed_modes),
+        )
+
+    @staticmethod
+    def _operand_global_shape(operand):
+        if isinstance(operand, DistributedTensor):
+            return tuple(operand.global_shape)
+        return tuple(int(dim) for dim in getattr(operand, "shape", ()))
+
+    def _operand_itemsize(self, operand):
+        if isinstance(operand, DistributedTensor):
+            size = self._prod_shape(operand.local_shape)
+            if size:
+                return int(operand.local_nbytes // size)
+            return int(getattr(getattr(operand, "dtype", None), "itemsize", 0) or 0)
+        size = self._prod_shape(getattr(operand, "shape", ()))
+        if size:
+            return int(self._array_nbytes(operand) // size)
+        return int(getattr(getattr(operand, "dtype", None), "itemsize", 0) or 0)
+
+    @staticmethod
+    def _mode_sizes_from_equation(input_modes, operands):
+        sizes = {}
+        for modes, operand in zip(input_modes, operands):
+            shape = AbstractBackend._operand_global_shape(operand)
+            if len(modes) != len(shape):
+                raise ValueError(
+                    "einsum operand rank mismatch: equation has {0} modes but array rank is {1}"
+                    .format(len(modes), len(shape))
+                )
+            for mode, dim in zip(modes, shape):
+                dim = int(dim)
+                if mode in sizes and sizes[mode] != dim:
+                    raise ValueError("einsum mode {0!r} has inconsistent sizes".format(mode))
+                sizes[mode] = dim
+        return sizes
+
+    @staticmethod
+    def _output_shape_from_sizes(output_modes, sizes):
+        return tuple(int(sizes[mode]) for mode in output_modes)
+
+    @staticmethod
+    def _distributed_modes_for_output(operands, output_modes):
+        distributed = []
+        for mode in output_modes:
+            for operand in operands:
+                if isinstance(operand, DistributedTensor) and mode in operand.sharding.sharded_modes:
+                    distributed.append(mode)
+                    break
+        return tuple(distributed)
+
+    def _derive_output_sharding(self, dist_spec, input_modes, output_modes, output_shape):
+        if dist_spec.output_sharding is not None:
+            return dist_spec.output_sharding
+        source = next((operand for operand in dist_spec.operands if isinstance(operand, DistributedTensor)), None)
+        if source is None:
+            return None
+        sharded_modes = tuple(mode for mode in output_modes if mode in source.sharding.sharded_modes)
+        ranks_per_mode = {
+            mode: source.sharding.ranks_per_mode[mode]
+            for mode in sharded_modes
+            if mode in source.sharding.ranks_per_mode
+        }
+        mode_to_mesh_axis = {
+            mode: source.sharding.mode_to_mesh_axis[mode]
+            for mode in sharded_modes
+            if mode in source.sharding.mode_to_mesh_axis
+        }
+        return ShardingSpec(
+            global_shape=output_shape,
+            modes=output_modes,
+            mesh=source.mesh,
+            ranks_per_mode=ranks_per_mode,
+            mode_to_mesh_axis=mode_to_mesh_axis,
+            sharded_modes=sharded_modes,
+            replicated_modes=tuple(mode for mode in output_modes if mode not in sharded_modes),
+        )
+
+    def _einsum_spec_from_distributed_spec(self, dist_spec):
+        input_modes, output_modes = parse_einsum_equation(dist_spec.equation)
+        operands = tuple(
+            TensorOperand(operand, modes, name="operand{0}".format(index))
+            for index, (operand, modes) in enumerate(zip(dist_spec.operands, input_modes))
+        )
+        return EinsumSpec(operands=operands, output_modes=output_modes, optimize=dist_spec.optimize)
+
+    def plan_contraction(
+        self,
+        spec,
+        *,
+        memory_limit=None,
+        prefer="balanced",
+        allow_slicing=True,
+        allow_distribution=False,
+        target_devices=None,
+    ):
+        del memory_limit, prefer, allow_slicing, target_devices
+        if isinstance(spec, DistributedContractionSpec):
+            input_modes, output_modes = parse_einsum_equation(spec.equation)
+            sizes = self._mode_sizes_from_equation(input_modes, spec.operands)
+            output_shape = self._output_shape_from_sizes(output_modes, sizes)
+            itemsize = max((self._operand_itemsize(operand) for operand in spec.operands), default=0)
+            comm_bytes = self._prod_shape(output_shape) * int(itemsize or 0)
+            distributed_modes = self._distributed_modes_for_output(spec.operands, output_modes)
+            einsum_spec = self._einsum_spec_from_distributed_spec(spec)
+            if not allow_distribution and distributed_modes:
+                raise BackendFeatureError("distributed contraction requires allow_distribution=True")
+            plan = self._plan_einsum_contraction(
+                einsum_spec,
+                distributed_modes=distributed_modes,
+                comm_bytes=comm_bytes if distributed_modes else 0,
+            )
+            if distributed_modes:
+                output_sharding = self._derive_output_sharding(spec, input_modes, output_modes, output_shape)
+                states = tuple(
+                    DistributionState(
+                        operand_index=index,
+                        modes=tuple(modes),
+                        sharding=operand.sharding if isinstance(operand, DistributedTensor) else None,
+                        distributed_modes=tuple(mode for mode in modes if isinstance(operand, DistributedTensor) and mode in operand.sharding.sharded_modes),
+                        replicated_modes=tuple(mode for mode in modes if not isinstance(operand, DistributedTensor) or mode not in operand.sharding.sharded_modes),
+                    )
+                    for index, (operand, modes) in enumerate(zip(spec.operands, input_modes))
+                )
+                step_plan = DistributedStepPlan(
+                    local_step=plan.steps[0],
+                    input_states=states,
+                    output_sharding=output_sharding,
+                    communication=(
+                        CommunicationPlan(
+                            kind="gather",
+                            bytes=plan.estimated_comm_bytes,
+                            modes=distributed_modes,
+                            reason="materialize distributed contraction output",
+                        ),
+                    ),
+                )
+                distributed_plan = DistributedContractionPlan(
+                    path=plan,
+                    steps=(step_plan,),
+                    output_sharding=output_sharding,
+                    estimated_comm_bytes=plan.estimated_comm_bytes,
+                )
+                step = plan.steps[0]
+                step = ContractionStep(
+                    kind=step.kind,
+                    inputs=step.inputs,
+                    output=step.output,
+                    input_modes=step.input_modes,
+                    output_modes=step.output_modes,
+                    plan=distributed_plan,
+                    estimated_flops=step.estimated_flops,
+                    estimated_read_bytes=step.estimated_read_bytes,
+                    estimated_write_bytes=step.estimated_write_bytes,
+                    estimated_copy_bytes=step.estimated_copy_bytes,
+                    estimated_peak_bytes=step.estimated_peak_bytes,
+                    estimated_comm_bytes=step.estimated_comm_bytes,
+                    required_workspace_bytes=step.required_workspace_bytes,
+                    reason=step.reason,
+                    fallback_reason=step.fallback_reason,
+                )
+                return ContractionPlan(
+                    steps=(step,),
+                    input_specs=plan.input_specs,
+                    output_modes=plan.output_modes,
+                    estimated_flops=plan.estimated_flops,
+                    estimated_read_bytes=plan.estimated_read_bytes,
+                    estimated_write_bytes=plan.estimated_write_bytes,
+                    estimated_copy_bytes=plan.estimated_copy_bytes,
+                    estimated_comm_bytes=plan.estimated_comm_bytes,
+                    required_workspace_bytes=plan.required_workspace_bytes,
+                    sliced_modes=plan.sliced_modes,
+                    distributed_modes=plan.distributed_modes,
+                )
+            return plan
+        return self._plan_einsum_contraction(spec)
+
     def synchronize(self, device=None, stream=None):
         return self.sync()
 
@@ -448,6 +693,58 @@ class AbstractBackend(SingleProcessDistributedMixin):
             dtype=getattr(x, "dtype", None),
             local_shape=tuple(getattr(x, "shape", ())),
             local_nbytes=self._array_nbytes(x),
+            rank_local_arrays=rank_local_arrays,
+        )
+
+    def _local_operand_for_rank(self, operand, rank):
+        if not self.is_distributed_array(operand):
+            return operand
+        if operand.rank_local_arrays is None:
+            if int(rank) == operand.mesh.local_rank:
+                return operand.local_array
+            raise BackendFeatureError("cannot execute distributed contraction without rank-local arrays")
+        return operand.rank_local_arrays[int(rank)]
+
+    def _execute_einsum(self, equation, operands):
+        xp = self.array_namespace or _np
+        einsum = getattr(xp, "einsum", None)
+        if einsum is None:
+            return _np.einsum(equation, *operands)
+        return einsum(equation, *operands)
+
+    def distributed_contract(self, spec, *, plan=None, stream=None, workspace=None):
+        del stream, workspace
+        if not isinstance(spec, DistributedContractionSpec):
+            raise TypeError("distributed_contract expects a DistributedContractionSpec")
+        if plan is None:
+            plan = self.plan_contraction(spec, allow_distribution=True)
+        input_modes, output_modes = parse_einsum_equation(spec.equation)
+        sizes = self._mode_sizes_from_equation(input_modes, spec.operands)
+        output_shape = self._output_shape_from_sizes(output_modes, sizes)
+        output_sharding = spec.output_sharding
+        if output_sharding is None and plan.steps:
+            distributed_plan = getattr(plan.steps[0], "plan", None)
+            output_sharding = getattr(distributed_plan, "output_sharding", None)
+        if output_sharding is None:
+            output_sharding = self._derive_output_sharding(spec, input_modes, output_modes, output_shape)
+        if output_sharding is None:
+            return self._execute_einsum(spec.equation, spec.operands)
+
+        mesh = output_sharding.mesh
+        rank_local_arrays = {}
+        for rank in range(mesh.world_size):
+            local_operands = tuple(self._local_operand_for_rank(operand, rank) for operand in spec.operands)
+            rank_local_arrays[rank] = self._execute_einsum(spec.equation, local_operands)
+        local_array = rank_local_arrays[mesh.local_rank]
+        return DistributedTensor(
+            local_array=local_array,
+            global_shape=output_shape,
+            modes=output_modes,
+            sharding=output_sharding,
+            mesh=mesh,
+            dtype=getattr(local_array, "dtype", None),
+            local_shape=tuple(getattr(local_array, "shape", ())),
+            local_nbytes=self._array_nbytes(local_array),
             rank_local_arrays=rank_local_arrays,
         )
 
