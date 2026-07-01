@@ -782,6 +782,16 @@ class DistributedStepPlan:
     estimated_total_s: float = 0.0
     kind: str = "distributed_contract"
 
+    @property
+    def local_contraction_plan(self):
+        return self.local_step.plan
+
+    @property
+    def communication_plan(self):
+        if not self.communication:
+            return None
+        return self.communication[0]
+
 
 @dataclass(frozen=True)
 class DistributedContractionPlan:

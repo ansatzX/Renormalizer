@@ -1897,6 +1897,8 @@ def test_plan_distributed_contraction_path_reports_communication_totals():
     assert distributed_path.total_gather_bytes == 160
     assert distributed_path.peak_local_bytes == 96
     assert distributed_path.estimated_comm_bytes == 256
+    assert distributed_path.steps[0].local_contraction_plan is distributed_path.steps[0].local_step.plan
+    assert distributed_path.steps[0].communication_plan == distributed_path.steps[0].communication[0]
     assert [item.kind for item in distributed_path.steps[0].communication] == ["redistribute", "gather"]
     assert distributed_path.steps[0].estimated_comm_s == pytest.approx(3.7)
     assert distributed_path.steps[0].estimated_total_s == pytest.approx(3.7)
@@ -1987,6 +1989,8 @@ def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan
     assert distributed_path.output_sharding.modes == ("i", "j")
     assert distributed_path.output_sharding.sharded_modes == ("i",)
     assert distributed_path.steps[0].kind == "activate_distribution"
+    assert distributed_path.steps[0].local_contraction_plan is distributed_path.steps[0].local_step.plan
+    assert distributed_path.steps[0].communication_plan == distributed_path.steps[0].communication[0]
     assert [item.kind for item in distributed_path.steps[0].communication] == ["activate_distribution"]
     assert distributed_path.total_comm_bytes == left.nbytes + right.nbytes
     assert distributed_path.total_redistribute_bytes == left.nbytes + right.nbytes
