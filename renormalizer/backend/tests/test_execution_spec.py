@@ -1697,6 +1697,42 @@ def test_execute_auto_distributed_dense_plan_shards_output():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_execute_auto_distributed_dense_plan_places_inputs_before_contracting():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class LocalOnlyBackend(NumpyBackend):
+        def matmul(self, A, B=None, **kwargs):
+            if B is not None and getattr(A, "shape", None) == (16, 4):
+                raise AssertionError("auto-distributed execution used full dense matmul")
+            return super().matmul(A, B, **kwargs)
+
+    backend = LocalOnlyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(64, dtype=np.float64).reshape(16, 4)
+    right = np.arange(12, dtype=np.float64).reshape(4, 3)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    distributed_path = backend.plan_distributed_contraction_path(
+        dense_path,
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=HardwareModel(network_bandwidth_Bps=80.0, latency_s=0.25),
+    )
+
+    result = backend.execute(distributed_path)
+
+    assert result.local_shape == (8, 3)
+    assert np.allclose(result.local_array, (left @ right)[:8, :])
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

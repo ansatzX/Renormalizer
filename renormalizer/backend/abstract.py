@@ -533,6 +533,22 @@ class AbstractBackend(SingleProcessDistributedMixin):
             and src.mode_to_mesh_axis.get(mode) == dst.mode_to_mesh_axis.get(mode)
         )
 
+    @staticmethod
+    def _sharding_specs_equivalent(left, right):
+        if left is right:
+            return True
+        if left is None or right is None:
+            return False
+        return (
+            tuple(left.global_shape) == tuple(right.global_shape)
+            and tuple(left.modes) == tuple(right.modes)
+            and left.mesh == right.mesh
+            and dict(left.ranks_per_mode) == dict(right.ranks_per_mode)
+            and dict(left.mode_to_mesh_axis) == dict(right.mode_to_mesh_axis)
+            and tuple(left.sharded_modes) == tuple(right.sharded_modes)
+            and tuple(left.replicated_modes) == tuple(right.replicated_modes)
+        )
+
     def _input_redistribution_items(
         self,
         operands,
@@ -631,7 +647,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 output_redistribution_required = (
                     output_sharding is not None
                     and natural_output_sharding is not None
-                    and output_sharding != natural_output_sharding
+                    and not self._sharding_specs_equivalent(output_sharding, natural_output_sharding)
                 )
                 input_redistribution_items, input_redistribution_modes = self._input_redistribution_items(
                     spec.operands,
@@ -1086,6 +1102,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
     @staticmethod
     def _einsum_equation_from_plan(plan):
         labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        all_modes = tuple(mode for operand in plan.input_specs for mode in operand.modes) + tuple(plan.output_modes)
+        if all(
+            isinstance(mode, str) and len(mode) == 1 and mode in labels
+            for mode in all_modes
+        ):
+            inputs = ["".join(operand.modes) for operand in plan.input_specs]
+            return "{0}->{1}".format(",".join(inputs), "".join(plan.output_modes))
+
         mapping = {}
 
         def label_for(mode):
@@ -1118,11 +1142,63 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return plan.steps[0].plan
         return None
 
-    def _execute_activate_distribution_plan(self, plan, *, stream=None, workspace=None):
+    def _placement_sharding_for_operand(self, operand, output_sharding):
+        operand_modes = tuple(operand.modes)
+        sharded_modes = tuple(
+            mode for mode in operand_modes
+            if mode in output_sharding.sharded_modes
+        )
+        if not sharded_modes:
+            return None
+        ranks_per_mode = {
+            mode: output_sharding.ranks_per_mode[mode]
+            for mode in sharded_modes
+            if mode in output_sharding.ranks_per_mode
+        }
+        mode_to_mesh_axis = {
+            mode: output_sharding.mode_to_mesh_axis[mode]
+            for mode in sharded_modes
+            if mode in output_sharding.mode_to_mesh_axis
+        }
+        return ShardingSpec(
+            global_shape=tuple(int(dim) for dim in getattr(operand.array, "shape", ())),
+            modes=operand_modes,
+            mesh=output_sharding.mesh,
+            ranks_per_mode=ranks_per_mode,
+            mode_to_mesh_axis=mode_to_mesh_axis,
+            sharded_modes=sharded_modes,
+            replicated_modes=tuple(mode for mode in operand_modes if mode not in sharded_modes),
+        )
+
+    def _placed_operands_for_activate_distribution(self, plan):
         if plan.output_sharding is None:
             raise BackendFeatureError("activate_distribution plan requires output_sharding")
-        dense_output = self.execute(plan.path, stream=stream, workspace=workspace)
-        return self.shard_tensor(dense_output, plan.output_sharding)
+        placed = []
+        for operand in plan.path.input_specs:
+            if isinstance(operand.array, DistributedTensor):
+                placed.append(operand.array)
+                continue
+            sharding = self._placement_sharding_for_operand(operand, plan.output_sharding)
+            if sharding is None:
+                placed.append(self.replicate_tensor(
+                    operand.array,
+                    plan.output_sharding.mesh,
+                    modes=operand.modes,
+                ))
+            else:
+                placed.append(self.shard_tensor(operand.array, sharding))
+        return tuple(placed)
+
+    def _execute_activate_distribution_plan(self, plan, *, stream=None, workspace=None):
+        del stream, workspace
+        if plan.output_sharding is None:
+            raise BackendFeatureError("activate_distribution plan requires output_sharding")
+        spec = DistributedContractionSpec(
+            equation=plan.equation or self._einsum_equation_from_plan(plan.path),
+            operands=self._placed_operands_for_activate_distribution(plan),
+            output_sharding=plan.output_sharding,
+        )
+        return self.distributed_contract(spec)
 
     def execute(self, plan, *, stream=None, workspace=None):
         if isinstance(plan, ContractionPlan):
@@ -1418,7 +1494,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 local_nbytes=self._array_nbytes(local_array),
                 rank_local_arrays=None,
             )
-            if output_sharding != execution_sharding:
+            if not self._sharding_specs_equivalent(output_sharding, execution_sharding):
                 return self.redistribute(result, output_sharding)
             return result
         rank_local_arrays = {}
@@ -1440,7 +1516,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             local_nbytes=self._array_nbytes(local_array),
             rank_local_arrays=rank_local_arrays,
         )
-        if output_sharding != execution_sharding:
+        if not self._sharding_specs_equivalent(output_sharding, execution_sharding):
             return self.redistribute(result, output_sharding)
         return result
 
