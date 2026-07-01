@@ -1315,6 +1315,58 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return None
 
     @staticmethod
+    def _device_specs_compatible(actual, expected):
+        if actual.kind != expected.kind:
+            return False
+        for attr in ("index", "local_rank", "global_rank", "visible_id"):
+            actual_value = getattr(actual, attr)
+            expected_value = getattr(expected, attr)
+            if actual_value is not None and expected_value is not None and actual_value != expected_value:
+                return False
+        return True
+
+    def _plan_required_workspace_bytes(self, plan):
+        if isinstance(plan, ContractionPlan):
+            return int(plan.required_workspace_bytes)
+        if isinstance(plan, MatmulPlan):
+            return int(plan.workspace_bytes)
+        if isinstance(plan, GroupedGemmPlan):
+            return int(plan.estimated_workspace_bytes)
+        if isinstance(plan, DistributedContractionPlan):
+            return max(
+                (
+                    int(getattr(step.local_step, "required_workspace_bytes", 0) or 0)
+                    for step in plan.steps
+                ),
+                default=0,
+            )
+        return 0
+
+    def _validate_workspace(self, workspace, *, required_bytes=0):
+        if workspace is None:
+            return
+        if not isinstance(workspace, Workspace):
+            raise TypeError("workspace must be a Workspace instance")
+        current = self.current_device()
+        if not self._device_specs_compatible(workspace.device, current):
+            raise BackendFeatureError(
+                "workspace device {0!r} is incompatible with current device {1!r}"
+                .format(workspace.device, current)
+            )
+        required_bytes = int(required_bytes or 0)
+        if int(workspace.nbytes) < required_bytes:
+            raise BackendFeatureError(
+                "workspace requires at least {0} bytes, got {1}"
+                .format(required_bytes, int(workspace.nbytes))
+            )
+        buffer_nbytes = self._array_nbytes(workspace.buffer)
+        if buffer_nbytes < int(workspace.nbytes):
+            raise BackendFeatureError(
+                "workspace buffer has {0} bytes, less than declared {1}"
+                .format(buffer_nbytes, int(workspace.nbytes))
+            )
+
+    @staticmethod
     def _einsum_equation_from_plan(plan):
         labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
         all_modes = tuple(mode for operand in plan.input_specs for mode in operand.modes) + tuple(plan.output_modes)
@@ -1405,7 +1457,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return tuple(placed)
 
     def _execute_activate_distribution_plan(self, plan, *, stream=None, workspace=None):
-        del stream, workspace
+        del stream
+        self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         if plan.output_sharding is None:
             raise BackendFeatureError("activate_distribution plan requires output_sharding")
         spec = DistributedContractionSpec(
@@ -1416,6 +1469,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return self.distributed_contract(spec, plan=plan)
 
     def execute(self, plan, *, stream=None, workspace=None):
+        self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         if isinstance(plan, ContractionPlan):
             if len(plan.steps) != 1:
                 raise BackendFeatureError("execute currently supports single-step ContractionPlan objects")
@@ -2047,6 +2101,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def distributed_contract(self, spec, *, plan=None, stream=None, workspace=None):
         if plan is None and isinstance(spec, DistributedContractionSpec):
             plan = self.plan_contraction(spec, allow_distribution=True)
+        self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         try:
             from renormalizer.utils import profiling
 
@@ -2225,6 +2280,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         )
 
     def execute_grouped_gemm_plan(self, plan, *, pack_threshold=4, stream=None, workspace=None):
+        self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         if len(plan.tasks) != len(plan.output_blocks):
             raise ValueError("GroupedGemmPlan tasks and output_blocks must have the same length")
         flat_outputs = {}
@@ -2734,6 +2790,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             pass
 
     def execute_matmul_plan(self, plan, *, stream=None, workspace=None, plan_hash=None):
+        self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         try:
             from renormalizer.utils import profiling
 

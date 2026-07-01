@@ -2528,3 +2528,36 @@ def test_workspace_stream_and_unified_execute_api_are_explicit():
     assert backend.wait_event(event, stream=stream) is None
     assert backend.release_workspace(workspace) is None
     assert np.allclose(result, left @ right)
+
+
+def test_execute_rejects_workspace_smaller_than_plan_requirement():
+    from dataclasses import replace
+
+    from renormalizer.backend.execution import BackendFeatureError
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    matmul_plan = replace(plan.steps[0].plan, workspace_bytes=64)
+    step = replace(plan.steps[0], plan=matmul_plan, required_workspace_bytes=64)
+    plan = replace(plan, steps=(step,), required_workspace_bytes=64)
+    workspace = backend.allocate_workspace(32)
+
+    with pytest.raises(BackendFeatureError, match="workspace.*64.*32"):
+        backend.execute(plan, workspace=workspace)
+
+
+def test_execute_rejects_workspace_on_wrong_device():
+    from renormalizer.backend.execution import BackendFeatureError, DeviceSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    workspace = backend.allocate_workspace(0, device=DeviceSpec(kind="cuda"))
+
+    with pytest.raises(BackendFeatureError, match="workspace device"):
+        backend.execute(plan, workspace=workspace)
