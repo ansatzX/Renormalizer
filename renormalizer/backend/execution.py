@@ -722,6 +722,7 @@ class DistributedContractionPlan:
     steps: tuple[DistributedStepPlan, ...]
     output_sharding: ShardingSpec | None
     estimated_comm_bytes: int = 0
+    equation: str | None = None
 
 
 @dataclass(frozen=True)

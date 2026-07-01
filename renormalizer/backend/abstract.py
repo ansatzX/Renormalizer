@@ -682,6 +682,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     steps=(step_plan,),
                     output_sharding=output_sharding,
                     estimated_comm_bytes=total_comm_bytes,
+                    equation=spec.equation,
                 )
                 step = plan.steps[0]
                 step = ContractionStep(
@@ -857,6 +858,33 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def release_workspace(self, workspace):
         return None
 
+    @staticmethod
+    def _einsum_equation_from_plan(plan):
+        labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        mapping = {}
+
+        def label_for(mode):
+            if mode not in mapping:
+                if len(mapping) >= len(labels):
+                    raise BackendFeatureError("cannot synthesize einsum equation for more than {0} modes".format(len(labels)))
+                mapping[mode] = labels[len(mapping)]
+            return mapping[mode]
+
+        inputs = []
+        for operand in plan.input_specs:
+            inputs.append("".join(label_for(mode) for mode in operand.modes))
+        output = "".join(label_for(mode) for mode in plan.output_modes)
+        return "{0}->{1}".format(",".join(inputs), output)
+
+    def _distributed_spec_from_plan(self, plan):
+        equation = plan.equation or self._einsum_equation_from_plan(plan.path)
+        operands = tuple(operand.array for operand in plan.path.input_specs)
+        return DistributedContractionSpec(
+            equation=equation,
+            operands=operands,
+            output_sharding=plan.output_sharding,
+        )
+
     def execute(self, plan, *, stream=None, workspace=None):
         if isinstance(plan, ContractionPlan):
             if len(plan.steps) != 1:
@@ -867,7 +895,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if isinstance(plan, GroupedGemmPlan):
             return self.execute_grouped_gemm_plan(plan, stream=stream, workspace=workspace)
         if isinstance(plan, DistributedContractionPlan):
-            raise BackendFeatureError("execute requires a DistributedContractionSpec for distributed plans")
+            spec = self._distributed_spec_from_plan(plan)
+            return self.distributed_contract(spec, plan=plan, stream=stream, workspace=workspace)
         raise BackendFeatureError("Unknown backend execution plan {0!r}".format(type(plan).__name__))
 
     def synchronize(self, device=None, stream=None):

@@ -1301,6 +1301,49 @@ def test_distributed_contract_redistributes_incompatible_input_sharding():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_execute_runs_distributed_contraction_plan():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionPlan, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(15, dtype=np.float64).reshape(5, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    contract_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(backend.shard_tensor(left, left_spec), right),
+    )
+    plan = backend.plan_contraction(contract_spec, allow_distribution=True)
+    distributed_plan = plan.steps[0].plan
+    workspace = backend.allocate_workspace(32)
+    stream = backend.default_stream()
+
+    assert isinstance(distributed_plan, DistributedContractionPlan)
+    assert distributed_plan.equation == "ik,kj->ij"
+
+    direct_result = backend.execute(distributed_plan, stream=stream, workspace=workspace)
+    wrapped_result = backend.execute(plan, stream=stream, workspace=workspace)
+
+    assert direct_result.sharding.sharded_modes == ("i",)
+    assert wrapped_result.sharding.sharded_modes == ("i",)
+    assert np.allclose(backend.gather_tensor(direct_result), left @ right)
+    assert np.allclose(backend.gather_tensor(wrapped_result), left @ right)
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend
