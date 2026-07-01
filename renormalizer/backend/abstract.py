@@ -983,6 +983,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
             output_sharding=plan.output_sharding,
         )
 
+    @staticmethod
+    def _distributed_plan_from_contraction_plan(plan):
+        if isinstance(plan, DistributedContractionPlan):
+            return plan
+        if isinstance(plan, ContractionPlan) and len(plan.steps) == 1 and isinstance(plan.steps[0].plan, DistributedContractionPlan):
+            return plan.steps[0].plan
+        return None
+
     def execute(self, plan, *, stream=None, workspace=None):
         if isinstance(plan, ContractionPlan):
             if len(plan.steps) != 1:
@@ -1127,7 +1135,68 @@ class AbstractBackend(SingleProcessDistributedMixin):
             total = value if total is None else total + value
         return total
 
-    def distributed_contract(self, spec, *, plan=None, stream=None, workspace=None):
+    def _record_distributed_contraction_execute(self, spec, plan, result, wall_s):
+        try:
+            from renormalizer.utils import profiling
+
+            if not profiling.should_record_op():
+                return
+            distributed_plan = self._distributed_plan_from_contraction_plan(plan)
+            communication = ()
+            if distributed_plan is not None and distributed_plan.steps:
+                communication = distributed_plan.steps[0].communication
+            step = plan.steps[0] if isinstance(plan, ContractionPlan) and plan.steps else None
+            flops = 0
+            if distributed_plan is not None:
+                flops = int(distributed_plan.total_flops or getattr(distributed_plan.path, "estimated_flops", 0))
+            elif step is not None:
+                flops = int(step.estimated_flops)
+            comm_bytes = 0
+            if distributed_plan is not None:
+                comm_bytes = int(distributed_plan.total_comm_bytes or distributed_plan.estimated_comm_bytes)
+            profiling.record(
+                "contraction_execute",
+                backend=self.name,
+                equation=spec.equation,
+                lowering="distributed",
+                input_shapes=[tuple(self._operand_global_shape(operand)) for operand in spec.operands],
+                output_shape=tuple(result.global_shape),
+                dtype=str(getattr(result, "dtype", None)),
+                device=str(self.current_device()),
+                flops=flops,
+                read_bytes=int(getattr(step, "estimated_read_bytes", 0)),
+                write_bytes=int(getattr(step, "estimated_write_bytes", 0)),
+                copy_bytes=int(getattr(step, "estimated_copy_bytes", 0)),
+                workspace_bytes=int(getattr(step, "required_workspace_bytes", 0)),
+                largest_intermediate=int(result.local_nbytes),
+                num_gemm=0,
+                num_batched_gemm=0,
+                num_grouped_tasks=0,
+                num_blocks=0,
+                num_shape_buckets=0,
+                fallback_reason=None,
+                distributed_modes=[str(mode) for mode in getattr(plan, "distributed_modes", ())],
+                rank=int(result.mesh.global_rank),
+                world_size=int(result.mesh.world_size),
+                local_shape=tuple(result.local_shape),
+                global_shape=tuple(result.global_shape),
+                communication=[
+                    {
+                        "collective": item.kind,
+                        "bytes": int(item.bytes),
+                        "modes": [str(mode) for mode in item.modes],
+                        "num_messages": 1,
+                        "block_size": int(item.bytes),
+                    }
+                    for item in communication
+                ],
+                comm_bytes=comm_bytes,
+                wall_s=wall_s,
+            )
+        except Exception:
+            pass
+
+    def _distributed_contract_impl(self, spec, *, plan=None, stream=None, workspace=None):
         del stream, workspace
         if not isinstance(spec, DistributedContractionSpec):
             raise TypeError("distributed_contract expects a DistributedContractionSpec")
@@ -1183,6 +1252,26 @@ class AbstractBackend(SingleProcessDistributedMixin):
         )
         if output_sharding != execution_sharding:
             return self.redistribute(result, output_sharding)
+        return result
+
+    def distributed_contract(self, spec, *, plan=None, stream=None, workspace=None):
+        if plan is None and isinstance(spec, DistributedContractionSpec):
+            plan = self.plan_contraction(spec, allow_distribution=True)
+        try:
+            from renormalizer.utils import profiling
+
+            should_profile = profiling.should_record_op()
+        except Exception:
+            should_profile = False
+        if not should_profile:
+            return self._distributed_contract_impl(spec, plan=plan, stream=stream, workspace=workspace)
+
+        import time
+
+        started = time.perf_counter()
+        result = self._distributed_contract_impl(spec, plan=plan, stream=stream, workspace=workspace)
+        wall_s = time.perf_counter() - started
+        self._record_distributed_contraction_execute(spec, plan, result, wall_s)
         return result
 
     def lower_pair_contraction_to_matmul(self, spec):
