@@ -17,6 +17,7 @@ from renormalizer.backend.execution import (
     legacy_device_kind,
     lower_pair_contraction_to_matmul,
 )
+from renormalizer.backend.gemm import GemmTask, grouped_gemm_fallback, run_gemm_task
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
 from renormalizer.backend.transforms import UnavailableTransforms
 
@@ -35,6 +36,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_jit = False
     supports_sparse = False
     supports_functional_update = True
+    supports_batched_matmul = True
+    supports_grouped_gemm = False
     host_array_types = (_np.ndarray,)
     device_array_types = ()
 
@@ -103,8 +106,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             events=False,
             memory_pool=self.supports_gpu,
             matmul=True,
-            batched_matmul=False,
-            grouped_gemm=False,
+            batched_matmul=self.supports_batched_matmul,
+            grouped_gemm=self.supports_grouped_gemm,
             strided_batched_gemm=False,
             einsum=True,
             contract_expression=True,
@@ -383,39 +386,124 @@ class AbstractBackend(SingleProcessDistributedMixin):
         current_modes = groups["batch_modes"] + groups["left_only_modes"] + groups["right_only_modes"]
         return self._transpose_modes(result, current_modes, groups["output_modes"])
 
-    def matmul(self, desc, *, stream=None, workspace=None):
+    @staticmethod
+    def _is_matmul_desc(value):
+        return all(hasattr(value, attr) for attr in ("A", "B", "m", "n", "k"))
+
+    @staticmethod
+    def _desc_to_task(desc):
+        return GemmTask(
+            desc.A,
+            desc.B,
+            C=desc.C,
+            trans_a=desc.trans_a,
+            trans_b=desc.trans_b,
+            conj_a=desc.conj_a,
+            conj_b=desc.conj_b,
+            alpha=desc.alpha,
+            beta=desc.beta,
+        )
+
+    def _execute_matmul_desc(self, desc, *, stream=None, workspace=None):
         if desc.batch_shape:
             raise BackendFeatureError("matmul received a batched descriptor; use batched_matmul")
-        xp = self.array_namespace or _np
         a, b, groups = self._prepare_matmul_desc(desc)
-        if desc.conj_a:
-            a = xp.conj(a)
-        if desc.conj_b:
-            b = xp.conj(b)
-        if desc.trans_a:
-            a = xp.swapaxes(a, -1, -2)
-        if desc.trans_b:
-            b = xp.swapaxes(b, -1, -2)
-        result = xp.matmul(a, b)
-        if desc.alpha != 1.0:
-            result = desc.alpha * result
+        result = self.matmul(
+            a,
+            b,
+            C=desc.C,
+            trans_a=desc.trans_a,
+            trans_b=desc.trans_b,
+            conj_a=desc.conj_a,
+            conj_b=desc.conj_b,
+            alpha=desc.alpha,
+            beta=desc.beta,
+        )
         return self._finalize_matmul_result(result, groups)
 
-    def batched_matmul(self, desc, *, stream=None, workspace=None):
+    def matmul(
+        self,
+        A,
+        B=None,
+        *,
+        C=None,
+        trans_a=False,
+        trans_b=False,
+        conj_a=False,
+        conj_b=False,
+        alpha=1.0,
+        beta=0.0,
+        stream=None,
+        workspace=None,
+    ):
+        if B is None and self._is_matmul_desc(A):
+            return self._execute_matmul_desc(A, stream=stream, workspace=workspace)
         xp = self.array_namespace or _np
+        return run_gemm_task(
+            GemmTask(
+                A,
+                B,
+                C=C,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                conj_a=conj_a,
+                conj_b=conj_b,
+                alpha=alpha,
+                beta=beta,
+            ),
+            xp=xp,
+        )
+
+    def _execute_batched_matmul_desc(self, desc, *, stream=None, workspace=None):
         a, b, groups = self._prepare_matmul_desc(desc)
-        if desc.conj_a:
-            a = xp.conj(a)
-        if desc.conj_b:
-            b = xp.conj(b)
-        if desc.trans_a:
-            a = xp.swapaxes(a, -1, -2)
-        if desc.trans_b:
-            b = xp.swapaxes(b, -1, -2)
-        result = xp.matmul(a, b)
-        if desc.alpha != 1.0:
-            result = desc.alpha * result
+        result = self.batched_matmul(
+            a,
+            b,
+            C=desc.C,
+            trans_a=desc.trans_a,
+            trans_b=desc.trans_b,
+            conj_a=desc.conj_a,
+            conj_b=desc.conj_b,
+            alpha=desc.alpha,
+            beta=desc.beta,
+        )
         return self._finalize_matmul_result(result, groups)
+
+    def batched_matmul(
+        self,
+        A,
+        B=None,
+        *,
+        C=None,
+        trans_a=False,
+        trans_b=False,
+        conj_a=False,
+        conj_b=False,
+        alpha=1.0,
+        beta=0.0,
+        stream=None,
+        workspace=None,
+    ):
+        if B is None and self._is_matmul_desc(A):
+            return self._execute_batched_matmul_desc(A, stream=stream, workspace=workspace)
+        xp = self.array_namespace or _np
+        if conj_a:
+            A = xp.conj(A)
+        if conj_b:
+            B = xp.conj(B)
+        if trans_a:
+            A = xp.swapaxes(A, -1, -2)
+        if trans_b:
+            B = xp.swapaxes(B, -1, -2)
+        result = xp.matmul(A, B)
+        if alpha != 1.0:
+            result = alpha * result
+        if C is not None:
+            if beta != 0.0:
+                result = result + beta * C
+            C[...] = result
+            return C
+        return result
 
     def _loop_matmul(self, desc, *, stream=None, workspace=None):
         xp = self.array_namespace or _np
@@ -428,19 +516,17 @@ class AbstractBackend(SingleProcessDistributedMixin):
             a = xp.swapaxes(a, -1, -2)
         if desc.trans_b:
             b = xp.swapaxes(b, -1, -2)
-        if not groups["batch_shape"]:
-            result = xp.matmul(a, b)
-        else:
-            dtype = desc.dtype_output or _np.result_type(getattr(desc.A, "dtype", None), getattr(desc.B, "dtype", None))
-            result = xp.empty(groups["batch_shape"] + (a.shape[-2], b.shape[-1]), dtype=dtype)
-            for index in _np.ndindex(groups["batch_shape"]):
-                result[index] = xp.matmul(a[index], b[index])
+        result = xp.matmul(a, b)
         if desc.alpha != 1.0:
             result = desc.alpha * result
         return self._finalize_matmul_result(result, groups)
 
-    def grouped_gemm(self, descs, *, stream=None, workspace=None):
-        raise BackendFeatureError("{0} backend does not provide grouped_gemm".format(self.name))
+    def grouped_gemm(self, tasks, *, pack_threshold=4, stream=None, workspace=None):
+        converted = [
+            self._desc_to_task(task) if self._is_matmul_desc(task) else task
+            for task in tasks
+        ]
+        return grouped_gemm_fallback(converted, xp=self.array_namespace or _np, pack_threshold=pack_threshold)
 
     def _handle_plan_fallback(self, plan):
         if plan.fallback_reason is None:

@@ -20,6 +20,8 @@ _BACKEND_PROTOCOL_RUNTIME_ATTRS = (
     "supports_jit",
     "supports_sparse",
     "supports_functional_update",
+    "supports_batched_matmul",
+    "supports_grouped_gemm",
     "host_array_types",
     "device_array_types",
     "ndarray",
@@ -156,6 +158,12 @@ class BackendProtocol(Protocol):
 
     supports_functional_update: bool
     """Whether update helpers return updated arrays without in-place mutation."""
+
+    supports_batched_matmul: bool
+    """Whether same-shape stacked batched matmul is available."""
+
+    supports_grouped_gemm: bool
+    """Whether native grouped GEMM is available, excluding bucketed fallback."""
 
     host_array_types: Tuple[Type[Any], ...]
     """Array classes that are already resident on host memory."""
@@ -316,16 +324,16 @@ class BackendProtocol(Protocol):
         """Execute a matmul plan using this backend's primitives or recorded fallback."""
         ...
 
-    def matmul(self, desc: Any, **kwargs: Any) -> Any:
-        """Execute one dense GEMM descriptor."""
+    def matmul(self, A: Any, B: Any = None, **kwargs: Any) -> Any:
+        """Execute one dense GEMM, or a descriptor for compatibility."""
         ...
 
-    def batched_matmul(self, desc: Any, **kwargs: Any) -> Any:
-        """Execute one batched GEMM descriptor."""
+    def batched_matmul(self, A: Any, B: Any = None, **kwargs: Any) -> Any:
+        """Execute same-shape stacked batched GEMM, or a descriptor for compatibility."""
         ...
 
     def grouped_gemm(self, descs: Any, **kwargs: Any) -> Any:
-        """Execute grouped GEMM descriptors, or raise when unsupported."""
+        """Execute grouped GEMM tasks through native support or bucketed fallback."""
         ...
 
     def sync(self) -> None:

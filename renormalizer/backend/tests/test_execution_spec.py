@@ -38,8 +38,10 @@ def test_numpy_backend_capabilities_and_array_info_are_explicit():
     info = backend.array_info(x)
 
     assert backend.capabilities.matmul is True
-    assert backend.capabilities.batched_matmul is False
+    assert backend.capabilities.batched_matmul is True
     assert backend.capabilities.grouped_gemm is False
+    assert backend.supports_batched_matmul is True
+    assert backend.supports_grouped_gemm is False
     assert backend.current_device() == DeviceSpec(kind="cpu")
     assert backend.device_count() == 1
 
@@ -99,7 +101,7 @@ def test_pair_contraction_lowering_reports_gemm_shape_and_costs():
     assert plan.fallback_reason is None
 
 
-def test_pair_contraction_lowering_records_batched_fallback_reason():
+def test_pair_contraction_lowering_reports_batched_gemm_for_same_shape_batch():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend
 
@@ -114,9 +116,88 @@ def test_pair_contraction_lowering_records_batched_fallback_reason():
 
     plan = backend.lower_pair_contraction_to_matmul(spec)
 
-    assert plan.kind == "fallback_tensordot"
+    assert plan.kind == "batched_gemm"
     assert plan.descs[0].batch_shape == (5,)
-    assert "batched_matmul" in plan.fallback_reason
+    assert plan.fallback_reason is None
+
+
+def test_backend_raw_matmul_and_stacked_batched_matmul():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    a = np.arange(6, dtype=np.float64).reshape(2, 3)
+    b = np.arange(12, dtype=np.float64).reshape(3, 4)
+    batch_a = np.arange(4 * 2 * 3, dtype=np.float64).reshape(4, 2, 3)
+    batch_b = np.arange(4 * 3 * 5, dtype=np.float64).reshape(4, 3, 5)
+
+    assert np.allclose(backend.matmul(a, b), a @ b)
+    assert np.allclose(backend.batched_matmul(batch_a, batch_b), np.matmul(batch_a, batch_b))
+
+
+def test_grouped_gemm_buckets_same_shape_tasks_and_preserves_order():
+    from renormalizer.backend.gemm import GemmTask, group_tasks_by_shape
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    tasks = [
+        GemmTask(
+            np.arange(6, dtype=np.float64).reshape(2, 3),
+            np.arange(12, dtype=np.float64).reshape(3, 4),
+            tag="same-0",
+        ),
+        GemmTask(
+            np.arange(6, 12, dtype=np.float64).reshape(2, 3),
+            np.arange(12, 24, dtype=np.float64).reshape(3, 4),
+            tag="same-1",
+        ),
+        GemmTask(
+            np.arange(12, dtype=np.float64).reshape(3, 4),
+            np.arange(8, dtype=np.float64).reshape(4, 2),
+            tag="ragged",
+        ),
+    ]
+
+    buckets = group_tasks_by_shape(tasks, xp=np)
+    results = backend.grouped_gemm(tasks, pack_threshold=2)
+
+    assert sorted(len(bucket_tasks) for bucket_tasks in buckets.values()) == [1, 2]
+    assert len(results) == len(tasks)
+    assert np.allclose(results[0], tasks[0].A @ tasks[0].B)
+    assert np.allclose(results[1], tasks[1].A @ tasks[1].B)
+    assert np.allclose(results[2], tasks[2].A @ tasks[2].B)
+
+
+def test_grouped_gemm_applies_flags_alpha_beta_and_updates_c():
+    from renormalizer.backend.gemm import GemmTask
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    a = np.arange(6, dtype=np.float64).reshape(3, 2)
+    b = np.arange(12, dtype=np.float64).reshape(3, 4)
+    c = np.ones((2, 4), dtype=np.float64)
+    task = GemmTask(a, b, C=c, trans_a=True, alpha=2.0, beta=3.0, tag="accumulate")
+
+    results = backend.grouped_gemm([task], pack_threshold=2)
+
+    expected = 2.0 * (a.T @ b) + 3.0 * np.ones((2, 4), dtype=np.float64)
+    assert results == [c]
+    assert np.allclose(c, expected)
+
+
+def test_should_batch_uses_copy_to_flop_heuristic():
+    from renormalizer.backend.gemm import GemmTask, should_batch
+
+    tiny_tasks = [
+        GemmTask(np.ones((1, 1), dtype=np.float64), np.ones((1, 1), dtype=np.float64))
+        for _ in range(8)
+    ]
+    large_tasks = [
+        GemmTask(np.ones((128, 128), dtype=np.float64), np.ones((128, 128), dtype=np.float64))
+        for _ in range(8)
+    ]
+
+    assert should_batch(tiny_tasks, xp=np, pack_threshold=4) is False
+    assert should_batch(large_tasks, xp=np, pack_threshold=4) is True
 
 
 def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
@@ -171,7 +252,7 @@ def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
     assert event["wall_s"] >= 0.0
 
 
-def test_execute_matmul_plan_preserves_generic_output_mode_order_for_fallback():
+def test_execute_batched_matmul_plan_preserves_generic_output_mode_order():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend
 
@@ -188,7 +269,7 @@ def test_execute_matmul_plan_preserves_generic_output_mode_order_for_fallback():
     result = backend.execute_matmul_plan(plan)
     expected = np.einsum("bik,bkj->bij", left, right).transpose(2, 0, 1)
 
-    assert plan.kind == "fallback_tensordot"
+    assert plan.kind == "batched_gemm"
     assert result.shape == (5, 2, 3)
     assert np.allclose(result, expected)
 
@@ -226,7 +307,7 @@ def test_backend_contraction_plan_event_records_generic_operands(tmp_path):
     ]
     plan = next(payload for payload in payloads if payload["event"] == "contraction_plan")
 
-    assert plan["lowering"] == "fallback_tensordot"
+    assert plan["lowering"] == "batched_gemm"
     assert plan["batch_modes"] == ["batch"]
     assert plan["output_modes"] == ["batch", "('left', 'site')", "('right', 'site')"]
     assert plan["operands"] == [

@@ -56,6 +56,8 @@ class BackendProxy:
     supports_jit = _delegate_backend_property("supports_jit")
     supports_sparse = _delegate_backend_property("supports_sparse")
     supports_functional_update = _delegate_backend_property("supports_functional_update")
+    supports_batched_matmul = _delegate_backend_property("supports_batched_matmul")
+    supports_grouped_gemm = _delegate_backend_property("supports_grouped_gemm")
     host_array_types = _delegate_backend_property("host_array_types")
     device_array_types = _delegate_backend_property("device_array_types")
     ndarray = _delegate_backend_property("ndarray")
