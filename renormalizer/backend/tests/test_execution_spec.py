@@ -1254,6 +1254,53 @@ def test_distributed_contract_redistributes_when_output_sharding_changes():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_distributed_contract_redistributes_incompatible_input_sharding():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(15, dtype=np.float64).reshape(5, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    right_spec = ShardingSpec(
+        global_shape=right.shape,
+        modes=("k", "j"),
+        mesh=mesh,
+        ranks_per_mode={"j": 2},
+        mode_to_mesh_axis={"j": "rank"},
+    )
+    contract_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(backend.shard_tensor(left, left_spec), backend.shard_tensor(right, right_spec)),
+    )
+
+    plan = backend.plan_contraction(contract_spec, allow_distribution=True)
+    result = backend.distributed_contract(contract_spec, plan=plan)
+    communication = plan.steps[0].plan.steps[0].communication
+
+    assert communication[0].kind == "redistribute"
+    assert communication[0].modes == ("j",)
+    assert communication[1].kind == "gather"
+    assert communication[1].modes == ("i",)
+    assert result.sharding.sharded_modes == ("i",)
+    assert result.local_shape == (3, 4)
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

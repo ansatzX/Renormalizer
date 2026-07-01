@@ -503,6 +503,69 @@ class AbstractBackend(SingleProcessDistributedMixin):
             replicated_modes=tuple(mode for mode in output_modes if mode not in sharded_modes),
         )
 
+    @staticmethod
+    def _sharding_mode_compatible(src, dst, mode):
+        if dst is None:
+            return False
+        if mode not in dst.sharded_modes:
+            return False
+        return (
+            src.mesh == dst.mesh
+            and src.ranks_per_mode.get(mode) == dst.ranks_per_mode.get(mode)
+            and src.mode_to_mesh_axis.get(mode) == dst.mode_to_mesh_axis.get(mode)
+        )
+
+    def _input_redistribution_items(
+        self,
+        operands,
+        input_modes,
+        output_sharding,
+        reduced_distributed_modes,
+    ):
+        reduced = set(reduced_distributed_modes)
+        items = []
+        seen = set()
+        for index, (operand, modes) in enumerate(zip(operands, input_modes)):
+            if not isinstance(operand, DistributedTensor):
+                continue
+            incompatible = tuple(
+                mode
+                for mode in operand.sharding.sharded_modes
+                if mode in modes
+                and mode not in reduced
+                and not self._sharding_mode_compatible(operand.sharding, output_sharding, mode)
+            )
+            if not incompatible:
+                continue
+            items.append((index, incompatible))
+            for mode in incompatible:
+                if mode not in seen:
+                    seen.add(mode)
+        return tuple(items), tuple(seen)
+
+    def _redistribute_incompatible_input_operands(
+        self,
+        operands,
+        input_modes,
+        output_sharding,
+        reduced_distributed_modes,
+    ):
+        items, _ = self._input_redistribution_items(
+            operands,
+            input_modes,
+            output_sharding,
+            reduced_distributed_modes,
+        )
+        if not items:
+            return tuple(operands)
+        redistributed = list(operands)
+        for index, _ in items:
+            operand = redistributed[index]
+            dense = self.gather_tensor(operand)
+            mesh = output_sharding.mesh if output_sharding is not None else operand.mesh
+            redistributed[index] = self.replicate_tensor(dense, mesh, modes=operand.modes)
+        return tuple(redistributed)
+
     def _einsum_spec_from_distributed_spec(self, dist_spec):
         input_modes, output_modes = parse_einsum_equation(dist_spec.equation)
         operands = tuple(
@@ -552,6 +615,21 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     and natural_output_sharding is not None
                     and output_sharding != natural_output_sharding
                 )
+                input_redistribution_items, input_redistribution_modes = self._input_redistribution_items(
+                    spec.operands,
+                    input_modes,
+                    natural_output_sharding or output_sharding,
+                    reduced_distributed_modes,
+                )
+                input_redistribution_bytes = sum(
+                    self._prod_shape(spec.operands[index].global_shape) * self._operand_itemsize(spec.operands[index])
+                    for index, _ in input_redistribution_items
+                )
+                active_distributed_modes = tuple(
+                    mode for mode in distributed_modes if mode not in set(input_redistribution_modes)
+                )
+                output_comm_bytes = plan.estimated_comm_bytes
+                total_comm_bytes = output_comm_bytes + input_redistribution_bytes
                 states = tuple(
                     DistributionState(
                         operand_index=index,
@@ -566,7 +644,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     local_step=plan.steps[0],
                     input_states=states,
                     output_sharding=output_sharding,
-                    communication=(
+                    communication=tuple(
+                        (
+                            CommunicationPlan(
+                                kind="redistribute",
+                                bytes=input_redistribution_bytes,
+                                modes=input_redistribution_modes,
+                                reason="redistribute incompatible input sharding before contraction",
+                            ),
+                        )
+                        if input_redistribution_modes
+                        else ()
+                    )
+                    + (
                         CommunicationPlan(
                             kind=(
                                 "allreduce"
@@ -575,8 +665,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
                                 if output_redistribution_required
                                 else "gather"
                             ),
-                            bytes=plan.estimated_comm_bytes,
-                            modes=reduced_distributed_modes or distributed_modes,
+                            bytes=output_comm_bytes,
+                            modes=reduced_distributed_modes or active_distributed_modes,
                             reason=(
                                 "sum partial outputs across reduced sharded modes"
                                 if reduced_distributed_modes
@@ -591,7 +681,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     path=plan,
                     steps=(step_plan,),
                     output_sharding=output_sharding,
-                    estimated_comm_bytes=plan.estimated_comm_bytes,
+                    estimated_comm_bytes=total_comm_bytes,
                 )
                 step = plan.steps[0]
                 step = ContractionStep(
@@ -606,7 +696,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     estimated_write_bytes=step.estimated_write_bytes,
                     estimated_copy_bytes=step.estimated_copy_bytes,
                     estimated_peak_bytes=step.estimated_peak_bytes,
-                    estimated_comm_bytes=step.estimated_comm_bytes,
+                    estimated_comm_bytes=total_comm_bytes,
                     required_workspace_bytes=step.required_workspace_bytes,
                     reason=step.reason,
                     fallback_reason=step.fallback_reason,
@@ -620,10 +710,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     estimated_read_bytes=plan.estimated_read_bytes,
                     estimated_write_bytes=plan.estimated_write_bytes,
                     estimated_copy_bytes=plan.estimated_copy_bytes,
-                    estimated_comm_bytes=plan.estimated_comm_bytes,
+                    estimated_comm_bytes=total_comm_bytes,
                     required_workspace_bytes=plan.required_workspace_bytes,
                     sliced_modes=plan.sliced_modes,
-                    distributed_modes=plan.distributed_modes,
+                    distributed_modes=active_distributed_modes,
                 )
             return plan
         return self._plan_einsum_contraction(spec)
@@ -937,12 +1027,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
         execution_sharding = natural_output_sharding or output_sharding
         mesh = execution_sharding.mesh
-        rank_local_arrays = {}
-        for rank in range(mesh.world_size):
-            local_operands = tuple(self._local_operand_for_rank(operand, rank) for operand in spec.operands)
-            rank_local_arrays[rank] = self._execute_einsum(spec.equation, local_operands)
         distributed_modes = self._distributed_modes_for_operands(spec.operands)
         reduced_distributed_modes = self._reduced_distributed_modes(distributed_modes, output_modes)
+        operands = self._redistribute_incompatible_input_operands(
+            spec.operands,
+            input_modes,
+            execution_sharding,
+            reduced_distributed_modes,
+        )
+        rank_local_arrays = {}
+        for rank in range(mesh.world_size):
+            local_operands = tuple(self._local_operand_for_rank(operand, rank) for operand in operands)
+            rank_local_arrays[rank] = self._execute_einsum(spec.equation, local_operands)
         if reduced_distributed_modes:
             reduced = self.allreduce(self._sum_rank_local_arrays(rank_local_arrays), op="sum")
             rank_local_arrays = {rank: reduced for rank in range(mesh.world_size)}
