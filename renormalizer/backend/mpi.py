@@ -20,8 +20,10 @@ class SingleProcessDistributedMixin:
     def gather(self, x, root=0):
         return [x]
 
-    def allgather(self, x):
-        return [x]
+    def allgather(self, x, axis=None):
+        if axis is None:
+            return [x]
+        return x
 
     def reduce_scatter(self, x, op="sum", axis=0):
         return x
@@ -171,12 +173,16 @@ class TorchDistributedMixin:
             for value, value_shape in zip(gathered, shapes)
         ]
 
-    def allgather(self, x):
+    def allgather(self, x, axis=None):
         if not self._distributed_ready():
-            return [x]
+            return [x] if axis is None else x
         torch_module = self._torch_module()
         if torch_module is not None and isinstance(x, torch_module.Tensor):
-            return self._allgather_tensor(x)
+            values = self._allgather_tensor(x)
+            if axis is None:
+                return values
+            axis = self._normalize_axis(axis, x.ndim)
+            return torch_module.cat(values, dim=axis)
         values = [None for _ in range(self.size)]
         self._distributed.all_gather_object(values, x)
         return values

@@ -531,8 +531,8 @@ class BackendProtocol(Protocol):
         """Gather values to one distributed worker."""
         ...
 
-    def allgather(self, x: Any) -> Any:
-        """Gather values to all distributed workers."""
+    def allgather(self, x: Any, axis: Any = None) -> Any:
+        """Gather values to all workers, or concatenate tensor shards along ``axis``."""
         ...
 
     def reduce_scatter(self, x: Any, op: str = "sum", axis: Any = 0) -> Any:

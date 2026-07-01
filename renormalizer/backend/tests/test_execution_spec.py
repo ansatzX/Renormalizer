@@ -329,6 +329,7 @@ def test_replicate_tensor_and_single_process_collectives():
     assert np.array_equal(backend.gather_tensor(distributed), x)
     assert backend.reduce_scatter(x) is x
     assert backend.alltoall(x) is x
+    assert backend.allgather(x, axis=0) is x
 
 
 def test_distributed_capabilities_advertise_collective_primitives():
