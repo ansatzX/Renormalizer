@@ -389,6 +389,7 @@ def test_distributed_capabilities_advertise_collective_primitives():
 
     assert capabilities.distributed is True
     assert capabilities.allreduce is True
+    assert capabilities.broadcast is True
     assert capabilities.allgather is True
     assert capabilities.reduce_scatter is True
     assert capabilities.alltoall is True

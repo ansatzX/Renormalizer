@@ -142,6 +142,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             distributed=self.is_distributed,
             distributed_array=True,
             allreduce=self.size > 1,
+            broadcast=self.size > 1,
             allgather=self.size > 1,
             reduce_scatter=self.size > 1,
             alltoall=self.size > 1,

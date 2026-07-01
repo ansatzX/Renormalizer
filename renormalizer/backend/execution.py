@@ -130,6 +130,7 @@ class BackendCapabilities:
     distributed: bool = False
     distributed_array: bool = False
     allreduce: bool = False
+    broadcast: bool = False
     allgather: bool = False
     reduce_scatter: bool = False
     alltoall: bool = False
