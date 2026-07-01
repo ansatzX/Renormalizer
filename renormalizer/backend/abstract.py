@@ -527,6 +527,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             self._desc_to_task(task) if self._is_matmul_desc(task) else task
             for task in tasks
         ]
+        fallback_reason = self._handle_grouped_gemm_fallback()
         stats = grouped_gemm_stats(converted, xp=xp, pack_threshold=pack_threshold)
         try:
             from renormalizer.utils import profiling
@@ -566,7 +567,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     num_grouped_tasks=stats.task_count,
                     num_blocks=stats.task_count,
                     num_shape_buckets=stats.shape_bucket_count,
-                    fallback_reason="native grouped_gemm unavailable; used bucketed fallback",
+                    fallback_reason=fallback_reason,
                     bucket_task_counts=stats.bucket_task_counts,
                     batched_bucket_count=stats.batched_bucket_count,
                     loop_bucket_count=stats.loop_bucket_count,
@@ -579,6 +580,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 pass
             return result
         return grouped_gemm_fallback(converted, xp=xp, pack_threshold=pack_threshold)
+
+    def _handle_grouped_gemm_fallback(self):
+        if self.supports_grouped_gemm:
+            return None
+        reason = "native grouped_gemm unavailable; used bucketed fallback"
+        if self.fallback_policy is FallbackPolicy.FORBID:
+            raise BackendFeatureError(reason)
+        if self.fallback_policy is FallbackPolicy.WARN:
+            import warnings
+
+            warnings.warn(reason, RuntimeWarning, stacklevel=3)
+        return reason
 
     def _handle_plan_fallback(self, plan):
         if plan.fallback_reason is None:

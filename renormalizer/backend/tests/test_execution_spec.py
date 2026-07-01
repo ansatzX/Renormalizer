@@ -184,6 +184,42 @@ def test_grouped_gemm_applies_flags_alpha_beta_and_updates_c():
     assert np.allclose(c, expected)
 
 
+def test_grouped_gemm_forbid_policy_rejects_bucketed_fallback():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.execution import BackendFeatureError
+    from renormalizer.backend.gemm import GemmTask
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend(config=BackendConfig(fallback_policy="forbid"))
+    tasks = [
+        GemmTask(
+            np.arange(6, dtype=np.float64).reshape(2, 3),
+            np.arange(12, dtype=np.float64).reshape(3, 4),
+        )
+    ]
+
+    with pytest.raises(BackendFeatureError, match="native grouped_gemm unavailable"):
+        backend.grouped_gemm(tasks)
+
+
+def test_grouped_gemm_warn_policy_emits_warning_and_returns_result():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.gemm import GemmTask
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend(config=BackendConfig(fallback_policy="warn"))
+    task = GemmTask(
+        np.arange(6, dtype=np.float64).reshape(2, 3),
+        np.arange(12, dtype=np.float64).reshape(3, 4),
+    )
+
+    with pytest.warns(RuntimeWarning, match="native grouped_gemm unavailable"):
+        results = backend.grouped_gemm([task])
+
+    assert len(results) == 1
+    assert np.allclose(results[0], task.A @ task.B)
+
+
 def test_should_batch_uses_copy_to_flop_heuristic():
     from renormalizer.backend.gemm import GemmTask, should_batch
 
