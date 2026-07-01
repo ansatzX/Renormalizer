@@ -1,0 +1,273 @@
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+import numpy as np
+
+from renormalizer.backend.config import BackendConfig
+from renormalizer.backend.factory import create_backend, is_backend_available, normalize_backend_name
+from renormalizer.backend.gemm import GemmTask
+
+
+DEFAULT_BACKENDS = ("numpy", "cupy", "torch", "jax")
+
+
+def parse_backend_names(value):
+    names = []
+    for item in str(value).split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item == "all":
+            candidates = DEFAULT_BACKENDS
+        else:
+            candidates = (item,)
+        for candidate in candidates:
+            normalized = normalize_backend_name(candidate)
+            if normalized not in names:
+                names.append(normalized)
+    return names
+
+
+def detect_gpu_count():
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", "-L"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return 0
+    if completed.returncode != 0:
+        return 0
+    return sum(1 for line in completed.stdout.splitlines() if line.strip().startswith("GPU "))
+
+
+def _to_numpy(backend, value):
+    return np.asarray(backend.to_numpy(value))
+
+
+def _sync_value(value):
+    block_until_ready = getattr(value, "block_until_ready", None)
+    if block_until_ready is not None:
+        block_until_ready()
+
+
+def _sync_backend(backend, value=None):
+    try:
+        if value is not None:
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    _sync_value(item)
+            else:
+                _sync_value(value)
+        backend.sync()
+    except Exception:
+        pass
+
+
+def _time_call(backend, repeat, fn):
+    _sync_backend(backend)
+    started = time.perf_counter()
+    result = None
+    for _ in range(int(repeat)):
+        result = fn()
+    _sync_backend(backend, result)
+    return result, time.perf_counter() - started
+
+
+def _record_base(backend, backend_name, device, operation, gpu_count, repeat):
+    return {
+        "backend": backend_name,
+        "device": device,
+        "device_spec": str(backend.current_device()),
+        "operation": operation,
+        "status": "passed",
+        "gpu_count": int(gpu_count),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "repeat": int(repeat),
+    }
+
+
+def _error_record(backend_name, device, operation, gpu_count, status, message):
+    return {
+        "backend": backend_name,
+        "device": device,
+        "operation": operation,
+        "status": status,
+        "gpu_count": int(gpu_count),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "error": str(message),
+    }
+
+
+def _random(shape, seed):
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal(shape).astype(np.float64)
+
+
+def _max_abs_error(actual, expected):
+    return float(np.max(np.abs(np.asarray(actual) - np.asarray(expected))))
+
+
+def _matmul_smoke(backend, backend_name, device, gpu_count, repeat, medium_dim):
+    a_np = _random((medium_dim, medium_dim), 1)
+    b_np = _random((medium_dim, medium_dim), 2)
+    a = backend.to_backend(a_np)
+    b = backend.to_backend(b_np)
+    result, wall_s = _time_call(backend, repeat, lambda: backend.matmul(a, b))
+    expected = a_np @ b_np
+    record = _record_base(backend, backend_name, device, "matmul", gpu_count, repeat)
+    record.update({
+        "shape_a": tuple(a_np.shape),
+        "shape_b": tuple(b_np.shape),
+        "wall_s": float(wall_s),
+        "max_abs_error": _max_abs_error(_to_numpy(backend, result), expected),
+    })
+    return record
+
+
+def _batched_matmul_smoke(backend, backend_name, device, gpu_count, repeat, batch, small_dim):
+    a_np = _random((batch, small_dim, small_dim), 3)
+    b_np = _random((batch, small_dim, small_dim), 4)
+    a = backend.to_backend(a_np)
+    b = backend.to_backend(b_np)
+    result, wall_s = _time_call(backend, repeat, lambda: backend.batched_matmul(a, b))
+    expected = np.matmul(a_np, b_np)
+    record = _record_base(backend, backend_name, device, "batched_matmul", gpu_count, repeat)
+    record.update({
+        "shape_a": tuple(a_np.shape),
+        "shape_b": tuple(b_np.shape),
+        "wall_s": float(wall_s),
+        "max_abs_error": _max_abs_error(_to_numpy(backend, result), expected),
+    })
+    return record
+
+
+def _grouped_gemm_smoke(backend, backend_name, device, gpu_count, repeat, batch, small_dim, pack_threshold):
+    tasks_np = []
+    for index in range(batch):
+        tasks_np.append((
+            _random((small_dim, small_dim), 100 + index),
+            _random((small_dim, small_dim), 200 + index),
+        ))
+    tasks = [
+        GemmTask(backend.to_backend(a_np), backend.to_backend(b_np), tag=index)
+        for index, (a_np, b_np) in enumerate(tasks_np)
+    ]
+    result, wall_s = _time_call(
+        backend,
+        repeat,
+        lambda: backend.grouped_gemm(tasks, pack_threshold=pack_threshold),
+    )
+    expected = [a_np @ b_np for a_np, b_np in tasks_np]
+    actual = [_to_numpy(backend, item) for item in result]
+    max_error = max(_max_abs_error(item, ref) for item, ref in zip(actual, expected))
+    record = _record_base(backend, backend_name, device, "grouped_gemm", gpu_count, repeat)
+    record.update({
+        "task_count": int(len(tasks)),
+        "shape": (small_dim, small_dim, small_dim),
+        "pack_threshold": int(pack_threshold),
+        "wall_s": float(wall_s),
+        "max_abs_error": float(max_error),
+    })
+    return record
+
+
+def run_backend_smoke(
+    backend_name,
+    *,
+    device,
+    batch,
+    small_dim,
+    medium_dim,
+    repeat,
+    pack_threshold,
+):
+    backend_name = normalize_backend_name(backend_name)
+    gpu_count = detect_gpu_count()
+    if not is_backend_available(backend_name):
+        return [_error_record(backend_name, device, "backend_import", gpu_count, "skipped", "backend is not available")]
+    try:
+        backend = create_backend(backend_name, config=BackendConfig(device=device))
+    except Exception as exc:
+        return [_error_record(backend_name, device, "backend_create", gpu_count, "error", exc)]
+
+    records = []
+    for operation, fn in (
+        ("matmul", lambda: _matmul_smoke(backend, backend_name, device, gpu_count, repeat, medium_dim)),
+        (
+            "batched_matmul",
+            lambda: _batched_matmul_smoke(backend, backend_name, device, gpu_count, repeat, batch, small_dim),
+        ),
+        (
+            "grouped_gemm",
+            lambda: _grouped_gemm_smoke(backend, backend_name, device, gpu_count, repeat, batch, small_dim, pack_threshold),
+        ),
+    ):
+        try:
+            records.append(fn())
+        except Exception as exc:
+            records.append(_error_record(backend_name, device, operation, gpu_count, "error", exc))
+    return records
+
+
+def write_jsonl(records, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        for record in records:
+            stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Smoke-test backend GEMM primitives.")
+    parser.add_argument("--backends", default="all", help="Comma-separated backend list, or 'all'.")
+    parser.add_argument("--device", default="cpu", help="Backend device, e.g. cpu or gpu.")
+    parser.add_argument("--gpu-index", type=int, default=None, help="Set CUDA_VISIBLE_DEVICES before backend creation.")
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--small-dim", type=int, default=32)
+    parser.add_argument("--medium-dim", type=int, default=128)
+    parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--pack-threshold", type=int, default=4)
+    parser.add_argument("--output", default=None, help="Optional JSONL output path.")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.gpu_index is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)
+
+    all_records = []
+    for backend_name in parse_backend_names(args.backends):
+        records = run_backend_smoke(
+            backend_name,
+            device=args.device,
+            batch=args.batch,
+            small_dim=args.small_dim,
+            medium_dim=args.medium_dim,
+            repeat=args.repeat,
+            pack_threshold=args.pack_threshold,
+        )
+        all_records.extend(records)
+
+    if args.output:
+        write_jsonl(all_records, args.output)
+    for record in all_records:
+        print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    return 1 if any(record.get("status") == "error" for record in all_records) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
