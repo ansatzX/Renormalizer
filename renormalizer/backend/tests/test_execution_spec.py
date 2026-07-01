@@ -200,6 +200,61 @@ def test_should_batch_uses_copy_to_flop_heuristic():
     assert should_batch(large_tasks, xp=np, pack_threshold=4) is True
 
 
+def test_grouped_gemm_records_bucketed_fallback_profile(tmp_path):
+    from renormalizer.backend.gemm import GemmTask
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    tasks = [
+        GemmTask(np.ones((128, 128), dtype=np.float64), np.ones((128, 128), dtype=np.float64), tag="batch-0"),
+        GemmTask(np.full((128, 128), 2.0, dtype=np.float64), np.ones((128, 128), dtype=np.float64), tag="batch-1"),
+        GemmTask(np.ones((3, 4), dtype=np.float64), np.ones((4, 5), dtype=np.float64), tag="loop"),
+    ]
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        results = backend.grouped_gemm(tasks, pack_threshold=2)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(results[0], tasks[0].A @ tasks[0].B)
+    assert np.allclose(results[1], tasks[1].A @ tasks[1].B)
+    assert np.allclose(results[2], tasks[2].A @ tasks[2].B)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    events = [payload for payload in payloads if payload["event"] == "contraction_execute"]
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["backend"] == "numpy"
+    assert event["lowering"] == "grouped_gemm"
+    assert event["num_grouped_tasks"] == 3
+    assert event["num_shape_buckets"] == 2
+    assert event["num_batched_gemm"] == 1
+    assert event["num_gemm"] == 1
+    assert event["num_blocks"] == 3
+    assert event["flops"] == 8388728
+    assert event["read_bytes"] == 524544
+    assert event["write_bytes"] == 262264
+    assert event["copy_bytes"] == 524288
+    assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
+    assert event["bucket_task_counts"] == [1, 2]
+    assert event["batched_bucket_count"] == 1
+    assert event["loop_bucket_count"] == 1
+    assert event["wall_s"] >= 0.0
+
+
 def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend

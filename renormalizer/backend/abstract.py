@@ -17,7 +17,7 @@ from renormalizer.backend.execution import (
     legacy_device_kind,
     lower_pair_contraction_to_matmul,
 )
-from renormalizer.backend.gemm import GemmTask, grouped_gemm_fallback, run_gemm_task
+from renormalizer.backend.gemm import GemmTask, array_nbytes, grouped_gemm_fallback, grouped_gemm_stats, run_gemm_task
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
 from renormalizer.backend.transforms import UnavailableTransforms
 
@@ -522,11 +522,63 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return self._finalize_matmul_result(result, groups)
 
     def grouped_gemm(self, tasks, *, pack_threshold=4, stream=None, workspace=None):
+        xp = self.array_namespace or _np
         converted = [
             self._desc_to_task(task) if self._is_matmul_desc(task) else task
             for task in tasks
         ]
-        return grouped_gemm_fallback(converted, xp=self.array_namespace or _np, pack_threshold=pack_threshold)
+        stats = grouped_gemm_stats(converted, xp=xp, pack_threshold=pack_threshold)
+        try:
+            from renormalizer.utils import profiling
+
+            should_profile = profiling.should_record_op()
+        except Exception:
+            should_profile = False
+        if should_profile:
+            import time
+
+            started = time.perf_counter()
+            result = grouped_gemm_fallback(converted, xp=xp, pack_threshold=pack_threshold)
+            wall_s = time.perf_counter() - started
+            try:
+                from renormalizer.utils import profiling
+
+                profiling.record(
+                    "contraction_execute",
+                    backend=self.name,
+                    equation=None,
+                    lowering="grouped_gemm",
+                    input_shapes=[
+                        [tuple(getattr(task.A, "shape", ())), tuple(getattr(task.B, "shape", ()))]
+                        for task in converted
+                    ],
+                    output_shape=[tuple(getattr(item, "shape", ())) for item in result],
+                    dtype=str(getattr(result[0], "dtype", None)) if result else None,
+                    device=str(self.current_device()),
+                    flops=stats.flops,
+                    read_bytes=stats.read_bytes,
+                    write_bytes=stats.write_bytes,
+                    copy_bytes=stats.copy_bytes,
+                    workspace_bytes=stats.workspace_bytes,
+                    largest_intermediate=max((array_nbytes(item) for item in result), default=0),
+                    num_gemm=stats.loop_task_count,
+                    num_batched_gemm=stats.batched_bucket_count,
+                    num_grouped_tasks=stats.task_count,
+                    num_blocks=stats.task_count,
+                    num_shape_buckets=stats.shape_bucket_count,
+                    fallback_reason="native grouped_gemm unavailable; used bucketed fallback",
+                    bucket_task_counts=stats.bucket_task_counts,
+                    batched_bucket_count=stats.batched_bucket_count,
+                    loop_bucket_count=stats.loop_bucket_count,
+                    batched_task_count=stats.batched_task_count,
+                    loop_task_count=stats.loop_task_count,
+                    pack_threshold=pack_threshold,
+                    wall_s=wall_s,
+                )
+            except Exception:
+                pass
+            return result
+        return grouped_gemm_fallback(converted, xp=xp, pack_threshold=pack_threshold)
 
     def _handle_plan_fallback(self, plan):
         if plan.fallback_reason is None:

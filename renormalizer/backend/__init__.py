@@ -24,7 +24,15 @@ from renormalizer.backend.execution import (
     parse_device_spec,
 )
 from renormalizer.backend.factory import SUPPORTED_BACKENDS, available_backends, is_backend_available
-from renormalizer.backend.gemm import GemmTask, gemm_task_key, group_tasks_by_shape, grouped_gemm_fallback, should_batch
+from renormalizer.backend.gemm import (
+    GemmTask,
+    GroupedGemmStats,
+    gemm_task_key,
+    group_tasks_by_shape,
+    grouped_gemm_fallback,
+    grouped_gemm_stats,
+    should_batch,
+)
 from renormalizer.backend.protocol import BackendProtocol
 from renormalizer.backend.transforms import UnavailableTransforms
 
@@ -44,6 +52,7 @@ __all__ = [
     "EinsumSpec",
     "FallbackPolicy",
     "GemmTask",
+    "GroupedGemmStats",
     "LayoutSpec",
     "LayoutTransform",
     "MatmulDesc",
@@ -58,6 +67,7 @@ __all__ = [
     "gemm_task_key",
     "group_tasks_by_shape",
     "grouped_gemm_fallback",
+    "grouped_gemm_stats",
     "is_backend_available",
     "parse_device_spec",
     "scalar_to_python",

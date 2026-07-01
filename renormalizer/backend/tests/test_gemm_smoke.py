@@ -35,3 +35,9 @@ def test_numpy_gemm_smoke_records_json_serializable_correctness():
         assert record["gpu_count"] >= 0
         assert "cuda_visible_devices" in record
         json.dumps(record)
+    grouped = next(record for record in records if record["operation"] == "grouped_gemm")
+    assert grouped["num_shape_buckets"] >= 1
+    assert grouped["num_grouped_tasks"] == 4
+    assert "num_batched_gemm" in grouped
+    assert "num_gemm" in grouped
+    assert "copy_bytes" in grouped
