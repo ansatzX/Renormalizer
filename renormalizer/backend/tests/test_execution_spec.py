@@ -1207,6 +1207,62 @@ def test_distributed_contract_allreduces_when_contracted_mode_is_sharded():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_distributed_contract_reduce_scatters_when_reducing_to_requested_output_sharding():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(24, dtype=np.float64).reshape(4, 6)
+    right = np.arange(30, dtype=np.float64).reshape(6, 5)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"k": 2},
+        mode_to_mesh_axis={"k": "rank"},
+    )
+    right_spec = ShardingSpec(
+        global_shape=right.shape,
+        modes=("k", "j"),
+        mesh=mesh,
+        ranks_per_mode={"k": 2},
+        mode_to_mesh_axis={"k": "rank"},
+    )
+    output_spec = ShardingSpec(
+        global_shape=(4, 5),
+        modes=("i", "j"),
+        mesh=mesh,
+        ranks_per_mode={"j": 2},
+        mode_to_mesh_axis={"j": "rank"},
+    )
+    contract_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(backend.shard_tensor(left, left_spec), backend.shard_tensor(right, right_spec)),
+        output_sharding=output_spec,
+    )
+
+    plan = backend.plan_contraction(contract_spec, allow_distribution=True)
+    result = backend.distributed_contract(contract_spec, plan=plan)
+    distributed_plan = plan.steps[0].plan
+    communication = distributed_plan.steps[0].communication
+
+    assert communication[0].kind == "reduce_scatter"
+    assert communication[0].modes == ("k", "j")
+    assert distributed_plan.total_allreduce_bytes == left.shape[0] * right.shape[1] * left.itemsize
+    assert distributed_plan.total_redistribute_bytes == 0
+    assert result.sharding == output_spec
+    assert result.local_shape == (4, 3)
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
 def test_distributed_contract_redistributes_when_output_sharding_changes():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

@@ -628,6 +628,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 active_distributed_modes = tuple(
                     mode for mode in distributed_modes if mode not in set(input_redistribution_modes)
                 )
+                reduce_scatter_required = bool(reduced_distributed_modes and output_redistribution_required)
+                reduce_scatter_modes = tuple(dict.fromkeys(
+                    tuple(reduced_distributed_modes) + tuple(output_sharding.sharded_modes if output_sharding is not None else ())
+                ))
                 output_comm_bytes = plan.estimated_comm_bytes
                 total_comm_bytes = output_comm_bytes + input_redistribution_bytes
                 states = tuple(
@@ -659,16 +663,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     + (
                         CommunicationPlan(
                             kind=(
-                                "allreduce"
+                                "reduce_scatter"
+                                if reduce_scatter_required
+                                else "allreduce"
                                 if reduced_distributed_modes
                                 else "alltoall"
                                 if output_redistribution_required
                                 else "gather"
                             ),
                             bytes=output_comm_bytes,
-                            modes=reduced_distributed_modes or active_distributed_modes,
+                            modes=reduce_scatter_modes if reduce_scatter_required else reduced_distributed_modes or active_distributed_modes,
                             reason=(
-                                "sum partial outputs across reduced sharded modes"
+                                "sum partial outputs and scatter to requested output sharding"
+                                if reduce_scatter_required
+                                else "sum partial outputs across reduced sharded modes"
                                 if reduced_distributed_modes
                                 else "redistribute contraction output to requested sharding"
                                 if output_redistribution_required
