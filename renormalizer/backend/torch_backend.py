@@ -98,6 +98,15 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
     def array(self, *args, **kwargs):
         copy = kwargs.pop("copy", None)
         kwargs = self._kwargs_with_default_dtype(args, kwargs)
+        if args and isinstance(args[0], torch.Tensor):
+            result = args[0].clone() if copy else args[0]
+            dtype = kwargs.get("dtype")
+            device = kwargs.get("device")
+            if dtype is not None or device is not None:
+                to = getattr(result, "to", None)
+                if callable(to):
+                    result = to(dtype=dtype, device=device)
+            return result
         result = torch.tensor(*args, **kwargs)
         if copy and isinstance(result, torch.Tensor):
             result = result.clone()

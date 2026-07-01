@@ -131,7 +131,7 @@ def test_legacy_backend_constants_are_not_used_in_core_call_sites():
     ]
 
     for path in checked:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         assert "OE_BACKEND" not in text
 
 
@@ -514,6 +514,26 @@ def test_torch_backend_explicit_conversion_methods_when_available():
     assert backend.is_array(y)
     assert backend.to_host(y).tolist() == [1.0, 2.0]
     assert backend.to_numpy(y).tolist() == [1.0, 2.0]
+
+
+def test_torch_backend_functional_update_copies_tensor_without_warning(recwarn):
+    try:
+        import torch
+    except ImportError as exc:
+        pytest.skip("could not import 'torch': {0}".format(exc))
+    except OSError as exc:
+        pytest.skip("torch is installed but failed to load: {0}".format(exc))
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.torch_backend import TorchBackend
+
+    backend = TorchBackend(config=BackendConfig(device="cpu"))
+    tensor = torch.arange(4, dtype=torch.float64)
+
+    updated = backend.at_set(tensor, 1, 9.0)
+
+    assert len(recwarn) == 0
+    assert updated.tolist() == [0.0, 9.0, 2.0, 3.0]
+    assert tensor.tolist() == [0.0, 1.0, 2.0, 3.0]
 
 
 def test_torch_backend_honors_explicit_device_config_with_fake_module(monkeypatch):
