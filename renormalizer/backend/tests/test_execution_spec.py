@@ -305,6 +305,46 @@ def test_real_distributed_redistribute_same_mesh_axes_uses_alltoall():
     assert np.array_equal(redistributed.local_array, x[:, 2:])
 
 
+def test_torch_alltoall_fallback_handles_empty_uneven_rank_chunks():
+    try:
+        import torch
+    except (ImportError, OSError) as exc:
+        pytest.skip("torch unavailable: {0}".format(exc))
+
+    from renormalizer.backend.mpi import TorchDistributedMixin
+
+    class FallbackAlltoallBackend(TorchDistributedMixin):
+        @property
+        def array_namespace(self):
+            return torch
+
+        @property
+        def rank(self):
+            return 3
+
+        @property
+        def size(self):
+            return 4
+
+        def _distributed_ready(self):
+            return True
+
+        def allgather(self, x, axis=None):
+            assert axis is None
+            return [
+                torch.arange(rank * 6, rank * 6 + 6, dtype=torch.float64).reshape(2, 3)
+                for rank in range(self.size)
+            ]
+
+    backend = FallbackAlltoallBackend()
+    x = torch.arange(6, dtype=torch.float64).reshape(2, 3)
+
+    result = backend.alltoall(x, split_axis=0, concat_axis=1)
+
+    assert tuple(result.shape) == (0, 12)
+    assert result.dtype == x.dtype
+
+
 def test_replicate_tensor_and_single_process_collectives():
     from renormalizer.backend import DeviceMesh, DeviceSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

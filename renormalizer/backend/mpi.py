@@ -224,7 +224,12 @@ class TorchDistributedMixin:
         concat_axis = self._normalize_axis(concat_axis, x.ndim)
         if x.shape[split_axis] % self.size != 0 or not hasattr(self._distributed, "all_to_all_single"):
             gathered = self.allgather(x)
-            chunks = [torch_module.chunk(item, self.size, dim=split_axis)[self.rank] for item in gathered]
+            chunks = []
+            for item in gathered:
+                local_slice = self._rank_slice(item.shape[split_axis], self.size, self.rank)
+                slices = [slice(None)] * item.ndim
+                slices[split_axis] = local_slice
+                chunks.append(item[tuple(slices)])
             return torch_module.cat(chunks, dim=concat_axis)
         moved = torch_module.movedim(x, split_axis, 0).contiguous()
         output = torch_module.empty_like(moved)
