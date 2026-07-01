@@ -20,12 +20,13 @@ from renormalizer.model.h_qc import qc_model, int_to_h, generate_ladder_operator
 from renormalizer.model import Model, Op
 from renormalizer.mps.backend import backend, xp, primme, IMPORT_PRIMME_EXCEPTION
 from renormalizer.mps.matrix import multi_tensor_contract, tensordot, asnumpy, asxp
-from renormalizer.mps.hop_expr import  hop_expr
+from renormalizer.mps.hop_expr import batched_hop_expr, hop_expr
 from renormalizer.mps.svd_qn import get_qn_mask
 from renormalizer.mps import Mpo, Mps, StackedMpo
 from renormalizer.mps.lib import Environ, cvec2cmat
 from renormalizer.mps.oe_contract_wrap import oe_contract
 from renormalizer.utils import Quantity, CompressConfig, CompressCriteria
+from renormalizer.backend import PackedVectorSpec
 
 
 logger = logging.getLogger(__name__)
@@ -474,13 +475,34 @@ def get_ham_iterative(
     # contraction expression
     cshape = qn_mask.shape
     expr = hop_expr(ltensor, rtensor, cmo, cshape, omega is not None)
-    return hdiag, expr
+    expr_batched_factory = lambda nrhs: batched_hop_expr(ltensor, rtensor, cmo, cshape, nrhs, omega is not None)
+    return hdiag, expr, expr_batched_factory
 
 
 def func_sum(funcs):
     def new_func(*args, **kwargs):
         return sum([func(*args, **kwargs) for func in funcs])
     return new_func
+
+
+def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
+    nrhs = 1 if x.ndim == 1 else x.shape[1]
+    spec = PackedVectorSpec(
+        qn_mask=qn_mask,
+        center_shape=qn_mask.shape,
+        packed_dim=int(np.sum(qn_mask)),
+        nrhs=int(nrhs),
+    )
+    packed = asxp(x)
+    if x.ndim == 1:
+        cstruct = backend.unpack_masked_vectors(packed, spec)
+        cout = expr(cstruct) * inverse
+    elif x.ndim == 2:
+        cstruct = backend.unpack_masked_vectors(packed, spec)
+        cout = batched_expr(cstruct) * inverse
+    else:
+        raise ValueError("packed RHS input must be 1D or 2D, got shape {0}".format(x.shape))
+    return asnumpy(backend.pack_masked_vectors(cout, spec))
 
 
 def eigh_iterative(
@@ -498,34 +520,22 @@ def eigh_iterative(
         assert isinstance(rtensor, list)
         assert len(ltensor) == len(rtensor)
         ham = [get_ham_iterative(mps, qn_mask, ltensor_item, rtensor_item, cmo_item, omega) for ltensor_item, rtensor_item, cmo_item in zip(ltensor, rtensor, cmo)]
-        hdiag = sum([hdiag_item for hdiag_item, expr_item in ham])
-        expr = func_sum([expr_item for hdiag_item, expr_item in ham])
+        hdiag = sum([hdiag_item for hdiag_item, expr_item, expr_batched_factory_item in ham])
+        expr = func_sum([expr_item for hdiag_item, expr_item, expr_batched_factory_item in ham])
+        expr_batched_factory = lambda nrhs: func_sum([
+            expr_batched_factory_item(nrhs)
+            for hdiag_item, expr_item, expr_batched_factory_item in ham
+        ])
     else:
-        hdiag, expr = get_ham_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega)
+        hdiag, expr, expr_batched_factory = get_ham_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega)
 
     count = 0
 
     def hop(x):
         nonlocal count
         count += 1
-        clist = []
-        if x.ndim == 1:
-            clist.append(x)
-        else:
-            for icol in range(x.shape[1]):
-                clist.append(x[:, icol])
-        res = []
-        for c in clist:
-            # convert c to initial structure according to qn pattern
-            cstruct = asxp(cvec2cmat(c, qn_mask))
-            cout = expr(cstruct) * inverse
-            # convert structure c to 1d according to qn
-            res.append(asnumpy(cout)[qn_mask])
-
-        if len(res) == 1:
-            return res[0]
-        else:
-            return np.stack(res, axis=1)
+        expr_batched = expr_batched_factory(x.shape[1]) if x.ndim == 2 else None
+        return _apply_hop_to_packed_vectors(x, qn_mask, expr, expr_batched, inverse)
 
     # Find the eigenvectors
     algo = mps.optimize_config.algo

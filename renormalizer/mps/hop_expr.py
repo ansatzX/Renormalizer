@@ -140,3 +140,76 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
     if profile_enabled:
         return _record_hop_expr(expr, nsite, ancilla_for_profile, twolayer, ltensor, rtensor, cmo, cshape, started)
     return expr
+
+
+def batched_hop_expr(ltensor, rtensor, cmo, cshape, nrhs, twolayer: bool = False):
+    profile_enabled = profiling.should_record_op()
+    started = time.perf_counter() if profile_enabled else None
+    nsite = len(cmo)
+    ancilla = 2 * nsite + 2 == len(cshape)
+    ancilla_for_profile = ancilla if nsite != 0 else None
+    if not ancilla:
+        assert nsite + 2 == len(cshape)
+
+    ltensor = asxp(ltensor)
+    rtensor = asxp(rtensor)
+    for i in range(len(cmo)):
+        cmo[i] = asxp(cmo[i])
+
+    batched_shape = tuple(cshape) + (int(nrhs),)
+
+    if twolayer:
+        assert nsite in [1, 2]
+        assert not ancilla
+        if nsite == 1:
+            expr = oe_contract_expression(
+                "abcd, befg, cfhi, jgik, aejr -> dhkr",
+                ltensor, cmo[0], cmo[0], rtensor, batched_shape,
+                constants=[0, 1, 2, 3],
+            )
+        else:
+            expr = oe_contract_expression(
+                "abcd, befg, cfhi, gjkl, ikmn, olnp, aejor -> dhmpr",
+                ltensor, cmo[0], cmo[0], cmo[1], cmo[1], rtensor, batched_shape,
+                constants=[0, 1, 2, 3, 4, 5],
+            )
+        if profile_enabled:
+            return _record_hop_expr(expr, nsite, ancilla_for_profile, twolayer, ltensor, rtensor, cmo, batched_shape, started)
+        return expr
+
+    if nsite == 0:
+        expr = oe_contract_expression(
+            "abc, lbk, ckr -> alr",
+            ltensor, rtensor, batched_shape,
+            constants=[0, 1],
+        )
+    elif nsite == 1:
+        if not ancilla:
+            expr = oe_contract_expression(
+                "abc, bdef, lfk, cekr -> adlr",
+                ltensor, cmo[0], rtensor, batched_shape,
+                constants=[0, 1, 2],
+            )
+        else:
+            expr = oe_contract_expression(
+                "abc, bdef, lfk, cegkr -> adglr",
+                ltensor, cmo[0], rtensor, batched_shape,
+                constants=[0, 1, 2],
+            )
+    else:
+        if not ancilla:
+            expr = oe_contract_expression(
+                "abc, bdef, fghj, ljk, cehkr -> adglr",
+                ltensor, cmo[0], cmo[1], rtensor, batched_shape,
+                constants=[0, 1, 2, 3],
+            )
+        else:
+            expr = oe_contract_expression(
+                "abc, bdef, fghj, ljk, cemhnkr -> admgnlr",
+                ltensor, cmo[0], cmo[1], rtensor, batched_shape,
+                constants=[0, 1, 2, 3],
+            )
+
+    if profile_enabled:
+        return _record_hop_expr(expr, nsite, ancilla_for_profile, twolayer, ltensor, rtensor, cmo, batched_shape, started)
+    return expr
