@@ -1296,6 +1296,38 @@ def test_plan_contraction_returns_dense_gemm_step_for_pair_einsum():
     assert step.estimated_comm_bytes == 0
 
 
+def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = backend.execute(plan)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(result, left @ right)
+    events = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    execute = next(event for event in events if event["event"] == "contraction_execute")
+
+    assert execute["plan_hash"] == plan.plan_hash
+
+
 def test_distributed_contract_matches_dense_for_row_sharded_matmul():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

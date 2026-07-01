@@ -1419,7 +1419,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if isinstance(plan, ContractionPlan):
             if len(plan.steps) != 1:
                 raise BackendFeatureError("execute currently supports single-step ContractionPlan objects")
-            return self.execute(plan.steps[0].plan, stream=stream, workspace=workspace)
+            inner_plan = plan.steps[0].plan
+            if isinstance(inner_plan, MatmulPlan):
+                return self.execute_matmul_plan(
+                    inner_plan,
+                    stream=stream,
+                    workspace=workspace,
+                    plan_hash=plan.plan_hash,
+                )
+            return self.execute(inner_plan, stream=stream, workspace=workspace)
         if isinstance(plan, MatmulPlan):
             return self.execute_matmul_plan(plan, stream=stream, workspace=workspace)
         if isinstance(plan, GroupedGemmPlan):
@@ -2688,7 +2696,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return self._loop_matmul(plan.descs[0], stream=stream, workspace=workspace)
         raise BackendFeatureError("Unknown MatmulPlan kind {0!r}".format(plan.kind))
 
-    def _record_contraction_execute(self, plan, result, wall_s):
+    def _record_contraction_execute(self, plan, result, wall_s, plan_hash=None):
         try:
             from renormalizer.utils import profiling
 
@@ -2700,6 +2708,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 backend=self.name,
                 equation=None,
                 lowering=plan.kind,
+                plan_hash=plan_hash or getattr(plan, "plan_hash", ""),
                 input_shapes=[
                     tuple(getattr(desc.A, "shape", ())),
                     tuple(getattr(desc.B, "shape", ())),
@@ -2724,7 +2733,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         except Exception:
             pass
 
-    def execute_matmul_plan(self, plan, *, stream=None, workspace=None):
+    def execute_matmul_plan(self, plan, *, stream=None, workspace=None, plan_hash=None):
         try:
             from renormalizer.utils import profiling
 
@@ -2737,7 +2746,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             start = time.perf_counter()
             result = self._execute_plan_impl(plan, stream=stream, workspace=workspace)
             wall_s = time.perf_counter() - start
-            self._record_contraction_execute(plan, result, wall_s)
+            self._record_contraction_execute(plan, result, wall_s, plan_hash=plan_hash)
             return result
         return self._execute_plan_impl(plan, stream=stream, workspace=workspace)
 
