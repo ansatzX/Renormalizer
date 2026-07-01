@@ -1158,6 +1158,55 @@ def test_distributed_contract_matches_dense_for_row_sharded_matmul():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_distributed_contract_allreduces_when_contracted_mode_is_sharded():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(24, dtype=np.float64).reshape(4, 6)
+    right = np.arange(30, dtype=np.float64).reshape(6, 5)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"k": 2},
+        mode_to_mesh_axis={"k": "rank"},
+    )
+    right_spec = ShardingSpec(
+        global_shape=right.shape,
+        modes=("k", "j"),
+        mesh=mesh,
+        ranks_per_mode={"k": 2},
+        mode_to_mesh_axis={"k": "rank"},
+    )
+    sharded_left = backend.shard_tensor(left, left_spec)
+    sharded_right = backend.shard_tensor(right, right_spec)
+    contract_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(sharded_left, sharded_right),
+    )
+
+    plan = backend.plan_contraction(contract_spec, allow_distribution=True)
+    result = backend.distributed_contract(contract_spec, plan=plan)
+    communication = plan.steps[0].plan.steps[0].communication
+
+    assert plan.distributed_modes == ("k",)
+    assert communication[0].kind == "allreduce"
+    assert communication[0].bytes == left.shape[0] * right.shape[1] * left.itemsize
+    assert result.sharding.sharded_modes == ()
+    assert result.sharding.replicated_modes == ("i", "j")
+    assert np.allclose(result.local_array, left @ right)
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

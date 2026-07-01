@@ -461,14 +461,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return tuple(int(sizes[mode]) for mode in output_modes)
 
     @staticmethod
-    def _distributed_modes_for_output(operands, output_modes):
+    def _distributed_modes_for_operands(operands):
         distributed = []
-        for mode in output_modes:
-            for operand in operands:
-                if isinstance(operand, DistributedTensor) and mode in operand.sharding.sharded_modes:
+        for operand in operands:
+            if not isinstance(operand, DistributedTensor):
+                continue
+            for mode in operand.sharding.sharded_modes:
+                if mode not in distributed:
                     distributed.append(mode)
-                    break
         return tuple(distributed)
+
+    @staticmethod
+    def _reduced_distributed_modes(distributed_modes, output_modes):
+        output_set = set(output_modes)
+        return tuple(mode for mode in distributed_modes if mode not in output_set)
 
     def _derive_output_sharding(self, dist_spec, input_modes, output_modes, output_shape):
         if dist_spec.output_sharding is not None:
@@ -522,7 +528,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             output_shape = self._output_shape_from_sizes(output_modes, sizes)
             itemsize = max((self._operand_itemsize(operand) for operand in spec.operands), default=0)
             comm_bytes = self._prod_shape(output_shape) * int(itemsize or 0)
-            distributed_modes = self._distributed_modes_for_output(spec.operands, output_modes)
+            distributed_modes = self._distributed_modes_for_operands(spec.operands)
+            reduced_distributed_modes = self._reduced_distributed_modes(distributed_modes, output_modes)
             einsum_spec = self._einsum_spec_from_distributed_spec(spec)
             if not allow_distribution and distributed_modes:
                 raise BackendFeatureError("distributed contraction requires allow_distribution=True")
@@ -549,10 +556,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     output_sharding=output_sharding,
                     communication=(
                         CommunicationPlan(
-                            kind="gather",
+                            kind="allreduce" if reduced_distributed_modes else "gather",
                             bytes=plan.estimated_comm_bytes,
-                            modes=distributed_modes,
-                            reason="materialize distributed contraction output",
+                            modes=reduced_distributed_modes or distributed_modes,
+                            reason=(
+                                "sum partial outputs across reduced sharded modes"
+                                if reduced_distributed_modes
+                                else "materialize distributed contraction output"
+                            ),
                         ),
                     ),
                 )
@@ -872,6 +883,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return _np.einsum(equation, *operands)
         return einsum(equation, *operands)
 
+    def _sum_rank_local_arrays(self, rank_local_arrays):
+        total = None
+        for rank in sorted(rank_local_arrays):
+            value = rank_local_arrays[rank]
+            total = value if total is None else total + value
+        return total
+
     def distributed_contract(self, spec, *, plan=None, stream=None, workspace=None):
         del stream, workspace
         if not isinstance(spec, DistributedContractionSpec):
@@ -895,6 +913,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
         for rank in range(mesh.world_size):
             local_operands = tuple(self._local_operand_for_rank(operand, rank) for operand in spec.operands)
             rank_local_arrays[rank] = self._execute_einsum(spec.equation, local_operands)
+        distributed_modes = self._distributed_modes_for_operands(spec.operands)
+        reduced_distributed_modes = self._reduced_distributed_modes(distributed_modes, output_modes)
+        if reduced_distributed_modes:
+            reduced = self.allreduce(self._sum_rank_local_arrays(rank_local_arrays), op="sum")
+            rank_local_arrays = {rank: reduced for rank in range(mesh.world_size)}
         local_array = rank_local_arrays[mesh.local_rank]
         return DistributedTensor(
             local_array=local_array,
