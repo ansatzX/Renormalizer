@@ -379,8 +379,8 @@ def pair_tensor_contract(
             TensorOperand(right_array, tuple(input_right), name="right"),
             output_modes=output_modes,
         )
-        backend.lower_pair_contraction_to_matmul(spec)
-        return tensordot(left_array, right_array, axes=(left_pos, right_pos))
+        plan = backend.lower_pair_contraction_to_matmul(spec)
+        return backend.execute_matmul_plan(plan)
     return tensordot(view_left, view_right, axes=(left_pos, right_pos))
 
 

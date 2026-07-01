@@ -294,8 +294,10 @@ def test_pair_tensor_contract_records_generic_contraction_plan(tmp_path):
         if line.strip()
     ]
     plans = [payload for payload in payloads if payload["event"] == "contraction_plan"]
+    executes = [payload for payload in payloads if payload["event"] == "contraction_execute"]
 
     assert len(plans) == 1
+    assert len(executes) == 1
     plan = plans[0]
     assert plan["backend"] == "numpy"
     assert plan["lowering"] == "gemm"
@@ -308,3 +310,12 @@ def test_pair_tensor_contract_records_generic_contraction_plan(tmp_path):
     assert plan["flops"] == 48
     assert plan["num_gemm"] == 1
     assert plan["fallback_reason"] is None
+    execute = executes[0]
+    assert execute["backend"] == "numpy"
+    assert execute["lowering"] == "gemm"
+    assert execute["input_shapes"] == [[2, 3], [3, 4]]
+    assert execute["output_shape"] == [2, 4]
+    assert execute["flops"] == 48
+    assert execute["num_gemm"] == 1
+    assert execute["fallback_reason"] is None
+    assert execute["wall_s"] >= 0.0
