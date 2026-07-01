@@ -1140,7 +1140,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             nbytes = int(item.bytes)
             total += self._rate_seconds(nbytes, bandwidth)
             if nbytes and hw.latency_s:
-                total += float(hw.latency_s)
+                total += int(item.num_messages) * float(hw.latency_s)
         return total
 
     def _with_distributed_step_timing(self, step, hw):
@@ -1712,8 +1712,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         "collective": item.kind,
                         "bytes": int(item.bytes),
                         "modes": [str(mode) for mode in item.modes],
-                        "num_messages": 1,
-                        "block_size": int(item.bytes),
+                        "num_messages": int(item.num_messages),
+                        "block_size": int(item.block_size),
                         "wall_s": pop_communication_wall_s(item.kind),
                     }
                     for item in communication

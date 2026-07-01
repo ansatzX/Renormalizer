@@ -768,6 +768,19 @@ class CommunicationPlan:
     bytes: int
     modes: tuple[Hashable, ...] = ()
     reason: str | None = None
+    num_messages: int = 1
+    block_size: int | None = None
+
+    def __post_init__(self):
+        bytes_ = int(self.bytes)
+        num_messages = int(self.num_messages)
+        if num_messages < 0:
+            raise ValueError("CommunicationPlan num_messages must be non-negative")
+        block_size = bytes_ if self.block_size is None else int(self.block_size)
+        object.__setattr__(self, "bytes", bytes_)
+        object.__setattr__(self, "modes", tuple(self.modes))
+        object.__setattr__(self, "num_messages", num_messages)
+        object.__setattr__(self, "block_size", block_size)
 
 
 @dataclass(frozen=True)

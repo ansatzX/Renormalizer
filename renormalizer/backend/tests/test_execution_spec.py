@@ -1612,6 +1612,8 @@ def test_distributed_contract_records_communication_profile(tmp_path):
     ]
     assert event["comm_bytes"] == 256
     assert event["wall_s"] >= 0.0
+    communications = plan.steps[0].plan.steps[0].communication
+    assert [(item.num_messages, item.block_size) for item in communications] == [(1, 96), (1, 160)]
 
 
 def test_distributed_contract_profile_measures_reduce_scatter_wall_time(tmp_path):
@@ -1900,6 +1902,7 @@ def test_plan_distributed_contraction_path_reports_communication_totals():
     assert distributed_path.steps[0].local_contraction_plan is distributed_path.steps[0].local_step.plan
     assert distributed_path.steps[0].communication_plan == distributed_path.steps[0].communication[0]
     assert [item.kind for item in distributed_path.steps[0].communication] == ["redistribute", "gather"]
+    assert [(item.num_messages, item.block_size) for item in distributed_path.steps[0].communication] == [(1, 96), (1, 160)]
     assert distributed_path.steps[0].estimated_comm_s == pytest.approx(3.7)
     assert distributed_path.steps[0].estimated_total_s == pytest.approx(3.7)
     left_state, right_state = distributed_path.steps[0].input_states
@@ -2153,6 +2156,27 @@ def test_estimate_redistribute_records_communication_cost():
     assert estimate.peak_bytes == 160
     assert estimate.comm_s == pytest.approx(2.25)
     assert estimate.total_s == pytest.approx(2.25)
+
+
+def test_communication_plan_message_count_contributes_latency():
+    from renormalizer.backend import CommunicationPlan, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    communication = CommunicationPlan(
+        kind="allreduce",
+        bytes=96,
+        modes=("k",),
+        num_messages=3,
+        block_size=32,
+    )
+
+    assert communication.num_messages == 3
+    assert communication.block_size == 32
+    assert backend._estimate_communication_sequence_s(
+        (communication,),
+        HardwareModel(network_bandwidth_Bps=24.0, latency_s=0.5),
+    ) == pytest.approx(5.5)
 
 
 def test_sharding_spec_can_replicate_over_unused_mesh_axes():
