@@ -1629,6 +1629,42 @@ def test_plan_distributed_contraction_path_reports_communication_totals():
     assert [item.kind for item in allreduce_path.steps[0].communication] == ["allreduce"]
 
 
+def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionPlan, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(64, dtype=np.float64).reshape(16, 4)
+    right = np.arange(12, dtype=np.float64).reshape(4, 3)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    hw = HardwareModel(network_bandwidth_Bps=80.0, latency_s=0.25)
+
+    distributed_path = backend.plan_distributed_contraction_path(
+        dense_path,
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=hw,
+    )
+
+    assert isinstance(distributed_path, DistributedContractionPlan)
+    assert distributed_path.output_sharding is not None
+    assert distributed_path.output_sharding.modes == ("i", "j")
+    assert distributed_path.output_sharding.sharded_modes == ("i",)
+    assert distributed_path.steps[0].kind == "activate_distribution"
+    assert [item.kind for item in distributed_path.steps[0].communication] == ["activate_distribution"]
+    assert distributed_path.total_comm_bytes == left.nbytes + right.nbytes
+    assert distributed_path.total_redistribute_bytes == left.nbytes + right.nbytes
+    assert distributed_path.steps[0].estimated_comm_s == pytest.approx((left.nbytes + right.nbytes) / 80.0 + 0.25)
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

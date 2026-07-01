@@ -717,6 +717,7 @@ class DistributedStepPlan:
     estimated_compute_s: float = 0.0
     estimated_comm_s: float = 0.0
     estimated_total_s: float = 0.0
+    kind: str = "distributed_contract"
 
 
 @dataclass(frozen=True)

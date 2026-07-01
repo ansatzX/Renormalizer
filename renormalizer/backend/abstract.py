@@ -901,7 +901,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             for communication in step.communication:
                 nbytes = int(communication.bytes)
                 total_comm_bytes += nbytes
-                if communication.kind in ("redistribute", "alltoall"):
+                if communication.kind in ("redistribute", "alltoall", "activate_distribution"):
                     total_redistribute_bytes += nbytes
                 elif communication.kind in ("allreduce", "reduce_scatter"):
                     total_allreduce_bytes += nbytes
@@ -953,7 +953,70 @@ class AbstractBackend(SingleProcessDistributedMixin):
             estimated_compute_s=compute_s,
             estimated_comm_s=comm_s,
             estimated_total_s=compute_s + comm_s,
+            kind=step.kind,
         )
+
+    def _output_shape_for_contraction_plan(self, path):
+        input_modes = tuple(operand.modes for operand in path.input_specs)
+        operands = tuple(operand.array for operand in path.input_specs)
+        sizes = self._mode_sizes_from_equation(input_modes, operands)
+        return self._output_shape_from_sizes(path.output_modes, sizes)
+
+    def _auto_output_sharding_for_path(self, path, mesh):
+        output_shape = self._output_shape_for_contraction_plan(path)
+        if not path.output_modes:
+            raise BackendFeatureError("cannot distribute scalar contraction output automatically")
+        candidates = list(zip(path.output_modes, output_shape))
+        selected_mode, _ = max(candidates, key=lambda item: (int(item[1]) >= int(mesh.world_size), int(item[1])))
+        return ShardingSpec(
+            global_shape=output_shape,
+            modes=path.output_modes,
+            mesh=mesh,
+            ranks_per_mode={selected_mode: int(mesh.world_size)},
+            mode_to_mesh_axis={selected_mode: mesh.axis_names[0]},
+            sharded_modes=(selected_mode,),
+            replicated_modes=tuple(mode for mode in path.output_modes if mode != selected_mode),
+        )
+
+    def _auto_distributed_plan_from_dense_path(self, path, mesh):
+        if not isinstance(path, ContractionPlan) or not path.steps:
+            raise BackendFeatureError("automatic distribution requires a non-empty ContractionPlan")
+        output_sharding = self._auto_output_sharding_for_path(path, mesh)
+        activation_bytes = int(path.estimated_read_bytes or sum(
+            self._array_nbytes(operand.array)
+            for operand in path.input_specs
+        ))
+        states = tuple(
+            DistributionState(
+                operand_index=index,
+                modes=operand.modes,
+                sharding=None,
+                distributed_modes=(),
+                replicated_modes=operand.modes,
+            )
+            for index, operand in enumerate(path.input_specs)
+        )
+        step_plan = DistributedStepPlan(
+            local_step=path.steps[0],
+            input_states=states,
+            output_sharding=output_sharding,
+            communication=(
+                CommunicationPlan(
+                    kind="activate_distribution",
+                    bytes=activation_bytes,
+                    modes=output_sharding.sharded_modes,
+                    reason="activate automatic output-mode distribution for dense contraction plan",
+                ),
+            ),
+            kind="activate_distribution",
+        )
+        return self._with_distributed_plan_totals(DistributedContractionPlan(
+            path=path,
+            steps=(step_plan,),
+            output_sharding=output_sharding,
+            estimated_comm_bytes=activation_bytes,
+            equation=self._einsum_equation_from_plan(path),
+        ))
 
     def plan_distributed_contraction_path(
         self,
@@ -962,11 +1025,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
         memory_limit_per_device=None,
         cost_model=None,
     ):
-        del mesh
         if isinstance(path, DistributedContractionPlan):
             distributed_plan = path
         elif isinstance(path, ContractionPlan) and len(path.steps) == 1 and isinstance(path.steps[0].plan, DistributedContractionPlan):
             distributed_plan = path.steps[0].plan
+        elif isinstance(path, ContractionPlan):
+            distributed_plan = self._auto_distributed_plan_from_dense_path(path, mesh)
         else:
             raise BackendFeatureError("plan_distributed_contraction_path requires a distributed ContractionPlan")
         if cost_model is not None:
