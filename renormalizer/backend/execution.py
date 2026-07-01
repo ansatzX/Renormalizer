@@ -714,6 +714,9 @@ class DistributedStepPlan:
     input_states: tuple[DistributionState, ...]
     output_sharding: ShardingSpec | None
     communication: tuple[CommunicationPlan, ...] = ()
+    estimated_compute_s: float = 0.0
+    estimated_comm_s: float = 0.0
+    estimated_total_s: float = 0.0
 
 
 @dataclass(frozen=True)

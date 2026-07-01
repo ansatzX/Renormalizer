@@ -927,6 +927,34 @@ class AbstractBackend(SingleProcessDistributedMixin):
             total_gather_bytes=total_gather_bytes,
         )
 
+    def _estimate_communication_sequence_s(self, communication, hw):
+        hw = HardwareModel() if hw is None else hw
+        bandwidth = self._hardware_comm_bandwidth(hw)
+        total = 0.0
+        for item in communication:
+            nbytes = int(item.bytes)
+            total += self._rate_seconds(nbytes, bandwidth)
+            if nbytes and hw.latency_s:
+                total += float(hw.latency_s)
+        return total
+
+    def _with_distributed_step_timing(self, step, hw):
+        hw = HardwareModel() if hw is None else hw
+        compute_s = self._rate_seconds(
+            int(step.local_step.estimated_flops),
+            self._hardware_flop_rate(hw),
+        )
+        comm_s = self._estimate_communication_sequence_s(step.communication, hw)
+        return DistributedStepPlan(
+            local_step=step.local_step,
+            input_states=step.input_states,
+            output_sharding=step.output_sharding,
+            communication=step.communication,
+            estimated_compute_s=compute_s,
+            estimated_comm_s=comm_s,
+            estimated_total_s=compute_s + comm_s,
+        )
+
     def plan_distributed_contraction_path(
         self,
         path,
@@ -934,13 +962,30 @@ class AbstractBackend(SingleProcessDistributedMixin):
         memory_limit_per_device=None,
         cost_model=None,
     ):
-        del mesh, cost_model
+        del mesh
         if isinstance(path, DistributedContractionPlan):
             distributed_plan = path
         elif isinstance(path, ContractionPlan) and len(path.steps) == 1 and isinstance(path.steps[0].plan, DistributedContractionPlan):
             distributed_plan = path.steps[0].plan
         else:
             raise BackendFeatureError("plan_distributed_contraction_path requires a distributed ContractionPlan")
+        if cost_model is not None:
+            distributed_plan = DistributedContractionPlan(
+                path=distributed_plan.path,
+                steps=tuple(
+                    self._with_distributed_step_timing(step, cost_model)
+                    for step in distributed_plan.steps
+                ),
+                output_sharding=distributed_plan.output_sharding,
+                estimated_comm_bytes=distributed_plan.estimated_comm_bytes,
+                equation=distributed_plan.equation,
+                peak_local_bytes=distributed_plan.peak_local_bytes,
+                total_flops=distributed_plan.total_flops,
+                total_comm_bytes=distributed_plan.total_comm_bytes,
+                total_redistribute_bytes=distributed_plan.total_redistribute_bytes,
+                total_allreduce_bytes=distributed_plan.total_allreduce_bytes,
+                total_gather_bytes=distributed_plan.total_gather_bytes,
+            )
         result = self._with_distributed_plan_totals(distributed_plan)
         if memory_limit_per_device is not None and result.peak_local_bytes > int(memory_limit_per_device):
             raise BackendFeatureError(

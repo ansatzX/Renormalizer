@@ -1588,6 +1588,8 @@ def test_plan_distributed_contraction_path_reports_communication_totals():
     assert distributed_path.peak_local_bytes == 96
     assert distributed_path.estimated_comm_bytes == 256
     assert [item.kind for item in distributed_path.steps[0].communication] == ["redistribute", "gather"]
+    assert distributed_path.steps[0].estimated_comm_s == pytest.approx(3.7)
+    assert distributed_path.steps[0].estimated_total_s == pytest.approx(3.7)
 
     left_reduced = np.arange(24, dtype=np.float64).reshape(4, 6)
     right_reduced = np.arange(30, dtype=np.float64).reshape(6, 5)
