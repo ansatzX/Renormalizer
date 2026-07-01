@@ -288,6 +288,64 @@ class EinsumSpec:
     constants: tuple[int, ...] = ()
     optimize: str | Any | None = None
 
+    def __post_init__(self):
+        object.__setattr__(self, "operands", tuple(self.operands))
+        object.__setattr__(self, "output_modes", tuple(self.output_modes))
+        object.__setattr__(self, "constants", tuple(int(index) for index in self.constants))
+
+
+def _parse_einsum_modes(modes, *, context):
+    if "..." in modes:
+        raise ValueError("backend.parse_einsum requires explicit modes; ellipsis is not supported")
+    return tuple(modes)
+
+
+def parse_einsum(equation, *operands, constants=(), optimize=None) -> EinsumSpec:
+    normalized = "".join(str(equation).split())
+    if normalized.count("->") != 1:
+        raise ValueError("backend.parse_einsum requires an explicit output using '->'")
+    lhs, rhs = normalized.split("->", 1)
+    if not lhs:
+        raise ValueError("backend.parse_einsum requires at least one input operand")
+    input_terms = tuple(lhs.split(","))
+    if len(input_terms) != len(operands):
+        raise ValueError(
+            "einsum operand count mismatch: equation has {0} operands but {1} arrays were provided"
+            .format(len(input_terms), len(operands))
+        )
+
+    constants = tuple(int(index) for index in constants)
+    for index in constants:
+        if index < 0 or index >= len(operands):
+            raise ValueError("einsum constant operand index {0} is out of range".format(index))
+
+    tensor_operands = []
+    input_mode_set = set()
+    for index, (modes_text, array) in enumerate(zip(input_terms, operands)):
+        modes = _parse_einsum_modes(modes_text, context="operand {0}".format(index))
+        shape = _shape_of(array)
+        if len(modes) != len(shape):
+            raise ValueError(
+                "einsum operand {0} rank mismatch: equation has {1} modes but array rank is {2}"
+                .format(index, len(modes), len(shape))
+            )
+        input_mode_set.update(modes)
+        tensor_operands.append(TensorOperand(array, modes, name="operand{0}".format(index)))
+
+    output_modes = _parse_einsum_modes(rhs, context="output")
+    if len(output_modes) != len(set(output_modes)):
+        raise ValueError("einsum output modes must be unique")
+    missing = [mode for mode in output_modes if mode not in input_mode_set]
+    if missing:
+        raise ValueError("einsum output modes are not present in any input: {0}".format(missing))
+
+    return EinsumSpec(
+        operands=tuple(tensor_operands),
+        output_modes=output_modes,
+        constants=constants,
+        optimize=optimize,
+    )
+
 
 @dataclass(frozen=True)
 class PairContractionSpec:

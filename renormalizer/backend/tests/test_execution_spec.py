@@ -121,6 +121,44 @@ def test_pair_contraction_lowering_reports_batched_gemm_for_same_shape_batch():
     assert plan.fallback_reason is None
 
 
+def test_backend_parse_einsum_builds_explicit_ir_operands():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+
+    spec = backend.parse_einsum("ab,bc->ac", left, right, optimize="greedy", constants=(1,))
+
+    assert spec.output_modes == ("a", "c")
+    assert spec.optimize == "greedy"
+    assert spec.constants == (1,)
+    assert [operand.modes for operand in spec.operands] == [("a", "b"), ("b", "c")]
+    assert [operand.name for operand in spec.operands] == ["operand0", "operand1"]
+    assert spec.operands[0].array is left
+    assert spec.operands[1].array is right
+    assert spec.operands[0].layout.logical_modes == ("a", "b")
+    assert spec.operands[1].layout.logical_modes == ("b", "c")
+
+
+def test_backend_parse_einsum_rejects_implicit_output():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+
+    with pytest.raises(ValueError, match="explicit output"):
+        backend.parse_einsum("ab,bc", np.ones((2, 3)), np.ones((3, 4)))
+
+
+def test_backend_parse_einsum_rejects_operand_rank_mismatch():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+
+    with pytest.raises(ValueError, match="rank"):
+        backend.parse_einsum("ab,bc->ac", np.ones((2, 3, 1)), np.ones((3, 4)))
+
+
 def test_backend_raw_matmul_and_stacked_batched_matmul():
     from renormalizer.backend.numpy_backend import NumpyBackend
 

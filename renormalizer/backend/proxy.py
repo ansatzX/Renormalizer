@@ -90,6 +90,7 @@ class BackendProxy:
     is_distributed_array = _delegate_backend_method("is_distributed_array")
     array_info = _delegate_backend_method("array_info")
     layout = _delegate_backend_method("layout")
+    parse_einsum = _delegate_backend_method("parse_einsum")
     astype = _delegate_backend_method("astype")
     ascontiguousarray = _delegate_backend_method("ascontiguousarray")
     current_device = _delegate_backend_method("current_device")

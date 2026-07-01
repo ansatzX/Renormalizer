@@ -16,6 +16,7 @@ from renormalizer.backend.execution import (
     layout_from_array,
     legacy_device_kind,
     lower_pair_contraction_to_matmul,
+    parse_einsum,
 )
 from renormalizer.backend.gemm import GemmTask, array_nbytes, grouped_gemm_fallback, grouped_gemm_stats, run_gemm_task
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
@@ -250,6 +251,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def layout(self, x: Any):
         return layout_from_array(x)
+
+    def parse_einsum(self, equation, *operands, constants=(), optimize=None):
+        return parse_einsum(equation, *operands, constants=constants, optimize=optimize)
 
     def lower_pair_contraction_to_matmul(self, spec):
         plan = lower_pair_contraction_to_matmul(spec, self.capabilities)

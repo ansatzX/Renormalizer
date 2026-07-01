@@ -56,6 +56,7 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "is_distributed_array",
     "array_info",
     "layout",
+    "parse_einsum",
     "astype",
     "ascontiguousarray",
     "current_device",
@@ -302,6 +303,10 @@ class BackendProtocol(Protocol):
 
     def layout(self, x: Any) -> Any:
         """Return backend layout metadata for an array."""
+        ...
+
+    def parse_einsum(self, equation: str, *operands: Any, **kwargs: Any) -> Any:
+        """Parse an explicit einsum equation into backend contraction IR."""
         ...
 
     def current_device(self) -> Any:
