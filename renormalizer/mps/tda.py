@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -12,8 +13,50 @@ from renormalizer.mps import Mps
 from renormalizer.mps.lib import Environ, compressed_sum
 from renormalizer.mps.oe_contract_wrap import oe_contract
 from renormalizer.lib import davidson
+from renormalizer.utils import profiling
 
 logger = logging.getLogger(__name__)
+
+
+def _tda_multi_hop(x, hop):
+    if x.ndim == 1:
+        return hop(x)
+    if x.ndim != 2:
+        raise ValueError("TDA multi_hop expects 1D or 2D RHS, got shape {0}".format(x.shape))
+
+    should_profile = profiling.should_record_op()
+    started = time.perf_counter() if should_profile else None
+    result = np.stack([hop(x[:, i]) for i in range(x.shape[1])], axis=1)
+    if should_profile:
+        profiling.record(
+            "contraction_execute",
+            backend=backend.name,
+            equation=None,
+            lowering="fallback_rhs_loop",
+            input_shapes=[tuple(x.shape)],
+            output_shape=tuple(result.shape),
+            dtype=str(getattr(result, "dtype", None)),
+            device=str(backend.current_device()),
+            flops=0,
+            read_bytes=int(getattr(x, "nbytes", 0)),
+            write_bytes=int(getattr(result, "nbytes", 0)),
+            copy_bytes=0,
+            workspace_bytes=0,
+            largest_intermediate=max(
+                int(getattr(x, "nbytes", 0)),
+                int(getattr(result, "nbytes", 0)),
+            ),
+            num_gemm=0,
+            num_batched_gemm=0,
+            num_grouped_tasks=0,
+            num_blocks=0,
+            num_shape_buckets=0,
+            num_rhs=int(x.shape[1]),
+            fallback_reason="tda matmat rebuilds ket-dependent environments per RHS",
+            wall_s=time.perf_counter() - started,
+        )
+    return result
+
 
 class TDA(object):
     r""" Tamm–Dancoff approximation (or called CIS) to calculate the excited
@@ -266,14 +309,6 @@ class TDA(object):
             if not restart:
                 cguess = None
 
-            def multi_hop(x):
-                if x.ndim == 1:
-                    return hop(x)
-                elif x.ndim == 2:
-                    return np.stack([hop(x[:,i]) for i in range(x.shape[1])],axis=1)
-                else:
-                    assert False
-    
             def precond(x): 
                 if x.ndim == 1:
                     return np.einsum("i, i -> i", 1/(hdiag+1e-4), x)
@@ -282,7 +317,8 @@ class TDA(object):
                 else:
                     assert False
             A = scipy.sparse.linalg.LinearOperator((xsize,xsize),
-                    matvec=multi_hop, matmat=multi_hop)
+                    matvec=lambda x: _tda_multi_hop(x, hop),
+                    matmat=lambda x: _tda_multi_hop(x, hop))
             M = scipy.sparse.linalg.LinearOperator((xsize,xsize),
                     matvec=precond, matmat=precond)
             e, c = primme.eigsh(A, k=min(nroots,xsize), which="SA", 
