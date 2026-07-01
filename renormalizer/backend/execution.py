@@ -775,6 +775,7 @@ class DistributedStepPlan:
     local_step: ContractionStep
     input_states: tuple[DistributionState, ...]
     output_sharding: ShardingSpec | None
+    output_state: DistributionState | None = None
     communication: tuple[CommunicationPlan, ...] = ()
     estimated_compute_s: float = 0.0
     estimated_comm_s: float = 0.0

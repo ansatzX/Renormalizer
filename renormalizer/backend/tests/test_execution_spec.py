@@ -1909,6 +1909,15 @@ def test_plan_distributed_contraction_path_reports_communication_totals():
     assert right_state.shape == right.shape
     assert right_state.local_shape == (3, 2)
     assert right_state.local_nbytes == 3 * 2 * right.itemsize
+    output_state = distributed_path.steps[0].output_state
+    assert output_state.tensor_id == distributed_path.steps[0].local_step.output
+    assert output_state.modes == ("i", "j")
+    assert output_state.shape == (5, 4)
+    assert output_state.sharding == distributed_path.output_sharding
+    assert output_state.distributed_modes == ("i",)
+    assert output_state.replicated_modes == ("j",)
+    assert output_state.local_shape == (3, 4)
+    assert output_state.local_nbytes == 3 * 4 * left.itemsize
 
     left_reduced = np.arange(24, dtype=np.float64).reshape(4, 6)
     right_reduced = np.arange(30, dtype=np.float64).reshape(6, 5)
@@ -1991,6 +2000,15 @@ def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan
     assert right_state.shape == right.shape
     assert right_state.local_shape == right.shape
     assert right_state.local_nbytes == right.nbytes
+    output_state = distributed_path.steps[0].output_state
+    assert output_state.tensor_id == distributed_path.steps[0].local_step.output
+    assert output_state.modes == ("i", "j")
+    assert output_state.shape == (16, 3)
+    assert output_state.sharding == distributed_path.output_sharding
+    assert output_state.distributed_modes == ("i",)
+    assert output_state.replicated_modes == ("j",)
+    assert output_state.local_shape == (8, 3)
+    assert output_state.local_nbytes == 8 * 3 * left.itemsize
 
 
 def test_execute_auto_distributed_dense_plan_shards_output():

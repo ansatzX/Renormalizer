@@ -496,6 +496,29 @@ class AbstractBackend(SingleProcessDistributedMixin):
             local_nbytes=self._array_nbytes(operand),
         )
 
+    def _distribution_state_for_output(self, tensor_id, modes, shape, sharding, itemsize):
+        modes = tuple(modes)
+        shape = tuple(int(dim) for dim in shape)
+        if sharding is None:
+            distributed_modes = ()
+            replicated_modes = modes
+            local_shape = shape
+        else:
+            distributed_modes = tuple(mode for mode in modes if mode in sharding.sharded_modes)
+            replicated_modes = tuple(mode for mode in modes if mode not in sharding.sharded_modes)
+            local_shape = self._local_shape_for_sharding(sharding)
+        return DistributionState(
+            operand_index=tensor_id,
+            tensor_id=tensor_id,
+            modes=modes,
+            sharding=sharding,
+            shape=shape,
+            distributed_modes=distributed_modes,
+            replicated_modes=replicated_modes,
+            local_shape=local_shape,
+            local_nbytes=self._prod_shape(local_shape) * int(itemsize or 0),
+        )
+
     @staticmethod
     def _mode_sizes_from_equation(input_modes, operands):
         sizes = {}
@@ -729,6 +752,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     local_step=plan.steps[0],
                     input_states=states,
                     output_sharding=output_sharding,
+                    output_state=self._distribution_state_for_output(
+                        plan.steps[0].output,
+                        output_modes,
+                        output_shape,
+                        output_sharding,
+                        itemsize,
+                    ),
                     communication=tuple(
                         (
                             CommunicationPlan(
@@ -1124,6 +1154,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             local_step=step.local_step,
             input_states=step.input_states,
             output_sharding=step.output_sharding,
+            output_state=step.output_state,
             communication=step.communication,
             estimated_compute_s=compute_s,
             estimated_comm_s=comm_s,
@@ -1183,10 +1214,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
             self._distribution_state_for_operand(index, operand.array, operand.modes)
             for index, operand in enumerate(path.input_specs)
         )
+        local_step = self._local_step_for_activate_distribution(path, output_sharding)
+        output_shape = self._output_shape_for_contraction_plan(path)
+        itemsize = max((self._operand_itemsize(operand.array) for operand in path.input_specs), default=0)
         step_plan = DistributedStepPlan(
-            local_step=self._local_step_for_activate_distribution(path, output_sharding),
+            local_step=local_step,
             input_states=states,
             output_sharding=output_sharding,
+            output_state=self._distribution_state_for_output(
+                local_step.output,
+                path.output_modes,
+                output_shape,
+                output_sharding,
+                itemsize,
+            ),
             communication=(
                 CommunicationPlan(
                     kind="activate_distribution",
