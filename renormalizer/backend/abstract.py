@@ -476,8 +476,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         output_set = set(output_modes)
         return tuple(mode for mode in distributed_modes if mode not in output_set)
 
-    def _derive_output_sharding(self, dist_spec, input_modes, output_modes, output_shape):
-        if dist_spec.output_sharding is not None:
+    def _derive_output_sharding(self, dist_spec, input_modes, output_modes, output_shape, *, use_requested=True):
+        if use_requested and dist_spec.output_sharding is not None:
             return dist_spec.output_sharding
         source = next((operand for operand in dist_spec.operands if isinstance(operand, DistributedTensor)), None)
         if source is None:
@@ -540,6 +540,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
             )
             if distributed_modes:
                 output_sharding = self._derive_output_sharding(spec, input_modes, output_modes, output_shape)
+                natural_output_sharding = self._derive_output_sharding(
+                    spec,
+                    input_modes,
+                    output_modes,
+                    output_shape,
+                    use_requested=False,
+                )
+                output_redistribution_required = (
+                    output_sharding is not None
+                    and natural_output_sharding is not None
+                    and output_sharding != natural_output_sharding
+                )
                 states = tuple(
                     DistributionState(
                         operand_index=index,
@@ -556,12 +568,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     output_sharding=output_sharding,
                     communication=(
                         CommunicationPlan(
-                            kind="allreduce" if reduced_distributed_modes else "gather",
+                            kind=(
+                                "allreduce"
+                                if reduced_distributed_modes
+                                else "alltoall"
+                                if output_redistribution_required
+                                else "gather"
+                            ),
                             bytes=plan.estimated_comm_bytes,
                             modes=reduced_distributed_modes or distributed_modes,
                             reason=(
                                 "sum partial outputs across reduced sharded modes"
                                 if reduced_distributed_modes
+                                else "redistribute contraction output to requested sharding"
+                                if output_redistribution_required
                                 else "materialize distributed contraction output"
                             ),
                         ),
@@ -900,15 +920,23 @@ class AbstractBackend(SingleProcessDistributedMixin):
         sizes = self._mode_sizes_from_equation(input_modes, spec.operands)
         output_shape = self._output_shape_from_sizes(output_modes, sizes)
         output_sharding = spec.output_sharding
+        natural_output_sharding = self._derive_output_sharding(
+            spec,
+            input_modes,
+            output_modes,
+            output_shape,
+            use_requested=False,
+        )
         if output_sharding is None and plan.steps:
             distributed_plan = getattr(plan.steps[0], "plan", None)
             output_sharding = getattr(distributed_plan, "output_sharding", None)
         if output_sharding is None:
-            output_sharding = self._derive_output_sharding(spec, input_modes, output_modes, output_shape)
+            output_sharding = natural_output_sharding
         if output_sharding is None:
             return self._execute_einsum(spec.equation, spec.operands)
 
-        mesh = output_sharding.mesh
+        execution_sharding = natural_output_sharding or output_sharding
+        mesh = execution_sharding.mesh
         rank_local_arrays = {}
         for rank in range(mesh.world_size):
             local_operands = tuple(self._local_operand_for_rank(operand, rank) for operand in spec.operands)
@@ -919,17 +947,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
             reduced = self.allreduce(self._sum_rank_local_arrays(rank_local_arrays), op="sum")
             rank_local_arrays = {rank: reduced for rank in range(mesh.world_size)}
         local_array = rank_local_arrays[mesh.local_rank]
-        return DistributedTensor(
+        result = DistributedTensor(
             local_array=local_array,
             global_shape=output_shape,
             modes=output_modes,
-            sharding=output_sharding,
+            sharding=execution_sharding,
             mesh=mesh,
             dtype=getattr(local_array, "dtype", None),
             local_shape=tuple(getattr(local_array, "shape", ())),
             local_nbytes=self._array_nbytes(local_array),
             rank_local_arrays=rank_local_arrays,
         )
+        if output_sharding != execution_sharding:
+            return self.redistribute(result, output_sharding)
+        return result
 
     def lower_pair_contraction_to_matmul(self, spec):
         plan = lower_pair_contraction_to_matmul(spec, self.capabilities)
