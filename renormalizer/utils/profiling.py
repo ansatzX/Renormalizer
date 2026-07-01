@@ -24,6 +24,8 @@ _OP_EVENTS = frozenset({
     "tensordot",
     "oe_contract",
     "oe_contract_expression",
+    "contraction_plan",
+    "contraction_execute",
     "svd_qn",
     "hop_expr",
 })

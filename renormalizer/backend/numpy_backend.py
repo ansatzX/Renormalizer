@@ -4,6 +4,7 @@ import logging
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
+from renormalizer.backend.execution import BackendCopyError, CopyPolicy, parse_device_spec
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,20 @@ class NumpyBackend(AbstractBackend):
         """Convert ``x`` to a host NumPy array."""
         return self.to_numpy(x)
 
-    def to_backend(self, x):
+    def to_backend(self, x, *, device=None, dtype=None, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to the NumPy backend representation."""
-        return np.asarray(x)
+        if device is not None:
+            spec = parse_device_spec(device)
+            if spec is not None and spec.kind != "cpu":
+                raise ValueError("numpy backend can only materialize CPU arrays")
+        copy = CopyPolicy.from_value(copy)
+        if isinstance(x, np.ndarray):
+            dtype_requires_copy = dtype is not None and np.dtype(dtype) != x.dtype
+            if copy is CopyPolicy.NEVER and dtype_requires_copy:
+                raise BackendCopyError("to_backend would require a dtype conversion copy")
+            if copy is CopyPolicy.ALWAYS:
+                return np.array(x, dtype=dtype, copy=True)
+            return np.asarray(x, dtype=dtype)
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_backend would require creating a NumPy array")
+        return np.asarray(x, dtype=dtype)

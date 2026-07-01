@@ -7,6 +7,9 @@ _BACKEND_PROTOCOL_RUNTIME_ATTRS = (
     "name",
     "config",
     "device",
+    "device_spec",
+    "capabilities",
+    "fallback_policy",
     "supported_device_kinds",
     "available_device_kinds",
     "supports_cpu",
@@ -48,6 +51,15 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "is_array",
     "is_host_array",
     "is_device_array",
+    "is_distributed_array",
+    "array_info",
+    "layout",
+    "astype",
+    "ascontiguousarray",
+    "current_device",
+    "set_device",
+    "device_count",
+    "lower_pair_contraction_to_matmul",
     "sync",
     "free_all_blocks",
     "log_memory_usage",
@@ -101,6 +113,15 @@ class BackendProtocol(Protocol):
 
     device: str
     """Configured compute device kind, such as ``"cpu"`` or ``"gpu"``."""
+
+    device_spec: Any
+    """Structured device placement descriptor."""
+
+    capabilities: Any
+    """Explicit backend execution capabilities."""
+
+    fallback_policy: Any
+    """Policy controlling unsupported execution primitive fallback."""
 
     supported_device_kinds: Tuple[str, ...]
     """Device kinds supported by this backend implementation."""
@@ -239,6 +260,14 @@ class BackendProtocol(Protocol):
         """Convert an array-like object to this backend's representation."""
         ...
 
+    def astype(self, x: Any, dtype: Any, **kwargs: Any) -> Any:
+        """Convert dtype using an explicit copy policy."""
+        ...
+
+    def ascontiguousarray(self, x: Any, **kwargs: Any) -> Any:
+        """Return a contiguous backend array using an explicit copy policy."""
+        ...
+
     def is_array(self, x: Any) -> bool:
         """Return whether ``x`` is an array recognized by this backend."""
         ...
@@ -249,6 +278,34 @@ class BackendProtocol(Protocol):
 
     def is_device_array(self, x: Any) -> bool:
         """Return whether ``x`` is a device-resident array."""
+        ...
+
+    def is_distributed_array(self, x: Any) -> bool:
+        """Return whether ``x`` is distributed across ranks/devices."""
+        ...
+
+    def array_info(self, x: Any) -> Any:
+        """Return shape, dtype, device, and layout metadata for an array."""
+        ...
+
+    def layout(self, x: Any) -> Any:
+        """Return backend layout metadata for an array."""
+        ...
+
+    def current_device(self) -> Any:
+        """Return the structured current device descriptor."""
+        ...
+
+    def set_device(self, device: Any) -> None:
+        """Set the active backend device."""
+        ...
+
+    def device_count(self) -> int:
+        """Return the number of available devices for this backend."""
+        ...
+
+    def lower_pair_contraction_to_matmul(self, spec: Any) -> Any:
+        """Lower a mode-labeled pair contraction to a matmul execution plan."""
         ...
 
     def sync(self) -> None:

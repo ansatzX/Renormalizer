@@ -2,16 +2,8 @@
 
 """Explicit backend configuration helpers."""
 
+from renormalizer.backend.execution import FallbackPolicy, legacy_device_kind, parse_device_spec
 
-_DEVICE_ALIASES = {
-    None: None,
-    "auto": None,
-    "default": None,
-    "cpu": "cpu",
-    "host": "cpu",
-    "gpu": "gpu",
-    "cuda": "gpu",
-}
 
 _PRECISION_ALIASES = {
     None: None,
@@ -33,12 +25,7 @@ _PRECISION_ALIASES = {
 
 
 def normalize_device(device):
-    key = device
-    if isinstance(device, str):
-        key = device.lower().strip()
-    if key in _DEVICE_ALIASES:
-        return _DEVICE_ALIASES[key]
-    raise ValueError("Unknown backend device {0!r}. Expected 'cpu', 'gpu', or None.".format(device))
+    return legacy_device_kind(parse_device_spec(device))
 
 
 def normalize_precision(precision):
@@ -67,20 +54,23 @@ class BackendConfig:
         seed when this is omitted.
     """
 
-    def __init__(self, device=None, precision=None, seed=None, **options):
-        self.device = normalize_device(device)
+    def __init__(self, device=None, precision=None, seed=None, fallback_policy=None, **options):
+        self.device_spec = parse_device_spec(device)
+        self.device = legacy_device_kind(self.device_spec)
         self.precision = normalize_precision(precision)
         self.seed = seed
+        self.fallback_policy = FallbackPolicy.from_value(fallback_policy)
         self.options = dict(options)
 
     def replace(self, **updates):
         values = dict(self.options)
         values.update(updates.pop("options", {}))
-        device = updates.pop("device", self.device)
+        device = updates.pop("device", self.device_spec)
         precision = updates.pop("precision", self.precision)
         seed = updates.pop("seed", self.seed)
+        fallback_policy = updates.pop("fallback_policy", self.fallback_policy)
         values.update(updates)
-        return BackendConfig(device=device, precision=precision, seed=seed, **values)
+        return BackendConfig(device=device, precision=precision, seed=seed, fallback_policy=fallback_policy, **values)
 
     @classmethod
     def from_config(cls, config=None, **overrides):
@@ -98,6 +88,14 @@ class BackendConfig:
 
     def __repr__(self):
         return (
-            "BackendConfig(device={0!r}, precision={1!r}, seed={2!r}, options={3!r})"
-            .format(self.device, self.precision, self.seed, self.options)
+            "BackendConfig(device={0!r}, device_spec={1!r}, precision={2!r}, "
+            "seed={3!r}, fallback_policy={4!r}, options={5!r})"
+            .format(
+                self.device,
+                self.device_spec,
+                self.precision,
+                self.seed,
+                self.fallback_policy,
+                self.options,
+            )
         )
