@@ -391,6 +391,19 @@ def _sizes_for_modes(modes, *maps):
     return tuple(sizes)
 
 
+def layout_from_modes_shape(modes, shape) -> LayoutSpec:
+    shape = tuple(int(dim) for dim in shape)
+    return LayoutSpec(
+        logical_shape=shape,
+        physical_shape=shape,
+        logical_modes=tuple(modes),
+        strides=None,
+        order="C",
+        contiguous_groups=(tuple(range(len(shape))),),
+        estimated_copy_bytes=0,
+    )
+
+
 def lower_pair_contraction_to_matmul(
     spec: PairContractionSpec,
     capabilities: BackendCapabilities,
@@ -408,6 +421,7 @@ def lower_pair_contraction_to_matmul(
     flops = int(2 * _prod(batch_shape) * m * n * k_left)
     read_bytes = _nbytes_of(spec.left.array) + _nbytes_of(spec.right.array)
     write_bytes = _prod(output_shape) * max(_itemsize_of(spec.left.array), _itemsize_of(spec.right.array))
+    output_layout = spec.output_layout or layout_from_modes_shape(spec.output_modes, output_shape)
     desc = MatmulDesc(
         A=spec.left.array,
         B=spec.right.array,
@@ -418,6 +432,7 @@ def lower_pair_contraction_to_matmul(
         batch_shape=batch_shape,
         layout_a=spec.left.layout,
         layout_b=spec.right.layout,
+        layout_c=output_layout,
         estimated_flops=flops,
         estimated_read_bytes=read_bytes,
         estimated_write_bytes=write_bytes,

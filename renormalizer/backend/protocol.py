@@ -60,6 +60,10 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "set_device",
     "device_count",
     "lower_pair_contraction_to_matmul",
+    "execute_matmul_plan",
+    "matmul",
+    "batched_matmul",
+    "grouped_gemm",
     "sync",
     "free_all_blocks",
     "log_memory_usage",
@@ -306,6 +310,22 @@ class BackendProtocol(Protocol):
 
     def lower_pair_contraction_to_matmul(self, spec: Any) -> Any:
         """Lower a mode-labeled pair contraction to a matmul execution plan."""
+        ...
+
+    def execute_matmul_plan(self, plan: Any, **kwargs: Any) -> Any:
+        """Execute a matmul plan using this backend's primitives or recorded fallback."""
+        ...
+
+    def matmul(self, desc: Any, **kwargs: Any) -> Any:
+        """Execute one dense GEMM descriptor."""
+        ...
+
+    def batched_matmul(self, desc: Any, **kwargs: Any) -> Any:
+        """Execute one batched GEMM descriptor."""
+        ...
+
+    def grouped_gemm(self, descs: Any, **kwargs: Any) -> Any:
+        """Execute grouped GEMM descriptors, or raise when unsupported."""
         ...
 
     def sync(self) -> None:

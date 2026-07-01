@@ -119,6 +119,80 @@ def test_pair_contraction_lowering_records_batched_fallback_reason():
     assert "batched_matmul" in plan.fallback_reason
 
 
+def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
+    from renormalizer.backend.execution import PairContractionSpec, TensorOperand
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    spec = PairContractionSpec.from_operands(
+        TensorOperand(left, ("i", "k"), name="left"),
+        TensorOperand(right, ("k", "j"), name="right"),
+        output_modes=("i", "j"),
+    )
+    plan = backend.lower_pair_contraction_to_matmul(spec)
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = backend.execute_matmul_plan(plan)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(result, left @ right)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    executes = [payload for payload in payloads if payload["event"] == "contraction_execute"]
+
+    assert len(executes) == 1
+    event = executes[0]
+    assert event["backend"] == "numpy"
+    assert event["lowering"] == "gemm"
+    assert event["input_shapes"] == [[2, 3], [3, 4]]
+    assert event["output_shape"] == [2, 4]
+    assert event["dtype"] == "float64"
+    assert event["flops"] == 48
+    assert event["read_bytes"] == 144
+    assert event["write_bytes"] == 64
+    assert event["num_gemm"] == 1
+    assert event["num_batched_gemm"] == 0
+    assert event["fallback_reason"] is None
+    assert event["wall_s"] >= 0.0
+
+
+def test_execute_matmul_plan_preserves_generic_output_mode_order_for_fallback():
+    from renormalizer.backend.execution import PairContractionSpec, TensorOperand
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(2 * 3 * 4, dtype=np.float64).reshape(2, 3, 4)
+    right = np.arange(2 * 4 * 5, dtype=np.float64).reshape(2, 4, 5)
+    spec = PairContractionSpec.from_operands(
+        TensorOperand(left, ("batch", "i", "k"), name="left"),
+        TensorOperand(right, ("batch", "k", "j"), name="right"),
+        output_modes=("j", "batch", "i"),
+    )
+
+    plan = backend.lower_pair_contraction_to_matmul(spec)
+    result = backend.execute_matmul_plan(plan)
+    expected = np.einsum("bik,bkj->bij", left, right).transpose(2, 0, 1)
+
+    assert plan.kind == "fallback_tensordot"
+    assert result.shape == (5, 2, 3)
+    assert np.allclose(result, expected)
+
+
 def test_backend_contraction_plan_event_records_generic_operands(tmp_path):
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend

@@ -8,8 +8,10 @@ import numpy as _np
 from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.execution import (
     BackendCapabilities,
+    BackendFeatureError,
     CopyPolicy,
     DeviceSpec,
+    FallbackPolicy,
     array_info_for_backend,
     layout_from_array,
     legacy_device_kind,
@@ -306,6 +308,218 @@ class AbstractBackend(SingleProcessDistributedMixin):
         except Exception:
             pass
         return plan
+
+    def _desc_mode_groups(self, desc):
+        if desc.layout_a is None or desc.layout_b is None or desc.layout_c is None:
+            raise ValueError("MatmulDesc execution requires input and output layouts")
+        left_modes = tuple(desc.layout_a.logical_modes)
+        right_modes = tuple(desc.layout_b.logical_modes)
+        output_modes = tuple(desc.layout_c.logical_modes)
+        left_set = set(left_modes)
+        right_set = set(right_modes)
+        output_set = set(output_modes)
+        batch_modes = tuple(mode for mode in output_modes if mode in left_set and mode in right_set)
+        contracted_modes = tuple(mode for mode in left_modes if mode in right_set and mode not in output_set)
+        left_only_modes = tuple(mode for mode in output_modes if mode in left_set and mode not in right_set)
+        right_only_modes = tuple(mode for mode in output_modes if mode in right_set and mode not in left_set)
+        return batch_modes, left_only_modes, contracted_modes, right_only_modes, output_modes
+
+    @staticmethod
+    def _mode_size_map(array, modes):
+        return {mode: int(dim) for mode, dim in zip(modes, getattr(array, "shape", ()))}
+
+    @staticmethod
+    def _shape_for_modes(modes, size_map):
+        return tuple(size_map[mode] for mode in modes)
+
+    @staticmethod
+    def _prod_shape(shape):
+        result = 1
+        for dim in shape:
+            result *= int(dim)
+        return result
+
+    def _transpose_modes(self, array, current_modes, target_modes):
+        current_modes = tuple(current_modes)
+        target_modes = tuple(target_modes)
+        if current_modes == target_modes:
+            return array
+        perm = tuple(current_modes.index(mode) for mode in target_modes)
+        xp = self.array_namespace or _np
+        return xp.transpose(array, perm)
+
+    def _prepare_matmul_desc(self, desc):
+        xp = self.array_namespace or _np
+        left_modes = tuple(desc.layout_a.logical_modes)
+        right_modes = tuple(desc.layout_b.logical_modes)
+        groups = self._desc_mode_groups(desc)
+        batch_modes, left_only_modes, contracted_modes, right_only_modes, output_modes = groups
+        left_sizes = self._mode_size_map(desc.A, left_modes)
+        right_sizes = self._mode_size_map(desc.B, right_modes)
+        batch_shape = self._shape_for_modes(batch_modes, left_sizes)
+        left_shape = self._shape_for_modes(left_only_modes, left_sizes)
+        contracted_shape = self._shape_for_modes(contracted_modes, left_sizes)
+        right_shape = self._shape_for_modes(right_only_modes, right_sizes)
+
+        left_target_modes = batch_modes + left_only_modes + contracted_modes
+        right_target_modes = batch_modes + contracted_modes + right_only_modes
+        a = self._transpose_modes(desc.A, left_modes, left_target_modes)
+        b = self._transpose_modes(desc.B, right_modes, right_target_modes)
+        a = xp.reshape(a, batch_shape + (self._prod_shape(left_shape), self._prod_shape(contracted_shape)))
+        b = xp.reshape(b, batch_shape + (self._prod_shape(contracted_shape), self._prod_shape(right_shape)))
+        return a, b, {
+            "batch_modes": batch_modes,
+            "left_only_modes": left_only_modes,
+            "right_only_modes": right_only_modes,
+            "output_modes": output_modes,
+            "batch_shape": batch_shape,
+            "left_shape": left_shape,
+            "right_shape": right_shape,
+        }
+
+    def _finalize_matmul_result(self, result, groups):
+        xp = self.array_namespace or _np
+        result = xp.reshape(result, groups["batch_shape"] + groups["left_shape"] + groups["right_shape"])
+        current_modes = groups["batch_modes"] + groups["left_only_modes"] + groups["right_only_modes"]
+        return self._transpose_modes(result, current_modes, groups["output_modes"])
+
+    def matmul(self, desc, *, stream=None, workspace=None):
+        if desc.batch_shape:
+            raise BackendFeatureError("matmul received a batched descriptor; use batched_matmul")
+        xp = self.array_namespace or _np
+        a, b, groups = self._prepare_matmul_desc(desc)
+        if desc.conj_a:
+            a = xp.conj(a)
+        if desc.conj_b:
+            b = xp.conj(b)
+        if desc.trans_a:
+            a = xp.swapaxes(a, -1, -2)
+        if desc.trans_b:
+            b = xp.swapaxes(b, -1, -2)
+        result = xp.matmul(a, b)
+        if desc.alpha != 1.0:
+            result = desc.alpha * result
+        return self._finalize_matmul_result(result, groups)
+
+    def batched_matmul(self, desc, *, stream=None, workspace=None):
+        xp = self.array_namespace or _np
+        a, b, groups = self._prepare_matmul_desc(desc)
+        if desc.conj_a:
+            a = xp.conj(a)
+        if desc.conj_b:
+            b = xp.conj(b)
+        if desc.trans_a:
+            a = xp.swapaxes(a, -1, -2)
+        if desc.trans_b:
+            b = xp.swapaxes(b, -1, -2)
+        result = xp.matmul(a, b)
+        if desc.alpha != 1.0:
+            result = desc.alpha * result
+        return self._finalize_matmul_result(result, groups)
+
+    def _loop_matmul(self, desc, *, stream=None, workspace=None):
+        xp = self.array_namespace or _np
+        a, b, groups = self._prepare_matmul_desc(desc)
+        if desc.conj_a:
+            a = xp.conj(a)
+        if desc.conj_b:
+            b = xp.conj(b)
+        if desc.trans_a:
+            a = xp.swapaxes(a, -1, -2)
+        if desc.trans_b:
+            b = xp.swapaxes(b, -1, -2)
+        if not groups["batch_shape"]:
+            result = xp.matmul(a, b)
+        else:
+            dtype = desc.dtype_output or _np.result_type(getattr(desc.A, "dtype", None), getattr(desc.B, "dtype", None))
+            result = xp.empty(groups["batch_shape"] + (a.shape[-2], b.shape[-1]), dtype=dtype)
+            for index in _np.ndindex(groups["batch_shape"]):
+                result[index] = xp.matmul(a[index], b[index])
+        if desc.alpha != 1.0:
+            result = desc.alpha * result
+        return self._finalize_matmul_result(result, groups)
+
+    def grouped_gemm(self, descs, *, stream=None, workspace=None):
+        raise BackendFeatureError("{0} backend does not provide grouped_gemm".format(self.name))
+
+    def _handle_plan_fallback(self, plan):
+        if plan.fallback_reason is None:
+            return
+        if self.fallback_policy is FallbackPolicy.FORBID:
+            raise BackendFeatureError(plan.fallback_reason)
+        if self.fallback_policy is FallbackPolicy.WARN:
+            import warnings
+
+            warnings.warn(plan.fallback_reason, RuntimeWarning, stacklevel=3)
+
+    def _execute_plan_impl(self, plan, *, stream=None, workspace=None):
+        if not plan.descs:
+            raise ValueError("MatmulPlan has no descriptors to execute")
+        if plan.kind == "gemm":
+            return self.matmul(plan.descs[0], stream=stream, workspace=workspace)
+        if plan.kind in ("batched_gemm", "strided_batched_gemm"):
+            return self.batched_matmul(plan.descs[0], stream=stream, workspace=workspace)
+        if plan.kind == "grouped_gemm":
+            return self.grouped_gemm(plan.descs, stream=stream, workspace=workspace)
+        if plan.kind in ("fallback_tensordot", "fallback_einsum"):
+            self._handle_plan_fallback(plan)
+            if len(plan.descs) != 1:
+                raise BackendFeatureError("fallback execution expects exactly one descriptor")
+            return self._loop_matmul(plan.descs[0], stream=stream, workspace=workspace)
+        raise BackendFeatureError("Unknown MatmulPlan kind {0!r}".format(plan.kind))
+
+    def _record_contraction_execute(self, plan, result, wall_s):
+        try:
+            from renormalizer.utils import profiling
+
+            if not profiling.should_record_op():
+                return
+            desc = plan.descs[0] if plan.descs else None
+            profiling.record(
+                "contraction_execute",
+                backend=self.name,
+                equation=None,
+                lowering=plan.kind,
+                input_shapes=[
+                    tuple(getattr(desc.A, "shape", ())),
+                    tuple(getattr(desc.B, "shape", ())),
+                ] if desc is not None else [],
+                output_shape=tuple(getattr(result, "shape", plan.output_shape)),
+                dtype=str(getattr(result, "dtype", None)),
+                device=str(self.current_device()),
+                flops=plan.estimated_flops,
+                read_bytes=sum(desc.estimated_read_bytes for desc in plan.descs),
+                write_bytes=sum(desc.estimated_write_bytes for desc in plan.descs),
+                copy_bytes=plan.copy_bytes,
+                workspace_bytes=plan.workspace_bytes,
+                largest_intermediate=getattr(result, "nbytes", None),
+                num_gemm=1 if plan.kind == "gemm" else 0,
+                num_batched_gemm=1 if plan.kind in ("batched_gemm", "strided_batched_gemm") else 0,
+                num_grouped_tasks=len(plan.descs) if plan.kind == "grouped_gemm" else 0,
+                num_blocks=0,
+                num_shape_buckets=0,
+                fallback_reason=plan.fallback_reason,
+                wall_s=wall_s,
+            )
+        except Exception:
+            pass
+
+    def execute_matmul_plan(self, plan, *, stream=None, workspace=None):
+        try:
+            from renormalizer.utils import profiling
+
+            should_profile = profiling.should_record_op()
+        except Exception:
+            should_profile = False
+        if should_profile:
+            import time
+
+            start = time.perf_counter()
+            result = self._execute_plan_impl(plan, stream=stream, workspace=workspace)
+            wall_s = time.perf_counter() - start
+            self._record_contraction_execute(plan, result, wall_s)
+            return result
+        return self._execute_plan_impl(plan, stream=stream, workspace=workspace)
 
     def sync(self):
         return None
