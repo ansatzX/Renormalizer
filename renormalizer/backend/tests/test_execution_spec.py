@@ -331,6 +331,27 @@ def test_replicate_tensor_and_single_process_collectives():
     assert backend.alltoall(x) is x
 
 
+def test_distributed_capabilities_advertise_collective_primitives():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class CollectiveBackend(NumpyBackend):
+        @property
+        def size(self):
+            return 2
+
+        @property
+        def is_distributed(self):
+            return True
+
+    capabilities = CollectiveBackend().capabilities
+
+    assert capabilities.distributed is True
+    assert capabilities.allreduce is True
+    assert capabilities.allgather is True
+    assert capabilities.reduce_scatter is True
+    assert capabilities.alltoall is True
+
+
 def test_jax_layout_transform_api_allows_same_size_device_reshape_when_available():
     try:
         __import__("jax")

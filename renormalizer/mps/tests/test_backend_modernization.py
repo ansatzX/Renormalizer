@@ -1368,6 +1368,17 @@ def test_backend_protocol_fallback_remains_structural_without_typing_extensions(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
+    required_execution_methods = {
+        "plan_contraction",
+        "plan_distributed_contraction_path",
+        "estimate_matmul",
+        "estimate_contraction",
+        "estimate_redistribute",
+        "execute",
+        "distributed_contract",
+    }
+    assert required_execution_methods <= set(module._BACKEND_PROTOCOL_RUNTIME_METHODS)
+
     attrs = {name: None for name in module._BACKEND_PROTOCOL_RUNTIME_ATTRS}
     attrs.update({name: (lambda *args, **kwargs: None) for name in module._BACKEND_PROTOCOL_RUNTIME_METHODS})
     fallback_backend = type("FallbackBackend", (), attrs)()
