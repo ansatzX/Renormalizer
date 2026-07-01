@@ -140,7 +140,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             contraction_path=True,
             custom_contraction_plan=True,
             distributed=self.is_distributed,
-            distributed_array=False,
+            distributed_array=True,
             allreduce=self.size > 1,
             allgather=self.size > 1,
             reduce_scatter=self.size > 1,
