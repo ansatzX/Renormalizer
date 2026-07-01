@@ -95,6 +95,8 @@ class BackendProxy:
     can_reshape_view = _delegate_backend_method("can_reshape_view")
     make_contiguous = _delegate_backend_method("make_contiguous")
     parse_einsum = _delegate_backend_method("parse_einsum")
+    unpack_masked_vectors = _delegate_backend_method("unpack_masked_vectors")
+    pack_masked_vectors = _delegate_backend_method("pack_masked_vectors")
     astype = _delegate_backend_method("astype")
     ascontiguousarray = _delegate_backend_method("ascontiguousarray")
     current_device = _delegate_backend_method("current_device")

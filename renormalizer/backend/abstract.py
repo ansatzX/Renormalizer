@@ -315,6 +315,50 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def synchronize(self, device=None, stream=None):
         return self.sync()
 
+    def unpack_masked_vectors(self, x: Any, spec):
+        mask = self._validated_packed_mask(spec)
+        shape = tuple(int(dim) for dim in getattr(x, "shape", ()))
+        if shape == (spec.packed_dim,):
+            struct = self._zeros_backend(spec.center_shape, getattr(x, "dtype", None))
+            return self._masked_set(struct, mask, x)
+        if shape != (spec.packed_dim, spec.nrhs):
+            raise ValueError(
+                "packed vector shape must be ({0},) or ({0}, {1}); got {2}"
+                .format(spec.packed_dim, spec.nrhs, shape)
+            )
+        struct = self._zeros_backend(spec.center_shape + (spec.nrhs,), getattr(x, "dtype", None))
+        struct = self._masked_set(struct, mask, x)
+        batch_axis = self._normalize_batch_axis(spec.batch_axis, len(spec.center_shape) + 1)
+        if batch_axis == len(spec.center_shape):
+            return struct
+        return self._move_axis(struct, len(spec.center_shape), batch_axis)
+
+    def pack_masked_vectors(self, x_struct: Any, spec):
+        mask = self._validated_packed_mask(spec)
+        shape = tuple(int(dim) for dim in getattr(x_struct, "shape", ()))
+        if shape == spec.center_shape:
+            return x_struct[mask]
+
+        ndim = len(spec.center_shape) + 1
+        batch_axis = self._normalize_batch_axis(spec.batch_axis, ndim)
+        expected_shape = list(spec.center_shape)
+        expected_shape.insert(batch_axis, spec.nrhs)
+        expected_shape = tuple(expected_shape)
+        if shape != expected_shape:
+            raise ValueError(
+                "center tensor shape must be {0} or {1}; got {2}"
+                .format(spec.center_shape, expected_shape, shape)
+            )
+        if batch_axis == len(spec.center_shape):
+            struct_last_batch = x_struct
+        else:
+            struct_last_batch = self._move_axis(x_struct, batch_axis, len(spec.center_shape))
+        packed = struct_last_batch[mask]
+        packed_shape = tuple(int(dim) for dim in getattr(packed, "shape", ()))
+        if packed_shape != (spec.packed_dim, spec.nrhs):
+            packed = self.reshape_view(packed, (spec.packed_dim, spec.nrhs))
+        return packed
+
     def lower_pair_contraction_to_matmul(self, spec):
         plan = lower_pair_contraction_to_matmul(spec, self.capabilities)
         try:
@@ -445,6 +489,55 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if xp_copy is not None:
             return xp_copy(x)
         return self.asarray(x)
+
+    def _validated_packed_mask(self, spec):
+        mask_host = _np.asarray(self.to_numpy(spec.qn_mask) if self.is_array(spec.qn_mask) else spec.qn_mask, dtype=bool)
+        if mask_host.shape != tuple(spec.center_shape):
+            raise ValueError(
+                "qn_mask shape must match center_shape {0}; got {1}"
+                .format(spec.center_shape, mask_host.shape)
+            )
+        if int(mask_host.sum()) != int(spec.packed_dim):
+            raise ValueError(
+                "packed_dim must match qn_mask true count {0}; got {1}"
+                .format(int(mask_host.sum()), spec.packed_dim)
+            )
+        return self.to_backend(mask_host)
+
+    def _zeros_backend(self, shape, dtype):
+        xp = self.array_namespace or _np
+        if self.name == "torch":
+            kwargs = {"dtype": dtype}
+            if hasattr(self, "_kwargs_with_configured_device"):
+                kwargs = self._kwargs_with_configured_device(kwargs)
+            return xp.zeros(tuple(shape), **kwargs)
+        return xp.zeros(tuple(shape), dtype=dtype)
+
+    def _masked_set(self, array, mask, values):
+        at = getattr(array, "at", None)
+        if at is not None:
+            return at[mask].set(values)
+        array[mask] = values
+        return array
+
+    @staticmethod
+    def _normalize_batch_axis(batch_axis, ndim):
+        axis = int(batch_axis)
+        if axis < 0:
+            axis += int(ndim)
+        if axis < 0 or axis >= int(ndim):
+            raise ValueError("batch_axis {0} is out of bounds for ndim {1}".format(batch_axis, ndim))
+        return axis
+
+    def _move_axis(self, array, source, destination):
+        xp = self.array_namespace or _np
+        moveaxis = getattr(xp, "moveaxis", None)
+        if moveaxis is not None:
+            return moveaxis(array, source, destination)
+        movedim = getattr(xp, "movedim", None)
+        if movedim is not None:
+            return movedim(array, source, destination)
+        return _np.moveaxis(array, source, destination)
 
     def _transpose_modes(self, array, current_modes, target_modes):
         current_modes = tuple(current_modes)

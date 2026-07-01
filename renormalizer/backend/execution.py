@@ -348,6 +348,30 @@ def parse_einsum(equation, *operands, constants=(), optimize=None) -> EinsumSpec
 
 
 @dataclass(frozen=True)
+class PackedVectorSpec:
+    qn_mask: Any
+    center_shape: tuple[int, ...]
+    batch_axis: int = -1
+    packed_dim: int = 0
+    nrhs: int = 1
+
+    def __post_init__(self):
+        center_shape = tuple(int(dim) for dim in self.center_shape)
+        packed_dim = int(self.packed_dim)
+        nrhs = int(self.nrhs)
+        if any(dim < 0 for dim in center_shape):
+            raise ValueError("center_shape dimensions must be non-negative")
+        if packed_dim < 0:
+            raise ValueError("packed_dim must be non-negative")
+        if nrhs < 1:
+            raise ValueError("nrhs must be positive")
+        object.__setattr__(self, "center_shape", center_shape)
+        object.__setattr__(self, "batch_axis", int(self.batch_axis))
+        object.__setattr__(self, "packed_dim", packed_dim)
+        object.__setattr__(self, "nrhs", nrhs)
+
+
+@dataclass(frozen=True)
 class PairContractionSpec:
     left: TensorOperand
     right: TensorOperand

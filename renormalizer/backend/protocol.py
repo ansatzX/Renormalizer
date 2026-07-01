@@ -61,6 +61,8 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "can_reshape_view",
     "make_contiguous",
     "parse_einsum",
+    "unpack_masked_vectors",
+    "pack_masked_vectors",
     "astype",
     "ascontiguousarray",
     "current_device",
@@ -328,6 +330,14 @@ class BackendProtocol(Protocol):
 
     def parse_einsum(self, equation: str, *operands: Any, **kwargs: Any) -> Any:
         """Parse an explicit einsum equation into backend contraction IR."""
+        ...
+
+    def unpack_masked_vectors(self, x: Any, spec: Any) -> Any:
+        """Unpack one or more packed masked vectors into a structured center tensor."""
+        ...
+
+    def pack_masked_vectors(self, x_struct: Any, spec: Any) -> Any:
+        """Pack a structured center tensor through its mask into vector form."""
         ...
 
     def current_device(self) -> Any:

@@ -138,6 +138,60 @@ def test_jax_layout_transform_api_allows_same_size_device_reshape_when_available
     assert tuple(reshaped.shape) == (4, 3)
 
 
+def test_packed_vector_spec_roundtrips_single_and_batched_rhs():
+    from renormalizer.backend.execution import PackedVectorSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mask = np.array([[True, False, True], [False, True, False]])
+
+    single_spec = PackedVectorSpec(qn_mask=mask, center_shape=mask.shape, packed_dim=3, nrhs=1)
+    single = np.array([1.0, 2.0, 3.0])
+    single_struct = backend.unpack_masked_vectors(single, single_spec)
+    assert single_struct.shape == mask.shape
+    assert np.array_equal(single_struct[mask], single)
+    assert np.array_equal(single_struct[~mask], np.zeros(np.count_nonzero(~mask)))
+    assert np.array_equal(backend.pack_masked_vectors(single_struct, single_spec), single)
+
+    batched_spec = PackedVectorSpec(qn_mask=mask, center_shape=mask.shape, packed_dim=3, nrhs=2)
+    batched = np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]])
+    batched_struct = backend.unpack_masked_vectors(batched, batched_spec)
+    assert batched_struct.shape == mask.shape + (2,)
+    assert np.array_equal(batched_struct[mask], batched)
+    assert np.array_equal(backend.pack_masked_vectors(batched_struct, batched_spec), batched)
+
+
+def test_packed_vector_spec_supports_non_last_batch_axis():
+    from renormalizer.backend.execution import PackedVectorSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mask = np.array([[True, False, True], [False, True, False]])
+    spec = PackedVectorSpec(qn_mask=mask, center_shape=mask.shape, batch_axis=0, packed_dim=3, nrhs=2)
+    packed = np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]])
+
+    struct = backend.unpack_masked_vectors(packed, spec)
+
+    assert struct.shape == (2,) + mask.shape
+    assert np.array_equal(np.moveaxis(struct, 0, -1)[mask], packed)
+    assert np.array_equal(backend.pack_masked_vectors(struct, spec), packed)
+
+
+def test_packed_vector_spec_rejects_wrong_packed_shapes():
+    from renormalizer.backend.execution import PackedVectorSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mask = np.array([[True, False, True], [False, True, False]])
+    spec = PackedVectorSpec(qn_mask=mask, center_shape=mask.shape, packed_dim=3, nrhs=2)
+
+    with pytest.raises(ValueError, match="packed vector shape"):
+        backend.unpack_masked_vectors(np.ones((4, 2)), spec)
+
+    with pytest.raises(ValueError, match="center tensor shape"):
+        backend.pack_masked_vectors(np.ones(mask.shape + (3,)), spec)
+
+
 def test_pair_contraction_lowering_reports_gemm_shape_and_costs():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend
