@@ -10,9 +10,14 @@ from renormalizer.backend.execution import (
     BackendCapabilities,
     BackendCopyError,
     BackendFeatureError,
+    BlockTensor,
     CopyPolicy,
     DeviceSpec,
     FallbackPolicy,
+    DenseBlock,
+    GroupedGemmPlan,
+    PairContractionSpec,
+    TensorOperand,
     array_info_for_backend,
     layout_from_array,
     legacy_device_kind,
@@ -419,6 +424,145 @@ class AbstractBackend(SingleProcessDistributedMixin):
         except Exception:
             pass
         return plan
+
+    @staticmethod
+    def _block_sort_key(item):
+        key = item[0]
+        qn_left = getattr(key, "qn_left", None)
+        qn_right = getattr(key, "qn_right", None)
+        extra = getattr(key, "extra", None)
+        if qn_left is not None and qn_right is not None:
+            return ("block_key", tuple(qn_left), tuple(qn_right), tuple(extra or ()), repr(key))
+        return (type(key).__name__, repr(key))
+
+    @staticmethod
+    def _is_zero_sized_block(block):
+        shape = tuple(int(dim) for dim in getattr(block, "shape", getattr(block.array, "shape", ())))
+        if shape:
+            return any(dim == 0 for dim in shape)
+        numel = getattr(block.array, "numel", None)
+        if callable(numel):
+            return int(numel()) == 0
+        size = getattr(block.array, "size", None)
+        if callable(size):
+            size = size()
+        if size is None:
+            return False
+        if isinstance(size, (tuple, list)):
+            product = 1
+            for dim in size:
+                product *= int(dim)
+            return product == 0
+        return int(size) == 0
+
+    @staticmethod
+    def _bucketed_by_desc_shape(descs):
+        buckets = {}
+        for index, desc in enumerate(descs):
+            key = (int(desc.m), int(desc.n), int(desc.k))
+            buckets.setdefault(key, []).append(index)
+        return {key: tuple(indices) for key, indices in buckets.items()}
+
+    def lower_block_contraction(self, spec):
+        descs = []
+        output_blocks = []
+        global_shape = None
+        for left_key, left_block in sorted(spec.left.blocks.items(), key=self._block_sort_key):
+            if self._is_zero_sized_block(left_block):
+                continue
+            for right_key, right_block in sorted(spec.right.blocks.items(), key=self._block_sort_key):
+                if self._is_zero_sized_block(right_block):
+                    continue
+                output_key = spec.qn_rule(left_key, right_key)
+                if output_key is None:
+                    continue
+                pair_spec = PairContractionSpec.from_operands(
+                    TensorOperand(left_block.array, tuple(left_block.modes), name="left"),
+                    TensorOperand(right_block.array, tuple(right_block.modes), name="right"),
+                    output_modes=spec.output_modes,
+                )
+                plan = lower_pair_contraction_to_matmul(pair_spec, self.capabilities)
+                if plan.kind == "fallback_tensordot":
+                    self._handle_plan_fallback(plan)
+                if not plan.descs:
+                    raise BackendFeatureError("block contraction lowering produced no GEMM descriptors")
+                desc = plan.descs[0]
+                descs.append(desc)
+                output_blocks.append(output_key)
+                if global_shape is None:
+                    global_shape = tuple(plan.output_shape)
+
+        repeated_outputs = len(set(output_blocks)) != len(output_blocks)
+        return GroupedGemmPlan(
+            tasks=tuple(descs),
+            output_blocks=tuple(output_blocks),
+            bucketed_by_shape=self._bucketed_by_desc_shape(descs),
+            scatter_add_required=bool(repeated_outputs and spec.accumulate),
+            estimated_flops=sum(int(desc.estimated_flops) for desc in descs),
+            estimated_read_bytes=sum(int(desc.estimated_read_bytes) for desc in descs),
+            estimated_write_bytes=sum(int(desc.estimated_write_bytes) for desc in descs),
+            estimated_workspace_bytes=sum(int(desc.estimated_workspace_bytes) for desc in descs),
+            output_modes=tuple(spec.output_modes),
+            global_shape=global_shape or (),
+            block_axis_meta={
+                "left": spec.left.block_axis_meta,
+                "right": spec.right.block_axis_meta,
+            },
+            backend=self.name,
+        )
+
+    def execute_grouped_gemm_plan(self, plan, *, pack_threshold=4, stream=None, workspace=None):
+        if len(plan.tasks) != len(plan.output_blocks):
+            raise ValueError("GroupedGemmPlan tasks and output_blocks must have the same length")
+        flat_outputs = {}
+        task_groups = {}
+        tasks = []
+        task_output_keys = []
+        functional_accumulation = self.name == "jax"
+        for desc, output_key in zip(plan.tasks, plan.output_blocks):
+            a, b, groups = self._prepare_matmul_desc(desc)
+            if output_key not in flat_outputs:
+                dtype = getattr(desc, "dtype_output", None) or getattr(a, "dtype", None)
+                flat_outputs[output_key] = self._zeros_backend((desc.m, desc.n), dtype)
+                task_groups[output_key] = groups
+            tasks.append(
+                GemmTask(
+                    a,
+                    b,
+                    C=None if functional_accumulation else flat_outputs[output_key],
+                    trans_a=desc.trans_a,
+                    trans_b=desc.trans_b,
+                    conj_a=desc.conj_a,
+                    conj_b=desc.conj_b,
+                    alpha=desc.alpha,
+                    beta=1.0,
+                    tag=output_key,
+                )
+            )
+            task_output_keys.append(output_key)
+
+        if tasks:
+            results = self.grouped_gemm(tasks, pack_threshold=pack_threshold, stream=stream, workspace=workspace)
+            if functional_accumulation:
+                for output_key, result in zip(task_output_keys, results):
+                    flat_outputs[output_key] = flat_outputs[output_key] + result
+
+        blocks = {}
+        for output_key in sorted(flat_outputs, key=lambda key: self._block_sort_key((key, None))):
+            array = self._finalize_matmul_result(flat_outputs[output_key], task_groups[output_key])
+            blocks[output_key] = DenseBlock(
+                key=output_key,
+                array=array,
+                modes=tuple(plan.output_modes),
+                shape=tuple(getattr(array, "shape", ())),
+            )
+        return BlockTensor(
+            blocks=blocks,
+            global_shape=tuple(plan.global_shape),
+            modes=tuple(plan.output_modes),
+            block_axis_meta=plan.block_axis_meta,
+            backend=self.name,
+        )
 
     def _desc_mode_groups(self, desc):
         if desc.layout_a is None or desc.layout_b is None or desc.layout_c is None:

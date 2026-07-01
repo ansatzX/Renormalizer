@@ -446,6 +446,216 @@ def test_grouped_gemm_records_bucketed_fallback_profile(tmp_path):
     assert event["wall_s"] >= 0.0
 
 
+def test_lower_block_contraction_builds_deterministic_grouped_gemm_plan():
+    from renormalizer.backend import (
+        BlockContractionSpec,
+        BlockKey,
+        BlockTensor,
+        DenseBlock,
+    )
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    out_key = BlockKey((0,), (1,))
+    skipped_key = BlockKey((3,), (4,))
+    left_blocks = {
+        BlockKey((0,), (2,), extra=("second",)): DenseBlock(
+            BlockKey((0,), (2,), extra=("second",)),
+            np.full((2, 3), 2.0),
+            ("i", "k"),
+            (2, 3),
+        ),
+        BlockKey((0,), (0,), extra=("first",)): DenseBlock(
+            BlockKey((0,), (0,), extra=("first",)),
+            np.ones((2, 3)),
+            ("i", "k"),
+            (2, 3),
+        ),
+    }
+    right_blocks = {
+        BlockKey((2,), (1,)): DenseBlock(
+            BlockKey((2,), (1,)),
+            np.ones((3, 4)),
+            ("k", "j"),
+            (3, 4),
+        ),
+        BlockKey((3,), (4,)): DenseBlock(
+            BlockKey((3,), (4,)),
+            np.ones((0, 4)),
+            ("k", "j"),
+            (0, 4),
+        ),
+        BlockKey((0,), (1,)): DenseBlock(
+            BlockKey((0,), (1,)),
+            np.full((3, 4), 3.0),
+            ("k", "j"),
+            (3, 4),
+        ),
+    }
+    left = BlockTensor(left_blocks, global_shape=(2, 3), modes=("i", "k"), block_axis_meta=None, backend="numpy")
+    right = BlockTensor(right_blocks, global_shape=(3, 4), modes=("k", "j"), block_axis_meta=None, backend="numpy")
+
+    def qn_rule(left_key, right_key):
+        if left_key.qn_right != right_key.qn_left:
+            return None
+        if right_key == skipped_key:
+            raise AssertionError("zero block should not be materialized")
+        return BlockKey(left_key.qn_left, right_key.qn_right)
+
+    plan = backend.lower_block_contraction(
+        BlockContractionSpec(left, right, output_modes=("i", "j"), qn_rule=qn_rule)
+    )
+
+    assert plan.output_blocks == (out_key, out_key)
+    assert [(desc.m, desc.n, desc.k) for desc in plan.tasks] == [(2, 4, 3), (2, 4, 3)]
+    assert plan.bucketed_by_shape == {(2, 4, 3): (0, 1)}
+    assert plan.scatter_add_required is True
+    assert plan.estimated_flops == 96
+    assert plan.estimated_read_bytes == 288
+    assert plan.estimated_write_bytes == 128
+    assert plan.output_modes == ("i", "j")
+
+
+def test_execute_grouped_gemm_plan_accumulates_sparse_output_blocks():
+    from renormalizer.backend import (
+        BlockContractionSpec,
+        BlockKey,
+        BlockTensor,
+        DenseBlock,
+    )
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    out_key = BlockKey((0,), (1,))
+    left_blocks = {
+        BlockKey((0,), (0,)): DenseBlock(BlockKey((0,), (0,)), np.ones((2, 3)), ("i", "k"), (2, 3)),
+        BlockKey((0,), (2,)): DenseBlock(BlockKey((0,), (2,)), np.full((2, 3), 2.0), ("i", "k"), (2, 3)),
+    }
+    right_blocks = {
+        BlockKey((0,), (1,)): DenseBlock(BlockKey((0,), (1,)), np.full((3, 4), 3.0), ("k", "j"), (3, 4)),
+        BlockKey((2,), (1,)): DenseBlock(BlockKey((2,), (1,)), np.ones((3, 4)), ("k", "j"), (3, 4)),
+    }
+    left = BlockTensor(left_blocks, global_shape=(2, 3), modes=("i", "k"), block_axis_meta={"left": True}, backend="numpy")
+    right = BlockTensor(right_blocks, global_shape=(3, 4), modes=("k", "j"), block_axis_meta={"right": True}, backend="numpy")
+    spec = BlockContractionSpec(
+        left,
+        right,
+        output_modes=("i", "j"),
+        qn_rule=lambda left_key, right_key: (
+            BlockKey(left_key.qn_left, right_key.qn_right)
+            if left_key.qn_right == right_key.qn_left
+            else None
+        ),
+    )
+
+    plan = backend.lower_block_contraction(spec)
+    result = backend.execute_grouped_gemm_plan(plan, pack_threshold=2)
+
+    expected = left_blocks[BlockKey((0,), (0,))].array @ right_blocks[BlockKey((0,), (1,))].array
+    expected += left_blocks[BlockKey((0,), (2,))].array @ right_blocks[BlockKey((2,), (1,))].array
+    assert result.modes == ("i", "j")
+    assert result.global_shape == (2, 4)
+    assert result.backend == "numpy"
+    assert tuple(result.blocks) == (out_key,)
+    assert np.allclose(result.blocks[out_key].array, expected)
+    assert result.blocks[out_key].shape == (2, 4)
+
+
+def test_torch_block_contraction_lowering_accepts_tensor_size_method_when_available():
+    from renormalizer.backend import (
+        BlockContractionSpec,
+        BlockKey,
+        BlockTensor,
+        DenseBlock,
+    )
+    from renormalizer.backend.config import BackendConfig
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available("torch"):
+        pytest.skip("torch unavailable")
+
+    backend = create_backend("torch", config=BackendConfig(device="cpu"))
+    left_key = BlockKey((0,), (0,))
+    right_key = BlockKey((0,), (1,))
+    left_array = backend.to_backend(np.ones((2, 3), dtype=np.float64))
+    right_array = backend.to_backend(np.ones((3, 4), dtype=np.float64))
+    spec = BlockContractionSpec(
+        BlockTensor(
+            {left_key: DenseBlock(left_key, left_array, ("i", "k"), (2, 3))},
+            global_shape=(2, 3),
+            modes=("i", "k"),
+            block_axis_meta=None,
+            backend="torch",
+        ),
+        BlockTensor(
+            {right_key: DenseBlock(right_key, right_array, ("k", "j"), (3, 4))},
+            global_shape=(3, 4),
+            modes=("k", "j"),
+            block_axis_meta=None,
+            backend="torch",
+        ),
+        output_modes=("i", "j"),
+        qn_rule=lambda left, right: BlockKey(left.qn_left, right.qn_right),
+    )
+
+    plan = backend.lower_block_contraction(spec)
+
+    assert [(desc.m, desc.n, desc.k) for desc in plan.tasks] == [(2, 4, 3)]
+
+
+def test_jax_grouped_gemm_plan_accumulates_sparse_blocks_when_available():
+    from renormalizer.backend import (
+        BlockContractionSpec,
+        BlockKey,
+        BlockTensor,
+        DenseBlock,
+    )
+    from renormalizer.backend.config import BackendConfig
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available("jax"):
+        pytest.skip("jax unavailable")
+
+    try:
+        backend = create_backend("jax", config=BackendConfig(device="cpu"))
+    except (ImportError, ValueError, RuntimeError) as exc:
+        pytest.skip("jax backend unavailable: {0}".format(exc))
+
+    out_key = BlockKey((0,), (1,))
+    left_np = {
+        BlockKey((0,), (0,)): np.ones((2, 3), dtype=np.float64),
+        BlockKey((0,), (2,)): np.full((2, 3), 2.0, dtype=np.float64),
+    }
+    right_np = {
+        BlockKey((0,), (1,)): np.full((3, 4), 3.0, dtype=np.float64),
+        BlockKey((2,), (1,)): np.ones((3, 4), dtype=np.float64),
+    }
+    left_blocks = {
+        key: DenseBlock(key, backend.to_backend(value), ("i", "k"), value.shape)
+        for key, value in left_np.items()
+    }
+    right_blocks = {
+        key: DenseBlock(key, backend.to_backend(value), ("k", "j"), value.shape)
+        for key, value in right_np.items()
+    }
+    spec = BlockContractionSpec(
+        BlockTensor(left_blocks, global_shape=(2, 3), modes=("i", "k"), block_axis_meta=None, backend="jax"),
+        BlockTensor(right_blocks, global_shape=(3, 4), modes=("k", "j"), block_axis_meta=None, backend="jax"),
+        output_modes=("i", "j"),
+        qn_rule=lambda left, right: (
+            BlockKey(left.qn_left, right.qn_right)
+            if left.qn_right == right.qn_left
+            else None
+        ),
+    )
+
+    result = backend.execute_grouped_gemm_plan(backend.lower_block_contraction(spec), pack_threshold=2)
+
+    expected = left_np[BlockKey((0,), (0,))] @ right_np[BlockKey((0,), (1,))]
+    expected += left_np[BlockKey((0,), (2,))] @ right_np[BlockKey((2,), (1,))]
+    assert np.allclose(backend.to_numpy(result.blocks[out_key].array), expected)
+
+
 def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend

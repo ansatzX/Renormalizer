@@ -69,7 +69,9 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "set_device",
     "device_count",
     "lower_pair_contraction_to_matmul",
+    "lower_block_contraction",
     "execute_matmul_plan",
+    "execute_grouped_gemm_plan",
     "matmul",
     "batched_matmul",
     "grouped_gemm",
@@ -356,8 +358,16 @@ class BackendProtocol(Protocol):
         """Lower a mode-labeled pair contraction to a matmul execution plan."""
         ...
 
+    def lower_block_contraction(self, spec: Any) -> Any:
+        """Lower a block-sparse contraction to a grouped GEMM plan."""
+        ...
+
     def execute_matmul_plan(self, plan: Any, **kwargs: Any) -> Any:
         """Execute a matmul plan using this backend's primitives or recorded fallback."""
+        ...
+
+    def execute_grouped_gemm_plan(self, plan: Any, **kwargs: Any) -> Any:
+        """Execute a grouped GEMM plan and return a sparse block tensor."""
         ...
 
     def matmul(self, A: Any, B: Any = None, **kwargs: Any) -> Any:

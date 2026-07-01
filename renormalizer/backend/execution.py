@@ -455,6 +455,45 @@ class MatmulPlan:
     fallback_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class BlockKey:
+    qn_left: tuple[int, ...]
+    qn_right: tuple[int, ...]
+    extra: tuple[Any, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "qn_left", tuple(self.qn_left))
+        object.__setattr__(self, "qn_right", tuple(self.qn_right))
+        object.__setattr__(self, "extra", tuple(self.extra))
+
+
+@dataclass(frozen=True)
+class GroupedGemmPlan:
+    tasks: tuple[MatmulDesc, ...]
+    output_blocks: tuple[Any, ...]
+    bucketed_by_shape: dict[tuple[int, int, int], tuple[int, ...]]
+    scatter_add_required: bool
+    estimated_flops: int
+    estimated_read_bytes: int
+    estimated_write_bytes: int
+    estimated_workspace_bytes: int
+    output_modes: tuple[Hashable, ...] = ()
+    global_shape: tuple[int, ...] = ()
+    block_axis_meta: Any = None
+    backend: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "tasks", tuple(self.tasks))
+        object.__setattr__(self, "output_blocks", tuple(self.output_blocks))
+        object.__setattr__(self, "output_modes", tuple(self.output_modes))
+        object.__setattr__(self, "global_shape", tuple(int(dim) for dim in self.global_shape))
+        bucketed = {
+            tuple(int(dim) for dim in shape): tuple(int(index) for index in indices)
+            for shape, indices in self.bucketed_by_shape.items()
+        }
+        object.__setattr__(self, "bucketed_by_shape", bucketed)
+
+
 def _mode_sizes(operand: TensorOperand) -> Mapping[Hashable, int]:
     return {mode: int(dim) for mode, dim in zip(operand.modes, _shape_of(operand.array))}
 
