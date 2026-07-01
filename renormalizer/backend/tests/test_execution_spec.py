@@ -1805,6 +1805,69 @@ def test_estimate_redistribute_records_communication_cost():
     assert estimate.total_s == pytest.approx(2.25)
 
 
+def test_sharding_spec_can_replicate_over_unused_mesh_axes():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+
+    mesh = DeviceMesh(
+        devices=tuple(DeviceSpec("cpu", global_rank=rank) for rank in range(4)),
+        shape=(2, 2),
+        axis_names=("row", "col"),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+
+    spec = ShardingSpec(
+        global_shape=(8, 4),
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "row"},
+    )
+
+    assert spec.sharded_modes == ("i",)
+    assert spec.replicated_modes == ("k",)
+    assert spec.local_slices[0] == (slice(0, 4), slice(None))
+    assert spec.local_slices[1] == (slice(0, 4), slice(None))
+    assert spec.local_slices[2] == (slice(4, 8), slice(None))
+    assert spec.local_slices[3] == (slice(4, 8), slice(None))
+
+
+def test_auto_distributed_dense_plan_uses_multi_axis_output_sharding():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=tuple(DeviceSpec("cpu", global_rank=rank) for rank in range(4)),
+        shape=(2, 2),
+        axis_names=("row", "col"),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(32, dtype=np.float64).reshape(8, 4)
+    right = np.arange(24, dtype=np.float64).reshape(4, 6)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+
+    distributed_path = backend.plan_distributed_contraction_path(
+        dense_path,
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=HardwareModel(network_bandwidth_Bps=80.0, latency_s=0.25),
+    )
+    result = backend.execute(distributed_path)
+
+    assert distributed_path.output_sharding.sharded_modes == ("i", "j")
+    assert distributed_path.output_sharding.ranks_per_mode == {"i": 2, "j": 2}
+    assert distributed_path.output_sharding.mode_to_mesh_axis == {"i": "row", "j": "col"}
+    assert distributed_path.output_sharding.local_slices[0] == (slice(0, 4), slice(0, 3))
+    assert distributed_path.output_sharding.local_slices[3] == (slice(4, 8), slice(3, 6))
+    assert result.local_shape == (4, 3)
+    assert np.allclose(result.local_array, (left @ right)[:4, :3])
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
 def test_workspace_stream_and_unified_execute_api_are_explicit():
     from renormalizer.backend import StreamEvent, Workspace
     from renormalizer.backend.execution import DeviceSpec

@@ -252,33 +252,80 @@ class ShardingSpec:
         unknown_modes = set(ranks_per_mode) - set(modes)
         if unknown_modes:
             raise ValueError("ranks_per_mode contains modes not present in tensor modes: {0}".format(sorted(unknown_modes)))
+        mode_to_mesh_axis = dict(self.mode_to_mesh_axis)
+        unknown_axis_modes = set(mode_to_mesh_axis) - set(modes)
+        if unknown_axis_modes:
+            raise ValueError("mode_to_mesh_axis contains modes not present in tensor modes: {0}".format(sorted(unknown_axis_modes)))
+        mesh_axis_to_index = {axis: index for index, axis in enumerate(self.mesh.axis_names)}
+        unknown_axes = set(mode_to_mesh_axis.values()) - set(mesh_axis_to_index)
+        if unknown_axes:
+            raise ValueError("mode_to_mesh_axis contains unknown mesh axes: {0}".format(sorted(unknown_axes)))
         sharded_modes = tuple(self.sharded_modes) or tuple(mode for mode in modes if ranks_per_mode.get(mode, 1) > 1)
         replicated_modes = tuple(self.replicated_modes) or tuple(mode for mode in modes if mode not in sharded_modes)
         if set(sharded_modes) & set(replicated_modes):
             raise ValueError("sharded_modes and replicated_modes must not overlap")
         if set(sharded_modes) | set(replicated_modes) != set(modes):
             raise ValueError("sharded_modes and replicated_modes must cover all modes")
+        mapped_axes = [mode_to_mesh_axis[mode] for mode in sharded_modes if mode in mode_to_mesh_axis]
+        if len(mapped_axes) != len(set(mapped_axes)):
+            raise ValueError("multiple sharded modes cannot map to the same mesh axis")
+        for mode in sharded_modes:
+            if mode not in mode_to_mesh_axis:
+                continue
+            axis = mode_to_mesh_axis[mode]
+            axis_parts = self.mesh.shape[mesh_axis_to_index[axis]]
+            requested_parts = ranks_per_mode.get(mode, axis_parts)
+            if requested_parts != axis_parts:
+                raise ValueError(
+                    "ranks_per_mode for mode {0!r} must match mesh axis {1!r} size {2}"
+                    .format(mode, axis, axis_parts)
+                )
+            ranks_per_mode[mode] = axis_parts
         shard_parts = tuple(ranks_per_mode.get(mode, 1) for mode in sharded_modes)
         shard_world = _prod(shard_parts)
-        if sharded_modes and shard_world != self.mesh.world_size:
+        has_axis_mapping = all(mode in mode_to_mesh_axis for mode in sharded_modes)
+        if sharded_modes and not has_axis_mapping and shard_world != self.mesh.world_size:
             raise ValueError("product of sharded ranks_per_mode must match mesh world_size")
         local_slices = self.local_slices
         if local_slices is None:
-            local_slices = self._compute_local_slices(global_shape, modes, sharded_modes, shard_parts)
+            local_slices = self._compute_local_slices(
+                global_shape,
+                modes,
+                sharded_modes,
+                shard_parts,
+                mode_to_mesh_axis,
+                mesh_axis_to_index,
+            )
         else:
             local_slices = {int(rank): tuple(slices) for rank, slices in local_slices.items()}
         object.__setattr__(self, "global_shape", global_shape)
         object.__setattr__(self, "modes", modes)
         object.__setattr__(self, "ranks_per_mode", ranks_per_mode)
-        object.__setattr__(self, "mode_to_mesh_axis", dict(self.mode_to_mesh_axis))
+        object.__setattr__(self, "mode_to_mesh_axis", mode_to_mesh_axis)
         object.__setattr__(self, "replicated_modes", replicated_modes)
         object.__setattr__(self, "sharded_modes", sharded_modes)
         object.__setattr__(self, "local_slices", local_slices)
 
-    def _compute_local_slices(self, global_shape, modes, sharded_modes, shard_parts):
+    def _compute_local_slices(self, global_shape, modes, sharded_modes, shard_parts, mode_to_mesh_axis, mesh_axis_to_index):
         if not sharded_modes:
             full_slice = tuple(slice(None) for _ in global_shape)
             return {rank: full_slice for rank in range(self.mesh.world_size)}
+        if all(mode in mode_to_mesh_axis for mode in sharded_modes):
+            result = {}
+            for rank in range(self.mesh.world_size):
+                mesh_coords = _rank_coordinates(rank, self.mesh.shape)
+                slices = []
+                for axis, mode in enumerate(modes):
+                    if mode in sharded_modes:
+                        mesh_axis = mode_to_mesh_axis[mode]
+                        mesh_position = mesh_axis_to_index[mesh_axis]
+                        parts = self.mesh.shape[mesh_position]
+                        coord = mesh_coords[mesh_position]
+                        slices.append(_split_slice(global_shape[axis], parts, coord))
+                    else:
+                        slices.append(slice(None))
+                result[rank] = tuple(slices)
+            return result
         sharded_mode_to_position = {mode: index for index, mode in enumerate(sharded_modes)}
         result = {}
         for rank in range(self.mesh.world_size):

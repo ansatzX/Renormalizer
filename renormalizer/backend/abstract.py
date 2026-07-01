@@ -497,24 +497,38 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def _derive_output_sharding(self, dist_spec, input_modes, output_modes, output_shape, *, use_requested=True):
         if use_requested and dist_spec.output_sharding is not None:
             return dist_spec.output_sharding
-        source = next((operand for operand in dist_spec.operands if isinstance(operand, DistributedTensor)), None)
-        if source is None:
+        sources = tuple(operand for operand in dist_spec.operands if isinstance(operand, DistributedTensor))
+        if not sources:
             return None
-        sharded_modes = tuple(mode for mode in output_modes if mode in source.sharding.sharded_modes)
-        ranks_per_mode = {
-            mode: source.sharding.ranks_per_mode[mode]
-            for mode in sharded_modes
-            if mode in source.sharding.ranks_per_mode
-        }
-        mode_to_mesh_axis = {
-            mode: source.sharding.mode_to_mesh_axis[mode]
-            for mode in sharded_modes
-            if mode in source.sharding.mode_to_mesh_axis
-        }
+        source = sources[0]
+        mesh = source.mesh
+        ranks_per_mode = {}
+        mode_to_mesh_axis = {}
+        selected_modes = []
+        used_mesh_axes = set()
+        for operand in sources:
+            if operand.mesh != mesh:
+                continue
+            for mode in output_modes:
+                if mode not in operand.sharding.sharded_modes:
+                    continue
+                if mode in selected_modes:
+                    continue
+                mesh_axis = operand.sharding.mode_to_mesh_axis.get(mode)
+                if mesh_axis is not None and mesh_axis in used_mesh_axes:
+                    continue
+                selected_modes.append(mode)
+                if mesh_axis is not None:
+                    used_mesh_axes.add(mesh_axis)
+                if mode in operand.sharding.ranks_per_mode:
+                    ranks_per_mode[mode] = operand.sharding.ranks_per_mode[mode]
+                if mesh_axis is not None:
+                    mode_to_mesh_axis[mode] = mesh_axis
+        sharded_modes = tuple(mode for mode in output_modes if mode in set(selected_modes))
         return ShardingSpec(
             global_shape=output_shape,
             modes=output_modes,
-            mesh=source.mesh,
+            mesh=mesh,
             ranks_per_mode=ranks_per_mode,
             mode_to_mesh_axis=mode_to_mesh_axis,
             sharded_modes=sharded_modes,
@@ -982,16 +996,34 @@ class AbstractBackend(SingleProcessDistributedMixin):
         output_shape = self._output_shape_for_contraction_plan(path)
         if not path.output_modes:
             raise BackendFeatureError("cannot distribute scalar contraction output automatically")
-        candidates = list(zip(path.output_modes, output_shape))
-        selected_mode, _ = max(candidates, key=lambda item: (int(item[1]) >= int(mesh.world_size), int(item[1])))
+        candidates = sorted(
+            list(zip(path.output_modes, output_shape)),
+            key=lambda item: (int(item[1]) >= 2, int(item[1])),
+            reverse=True,
+        )
+        assignments = {}
+        used_modes = set()
+        for axis_name, axis_size in zip(mesh.axis_names, mesh.shape):
+            if int(axis_size) <= 1:
+                continue
+            candidate = next((item for item in candidates if item[0] not in used_modes), None)
+            if candidate is None:
+                break
+            mode, _ = candidate
+            used_modes.add(mode)
+            assignments[mode] = (axis_name, int(axis_size))
+        if not assignments:
+            selected_mode, _ = candidates[0]
+            assignments[selected_mode] = (mesh.axis_names[0], int(mesh.shape[0]))
+        sharded_modes = tuple(mode for mode in path.output_modes if mode in assignments)
         return ShardingSpec(
             global_shape=output_shape,
             modes=path.output_modes,
             mesh=mesh,
-            ranks_per_mode={selected_mode: int(mesh.world_size)},
-            mode_to_mesh_axis={selected_mode: mesh.axis_names[0]},
-            sharded_modes=(selected_mode,),
-            replicated_modes=tuple(mode for mode in path.output_modes if mode != selected_mode),
+            ranks_per_mode={mode: parts for mode, (_, parts) in assignments.items()},
+            mode_to_mesh_axis={mode: axis_name for mode, (axis_name, _) in assignments.items()},
+            sharded_modes=sharded_modes,
+            replicated_modes=tuple(mode for mode in path.output_modes if mode not in sharded_modes),
         )
 
     def _auto_distributed_plan_from_dense_path(self, path, mesh):
