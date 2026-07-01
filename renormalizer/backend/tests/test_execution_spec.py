@@ -1868,6 +1868,39 @@ def test_auto_distributed_dense_plan_uses_multi_axis_output_sharding():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_auto_distributed_dense_plan_reports_local_step_costs():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=tuple(DeviceSpec("cpu", global_rank=rank) for rank in range(4)),
+        shape=(2, 2),
+        axis_names=("row", "col"),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(32, dtype=np.float64).reshape(8, 4)
+    right = np.arange(24, dtype=np.float64).reshape(4, 6)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+
+    distributed_path = backend.plan_distributed_contraction_path(
+        dense_path,
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=HardwareModel(flop_per_s=48.0, network_bandwidth_Bps=80.0, latency_s=0.25),
+    )
+    step = distributed_path.steps[0]
+
+    assert dense_path.estimated_flops == 384
+    assert step.local_step.estimated_flops == 96
+    assert step.local_step.estimated_read_bytes == (4 * 4 + 4 * 3) * left.itemsize
+    assert step.local_step.estimated_write_bytes == 4 * 3 * left.itemsize
+    assert step.estimated_compute_s == pytest.approx(2.0)
+    assert step.estimated_total_s == pytest.approx(step.estimated_compute_s + step.estimated_comm_s)
+
+
 def test_workspace_stream_and_unified_execute_api_are_explicit():
     from renormalizer.backend import StreamEvent, Workspace
     from renormalizer.backend.execution import DeviceSpec

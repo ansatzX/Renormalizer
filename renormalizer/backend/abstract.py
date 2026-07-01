@@ -28,6 +28,7 @@ from renormalizer.backend.execution import (
     DenseBlock,
     GroupedGemmPlan,
     HardwareModel,
+    MatmulDesc,
     MatmulPlan,
     PairContractionSpec,
     ShardingSpec,
@@ -895,14 +896,126 @@ class AbstractBackend(SingleProcessDistributedMixin):
         local_slices = sharding.local_slices.get(sharding.mesh.local_rank)
         if local_slices is None:
             return 0
+        local_shape = self._local_shape_for_slices(sharding.global_shape, local_slices)
+        return self._prod_shape(local_shape) * int(itemsize)
+
+    @staticmethod
+    def _local_shape_for_slices(global_shape, local_slices):
         local_shape = []
-        for local_slice, dim in zip(local_slices, sharding.global_shape):
+        for local_slice, dim in zip(local_slices, global_shape):
             start, stop, step = local_slice.indices(dim)
             if step != 1:
                 local_shape.append(len(range(start, stop, step)))
             else:
                 local_shape.append(max(0, stop - start))
-        return self._prod_shape(local_shape) * int(itemsize)
+        return tuple(local_shape)
+
+    def _local_shape_for_sharding(self, sharding):
+        local_slices = sharding.local_slices.get(sharding.mesh.local_rank)
+        if local_slices is None:
+            return ()
+        return self._local_shape_for_slices(sharding.global_shape, local_slices)
+
+    def _local_shape_for_activate_distribution_operand(self, operand, output_sharding):
+        sharding = self._placement_sharding_for_operand(operand, output_sharding)
+        if sharding is None:
+            return tuple(int(dim) for dim in getattr(operand.array, "shape", ()))
+        return self._local_shape_for_sharding(sharding)
+
+    def _local_step_for_activate_distribution(self, path, output_sharding):
+        step = path.steps[0]
+        if len(path.input_specs) != 2:
+            return step
+        local_input_shapes = tuple(
+            self._local_shape_for_activate_distribution_operand(operand, output_sharding)
+            for operand in path.input_specs
+        )
+        if not all(local_input_shapes):
+            return step
+        size_map = {}
+        for operand, local_shape in zip(path.input_specs, local_input_shapes):
+            for mode, dim in zip(operand.modes, local_shape):
+                dim = int(dim)
+                if mode in size_map and size_map[mode] != dim:
+                    return step
+                size_map[mode] = dim
+        output_shape = self._local_shape_for_sharding(output_sharding)
+        if not output_shape:
+            output_shape = tuple(size_map[mode] for mode in path.output_modes)
+        input_mode_sets = tuple(set(operand.modes) for operand in path.input_specs)
+        output_set = set(path.output_modes)
+        batch_modes = tuple(mode for mode in path.output_modes if mode in input_mode_sets[0] and mode in input_mode_sets[1])
+        contracted_modes = tuple(mode for mode in path.input_specs[0].modes if mode in input_mode_sets[1] and mode not in output_set)
+        left_only_modes = tuple(mode for mode in path.output_modes if mode in input_mode_sets[0] and mode not in input_mode_sets[1])
+        right_only_modes = tuple(mode for mode in path.output_modes if mode in input_mode_sets[1] and mode not in input_mode_sets[0])
+        batch_shape = tuple(size_map[mode] for mode in batch_modes)
+        m = self._prod_shape(tuple(size_map[mode] for mode in left_only_modes))
+        n = self._prod_shape(tuple(size_map[mode] for mode in right_only_modes))
+        k = self._prod_shape(tuple(size_map[mode] for mode in contracted_modes))
+        itemsize = max((self._operand_itemsize(operand.array) for operand in path.input_specs), default=0)
+        read_bytes = sum(
+            self._prod_shape(local_shape) * self._operand_itemsize(operand.array)
+            for operand, local_shape in zip(path.input_specs, local_input_shapes)
+        )
+        write_bytes = self._prod_shape(output_shape) * int(itemsize or 0)
+        flops = int(2 * self._prod_shape(batch_shape) * m * n * k)
+        local_plan = step.plan
+        if isinstance(local_plan, MatmulPlan) and len(local_plan.descs) == 1:
+            desc = local_plan.descs[0]
+            local_desc = MatmulDesc(
+                A=desc.A,
+                B=desc.B,
+                C=desc.C,
+                m=m,
+                n=n,
+                k=k,
+                batch_shape=batch_shape,
+                trans_a=desc.trans_a,
+                trans_b=desc.trans_b,
+                conj_a=desc.conj_a,
+                conj_b=desc.conj_b,
+                alpha=desc.alpha,
+                beta=desc.beta,
+                dtype_compute=desc.dtype_compute,
+                dtype_output=desc.dtype_output,
+                layout_a=desc.layout_a,
+                layout_b=desc.layout_b,
+                layout_c=desc.layout_c,
+                estimated_flops=flops,
+                estimated_read_bytes=read_bytes,
+                estimated_write_bytes=write_bytes,
+                estimated_workspace_bytes=desc.estimated_workspace_bytes,
+            )
+            local_plan = MatmulPlan(
+                kind=local_plan.kind,
+                descs=(local_desc,),
+                pre_ops=local_plan.pre_ops,
+                post_ops=local_plan.post_ops,
+                output_shape=output_shape,
+                copy_bytes=local_plan.copy_bytes,
+                workspace_bytes=local_plan.workspace_bytes,
+                estimated_flops=flops,
+                estimated_time_s=local_plan.estimated_time_s,
+                reason=local_plan.reason,
+                fallback_reason=local_plan.fallback_reason,
+            )
+        return ContractionStep(
+            kind=step.kind,
+            inputs=step.inputs,
+            output=step.output,
+            input_modes=step.input_modes,
+            output_modes=step.output_modes,
+            plan=local_plan,
+            estimated_flops=flops,
+            estimated_read_bytes=read_bytes,
+            estimated_write_bytes=write_bytes,
+            estimated_copy_bytes=step.estimated_copy_bytes,
+            estimated_peak_bytes=max(write_bytes, step.required_workspace_bytes),
+            estimated_comm_bytes=step.estimated_comm_bytes,
+            required_workspace_bytes=step.required_workspace_bytes,
+            reason=step.reason,
+            fallback_reason=step.fallback_reason,
+        )
 
     def _peak_local_bytes_for_distributed_plan(self, plan):
         itemsize = max(
@@ -1045,7 +1158,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             for index, operand in enumerate(path.input_specs)
         )
         step_plan = DistributedStepPlan(
-            local_step=path.steps[0],
+            local_step=self._local_step_for_activate_distribution(path, output_sharding),
             input_states=states,
             output_sharding=output_sharding,
             communication=(
