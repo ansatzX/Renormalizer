@@ -175,6 +175,151 @@ def _prod(values) -> int:
     return int(reduce(mul, values, 1))
 
 
+def _split_slice(dim: int, parts: int, index: int) -> slice:
+    base = int(dim) // int(parts)
+    remainder = int(dim) % int(parts)
+    start = int(index) * base + min(int(index), remainder)
+    stop = start + base + (1 if int(index) < remainder else 0)
+    return slice(start, stop)
+
+
+def _rank_coordinates(rank: int, parts_by_mode: tuple[int, ...]) -> tuple[int, ...]:
+    coords = []
+    remaining = int(rank)
+    for parts in reversed(parts_by_mode):
+        coords.append(remaining % int(parts))
+        remaining //= int(parts)
+    return tuple(reversed(coords))
+
+
+@dataclass(frozen=True)
+class DeviceMesh:
+    devices: tuple[DeviceSpec, ...]
+    shape: tuple[int, ...]
+    axis_names: tuple[str, ...]
+    backend: str
+    local_rank: int = 0
+    global_rank: int = 0
+    world_size: int | None = None
+
+    def __post_init__(self):
+        devices = tuple(parse_device_spec(device) if not isinstance(device, DeviceSpec) else device for device in self.devices)
+        shape = tuple(int(dim) for dim in self.shape)
+        axis_names = tuple(str(name) for name in self.axis_names)
+        if any(dim <= 0 for dim in shape):
+            raise ValueError("DeviceMesh shape dimensions must be positive")
+        if len(axis_names) != len(shape):
+            raise ValueError("DeviceMesh axis_names must match mesh rank")
+        if _prod(shape) != len(devices):
+            raise ValueError("DeviceMesh shape product must match number of devices")
+        world_size = len(devices) if self.world_size is None else int(self.world_size)
+        if world_size != len(devices):
+            raise ValueError("DeviceMesh world_size must match number of devices")
+        local_rank = int(self.local_rank)
+        global_rank = int(self.global_rank)
+        if local_rank < 0 or local_rank >= world_size:
+            raise ValueError("DeviceMesh local_rank is out of range")
+        if global_rank < 0 or global_rank >= world_size:
+            raise ValueError("DeviceMesh global_rank is out of range")
+        object.__setattr__(self, "devices", devices)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "axis_names", axis_names)
+        object.__setattr__(self, "local_rank", local_rank)
+        object.__setattr__(self, "global_rank", global_rank)
+        object.__setattr__(self, "world_size", world_size)
+
+
+@dataclass(frozen=True)
+class ShardingSpec:
+    global_shape: tuple[int, ...]
+    modes: tuple[Hashable, ...]
+    mesh: DeviceMesh
+    ranks_per_mode: dict[Hashable, int]
+    mode_to_mesh_axis: dict[Hashable, str]
+    replicated_modes: tuple[Hashable, ...] = ()
+    sharded_modes: tuple[Hashable, ...] = ()
+    local_slices: dict[int, tuple[slice, ...]] | None = None
+
+    def __post_init__(self):
+        global_shape = tuple(int(dim) for dim in self.global_shape)
+        modes = tuple(self.modes)
+        if len(global_shape) != len(modes):
+            raise ValueError("ShardingSpec modes must match global_shape rank")
+        ranks_per_mode = {mode: int(count) for mode, count in self.ranks_per_mode.items()}
+        if any(count <= 0 for count in ranks_per_mode.values()):
+            raise ValueError("ranks_per_mode values must be positive")
+        unknown_modes = set(ranks_per_mode) - set(modes)
+        if unknown_modes:
+            raise ValueError("ranks_per_mode contains modes not present in tensor modes: {0}".format(sorted(unknown_modes)))
+        sharded_modes = tuple(self.sharded_modes) or tuple(mode for mode in modes if ranks_per_mode.get(mode, 1) > 1)
+        replicated_modes = tuple(self.replicated_modes) or tuple(mode for mode in modes if mode not in sharded_modes)
+        if set(sharded_modes) & set(replicated_modes):
+            raise ValueError("sharded_modes and replicated_modes must not overlap")
+        if set(sharded_modes) | set(replicated_modes) != set(modes):
+            raise ValueError("sharded_modes and replicated_modes must cover all modes")
+        shard_parts = tuple(ranks_per_mode.get(mode, 1) for mode in sharded_modes)
+        shard_world = _prod(shard_parts)
+        if sharded_modes and shard_world != self.mesh.world_size:
+            raise ValueError("product of sharded ranks_per_mode must match mesh world_size")
+        local_slices = self.local_slices
+        if local_slices is None:
+            local_slices = self._compute_local_slices(global_shape, modes, sharded_modes, shard_parts)
+        else:
+            local_slices = {int(rank): tuple(slices) for rank, slices in local_slices.items()}
+        object.__setattr__(self, "global_shape", global_shape)
+        object.__setattr__(self, "modes", modes)
+        object.__setattr__(self, "ranks_per_mode", ranks_per_mode)
+        object.__setattr__(self, "mode_to_mesh_axis", dict(self.mode_to_mesh_axis))
+        object.__setattr__(self, "replicated_modes", replicated_modes)
+        object.__setattr__(self, "sharded_modes", sharded_modes)
+        object.__setattr__(self, "local_slices", local_slices)
+
+    def _compute_local_slices(self, global_shape, modes, sharded_modes, shard_parts):
+        if not sharded_modes:
+            full_slice = tuple(slice(None) for _ in global_shape)
+            return {rank: full_slice for rank in range(self.mesh.world_size)}
+        sharded_mode_to_position = {mode: index for index, mode in enumerate(sharded_modes)}
+        result = {}
+        for rank in range(self.mesh.world_size):
+            coords = _rank_coordinates(rank, shard_parts)
+            slices = []
+            for axis, mode in enumerate(modes):
+                if mode in sharded_mode_to_position:
+                    position = sharded_mode_to_position[mode]
+                    slices.append(_split_slice(global_shape[axis], shard_parts[position], coords[position]))
+                else:
+                    slices.append(slice(None))
+            result[rank] = tuple(slices)
+        return result
+
+
+@dataclass
+class DistributedTensor:
+    local_array: Any
+    global_shape: tuple[int, ...]
+    modes: tuple[Hashable, ...]
+    sharding: ShardingSpec
+    mesh: DeviceMesh
+    dtype: Any | None = None
+    local_shape: tuple[int, ...] = ()
+    local_nbytes: int = 0
+    rank_local_arrays: dict[int, Any] | None = None
+
+    def __post_init__(self):
+        self.global_shape = tuple(int(dim) for dim in self.global_shape)
+        self.modes = tuple(self.modes)
+        if self.dtype is None:
+            self.dtype = getattr(self.local_array, "dtype", None)
+        if not self.local_shape:
+            self.local_shape = _shape_of(self.local_array)
+        else:
+            self.local_shape = tuple(int(dim) for dim in self.local_shape)
+        if not self.local_nbytes:
+            self.local_nbytes = _nbytes_of(self.local_array)
+        if self.rank_local_arrays is not None:
+            self.rank_local_arrays = {int(rank): array for rank, array in self.rank_local_arrays.items()}
+
+
 def _shape_of(array) -> tuple[int, ...]:
     return tuple(int(dim) for dim in getattr(array, "shape", ()))
 

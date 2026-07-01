@@ -63,6 +63,10 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "parse_einsum",
     "unpack_masked_vectors",
     "pack_masked_vectors",
+    "shard_tensor",
+    "gather_tensor",
+    "redistribute",
+    "replicate_tensor",
     "astype",
     "ascontiguousarray",
     "current_device",
@@ -88,6 +92,8 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "broadcast",
     "gather",
     "allgather",
+    "reduce_scatter",
+    "alltoall",
 )
 
 try:
@@ -342,6 +348,22 @@ class BackendProtocol(Protocol):
         """Pack a structured center tensor through its mask into vector form."""
         ...
 
+    def shard_tensor(self, x: Any, spec: Any) -> Any:
+        """Create a distributed tensor from a dense tensor and sharding spec."""
+        ...
+
+    def gather_tensor(self, x: Any, root: Any = None) -> Any:
+        """Gather a distributed tensor to a dense tensor."""
+        ...
+
+    def redistribute(self, x: Any, new_spec: Any) -> Any:
+        """Redistribute a distributed tensor according to a new sharding spec."""
+        ...
+
+    def replicate_tensor(self, x: Any, mesh: Any, **kwargs: Any) -> Any:
+        """Replicate a dense tensor across a device mesh."""
+        ...
+
     def current_device(self) -> Any:
         """Return the structured current device descriptor."""
         ...
@@ -441,4 +463,12 @@ class BackendProtocol(Protocol):
 
     def allgather(self, x: Any) -> Any:
         """Gather values to all distributed workers."""
+        ...
+
+    def reduce_scatter(self, x: Any, op: str = "sum", axis: Any = 0) -> Any:
+        """Reduce and scatter a value across distributed workers."""
+        ...
+
+    def alltoall(self, x: Any, split_axis: Any = 0, concat_axis: Any = 0) -> Any:
+        """Exchange tensor chunks across distributed workers."""
         ...

@@ -97,6 +97,10 @@ class BackendProxy:
     parse_einsum = _delegate_backend_method("parse_einsum")
     unpack_masked_vectors = _delegate_backend_method("unpack_masked_vectors")
     pack_masked_vectors = _delegate_backend_method("pack_masked_vectors")
+    shard_tensor = _delegate_backend_method("shard_tensor")
+    gather_tensor = _delegate_backend_method("gather_tensor")
+    redistribute = _delegate_backend_method("redistribute")
+    replicate_tensor = _delegate_backend_method("replicate_tensor")
     astype = _delegate_backend_method("astype")
     ascontiguousarray = _delegate_backend_method("ascontiguousarray")
     current_device = _delegate_backend_method("current_device")
@@ -122,6 +126,8 @@ class BackendProxy:
     broadcast = _delegate_backend_method("broadcast")
     gather = _delegate_backend_method("gather")
     allgather = _delegate_backend_method("allgather")
+    reduce_scatter = _delegate_backend_method("reduce_scatter")
+    alltoall = _delegate_backend_method("alltoall")
 
     def __getattr__(self, name):
         return getattr(self.current, name)

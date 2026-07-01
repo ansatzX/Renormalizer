@@ -7,16 +7,19 @@ import numpy as _np
 
 from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.execution import (
+    ArrayInfo,
     BackendCapabilities,
     BackendCopyError,
     BackendFeatureError,
     BlockTensor,
     CopyPolicy,
     DeviceSpec,
+    DistributedTensor,
     FallbackPolicy,
     DenseBlock,
     GroupedGemmPlan,
     PairContractionSpec,
+    ShardingSpec,
     TensorOperand,
     array_info_for_backend,
     layout_from_array,
@@ -248,9 +251,33 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return isinstance(x, self.device_array_types)
 
     def is_distributed_array(self, x: Any) -> bool:
-        return False
+        return isinstance(x, DistributedTensor)
 
     def array_info(self, x: Any):
+        if self.is_distributed_array(x):
+            local_info = array_info_for_backend(self, x.local_array, self.current_device())
+            return ArrayInfo(
+                shape=tuple(x.global_shape),
+                dtype=x.dtype,
+                itemsize=local_info.itemsize,
+                ndim=len(x.global_shape),
+                size=self._prod_shape(x.global_shape),
+                nbytes=int(x.local_nbytes),
+                device=DeviceSpec(
+                    kind="distributed",
+                    local_rank=x.mesh.local_rank,
+                    global_rank=x.mesh.global_rank,
+                ),
+                is_host=False,
+                is_device=local_info.is_device,
+                is_distributed=True,
+                strides=None,
+                order="distributed",
+                contiguous=False,
+                writeable=local_info.writeable,
+                owns_data=local_info.owns_data,
+                backend_name=self.name,
+            )
         return array_info_for_backend(self, x, self.current_device())
 
     def layout(self, x: Any):
@@ -363,6 +390,66 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if packed_shape != (spec.packed_dim, spec.nrhs):
             packed = self.reshape_view(packed, (spec.packed_dim, spec.nrhs))
         return packed
+
+    def shard_tensor(self, x, spec: ShardingSpec):
+        if self.is_distributed_array(x):
+            x = self.gather_tensor(x)
+        rank_local_arrays = {
+            int(rank): x[tuple(local_slice)]
+            for rank, local_slice in spec.local_slices.items()
+        }
+        local_array = rank_local_arrays[spec.mesh.local_rank]
+        return DistributedTensor(
+            local_array=local_array,
+            global_shape=spec.global_shape,
+            modes=spec.modes,
+            sharding=spec,
+            mesh=spec.mesh,
+            dtype=getattr(local_array, "dtype", None),
+            local_shape=tuple(getattr(local_array, "shape", ())),
+            local_nbytes=self._array_nbytes(local_array),
+            rank_local_arrays=rank_local_arrays,
+        )
+
+    def gather_tensor(self, x, root=None):
+        if not self.is_distributed_array(x):
+            return x
+        if x.rank_local_arrays is None:
+            if x.sharding.local_slices.get(x.mesh.local_rank) == tuple(slice(None) for _ in x.global_shape):
+                return x.local_array
+            raise BackendFeatureError("cannot gather distributed tensor without rank-local arrays")
+        result = self._zeros_backend(x.global_shape, x.dtype)
+        for rank in sorted(x.rank_local_arrays):
+            result = self._slice_set(result, x.sharding.local_slices[rank], x.rank_local_arrays[rank])
+        return result
+
+    def redistribute(self, x, new_spec: ShardingSpec):
+        dense = self.gather_tensor(x)
+        return self.shard_tensor(dense, new_spec)
+
+    def replicate_tensor(self, x, mesh, *, modes=None):
+        modes = tuple(range(len(getattr(x, "shape", ())))) if modes is None else tuple(modes)
+        spec = ShardingSpec(
+            global_shape=tuple(int(dim) for dim in getattr(x, "shape", ())),
+            modes=modes,
+            mesh=mesh,
+            ranks_per_mode={},
+            mode_to_mesh_axis={},
+            replicated_modes=modes,
+            sharded_modes=(),
+        )
+        rank_local_arrays = {rank: x for rank in spec.local_slices}
+        return DistributedTensor(
+            local_array=rank_local_arrays[mesh.local_rank],
+            global_shape=spec.global_shape,
+            modes=modes,
+            sharding=spec,
+            mesh=mesh,
+            dtype=getattr(x, "dtype", None),
+            local_shape=tuple(getattr(x, "shape", ())),
+            local_nbytes=self._array_nbytes(x),
+            rank_local_arrays=rank_local_arrays,
+        )
 
     def lower_pair_contraction_to_matmul(self, spec):
         plan = lower_pair_contraction_to_matmul(spec, self.capabilities)
@@ -663,6 +750,27 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return at[mask].set(values)
         array[mask] = values
         return array
+
+    def _slice_set(self, array, slices, values):
+        slices = tuple(slices)
+        at = getattr(array, "at", None)
+        if at is not None:
+            return at[slices].set(values)
+        array[slices] = values
+        return array
+
+    @staticmethod
+    def _array_nbytes(array):
+        nbytes = getattr(array, "nbytes", None)
+        if nbytes is not None:
+            return int(nbytes)
+        numel = getattr(array, "numel", None)
+        element_size = getattr(array, "element_size", None)
+        if callable(numel) and callable(element_size):
+            return int(numel() * element_size())
+        dtype = getattr(array, "dtype", None)
+        itemsize = int(getattr(dtype, "itemsize", 0) or 0)
+        return AbstractBackend._prod_shape(getattr(array, "shape", ())) * itemsize
 
     @staticmethod
     def _normalize_batch_axis(batch_axis, ndim):

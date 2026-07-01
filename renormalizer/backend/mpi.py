@@ -20,3 +20,9 @@ class SingleProcessDistributedMixin:
 
     def allgather(self, x):
         return [x]
+
+    def reduce_scatter(self, x, op="sum", axis=0):
+        return x
+
+    def alltoall(self, x, split_axis=0, concat_axis=0):
+        return x

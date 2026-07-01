@@ -118,6 +118,105 @@ def test_backend_synchronize_alias_delegates_to_sync():
     assert calls == ["sync"]
 
 
+def test_device_mesh_and_sharding_spec_compute_local_slices():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    spec = ShardingSpec(
+        global_shape=(5, 3),
+        modes=("x", "y"),
+        mesh=mesh,
+        ranks_per_mode={"x": 2},
+        mode_to_mesh_axis={"x": "rank"},
+    )
+
+    assert mesh.world_size == 2
+    assert spec.sharded_modes == ("x",)
+    assert spec.replicated_modes == ("y",)
+    assert spec.local_slices == {
+        0: (slice(0, 3), slice(None)),
+        1: (slice(3, 5), slice(None)),
+    }
+
+
+def test_numpy_shard_gather_and_redistribute_roundtrip():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    row_spec = ShardingSpec(
+        global_shape=(5, 4),
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"row": 2},
+        mode_to_mesh_axis={"row": "rank"},
+    )
+    col_spec = ShardingSpec(
+        global_shape=(5, 4),
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"col": 2},
+        mode_to_mesh_axis={"col": "rank"},
+    )
+    x = np.arange(20, dtype=np.float64).reshape(5, 4)
+
+    distributed = backend.shard_tensor(x, row_spec)
+    redistributed = backend.redistribute(distributed, col_spec)
+
+    assert backend.is_distributed_array(distributed) is True
+    assert distributed.global_shape == (5, 4)
+    assert distributed.modes == ("row", "col")
+    assert distributed.local_shape == (3, 4)
+    assert np.array_equal(distributed.local_array, x[:3, :])
+    assert np.array_equal(backend.gather_tensor(distributed), x)
+    assert redistributed.sharding == col_spec
+    assert redistributed.local_shape == (5, 2)
+    assert np.array_equal(redistributed.local_array, x[:, :2])
+    assert np.array_equal(backend.gather_tensor(redistributed), x)
+
+
+def test_replicate_tensor_and_single_process_collectives():
+    from renormalizer.backend import DeviceMesh, DeviceSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    x = np.arange(6, dtype=np.float64).reshape(2, 3)
+
+    distributed = backend.replicate_tensor(x, mesh, modes=("i", "j"))
+
+    assert distributed.sharding.sharded_modes == ()
+    assert distributed.sharding.replicated_modes == ("i", "j")
+    assert np.array_equal(distributed.local_array, x)
+    assert np.array_equal(distributed.rank_local_arrays[0], x)
+    assert np.array_equal(distributed.rank_local_arrays[1], x)
+    assert np.array_equal(backend.gather_tensor(distributed), x)
+    assert backend.reduce_scatter(x) is x
+    assert backend.alltoall(x) is x
+
+
 def test_jax_layout_transform_api_allows_same_size_device_reshape_when_available():
     try:
         __import__("jax")
