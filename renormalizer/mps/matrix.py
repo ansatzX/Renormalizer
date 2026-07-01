@@ -4,6 +4,8 @@
 import weakref
 import logging
 import time
+from collections import OrderedDict
+from dataclasses import replace
 from typing import List, Union
 
 from renormalizer.backend.boundary import eye_like, scalar_to_python as _scalar_to_python
@@ -11,6 +13,9 @@ from renormalizer.mps.backend import np, backend, xp
 from renormalizer.utils import profiling
 
 logger = logging.getLogger(__name__)
+
+_PAIR_CONTRACTION_PLAN_CACHE_MAXSIZE = 512
+_PAIR_CONTRACTION_PLAN_CACHE = OrderedDict()
 
 
 
@@ -369,8 +374,82 @@ def pair_tensor_contract(
     output_modes += tuple(mode for mode in input_right if mode not in removed)
     equation = "{0},{1}->{2}".format(input_left, input_right, "".join(output_modes))
     spec = backend.parse_einsum(equation, left_array, right_array)
-    plan = backend.plan_contraction(spec)
+    if profiling.should_record_op():
+        plan = backend.plan_contraction(spec)
+    else:
+        plan = _cached_pair_contraction_plan(equation, spec, left_array, right_array)
     return backend.execute(plan)
+
+
+def _array_plan_cache_key(array):
+    try:
+        info = backend.array_info(array)
+        return (
+            info.shape,
+            str(info.dtype),
+            info.strides,
+            info.order,
+            info.contiguous,
+            str(info.device),
+        )
+    except Exception:
+        strides = getattr(array, "strides", None)
+        if callable(strides):
+            strides = strides()
+        if strides is not None:
+            strides = tuple(int(stride) for stride in strides)
+        return (
+            tuple(int(dim) for dim in getattr(array, "shape", ())),
+            str(getattr(array, "dtype", None)),
+            strides,
+            "unknown",
+            False,
+            str(backend.current_device()),
+        )
+
+
+def _pair_contraction_plan_cache_key(equation, spec):
+    return (
+        backend.name,
+        str(backend.current_device()),
+        str(backend.fallback_policy),
+        equation,
+        tuple(operand.modes for operand in spec.operands),
+        tuple(spec.output_modes),
+        tuple(_array_plan_cache_key(operand.array) for operand in spec.operands),
+    )
+
+
+def _refresh_matmul_plan_arrays(plan, left_array, right_array):
+    if not hasattr(plan, "descs"):
+        return plan
+    descs = []
+    for index, desc in enumerate(plan.descs):
+        if index == 0:
+            descs.append(replace(desc, A=left_array, B=right_array, C=None))
+        else:
+            descs.append(desc)
+    return replace(plan, descs=tuple(descs))
+
+
+def _refresh_pair_contraction_plan_arrays(plan, spec, left_array, right_array):
+    steps = []
+    for step in plan.steps:
+        steps.append(replace(step, plan=_refresh_matmul_plan_arrays(step.plan, left_array, right_array)))
+    return replace(plan, steps=tuple(steps), input_specs=spec.operands)
+
+
+def _cached_pair_contraction_plan(equation, spec, left_array, right_array):
+    key = _pair_contraction_plan_cache_key(equation, spec)
+    cached = _PAIR_CONTRACTION_PLAN_CACHE.get(key)
+    if cached is None:
+        plan = backend.plan_contraction(spec)
+        _PAIR_CONTRACTION_PLAN_CACHE[key] = plan
+        if len(_PAIR_CONTRACTION_PLAN_CACHE) > _PAIR_CONTRACTION_PLAN_CACHE_MAXSIZE:
+            _PAIR_CONTRACTION_PLAN_CACHE.popitem(last=False)
+        return plan
+    _PAIR_CONTRACTION_PLAN_CACHE.move_to_end(key)
+    return _refresh_pair_contraction_plan_arrays(cached, spec, left_array, right_array)
 
 
 def asnumpy(array):

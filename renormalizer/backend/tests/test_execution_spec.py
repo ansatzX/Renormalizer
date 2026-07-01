@@ -1052,6 +1052,35 @@ def test_pair_tensor_contract_uses_backend_execute_without_profiling(monkeypatch
     assert np.allclose(matrix.asnumpy(result), left @ right)
 
 
+def test_pair_tensor_contract_reuses_plan_without_reusing_old_arrays(monkeypatch):
+    from renormalizer.mps import matrix
+
+    cache = getattr(matrix, "_PAIR_CONTRACTION_PLAN_CACHE", None)
+    if cache is not None:
+        cache.clear()
+
+    calls = []
+    current_backend = matrix.backend.current
+    original_plan_contraction = current_backend.plan_contraction
+
+    def counting_plan_contraction(spec, **kwargs):
+        calls.append(spec)
+        return original_plan_contraction(spec, **kwargs)
+
+    monkeypatch.setattr(current_backend, "plan_contraction", counting_plan_contraction)
+    left0 = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right0 = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left1 = left0 + 10.0
+    right1 = right0 - 2.0
+
+    result0 = matrix.pair_tensor_contract(left0, "ik", right0, "kj", {"k"})
+    result1 = matrix.pair_tensor_contract(left1, "ik", right1, "kj", {"k"})
+
+    assert len(calls) == 1
+    assert np.allclose(matrix.asnumpy(result0), left0 @ right0)
+    assert np.allclose(matrix.asnumpy(result1), left1 @ right1)
+
+
 def test_plan_contraction_returns_dense_gemm_step_for_pair_einsum():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
