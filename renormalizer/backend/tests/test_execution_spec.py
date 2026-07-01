@@ -2134,6 +2134,64 @@ def test_execute_auto_distributed_dense_plan_shards_output():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_execute_auto_distributed_profile_preserves_plan_identity_and_estimates(tmp_path):
+    from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(64, dtype=np.float64).reshape(16, 4)
+    right = np.arange(12, dtype=np.float64).reshape(4, 3)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    distributed_path = backend.plan_distributed_contraction_path(
+        dense_path,
+        mesh,
+        memory_limit_per_device=1024,
+        cost_model=HardwareModel(network_bandwidth_Bps=80.0, latency_s=0.25),
+    )
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = backend.execute(distributed_path)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(payload for payload in payloads if payload["event"] == "contraction_execute")
+    step = distributed_path.steps[0]
+
+    assert event["plan_hash"] == dense_path.plan_hash
+    assert event["distributed_step_kind"] == "activate_distribution"
+    assert event["distributed_modes"] == ["i"]
+    assert event["read_bytes"] == dense_path.estimated_read_bytes
+    assert event["write_bytes"] == dense_path.estimated_write_bytes
+    assert event["copy_bytes"] == dense_path.estimated_copy_bytes
+    assert event["workspace_bytes"] == dense_path.required_workspace_bytes
+    assert event["estimated_compute_s"] == pytest.approx(step.estimated_compute_s)
+    assert event["estimated_comm_s"] == pytest.approx(step.estimated_comm_s)
+    assert event["estimated_total_s"] == pytest.approx(step.estimated_total_s)
+    assert event["communication"][0]["collective"] == "activate_distribution"
+
+
 def test_execute_auto_distributed_dense_plan_places_inputs_before_contracting():
     from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

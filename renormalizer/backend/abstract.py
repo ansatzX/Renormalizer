@@ -1413,7 +1413,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             operands=self._placed_operands_for_activate_distribution(plan),
             output_sharding=plan.output_sharding,
         )
-        return self.distributed_contract(spec)
+        return self.distributed_contract(spec, plan=plan)
 
     def execute(self, plan, *, stream=None, workspace=None):
         if isinstance(plan, ContractionPlan):
@@ -1787,6 +1787,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             communication = ()
             input_states = ()
             output_state = None
+            distributed_step = None
             local_profile = self._local_contraction_profile(None)
             if distributed_plan is not None and distributed_plan.steps:
                 distributed_step = distributed_plan.steps[0]
@@ -1798,6 +1799,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     distributed_step.local_step,
                 )
             step = plan.steps[0] if isinstance(plan, ContractionPlan) and plan.steps else None
+            plan_hash = ""
+            if distributed_plan is not None:
+                plan_hash = getattr(distributed_plan.path, "plan_hash", "")
+            elif isinstance(plan, ContractionPlan):
+                plan_hash = getattr(plan, "plan_hash", "")
+            metric_plan = distributed_plan.path if distributed_plan is not None else plan
             flops = 0
             if distributed_plan is not None:
                 flops = int(distributed_plan.total_flops or getattr(distributed_plan.path, "estimated_flops", 0))
@@ -1819,20 +1826,25 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     return 0.0
                 return timings.pop(0)
 
+            distributed_modes = tuple(getattr(plan, "distributed_modes", ()))
+            if not distributed_modes and output_state is not None:
+                distributed_modes = tuple(getattr(output_state, "distributed_modes", ()))
+
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
                 equation=spec.equation,
                 lowering="distributed",
+                plan_hash=plan_hash,
                 input_shapes=[tuple(self._operand_global_shape(operand)) for operand in spec.operands],
                 output_shape=tuple(result.global_shape),
                 dtype=str(getattr(result, "dtype", None)),
                 device=str(self.current_device()),
                 flops=flops,
-                read_bytes=int(getattr(step, "estimated_read_bytes", 0)),
-                write_bytes=int(getattr(step, "estimated_write_bytes", 0)),
-                copy_bytes=int(getattr(step, "estimated_copy_bytes", 0)),
-                workspace_bytes=int(getattr(step, "required_workspace_bytes", 0)),
+                read_bytes=int(getattr(metric_plan, "estimated_read_bytes", 0)),
+                write_bytes=int(getattr(metric_plan, "estimated_write_bytes", 0)),
+                copy_bytes=int(getattr(metric_plan, "estimated_copy_bytes", 0)),
+                workspace_bytes=int(getattr(metric_plan, "required_workspace_bytes", 0)),
                 largest_intermediate=int(result.local_nbytes),
                 local_lowering=local_profile["local_lowering"],
                 num_gemm=local_profile["num_gemm"],
@@ -1847,7 +1859,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 local_workspace_bytes=local_profile["local_workspace_bytes"],
                 local_peak_bytes=local_profile["local_peak_bytes"],
                 fallback_reason=local_profile["fallback_reason"],
-                distributed_modes=[str(mode) for mode in getattr(plan, "distributed_modes", ())],
+                distributed_modes=[str(mode) for mode in distributed_modes],
+                distributed_step_kind=getattr(distributed_step, "kind", None),
+                estimated_compute_s=float(getattr(distributed_step, "estimated_compute_s", 0.0)),
+                estimated_comm_s=float(getattr(distributed_step, "estimated_comm_s", 0.0)),
+                estimated_total_s=float(getattr(distributed_step, "estimated_total_s", 0.0)),
                 rank=int(result.mesh.global_rank),
                 world_size=int(result.mesh.world_size),
                 local_shape=tuple(result.local_shape),
