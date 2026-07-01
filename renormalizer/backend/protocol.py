@@ -56,6 +56,10 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "is_distributed_array",
     "array_info",
     "layout",
+    "permute",
+    "reshape_view",
+    "can_reshape_view",
+    "make_contiguous",
     "parse_einsum",
     "astype",
     "ascontiguousarray",
@@ -67,6 +71,7 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "matmul",
     "batched_matmul",
     "grouped_gemm",
+    "synchronize",
     "sync",
     "free_all_blocks",
     "log_memory_usage",
@@ -305,6 +310,22 @@ class BackendProtocol(Protocol):
         """Return backend layout metadata for an array."""
         ...
 
+    def permute(self, x: Any, perm: Any, **kwargs: Any) -> Any:
+        """Return an array with axes reordered by ``perm``."""
+        ...
+
+    def reshape_view(self, x: Any, shape: Any) -> Any:
+        """Reshape an array only when the reshape can be represented as a view."""
+        ...
+
+    def can_reshape_view(self, x: Any, shape: Any) -> bool:
+        """Return whether ``reshape_view`` can satisfy the requested shape."""
+        ...
+
+    def make_contiguous(self, x: Any, **kwargs: Any) -> Any:
+        """Return a C-contiguous backend array using an explicit copy policy."""
+        ...
+
     def parse_einsum(self, equation: str, *operands: Any, **kwargs: Any) -> Any:
         """Parse an explicit einsum equation into backend contraction IR."""
         ...
@@ -339,6 +360,10 @@ class BackendProtocol(Protocol):
 
     def grouped_gemm(self, descs: Any, **kwargs: Any) -> Any:
         """Execute grouped GEMM tasks through native support or bucketed fallback."""
+        ...
+
+    def synchronize(self, device: Any = None, stream: Any = None) -> Any:
+        """Synchronize backend work, optionally scoped to a device or stream."""
         ...
 
     def sync(self) -> None:

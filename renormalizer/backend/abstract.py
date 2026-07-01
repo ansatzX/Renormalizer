@@ -8,6 +8,7 @@ import numpy as _np
 from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.execution import (
     BackendCapabilities,
+    BackendCopyError,
     BackendFeatureError,
     CopyPolicy,
     DeviceSpec,
@@ -226,13 +227,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def astype(self, x: Any, dtype, *, copy=CopyPolicy.IF_NEEDED):
         copy = CopyPolicy.from_value(copy)
         if copy is CopyPolicy.NEVER and getattr(x, "dtype", None) != dtype:
-            from renormalizer.backend.execution import BackendCopyError
-
             raise BackendCopyError("astype would require a copy")
         return self.asarray(x, dtype=dtype)
 
     def ascontiguousarray(self, x: Any, *, copy=CopyPolicy.IF_NEEDED):
-        return self.asarray(x)
+        return self.make_contiguous(x, copy_policy=copy)
 
     def is_array(self, x: Any) -> bool:
         return isinstance(x, self.ndarray)
@@ -252,8 +251,69 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def layout(self, x: Any):
         return layout_from_array(x)
 
+    def permute(self, x: Any, perm, *, copy_policy=CopyPolicy.IF_NEEDED):
+        copy_policy = CopyPolicy.from_value(copy_policy)
+        perm = tuple(int(index) for index in perm)
+        xp = self.array_namespace or _np
+        if hasattr(x, "permute"):
+            result = x.permute(*perm)
+        elif hasattr(xp, "permute"):
+            result = xp.permute(x, perm)
+        else:
+            result = xp.transpose(x, perm)
+        if copy_policy is CopyPolicy.ALWAYS:
+            return self.make_contiguous(result, copy_policy=CopyPolicy.ALWAYS)
+        return result
+
+    def can_reshape_view(self, x: Any, shape) -> bool:
+        shape = tuple(int(dim) for dim in shape)
+        if self._prod_shape(shape) != self._prod_shape(getattr(x, "shape", ())):
+            return False
+        if hasattr(x, "view") and self.name == "torch":
+            try:
+                x.view(*shape)
+                return True
+            except Exception:
+                return False
+        xp = self.array_namespace or _np
+        try:
+            reshaped = xp.reshape(x, shape)
+        except Exception:
+            return False
+        if self.name == "jax":
+            return True
+        return self._shares_memory(reshaped, x)
+
+    def reshape_view(self, x: Any, shape):
+        shape = tuple(int(dim) for dim in shape)
+        if not self.can_reshape_view(x, shape):
+            raise BackendCopyError("reshape would require a copy")
+        if hasattr(x, "view") and self.name == "torch":
+            return x.view(*shape)
+        xp = self.array_namespace or _np
+        return xp.reshape(x, shape)
+
+    def make_contiguous(self, x: Any, *, copy_policy=CopyPolicy.IF_NEEDED):
+        copy_policy = CopyPolicy.from_value(copy_policy)
+        if self._is_c_contiguous(x):
+            if copy_policy is CopyPolicy.ALWAYS:
+                return self._copy_array(x)
+            return x
+        if copy_policy is CopyPolicy.NEVER:
+            raise BackendCopyError("make_contiguous would require a copy")
+        if hasattr(x, "contiguous"):
+            return x.contiguous()
+        xp = self.array_namespace or _np
+        ascontiguousarray = getattr(xp, "ascontiguousarray", None)
+        if ascontiguousarray is not None:
+            return ascontiguousarray(x)
+        return self.asarray(x)
+
     def parse_einsum(self, equation, *operands, constants=(), optimize=None):
         return parse_einsum(equation, *operands, constants=constants, optimize=optimize)
+
+    def synchronize(self, device=None, stream=None):
+        return self.sync()
 
     def lower_pair_contraction_to_matmul(self, spec):
         plan = lower_pair_contraction_to_matmul(spec, self.capabilities)
@@ -345,6 +405,46 @@ class AbstractBackend(SingleProcessDistributedMixin):
         for dim in shape:
             result *= int(dim)
         return result
+
+    def _shares_memory(self, left, right):
+        if left is right:
+            return True
+        xp = self.array_namespace or _np
+        shares_memory = getattr(xp, "shares_memory", None)
+        if shares_memory is not None:
+            try:
+                return bool(shares_memory(left, right))
+            except Exception:
+                pass
+        try:
+            return bool(_np.shares_memory(left, right))
+        except Exception:
+            return False
+
+    def _is_c_contiguous(self, x):
+        is_contiguous = getattr(x, "is_contiguous", None)
+        if callable(is_contiguous):
+            try:
+                return bool(is_contiguous())
+            except Exception:
+                pass
+        try:
+            return self.layout(x).order == "C"
+        except Exception:
+            return False
+
+    def _copy_array(self, x):
+        copy = getattr(x, "copy", None)
+        if callable(copy):
+            return copy()
+        clone = getattr(x, "clone", None)
+        if callable(clone):
+            return clone()
+        xp = self.array_namespace or _np
+        xp_copy = getattr(xp, "copy", None)
+        if xp_copy is not None:
+            return xp_copy(x)
+        return self.asarray(x)
 
     def _transpose_modes(self, array, current_modes, target_modes):
         current_modes = tuple(current_modes)

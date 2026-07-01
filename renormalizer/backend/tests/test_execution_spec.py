@@ -75,6 +75,69 @@ def test_numpy_copy_policy_rejects_required_copy_and_allows_explicit_copy():
         backend.to_backend([1.0, 2.0], copy=CopyPolicy.NEVER)
 
 
+def test_numpy_layout_transform_api_tracks_view_and_contiguous_copy():
+    from renormalizer.backend.execution import BackendCopyError
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    x = np.arange(12, dtype=np.float64).reshape(3, 4)
+
+    transposed = backend.permute(x, (1, 0))
+    assert np.array_equal(transposed, x.T)
+    assert np.shares_memory(transposed, x)
+
+    assert backend.can_reshape_view(x, (4, 3)) is True
+    reshaped = backend.reshape_view(x, (4, 3))
+    assert reshaped.shape == (4, 3)
+    assert np.shares_memory(reshaped, x)
+
+    strided = x[::2, ::2]
+    assert backend.can_reshape_view(strided, (4,)) is False
+    with pytest.raises(BackendCopyError, match="reshape would require a copy"):
+        backend.reshape_view(strided, (4,))
+
+    contiguous = backend.make_contiguous(transposed)
+    assert contiguous.flags["C_CONTIGUOUS"]
+    assert np.array_equal(contiguous, transposed)
+    assert not np.shares_memory(contiguous, transposed)
+
+
+def test_backend_synchronize_alias_delegates_to_sync():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    calls = []
+
+    def fake_sync():
+        calls.append("sync")
+        return "synced"
+
+    backend.sync = fake_sync
+
+    assert backend.synchronize(device=None, stream=None) == "synced"
+    assert calls == ["sync"]
+
+
+def test_jax_layout_transform_api_allows_same_size_device_reshape_when_available():
+    try:
+        __import__("jax")
+    except (ImportError, OSError) as exc:
+        pytest.skip("jax unavailable: {0}".format(exc))
+
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.jax_backend import JaxBackend
+
+    try:
+        backend = JaxBackend(config=BackendConfig(device="cpu"))
+    except (ImportError, ValueError, RuntimeError) as exc:
+        pytest.skip("jax backend unavailable: {0}".format(exc))
+    x = backend.to_backend(np.arange(12, dtype=np.float64).reshape(3, 4))
+
+    assert backend.can_reshape_view(x, (4, 3)) is True
+    reshaped = backend.reshape_view(x, (4, 3))
+    assert tuple(reshaped.shape) == (4, 3)
+
+
 def test_pair_contraction_lowering_reports_gemm_shape_and_costs():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend
