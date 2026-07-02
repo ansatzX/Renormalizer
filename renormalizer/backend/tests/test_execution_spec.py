@@ -1875,6 +1875,46 @@ def test_block_tensor_rejects_inconsistent_block_metadata():
         BlockTensor({key: wrong_modes}, global_shape=(2, 3), modes=("i", "k"), block_axis_meta=None, backend="numpy")
 
 
+def test_block_contraction_spec_rejects_invalid_metadata():
+    from renormalizer.backend import BlockContractionSpec, BlockKey, BlockTensor, DenseBlock
+
+    left_key = BlockKey((0,), (0,))
+    right_key = BlockKey((0,), (1,))
+    left = BlockTensor(
+        {left_key: DenseBlock(left_key, np.ones((2, 3)), ("i", "k"), (2, 3))},
+        global_shape=(2, 3),
+        modes=("i", "k"),
+        block_axis_meta=None,
+        backend="numpy",
+    )
+    right = BlockTensor(
+        {right_key: DenseBlock(right_key, np.ones((3, 4)), ("k", "j"), (3, 4))},
+        global_shape=(3, 4),
+        modes=("k", "j"),
+        block_axis_meta=None,
+        backend="numpy",
+    )
+    other_backend = BlockTensor(
+        {right_key: DenseBlock(right_key, np.ones((3, 4)), ("k", "j"), (3, 4))},
+        global_shape=(3, 4),
+        modes=("k", "j"),
+        block_axis_meta=None,
+        backend="torch",
+    )
+
+    with pytest.raises(ValueError, match="BlockContractionSpec qn_rule must be callable"):
+        BlockContractionSpec(left, right, output_modes=("i", "j"), qn_rule=None)
+
+    with pytest.raises(ValueError, match="BlockContractionSpec output_modes must be unique"):
+        BlockContractionSpec(left, right, output_modes=("i", "i"), qn_rule=lambda left, right: None)
+
+    with pytest.raises(ValueError, match="BlockContractionSpec output_modes are not present in operands"):
+        BlockContractionSpec(left, right, output_modes=("i", "missing"), qn_rule=lambda left, right: None)
+
+    with pytest.raises(ValueError, match="BlockContractionSpec left and right backends must match"):
+        BlockContractionSpec(left, other_backend, output_modes=("i", "j"), qn_rule=lambda left, right: None)
+
+
 def test_lower_block_contraction_builds_deterministic_grouped_gemm_plan():
     from renormalizer.backend import (
         BlockContractionSpec,

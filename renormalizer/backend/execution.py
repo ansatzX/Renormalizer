@@ -1709,3 +1709,21 @@ class BlockContractionSpec:
     output_modes: tuple[Hashable, ...]
     qn_rule: Callable[[Any, Any], Any | None]
     accumulate: bool = True
+
+    def __post_init__(self):
+        output_modes = tuple(self.output_modes)
+        if not callable(self.qn_rule):
+            raise ValueError("BlockContractionSpec qn_rule must be callable")
+        if len(set(output_modes)) != len(output_modes):
+            raise ValueError("BlockContractionSpec output_modes must be unique")
+        operand_modes = set(self.left.modes) | set(self.right.modes)
+        missing_modes = set(output_modes) - operand_modes
+        if missing_modes:
+            raise ValueError(
+                "BlockContractionSpec output_modes are not present in operands: {0}"
+                .format(sorted(missing_modes))
+            )
+        if self.left.backend != self.right.backend:
+            raise ValueError("BlockContractionSpec left and right backends must match")
+        object.__setattr__(self, "output_modes", output_modes)
+        object.__setattr__(self, "accumulate", bool(self.accumulate))
