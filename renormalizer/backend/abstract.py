@@ -321,6 +321,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
         a, b = self._promote_tensordot_operands(a, b)
         return xp.tensordot(a, b, axes)
 
+    def einsum(self, subscripts, *operands, **kwargs):
+        return self.contract(subscripts, *operands, **kwargs)
+
     @staticmethod
     def _dtype_matches(actual, requested):
         if requested is None:

@@ -51,6 +51,7 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "to_host",
     "to_backend",
     "tensordot",
+    "einsum",
     "is_array",
     "is_host_array",
     "is_device_array",
@@ -307,6 +308,10 @@ class BackendProtocol(Protocol):
 
     def tensordot(self, a: Any, b: Any, axes: Any = 2) -> Any:
         """Contract two tensors through the backend boundary."""
+        ...
+
+    def einsum(self, subscripts: Any, *operands: Any, **kwargs: Any) -> Any:
+        """Execute an einsum contraction through the backend boundary."""
         ...
 
     def astype(self, x: Any, dtype: Any, **kwargs: Any) -> Any:

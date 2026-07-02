@@ -85,6 +85,7 @@ class BackendProxy:
     to_host = _delegate_backend_method("to_host")
     to_backend = _delegate_backend_method("to_backend")
     tensordot = _delegate_backend_method("tensordot")
+    einsum = _delegate_backend_method("einsum")
     is_array = _delegate_backend_method("is_array")
     is_host_array = _delegate_backend_method("is_host_array")
     is_device_array = _delegate_backend_method("is_device_array")

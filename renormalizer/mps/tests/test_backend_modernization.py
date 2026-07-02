@@ -205,6 +205,31 @@ def test_backend_protocol_and_conversion_surface():
     assert r.backend.numpy(y).tolist() == [1.0, 2.0]
 
 
+def test_backend_einsum_uses_backend_contract(monkeypatch):
+    import renormalizer as r
+
+    current_backend = r.backend.current
+    original_contract = current_backend.contract
+    calls = []
+
+    def counting_contract(*args, **kwargs):
+        calls.append((args, dict(kwargs)))
+        return original_contract(*args, **kwargs)
+
+    monkeypatch.setattr(current_backend, "contract", counting_contract)
+    left_np = np.arange(6.0).reshape(2, 3)
+    right_np = np.arange(12.0).reshape(3, 4)
+    left = r.backend.to_backend(left_np)
+    right = r.backend.to_backend(right_np)
+
+    result = r.backend.einsum("ik,kj->ij", left, right)
+
+    assert len(calls) == 1
+    assert calls[0][0][0] == "ik,kj->ij"
+    assert len(calls[0][0][1:]) == 2
+    assert np.allclose(r.backend.to_numpy(result), left_np @ right_np)
+
+
 def test_numpy_backend_explicit_conversion_methods():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
