@@ -432,6 +432,7 @@ class _ProfilingRuntime:
             "path",
             "contraction_types",
             "contraction_steps",
+            "shape_buckets",
             "blocks",
         }
         return {

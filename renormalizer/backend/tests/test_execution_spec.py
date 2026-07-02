@@ -847,6 +847,10 @@ def test_grouped_gemm_records_bucketed_fallback_profile(tmp_path):
     assert event["copy_bytes"] == 524288
     assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
     assert event["bucket_task_counts"] == [1, 2]
+    assert event["shape_buckets"] == [
+        {"m": 3, "n": 5, "k": 4, "task_indices": [2], "task_count": 1},
+        {"m": 128, "n": 128, "k": 128, "task_indices": [0, 1], "task_count": 2},
+    ]
     assert event["batched_bucket_count"] == 1
     assert event["loop_bucket_count"] == 1
     assert event["wall_s"] >= 0.0
@@ -1027,6 +1031,9 @@ def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
     assert event["num_blocks"] == 1
     assert event["num_shape_buckets"] == 1
     assert event["scatter_add_required"] is True
+    assert event["shape_buckets"] == [
+        {"m": 2, "n": 4, "k": 3, "task_indices": [0, 1], "task_count": 2},
+    ]
     assert event["output_block_keys"] == [
         {"extra": [], "qn_left": [0], "qn_right": [1]},
         {"extra": [], "qn_left": [0], "qn_right": [1]},

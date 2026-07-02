@@ -44,7 +44,14 @@ from renormalizer.backend.execution import (
     parse_device_spec,
     parse_einsum_equation,
 )
-from renormalizer.backend.gemm import GemmTask, array_nbytes, grouped_gemm_bucketed, grouped_gemm_stats, run_gemm_task
+from renormalizer.backend.gemm import (
+    GemmTask,
+    array_nbytes,
+    gemm_task_key,
+    grouped_gemm_bucketed,
+    grouped_gemm_stats,
+    run_gemm_task,
+)
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
 from renormalizer.backend.transforms import UnavailableTransforms
 
@@ -2584,6 +2591,28 @@ class AbstractBackend(SingleProcessDistributedMixin):
             buckets.setdefault(key, []).append(index)
         return {key: tuple(indices) for key, indices in buckets.items()}
 
+    @staticmethod
+    def _profile_shape_buckets(bucketed_by_shape):
+        return [
+            {
+                "m": int(shape[0]),
+                "n": int(shape[1]),
+                "k": int(shape[2]),
+                "task_indices": [int(index) for index in indices],
+                "task_count": int(len(indices)),
+            }
+            for shape, indices in sorted(bucketed_by_shape.items())
+        ]
+
+    @staticmethod
+    def _bucketed_by_task_shape(tasks, *, xp=None):
+        buckets = {}
+        for index, task in enumerate(tasks):
+            key = gemm_task_key(task, xp=xp)
+            shape = (int(key[2]), int(key[3]), int(key[4]))
+            buckets.setdefault(shape, []).append(index)
+        return {shape: tuple(indices) for shape, indices in buckets.items()}
+
     def lower_block_contraction(self, spec):
         descs = []
         output_blocks = []
@@ -2737,6 +2766,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     for key, block in sorted(result.blocks.items(), key=self._block_sort_key)
                 ],
                 bucket_task_counts=[len(indices) for indices in plan.bucketed_by_shape.values()],
+                shape_buckets=self._profile_shape_buckets(plan.bucketed_by_shape),
                 pack_threshold=pack_threshold,
                 wall_s=time.perf_counter() - started,
             )
@@ -3119,6 +3149,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     num_shape_buckets=stats.shape_bucket_count,
                     fallback_reason=fallback_reason,
                     bucket_task_counts=stats.bucket_task_counts,
+                    shape_buckets=self._profile_shape_buckets(self._bucketed_by_task_shape(converted, xp=xp)),
                     batched_bucket_count=stats.batched_bucket_count,
                     loop_bucket_count=stats.loop_bucket_count,
                     batched_task_count=stats.batched_task_count,
