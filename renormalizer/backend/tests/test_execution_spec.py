@@ -1559,6 +1559,27 @@ def test_contraction_plan_hash_includes_nested_step_plan_identity():
     assert changed_plan.plan_hash != base_plan.plan_hash
 
 
+def test_contraction_plan_hash_includes_operand_layout():
+    from renormalizer.backend import ContractionPlan, TensorOperand
+
+    c_order = np.ascontiguousarray(np.arange(6, dtype=np.float64).reshape(2, 3))
+    f_order = np.asfortranarray(c_order)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    assert c_order.strides != f_order.strides
+
+    def plan_for(left):
+        kwargs = _valid_contraction_plan_kwargs()
+        kwargs["input_specs"] = (
+            TensorOperand(left, ("i", "k")),
+            TensorOperand(right, ("k", "j")),
+        )
+        return ContractionPlan(**kwargs)
+
+    assert plan_for(c_order).input_specs[0].layout.order == "C"
+    assert plan_for(f_order).input_specs[0].layout.order == "F"
+    assert plan_for(c_order).plan_hash != plan_for(f_order).plan_hash
+
+
 def _valid_sliced_contraction_plan_kwargs():
     from renormalizer.backend import ContractionPlan
 

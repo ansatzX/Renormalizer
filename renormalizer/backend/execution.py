@@ -1562,7 +1562,15 @@ def _contraction_plan_hash(plan: ContractionPlan) -> str:
             )
             for step in plan.steps
         ),
-        tuple((operand.modes, _shape_of(operand.array), str(getattr(operand.array, "dtype", None))) for operand in plan.input_specs),
+        tuple(
+            (
+                operand.modes,
+                _shape_of(operand.array),
+                str(getattr(operand.array, "dtype", None)),
+                _layout_hash_payload(operand.layout),
+            )
+            for operand in plan.input_specs
+        ),
         plan.output_modes,
         plan.estimated_peak_bytes,
         plan.sliced_modes,
@@ -1578,6 +1586,22 @@ def _nested_step_plan_hash_payload(plan):
     if plan_hash:
         return (type(plan).__name__, str(plan_hash))
     return (type(plan).__name__, repr(plan))
+
+
+def _layout_hash_payload(layout):
+    if layout is None:
+        return None
+    return (
+        layout.logical_shape,
+        layout.physical_shape,
+        layout.logical_modes,
+        layout.strides,
+        layout.order,
+        layout.contiguous_groups,
+        layout.requires_transpose,
+        layout.transpose_perm,
+        layout.estimated_copy_bytes,
+    )
 
 
 def _layout_transform_hash_payload(transform):
