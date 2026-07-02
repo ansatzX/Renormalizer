@@ -61,6 +61,8 @@ class BackendConfig:
         self.seed = seed
         self.fallback_policy = FallbackPolicy.from_value(fallback_policy)
         self.options = dict(options)
+        if self.fallback_policy is FallbackPolicy.SILENT and not self.options.get("allow_silent_fallback", False):
+            raise ValueError("silent fallback policy requires allow_silent_fallback=True")
 
     def replace(self, **updates):
         values = dict(self.options)

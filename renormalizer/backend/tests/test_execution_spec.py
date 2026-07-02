@@ -29,6 +29,23 @@ def test_backend_config_keeps_legacy_device_kind_and_exposes_device_spec():
     assert config.fallback_policy is FallbackPolicy.RECORD
 
 
+def test_backend_config_rejects_silent_fallback_without_explicit_opt_in():
+    from renormalizer.backend import BackendConfig
+
+    with pytest.raises(ValueError, match="silent fallback policy requires allow_silent_fallback=True"):
+        BackendConfig(fallback_policy="silent")
+
+
+def test_backend_config_allows_silent_fallback_with_explicit_opt_in():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.execution import FallbackPolicy
+
+    config = BackendConfig(fallback_policy="silent", allow_silent_fallback=True)
+
+    assert config.fallback_policy is FallbackPolicy.SILENT
+    assert config.options["allow_silent_fallback"] is True
+
+
 def test_numpy_backend_capabilities_and_array_info_are_explicit():
     from renormalizer.backend.numpy_backend import NumpyBackend
     from renormalizer.backend.execution import DeviceSpec
