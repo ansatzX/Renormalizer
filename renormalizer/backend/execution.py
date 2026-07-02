@@ -1179,12 +1179,26 @@ class SlicedContractionPlan:
     operand_slices: tuple[tuple[tuple[slice, ...], ...], ...]
 
     def __post_init__(self):
-        object.__setattr__(self, "output_axis", int(self.output_axis))
-        object.__setattr__(self, "output_slices", tuple(tuple(item) for item in self.output_slices))
+        output_axis = int(self.output_axis)
+        output_rank = len(self.base_plan.output_modes)
+        if output_axis < 0:
+            output_axis += output_rank
+        if output_axis < 0 or output_axis >= output_rank:
+            raise ValueError("SlicedContractionPlan output_axis is out of bounds")
+        output_slices = tuple(tuple(item) for item in self.output_slices)
+        if not output_slices:
+            raise ValueError("SlicedContractionPlan output_slices must be non-empty")
+        operand_slices = tuple(tuple(tuple(slices) for slices in item) for item in self.operand_slices)
+        if len(operand_slices) != len(output_slices):
+            raise ValueError("SlicedContractionPlan operand_slices must match output_slices length")
+        if any(len(group) != len(self.base_plan.input_specs) for group in operand_slices):
+            raise ValueError("SlicedContractionPlan operand slice groups must match input_specs length")
+        object.__setattr__(self, "output_axis", output_axis)
+        object.__setattr__(self, "output_slices", output_slices)
         object.__setattr__(
             self,
             "operand_slices",
-            tuple(tuple(tuple(slices) for slices in item) for item in self.operand_slices),
+            operand_slices,
         )
 
 

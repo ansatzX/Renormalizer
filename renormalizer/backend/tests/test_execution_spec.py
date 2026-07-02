@@ -1461,6 +1461,42 @@ def test_contraction_plan_rejects_inconsistent_step_metadata():
         ContractionPlan(**kwargs)
 
 
+def _valid_sliced_contraction_plan_kwargs():
+    from renormalizer.backend import ContractionPlan
+
+    return {
+        "base_plan": ContractionPlan(**_valid_contraction_plan_kwargs()),
+        "sliced_mode": "i",
+        "output_axis": 0,
+        "output_slices": ((slice(0, 1), slice(None)),),
+        "operand_slices": (((slice(0, 1), slice(None)), (slice(None), slice(None))),),
+    }
+
+
+def test_sliced_contraction_plan_rejects_invalid_slice_metadata():
+    from renormalizer.backend import SlicedContractionPlan
+
+    kwargs = _valid_sliced_contraction_plan_kwargs()
+    kwargs["output_axis"] = 2
+    with pytest.raises(ValueError, match="SlicedContractionPlan output_axis is out of bounds"):
+        SlicedContractionPlan(**kwargs)
+
+    kwargs = _valid_sliced_contraction_plan_kwargs()
+    kwargs["output_slices"] = ()
+    with pytest.raises(ValueError, match="SlicedContractionPlan output_slices must be non-empty"):
+        SlicedContractionPlan(**kwargs)
+
+    kwargs = _valid_sliced_contraction_plan_kwargs()
+    kwargs["operand_slices"] = ()
+    with pytest.raises(ValueError, match="SlicedContractionPlan operand_slices must match output_slices length"):
+        SlicedContractionPlan(**kwargs)
+
+    kwargs = _valid_sliced_contraction_plan_kwargs()
+    kwargs["operand_slices"] = (((slice(None), slice(None)),),)
+    with pytest.raises(ValueError, match="SlicedContractionPlan operand slice groups must match input_specs length"):
+        SlicedContractionPlan(**kwargs)
+
+
 @pytest.mark.parametrize(
     "field",
     [
