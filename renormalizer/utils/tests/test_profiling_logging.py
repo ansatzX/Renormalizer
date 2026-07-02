@@ -488,6 +488,51 @@ def test_trace_mode_keeps_log_concise_with_summary(caplog, monkeypatch, tmp_path
     assert event["input_shapes"] == [[2, 3], [3, 4]]
 
 
+def test_trace_summary_excludes_large_grouped_gemm_task_metadata(caplog, tmp_path):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    try:
+        profiling.record(
+            "contraction_execute",
+            lowering="grouped_gemm",
+            task_operands=[
+                [
+                    {"name": "task0.A", "shape": (2, 3), "modes": ("m", "k")},
+                    {"name": "task0.B", "shape": (3, 4), "modes": ("k", "n")},
+                ],
+            ],
+            task_specs=[
+                {
+                    "index": 0,
+                    "m": 2,
+                    "n": 4,
+                    "k": 3,
+                },
+            ],
+            wall_s=0.25,
+        )
+        profiling.flush_summaries()
+    finally:
+        profiling.close_event_output()
+
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "contraction_execute")
+    assert event["task_operands"][0][0]["name"] == "task0.A"
+    assert event["task_specs"][0]["m"] == 2
+
+    log_payloads = _profiling_payloads(caplog, profiling)
+    summary = next(
+        payload for payload in log_payloads
+        if payload["event"] == "profile_summary" and payload["source_event"] == "contraction_execute"
+    )
+    assert "task_operands" not in summary["signature"]
+    assert "task_specs" not in summary["signature"]
+
+
 def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
     import numpy as np
 

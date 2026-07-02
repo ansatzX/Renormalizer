@@ -472,6 +472,8 @@ class _ProfilingRuntime:
             "contraction_steps",
             "shape_buckets",
             "blocks",
+            "task_operands",
+            "task_specs",
         }
         return {
             key: value for key, value in payload.items()
