@@ -1687,6 +1687,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
             equation=self._einsum_equation_from_plan(path),
         ))
 
+    @staticmethod
+    def _effective_memory_limit_per_device(memory_limit_per_device, cost_model):
+        if memory_limit_per_device is not None:
+            return int(memory_limit_per_device)
+        if cost_model is not None and getattr(cost_model, "max_memory_bytes", None) is not None:
+            return int(cost_model.max_memory_bytes)
+        return None
+
     def plan_distributed_contraction_path(
         self,
         path,
@@ -1720,10 +1728,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 total_gather_bytes=distributed_plan.total_gather_bytes,
             )
         result = self._with_distributed_plan_totals(distributed_plan)
-        if memory_limit_per_device is not None and result.peak_local_bytes > int(memory_limit_per_device):
+        effective_memory_limit = self._effective_memory_limit_per_device(memory_limit_per_device, cost_model)
+        if effective_memory_limit is not None and result.peak_local_bytes > effective_memory_limit:
             raise BackendFeatureError(
                 "distributed contraction peak local bytes {0} exceeds memory limit {1}"
-                .format(result.peak_local_bytes, int(memory_limit_per_device))
+                .format(result.peak_local_bytes, effective_memory_limit)
             )
         return result
 

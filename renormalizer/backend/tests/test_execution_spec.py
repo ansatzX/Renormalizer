@@ -2463,6 +2463,31 @@ def test_plan_distributed_contraction_path_reports_communication_totals():
     assert [item.kind for item in allreduce_path.steps[0].communication] == ["allreduce"]
 
 
+def test_plan_distributed_contraction_path_uses_cost_model_memory_limit():
+    from renormalizer.backend import BackendFeatureError, DeviceMesh, DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.ones((4, 3), dtype=np.float64)
+    right = np.ones((3, 2), dtype=np.float64)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+
+    with pytest.raises(BackendFeatureError, match="peak local bytes 96 exceeds memory limit 95"):
+        backend.plan_distributed_contraction_path(
+            dense_path,
+            mesh,
+            cost_model=HardwareModel(max_memory_bytes=95),
+        )
+
+
 def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionPlan, HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend
