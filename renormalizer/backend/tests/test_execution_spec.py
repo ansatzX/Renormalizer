@@ -2848,6 +2848,16 @@ def test_distributed_contract_records_communication_profile(tmp_path):
     assert event["equation"] == "ik,kj->ij"
     assert event["lowering"] == "distributed"
     assert event["input_dtypes"] == ["float64", "float64"]
+    assert event["operands"][0]["modes"] == ["i", "k"]
+    assert event["operands"][0]["shape"] == [5, 3]
+    assert event["operands"][0]["nbytes"] == 72
+    assert event["operands"][0]["is_host"] is False
+    assert event["operands"][0]["is_device"] is False
+    assert event["operands"][0]["is_distributed"] is True
+    assert event["operands"][0]["device_kind"] == "distributed"
+    assert event["operands"][1]["modes"] == ["k", "j"]
+    assert event["operands"][1]["shape"] == [3, 4]
+    assert event["operands"][1]["nbytes"] == 48
     assert event["local_lowering"] == "gemm"
     assert event["num_gemm"] == 1
     assert event["num_batched_gemm"] == 0

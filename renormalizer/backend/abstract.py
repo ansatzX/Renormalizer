@@ -3293,6 +3293,32 @@ class AbstractBackend(SingleProcessDistributedMixin):
             distributed_modes = tuple(getattr(plan, "distributed_modes", ()))
             if not distributed_modes and output_state is not None:
                 distributed_modes = tuple(getattr(output_state, "distributed_modes", ()))
+            input_modes, _ = parse_einsum_equation(spec.equation)
+
+            def operand_payload(index, operand):
+                info = self.array_info(operand)
+                return {
+                    "name": "operand{0}".format(index),
+                    "modes": [str(mode) for mode in input_modes[index]],
+                    "shape": info.shape,
+                    "dtype": str(info.dtype),
+                    "itemsize": info.itemsize,
+                    "size": info.size,
+                    "nbytes": info.nbytes,
+                    "ndim": info.ndim,
+                    "strides": info.strides,
+                    "order": info.order,
+                    "contiguous": info.contiguous,
+                    "writeable": info.writeable,
+                    "owns_data": info.owns_data,
+                    "backend": info.backend_name,
+                    "device": str(info.device),
+                    "device_kind": info.device.kind,
+                    "device_index": info.device.index,
+                    "is_host": info.is_host,
+                    "is_device": info.is_device,
+                    "is_distributed": info.is_distributed,
+                }
 
             profiling.record(
                 "contraction_execute",
@@ -3301,6 +3327,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 lowering="distributed",
                 plan_hash=plan_hash,
                 input_shapes=[tuple(self._operand_global_shape(operand)) for operand in spec.operands],
+                operands=[
+                    operand_payload(index, operand)
+                    for index, operand in enumerate(spec.operands)
+                ],
                 input_dtypes=[str(self._operand_dtype(operand)) for operand in spec.operands],
                 output_shape=tuple(result.global_shape),
                 dtype=str(getattr(result, "dtype", None)),
