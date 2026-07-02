@@ -670,9 +670,18 @@ class TensorOperand:
     name: str | None = None
 
     def __post_init__(self):
-        object.__setattr__(self, "modes", tuple(self.modes))
+        modes = tuple(self.modes)
+        shape = _shape_of(self.array)
+        if len(modes) != len(shape):
+            raise ValueError("TensorOperand modes must match array rank")
+        if self.layout is not None:
+            if tuple(self.layout.logical_modes) != modes:
+                raise ValueError("TensorOperand layout modes must match operand modes")
+            if tuple(self.layout.logical_shape) != shape:
+                raise ValueError("TensorOperand layout shape must match array shape")
+        object.__setattr__(self, "modes", modes)
         if self.layout is None:
-            object.__setattr__(self, "layout", layout_from_array(self.array, self.modes))
+            object.__setattr__(self, "layout", layout_from_array(self.array, modes))
 
 
 @dataclass(frozen=True)

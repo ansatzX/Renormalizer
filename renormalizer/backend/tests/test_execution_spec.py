@@ -1115,6 +1115,37 @@ def test_packed_vector_spec_rejects_wrong_packed_shapes():
         backend.pack_masked_vectors(np.ones(mask.shape + (3,)), spec)
 
 
+def test_tensor_operand_rejects_inconsistent_layout_metadata():
+    from renormalizer.backend import LayoutSpec, TensorOperand
+
+    array = np.ones((2, 3))
+    wrong_modes = LayoutSpec(
+        logical_shape=(2, 3),
+        physical_shape=(2, 3),
+        logical_modes=("x", "y"),
+        strides=None,
+        order="C",
+        contiguous_groups=((0, 1),),
+    )
+    wrong_shape = LayoutSpec(
+        logical_shape=(2, 4),
+        physical_shape=(2, 4),
+        logical_modes=("i", "k"),
+        strides=None,
+        order="C",
+        contiguous_groups=((0, 1),),
+    )
+
+    with pytest.raises(ValueError, match="TensorOperand modes must match array rank"):
+        TensorOperand(array, ("i", "k", "extra"))
+
+    with pytest.raises(ValueError, match="TensorOperand layout modes must match operand modes"):
+        TensorOperand(array, ("i", "k"), layout=wrong_modes)
+
+    with pytest.raises(ValueError, match="TensorOperand layout shape must match array shape"):
+        TensorOperand(array, ("i", "k"), layout=wrong_shape)
+
+
 def test_pair_contraction_lowering_reports_gemm_shape_and_costs():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend
