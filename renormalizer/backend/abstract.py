@@ -580,6 +580,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "allow_slicing",
             "allow_distribution",
             "target_devices",
+            "stream",
+            "workspace",
         }
         for key, value in kwargs.items():
             if key == "backend" and value is None:
@@ -606,7 +608,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
             if key in kwargs
         }
         plan = self.plan_contraction(spec, **plan_kwargs)
-        return self.execute(plan)
+        execute_kwargs = {
+            key: kwargs[key]
+            for key in ("stream", "workspace")
+            if key in kwargs
+        }
+        return self.execute(plan, **execute_kwargs)
 
     def contract(self, *args, **kwargs):
         import opt_einsum as oe

@@ -3484,6 +3484,41 @@ def test_workspace_stream_and_unified_execute_api_are_explicit():
     assert np.allclose(result, left @ right)
 
 
+def test_explicit_contract_forwards_workspace_to_unified_execute():
+    from renormalizer.backend.execution import BackendFeatureError, DeviceSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    workspace = backend.allocate_workspace(0, device=DeviceSpec(kind="cuda"))
+
+    with pytest.raises(BackendFeatureError, match="workspace device"):
+        backend.contract("ik,kj->ij", left, right, workspace=workspace)
+
+
+def test_explicit_contract_forwards_stream_and_workspace_to_unified_execute():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class RecordingBackend(NumpyBackend):
+        def execute(self, plan, *, stream=None, workspace=None):
+            self.seen_stream = stream
+            self.seen_workspace = workspace
+            return super().execute(plan, stream=stream, workspace=workspace)
+
+    backend = RecordingBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    stream = object()
+    workspace = backend.allocate_workspace(32)
+
+    result = backend.contract("ik,kj->ij", left, right, stream=stream, workspace=workspace)
+
+    assert np.allclose(result, left @ right)
+    assert backend.seen_stream is stream
+    assert backend.seen_workspace is workspace
+
+
 def test_execute_rejects_workspace_smaller_than_plan_requirement():
     from dataclasses import replace
 
