@@ -3577,6 +3577,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     global_shape = tuple(plan.output_shape)
 
         repeated_outputs = len(set(output_blocks)) != len(output_blocks)
+        if repeated_outputs and not spec.accumulate:
+            raise BackendFeatureError(
+                "duplicate output block keys require accumulate=True; got accumulate=False"
+            )
         plan = GroupedGemmPlan(
             tasks=tuple(descs),
             output_blocks=tuple(output_blocks),
