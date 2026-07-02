@@ -940,6 +940,54 @@ def test_matmul_desc_rejects_negative_estimates(field):
         MatmulDesc(None, None, None, 2, 3, 4, **kwargs)
 
 
+def _valid_matmul_plan_kwargs():
+    from renormalizer.backend import MatmulDesc
+
+    return {
+        "kind": "gemm",
+        "descs": (MatmulDesc(None, None, None, 2, 3, 4),),
+        "pre_ops": (),
+        "post_ops": (),
+        "output_shape": (2, 3),
+        "copy_bytes": 0,
+        "workspace_bytes": 0,
+        "estimated_flops": 0,
+        "estimated_time_s": None,
+        "reason": "test plan",
+    }
+
+
+def test_matmul_plan_rejects_unknown_kind():
+    from renormalizer.backend import MatmulPlan
+
+    kwargs = _valid_matmul_plan_kwargs()
+    kwargs["kind"] = "mystery"
+
+    with pytest.raises(ValueError, match="Unknown MatmulPlan kind"):
+        MatmulPlan(**kwargs)
+
+
+def test_matmul_plan_rejects_negative_output_dimensions():
+    from renormalizer.backend import MatmulPlan
+
+    kwargs = _valid_matmul_plan_kwargs()
+    kwargs["output_shape"] = (2, -1)
+
+    with pytest.raises(ValueError, match="MatmulPlan output_shape dimensions must be non-negative"):
+        MatmulPlan(**kwargs)
+
+
+@pytest.mark.parametrize("field", ["copy_bytes", "workspace_bytes", "estimated_flops"])
+def test_matmul_plan_rejects_negative_estimates(field):
+    from renormalizer.backend import MatmulPlan
+
+    kwargs = _valid_matmul_plan_kwargs()
+    kwargs[field] = -1
+
+    with pytest.raises(ValueError, match="MatmulPlan {0} must be non-negative".format(field)):
+        MatmulPlan(**kwargs)
+
+
 def test_pair_contraction_lowering_reports_batched_gemm_for_same_shape_batch():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend

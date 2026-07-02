@@ -747,6 +747,15 @@ class LayoutTransform:
 
 @dataclass(frozen=True)
 class MatmulPlan:
+    VALID_KINDS = frozenset((
+        "gemm",
+        "strided_batched_gemm",
+        "batched_gemm",
+        "grouped_gemm",
+        "fallback_tensordot",
+        "fallback_einsum",
+    ))
+
     kind: str
     descs: tuple[MatmulDesc, ...]
     pre_ops: tuple[LayoutTransform, ...]
@@ -758,6 +767,24 @@ class MatmulPlan:
     estimated_time_s: float | None
     reason: str
     fallback_reason: str | None = None
+
+    def __post_init__(self):
+        kind = str(self.kind)
+        if kind not in self.VALID_KINDS:
+            raise ValueError("Unknown MatmulPlan kind {0!r}".format(self.kind))
+        output_shape = tuple(int(dim) for dim in self.output_shape)
+        if any(dim < 0 for dim in output_shape):
+            raise ValueError("MatmulPlan output_shape dimensions must be non-negative")
+        for field in ("copy_bytes", "workspace_bytes", "estimated_flops"):
+            value = int(getattr(self, field))
+            if value < 0:
+                raise ValueError("MatmulPlan {0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "descs", tuple(self.descs))
+        object.__setattr__(self, "pre_ops", tuple(self.pre_ops))
+        object.__setattr__(self, "post_ops", tuple(self.post_ops))
+        object.__setattr__(self, "output_shape", output_shape)
 
 
 @dataclass(frozen=True)
