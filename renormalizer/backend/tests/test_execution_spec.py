@@ -2886,6 +2886,26 @@ def test_plan_contraction_rejects_unknown_preference_strategy():
         backend.plan_contraction(spec, prefer="fastest")
 
 
+def test_plan_contraction_memory_preference_uses_slicing_to_reduce_peak():
+    from renormalizer.backend import SlicedContractionPlan
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    time_plan = backend.plan_contraction(spec, prefer="time")
+    memory_plan = backend.plan_contraction(spec, prefer="memory")
+
+    assert time_plan.steps[0].kind == "gemm"
+    assert memory_plan.steps[0].kind == "slice"
+    assert isinstance(memory_plan.steps[0].plan, SlicedContractionPlan)
+    assert memory_plan.estimated_peak_bytes < time_plan.estimated_peak_bytes
+    assert memory_plan.estimated_read_bytes > time_plan.estimated_read_bytes
+    assert np.allclose(backend.execute(memory_plan), left @ right)
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

@@ -1122,6 +1122,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ), memory_limit=memory_limit, allow_slicing=allow_slicing)
             return self._enforce_plan_memory_limit(plan, memory_limit=memory_limit, allow_slicing=allow_slicing)
         plan = self._plan_einsum_contraction(spec)
+        plan = self._apply_contraction_plan_preference(
+            plan,
+            prefer=prefer,
+            memory_limit=memory_limit,
+            allow_slicing=allow_slicing,
+        )
         if target_device_specs is not None:
             mesh = self._mesh_from_target_devices(target_device_specs)
             distributed_plan = self.plan_distributed_contraction_path(
@@ -1383,6 +1389,35 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "memory_limit {0} bytes is below contraction plan peak {1} bytes"
             .format(limit, peak)
         )
+
+    def _memory_preferred_slicing_limit(self, plan, peak):
+        output_shape = self._output_shape_for_contraction_plan(plan)
+        candidates = [
+            int(dim)
+            for dim in output_shape
+            if int(dim) > 1
+        ]
+        if not candidates:
+            return None
+        largest_dim = max(candidates)
+        return max(1, (int(peak) + largest_dim - 1) // largest_dim)
+
+    def _apply_contraction_plan_preference(self, plan, *, prefer, memory_limit=None, allow_slicing=True):
+        if prefer != "memory" or memory_limit is not None or not allow_slicing:
+            return plan
+        peak = int(getattr(plan, "estimated_peak_bytes", 0) or 0)
+        if peak <= 0:
+            return plan
+        limit = self._memory_preferred_slicing_limit(plan, peak)
+        if limit is None or limit >= peak:
+            return plan
+        try:
+            candidate = self._build_output_slicing_plan(plan, memory_limit=limit, peak=peak)
+        except BackendFeatureError:
+            return plan
+        if int(candidate.estimated_peak_bytes or 0) < peak:
+            return candidate
+        return plan
 
     @staticmethod
     def _rate_seconds(amount, rate):
