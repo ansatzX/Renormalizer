@@ -636,7 +636,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @staticmethod
     def _explicit_contract_is_plannable(args, kwargs):
-        if len(args) != 3 or not isinstance(args[0], str):
+        if len(args) < 3 or not isinstance(args[0], str):
             return False
         equation = "".join(args[0].split())
         if "->" not in equation or "..." in equation:
@@ -679,9 +679,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return all(key in supported_kwargs for key in kwargs)
 
     def _execute_explicit_planned_contract(self, args, kwargs):
-        equation, left, right = args
+        equation = args[0]
+        operands = args[1:]
         optimize = kwargs.get("optimize")
-        spec = self.parse_einsum(equation, left, right, optimize=optimize)
+        spec = self.parse_einsum(equation, *operands, optimize=optimize)
         plan_kwargs = {
             key: kwargs[key]
             for key in (
