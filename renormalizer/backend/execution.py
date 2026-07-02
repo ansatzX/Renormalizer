@@ -397,6 +397,13 @@ class ShardingSpec:
             )
         else:
             local_slices = {int(rank): tuple(slices) for rank, slices in local_slices.items()}
+            if set(local_slices) != set(range(self.mesh.world_size)):
+                raise ValueError("ShardingSpec local_slices ranks must match mesh ranks")
+            for slices in local_slices.values():
+                if len(slices) != len(global_shape):
+                    raise ValueError("ShardingSpec local_slices entries must match global_shape rank")
+                if any(not isinstance(item, slice) for item in slices):
+                    raise ValueError("ShardingSpec local_slices entries must be slice objects")
         object.__setattr__(self, "global_shape", global_shape)
         object.__setattr__(self, "modes", modes)
         object.__setattr__(self, "ranks_per_mode", ranks_per_mode)

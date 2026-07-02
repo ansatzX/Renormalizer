@@ -610,6 +610,35 @@ def test_device_mesh_and_sharding_spec_compute_local_slices():
     }
 
 
+def test_sharding_spec_rejects_invalid_explicit_local_slices():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    kwargs = {
+        "global_shape": (5, 3),
+        "modes": ("x", "y"),
+        "mesh": mesh,
+        "ranks_per_mode": {"x": 2},
+        "mode_to_mesh_axis": {"x": "rank"},
+    }
+
+    with pytest.raises(ValueError, match="ShardingSpec local_slices ranks must match mesh ranks"):
+        ShardingSpec(**{**kwargs, "local_slices": {0: (slice(None), slice(None))}})
+
+    with pytest.raises(ValueError, match="ShardingSpec local_slices entries must match global_shape rank"):
+        ShardingSpec(**{**kwargs, "local_slices": {0: (slice(0, 3),), 1: (slice(3, 5),)}})
+
+    with pytest.raises(ValueError, match="ShardingSpec local_slices entries must be slice objects"):
+        ShardingSpec(**{**kwargs, "local_slices": {0: (slice(0, 3), slice(None)), 1: (3, slice(None))}})
+
+
 def test_numpy_shard_gather_and_redistribute_roundtrip():
     from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend
