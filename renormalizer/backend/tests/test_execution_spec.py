@@ -1058,8 +1058,8 @@ def test_torch_array_info_and_layout_report_contiguous_strides_when_available():
     assert layout.contiguous_groups == ((0, 1),)
 
 
-def test_cupy_grouped_gemm_is_backend_primitive_when_available():
-    from renormalizer.backend import BackendConfig
+def test_cupy_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
+    from renormalizer.backend import BackendConfig, BackendFeatureError
     from renormalizer.backend.factory import create_backend, is_backend_available
     from renormalizer.backend.gemm import GemmTask
 
@@ -1067,7 +1067,7 @@ def test_cupy_grouped_gemm_is_backend_primitive_when_available():
         pytest.skip("cupy unavailable")
 
     try:
-        backend = create_backend("cupy", config=BackendConfig(device="gpu", fallback_policy="forbid"))
+        backend = create_backend("cupy", config=BackendConfig(device="gpu", fallback_policy="record"))
     except (ImportError, ValueError, RuntimeError) as exc:
         pytest.skip("cupy backend unavailable: {0}".format(exc))
     a_np = np.arange(2 * 4 * 4, dtype=np.float64).reshape(2, 4, 4)
@@ -1079,11 +1079,19 @@ def test_cupy_grouped_gemm_is_backend_primitive_when_available():
 
     results = backend.grouped_gemm(tasks, pack_threshold=2)
 
-    assert backend.supports_grouped_gemm is True
-    assert backend.capabilities.grouped_gemm is True
+    assert backend.supports_grouped_gemm is False
+    assert backend.capabilities.grouped_gemm is False
     assert [tuple(result.shape) for result in results] == [(4, 4), (4, 4)]
     assert np.allclose(backend.to_numpy(results[0]), a_np[0] @ b_np[0])
     assert np.allclose(backend.to_numpy(results[1]), a_np[1] @ b_np[1])
+
+    strict_backend = create_backend("cupy", config=BackendConfig(device="gpu", fallback_policy="forbid"))
+    strict_tasks = [
+        GemmTask(strict_backend.to_backend(a_np[index]), strict_backend.to_backend(b_np[index]), tag=index)
+        for index in range(2)
+    ]
+    with pytest.raises(BackendFeatureError, match="native grouped_gemm unavailable"):
+        strict_backend.grouped_gemm(strict_tasks, pack_threshold=2)
 
 
 def test_should_batch_uses_copy_to_flop_heuristic():
@@ -1846,34 +1854,44 @@ def test_backend_contraction_plan_event_records_generic_operands(tmp_path):
             "modes": ["batch", "('left', 'site')", "bond"],
             "shape": [2, 3, 4],
             "dtype": "float32",
+            "itemsize": 4,
+            "size": 24,
             "nbytes": 96,
             "ndim": 3,
             "strides": [48, 16, 4],
             "order": "C",
             "contiguous": True,
+            "writeable": True,
+            "owns_data": True,
             "backend": "numpy",
             "device": "DeviceSpec(kind='cpu', index=None, local_rank=None, global_rank=None, visible_id=None)",
             "device_kind": "cpu",
             "device_index": None,
             "is_host": True,
             "is_device": False,
+            "is_distributed": False,
         },
         {
             "name": "right_tensor",
             "modes": ["batch", "bond", "('right', 'site')"],
             "shape": [2, 4, 5],
             "dtype": "float32",
+            "itemsize": 4,
+            "size": 40,
             "nbytes": 160,
             "ndim": 3,
             "strides": [80, 20, 4],
             "order": "C",
             "contiguous": True,
+            "writeable": True,
+            "owns_data": True,
             "backend": "numpy",
             "device": "DeviceSpec(kind='cpu', index=None, local_rank=None, global_rank=None, visible_id=None)",
             "device_kind": "cpu",
             "device_index": None,
             "is_host": True,
             "is_device": False,
+            "is_distributed": False,
         },
     ]
 
