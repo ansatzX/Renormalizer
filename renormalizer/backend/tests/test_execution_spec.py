@@ -3650,6 +3650,7 @@ def test_plan_contraction_records_sliced_plan_profile_event(tmp_path):
     assert event["sliced_modes"] == [str(mode) for mode in plan.sliced_modes]
     assert event["num_slices"] == len(plan.steps[0].plan.output_slices)
     assert event["base_lowering"] == "gemm"
+    assert event["input_dtypes"] == ["float64", "float64"]
     assert event["peak_bytes"] == plan.estimated_peak_bytes
     assert event["read_bytes"] == plan.estimated_read_bytes
 

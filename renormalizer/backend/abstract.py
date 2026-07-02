@@ -1686,6 +1686,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     tuple(getattr(operand.array, "shape", ()))
                     for operand in plan.input_specs
                 ],
+                input_dtypes=[
+                    str(getattr(operand.array, "dtype", None))
+                    for operand in plan.input_specs
+                ],
                 output_shape=output_shape,
                 device=str(self.current_device()),
                 device_info=self._profile_device(self.current_device()),
