@@ -3394,10 +3394,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 )
             step = plan.steps[0] if isinstance(plan, ContractionPlan) and plan.steps else None
             plan_hash = ""
-            if distributed_plan is not None:
-                plan_hash = getattr(distributed_plan.path, "plan_hash", "")
-            elif isinstance(plan, ContractionPlan):
+            if isinstance(plan, ContractionPlan):
                 plan_hash = getattr(plan, "plan_hash", "")
+            elif distributed_plan is not None:
+                plan_hash = getattr(distributed_plan.path, "plan_hash", "")
+            local_plan_hash = (
+                getattr(distributed_plan.path, "plan_hash", "")
+                if distributed_plan is not None
+                else ""
+            )
             metric_plan = distributed_plan.path if distributed_plan is not None else plan
             flops = 0
             if distributed_plan is not None:
@@ -3423,7 +3428,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             distributed_modes = tuple(getattr(plan, "distributed_modes", ()))
             if not distributed_modes and output_state is not None:
                 distributed_modes = tuple(getattr(output_state, "distributed_modes", ()))
-            input_modes, _ = parse_einsum_equation(spec.equation)
+            input_modes, output_modes = parse_einsum_equation(spec.equation)
 
             def operand_payload(index, operand):
                 info = self.array_info(operand)
@@ -3456,6 +3461,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 equation=spec.equation,
                 lowering="distributed",
                 plan_hash=plan_hash,
+                local_plan_hash=local_plan_hash,
+                input_modes=[[str(mode) for mode in modes] for modes in input_modes],
+                output_modes=[str(mode) for mode in output_modes],
                 input_shapes=[tuple(self._operand_global_shape(operand)) for operand in spec.operands],
                 operands=[
                     operand_payload(index, operand)

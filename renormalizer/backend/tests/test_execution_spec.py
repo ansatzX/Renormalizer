@@ -2847,6 +2847,10 @@ def test_distributed_contract_records_communication_profile(tmp_path):
     assert event["backend"] == "numpy"
     assert event["equation"] == "ik,kj->ij"
     assert event["lowering"] == "distributed"
+    assert event["plan_hash"] == plan.plan_hash
+    assert event["local_plan_hash"] == plan.steps[0].plan.path.plan_hash
+    assert event["input_modes"] == [["i", "k"], ["k", "j"]]
+    assert event["output_modes"] == ["i", "j"]
     assert event["input_dtypes"] == ["float64", "float64"]
     assert event["operands"][0]["modes"] == ["i", "k"]
     assert event["operands"][0]["shape"] == [5, 3]
