@@ -885,7 +885,23 @@ class ContractionPlan:
     plan_hash: str = ""
 
     def __post_init__(self):
-        object.__setattr__(self, "steps", tuple(self.steps))
+        steps = tuple(self.steps)
+        if not steps:
+            raise ValueError("ContractionPlan steps must be non-empty")
+        for field in (
+            "estimated_flops",
+            "estimated_peak_bytes",
+            "estimated_read_bytes",
+            "estimated_write_bytes",
+            "estimated_copy_bytes",
+            "estimated_comm_bytes",
+            "required_workspace_bytes",
+        ):
+            value = int(getattr(self, field))
+            if value < 0:
+                raise ValueError("ContractionPlan {0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
+        object.__setattr__(self, "steps", steps)
         object.__setattr__(self, "input_specs", tuple(self.input_specs))
         object.__setattr__(self, "output_modes", tuple(self.output_modes))
         object.__setattr__(self, "sliced_modes", tuple(self.sliced_modes))

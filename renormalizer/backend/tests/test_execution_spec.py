@@ -1060,6 +1060,52 @@ def test_contraction_step_rejects_negative_estimates(field):
         ContractionStep(**kwargs)
 
 
+def _valid_contraction_plan_kwargs():
+    from renormalizer.backend import ContractionStep, TensorOperand
+
+    step = ContractionStep(**_valid_contraction_step_kwargs())
+    return {
+        "steps": (step,),
+        "input_specs": (
+            TensorOperand(None, ("i", "k")),
+            TensorOperand(None, ("k", "j")),
+        ),
+        "output_modes": ("i", "j"),
+    }
+
+
+def test_contraction_plan_rejects_empty_steps():
+    from renormalizer.backend import ContractionPlan
+
+    kwargs = _valid_contraction_plan_kwargs()
+    kwargs["steps"] = ()
+
+    with pytest.raises(ValueError, match="ContractionPlan steps must be non-empty"):
+        ContractionPlan(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "estimated_flops",
+        "estimated_peak_bytes",
+        "estimated_read_bytes",
+        "estimated_write_bytes",
+        "estimated_copy_bytes",
+        "estimated_comm_bytes",
+        "required_workspace_bytes",
+    ],
+)
+def test_contraction_plan_rejects_negative_estimates(field):
+    from renormalizer.backend import ContractionPlan
+
+    kwargs = _valid_contraction_plan_kwargs()
+    kwargs[field] = -1
+
+    with pytest.raises(ValueError, match="ContractionPlan {0} must be non-negative".format(field)):
+        ContractionPlan(**kwargs)
+
+
 def test_pair_contraction_lowering_reports_batched_gemm_for_same_shape_batch():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend
