@@ -25,9 +25,15 @@ _BACKEND_PROTOCOL_RUNTIME_ATTRS = (
     "supports_fp32",
     "supports_fp64",
     "supports_mixed_precision",
+    "supports_device_index",
+    "supports_matmul",
     "supports_batched_matmul",
     "supports_grouped_gemm",
     "supports_strided_batched_gemm",
+    "supports_einsum",
+    "supports_contract_expression",
+    "supports_contraction_path",
+    "supports_custom_contraction_plan",
     "supports_streams",
     "supports_events",
     "supports_memory_pool",
@@ -227,6 +233,12 @@ class BackendProtocol(Protocol):
     supports_mixed_precision: bool
     """Whether mixed-precision execution is natively supported."""
 
+    supports_device_index: bool
+    """Whether indexed device selection is supported."""
+
+    supports_matmul: bool
+    """Whether dense matrix multiplication primitives are available."""
+
     supports_batched_matmul: bool
     """Whether same-shape stacked batched matmul is available."""
 
@@ -235,6 +247,18 @@ class BackendProtocol(Protocol):
 
     supports_strided_batched_gemm: bool
     """Whether native strided batched GEMM is available."""
+
+    supports_einsum: bool
+    """Whether direct einsum execution is available."""
+
+    supports_contract_expression: bool
+    """Whether reusable contraction expression execution is available."""
+
+    supports_contraction_path: bool
+    """Whether contraction path planning is available."""
+
+    supports_custom_contraction_plan: bool
+    """Whether backend execution plans can be produced and executed."""
 
     supports_streams: bool
     """Whether backend stream primitives are available."""

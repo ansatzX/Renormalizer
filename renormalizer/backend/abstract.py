@@ -163,9 +163,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_fp32 = True
     supports_fp64 = True
     supports_mixed_precision = False
+    supports_device_index = False
+    supports_matmul = True
     supports_batched_matmul = True
     supports_grouped_gemm = False
     supports_strided_batched_gemm = False
+    supports_einsum = True
+    supports_contract_expression = True
+    supports_contraction_path = True
+    supports_custom_contraction_plan = True
     supports_streams = False
     supports_events = False
     supports_memory_pool = False
@@ -247,18 +253,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
             fp32=self.supports_fp32,
             fp64=self.supports_fp64,
             mixed_precision=self.supports_mixed_precision,
-            device_index=self.supports_gpu,
+            device_index=self.supports_device_index,
             streams=bool(self.supports_streams and self.device == "gpu"),
             events=bool(self.supports_events and self.device == "gpu"),
             memory_pool=self.supports_memory_pool,
-            matmul=True,
+            matmul=self.supports_matmul,
             batched_matmul=self.supports_batched_matmul,
             grouped_gemm=self.supports_grouped_gemm,
             strided_batched_gemm=self.supports_strided_batched_gemm,
-            einsum=True,
-            contract_expression=True,
-            contraction_path=True,
-            custom_contraction_plan=True,
+            einsum=self.supports_einsum,
+            contract_expression=self.supports_contract_expression,
+            contraction_path=self.supports_contraction_path,
+            custom_contraction_plan=self.supports_custom_contraction_plan,
             block_sparse=self.supports_block_sparse,
             packed_blocks=self.supports_packed_blocks,
             scatter_add=self.supports_scatter_add,

@@ -171,9 +171,15 @@ def test_backend_protocol_capability_flags_are_explicit():
         "supports_fp32",
         "supports_fp64",
         "supports_mixed_precision",
+        "supports_device_index",
+        "supports_matmul",
         "supports_batched_matmul",
         "supports_grouped_gemm",
         "supports_strided_batched_gemm",
+        "supports_einsum",
+        "supports_contract_expression",
+        "supports_contraction_path",
+        "supports_custom_contraction_plan",
         "supports_streams",
         "supports_events",
         "supports_memory_pool",
@@ -203,6 +209,12 @@ def test_backend_capability_flags_mirror_capability_fields():
     assert backend.supports_fp32 is backend.capabilities.fp32
     assert backend.supports_fp64 is backend.capabilities.fp64
     assert backend.supports_mixed_precision is backend.capabilities.mixed_precision
+    assert backend.supports_device_index is backend.capabilities.device_index
+    assert backend.supports_matmul is backend.capabilities.matmul
+    assert backend.supports_einsum is backend.capabilities.einsum
+    assert backend.supports_contract_expression is backend.capabilities.contract_expression
+    assert backend.supports_contraction_path is backend.capabilities.contraction_path
+    assert backend.supports_custom_contraction_plan is backend.capabilities.custom_contraction_plan
     assert backend.supports_distributed_array is backend.capabilities.distributed_array
     assert backend.supports_strided_batched_gemm is backend.capabilities.strided_batched_gemm
     assert backend.supports_point_to_point is backend.capabilities.point_to_point

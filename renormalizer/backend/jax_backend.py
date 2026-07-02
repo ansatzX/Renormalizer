@@ -60,6 +60,7 @@ class JaxBackend(AbstractBackend):
     opt_einsum_name = "jax"
     supports_cpu = True
     supports_gpu = True
+    supports_device_index = True
     supports_autodiff = True
     supports_jit = True
     supports_functional_update = True
