@@ -940,6 +940,22 @@ def test_matmul_desc_rejects_negative_estimates(field):
         MatmulDesc(None, None, None, 2, 3, 4, **kwargs)
 
 
+def test_layout_transform_rejects_negative_shape_dimensions():
+    from renormalizer.backend import LayoutTransform
+
+    with pytest.raises(ValueError, match="LayoutTransform input_shape dimensions must be non-negative"):
+        LayoutTransform(kind="reshape", input_shape=(2, -1), output_shape=(2,))
+    with pytest.raises(ValueError, match="LayoutTransform output_shape dimensions must be non-negative"):
+        LayoutTransform(kind="reshape", input_shape=(2,), output_shape=(2, -1))
+
+
+def test_layout_transform_rejects_negative_copy_bytes():
+    from renormalizer.backend import LayoutTransform
+
+    with pytest.raises(ValueError, match="LayoutTransform copy_bytes must be non-negative"):
+        LayoutTransform(kind="transpose", input_shape=(2, 3), output_shape=(3, 2), copy_bytes=-1)
+
+
 def _valid_matmul_plan_kwargs():
     from renormalizer.backend import MatmulDesc
 

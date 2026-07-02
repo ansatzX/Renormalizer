@@ -744,6 +744,21 @@ class LayoutTransform:
     copy_bytes: int = 0
     reason: str | None = None
 
+    def __post_init__(self):
+        input_shape = tuple(int(dim) for dim in self.input_shape)
+        output_shape = tuple(int(dim) for dim in self.output_shape)
+        copy_bytes = int(self.copy_bytes)
+        if any(dim < 0 for dim in input_shape):
+            raise ValueError("LayoutTransform input_shape dimensions must be non-negative")
+        if any(dim < 0 for dim in output_shape):
+            raise ValueError("LayoutTransform output_shape dimensions must be non-negative")
+        if copy_bytes < 0:
+            raise ValueError("LayoutTransform copy_bytes must be non-negative")
+        object.__setattr__(self, "kind", str(self.kind))
+        object.__setattr__(self, "input_shape", input_shape)
+        object.__setattr__(self, "output_shape", output_shape)
+        object.__setattr__(self, "copy_bytes", copy_bytes)
+
 
 @dataclass(frozen=True)
 class MatmulPlan:
