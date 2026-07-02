@@ -1,5 +1,6 @@
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -131,3 +132,60 @@ def test_oe_contract_expression_profiling_records_operand_array_backends(caplog,
     event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "oe_contract_expression")
     assert event["operand_array_types"] == ["numpy.ndarray", "numpy.ndarray"]
     assert event["operand_array_backends"] == ["numpy", "numpy"]
+
+
+def test_oe_contract_expression_uses_backend_expression_and_path(monkeypatch, caplog, tmp_path):
+    from renormalizer.mps import oe_contract_wrap
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import PROFILING
+
+    class FakeExpression:
+        contraction_list = [((0, 1), frozenset(), "ij,jk->ik", ("ik",), "GEMM")]
+
+        def __call__(self, matrix, *args, **kwargs):
+            return matrix
+
+    class FakeBackend:
+        name = "fake"
+        memory_errors = (MemoryError,)
+        ndarray = (np.ndarray,)
+
+        def __init__(self):
+            self.expression_calls = []
+            self.path_calls = []
+
+        def contract_expression(self, *args, **kwargs):
+            self.expression_calls.append((args, dict(kwargs)))
+            return FakeExpression()
+
+        def contract_path(self, *args, **kwargs):
+            self.path_calls.append((args, dict(kwargs)))
+            return [(0, 1)], SimpleNamespace(opt_cost=16, largest_intermediate=4)
+
+    fake_backend = FakeBackend()
+    monkeypatch.setattr(oe_contract_wrap, "backend", fake_backend)
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    a = np.ones((2, 2))
+    try:
+        expr = oe_contract_expression("ij,jk->ik", a, (2, 2), constants=[0], optimize="greedy")
+        result = expr(a)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert len(fake_backend.expression_calls) == 1
+    assert fake_backend.expression_calls[0][0][:3] == ("ij,jk->ik", a, (2, 2))
+    assert fake_backend.expression_calls[0][1]["optimize"] == "greedy"
+    assert len(fake_backend.path_calls) == 1
+    assert fake_backend.path_calls[0][0] == ("ij,jk->ik", (2, 2), (2, 2))
+    assert fake_backend.path_calls[0][1] == {"shapes": True, "optimize": "greedy"}
+    assert result is a
+
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "oe_contract_expression")
+    assert event["backend"] == "fake"
+    assert event["path"] == [[0, 1]]
+    assert event["flop_count"] == 16
+    assert event["largest_intermediate"] == 4

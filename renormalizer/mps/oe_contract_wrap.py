@@ -72,7 +72,7 @@ def oe_contract(*args, **kwargs):
 
 def oe_contract_expression(*args, **kwargs):
     update_kwargs(args, kwargs)
-    expr = oe.contract_expression(*args, **kwargs)
+    expr = backend.contract_expression(*args, **kwargs)
     path_summary = None
 
     def expr_wrapped(matrix: xp.ndarray, *args2, **kwargs2):
@@ -88,7 +88,7 @@ def oe_contract_expression(*args, **kwargs):
             raise e
         if profile_enabled:
             if path_summary is None:
-                path_summary = profiling.contract_expression_path_summary(oe.contract_path, args, kwargs, expr)
+                path_summary = profiling.contract_expression_path_summary(backend.contract_path, args, kwargs, expr)
             profile_operands = (matrix, *args2, *args[1:])
             profiling.record(
                 "oe_contract_expression",
