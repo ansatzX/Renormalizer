@@ -1295,6 +1295,9 @@ def test_backend_contraction_plan_event_records_generic_operands(tmp_path):
     ]
     plan = next(payload for payload in payloads if payload["event"] == "contraction_plan")
 
+    assert plan["equation"] == "batch('left', 'site')bond,batchbond('right', 'site')->batch('left', 'site')('right', 'site')"
+    assert isinstance(plan["plan_hash"], str)
+    assert plan["plan_hash"]
     assert plan["lowering"] == "batched_gemm"
     assert plan["batch_modes"] == ["batch"]
     assert plan["output_modes"] == ["batch", "('left', 'site')", "('right', 'site')"]
@@ -1483,13 +1486,13 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     backend = NumpyBackend()
     left = np.arange(6, dtype=np.float64).reshape(2, 3)
     right = np.arange(12, dtype=np.float64).reshape(3, 4)
-    plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
     event_path = tmp_path / "events.jsonl"
     old_level = package_logger.level
     try:
         init_log(PROFILING)
         profiling.register_event_output(event_path)
 
+        plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
         result = backend.execute(plan)
     finally:
         profiling.close_event_output()
@@ -1502,8 +1505,11 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
         for line in event_path.read_text().splitlines()
         if line.strip()
     ]
+    plan_event = next(event for event in events if event["event"] == "contraction_plan")
     execute = next(event for event in events if event["event"] == "contraction_execute")
 
+    assert plan_event["equation"] == "ik,kj->ij"
+    assert plan_event["plan_hash"] == plan.plan_hash
     assert execute["plan_hash"] == plan.plan_hash
     assert execute["equation"] == "ik,kj->ij"
     assert execute["input_modes"] == [["i", "k"], ["k", "j"]]

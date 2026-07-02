@@ -628,6 +628,23 @@ class AbstractBackend(SingleProcessDistributedMixin):
             fallback_reason=plan.fallback_reason,
         )
 
+    @staticmethod
+    def _contraction_plan_from_step(step, input_specs, output_modes, *, sliced_modes=(), distributed_modes=()):
+        return ContractionPlan(
+            steps=(step,),
+            input_specs=input_specs,
+            output_modes=output_modes,
+            estimated_flops=step.estimated_flops,
+            estimated_peak_bytes=step.estimated_peak_bytes,
+            estimated_read_bytes=step.estimated_read_bytes,
+            estimated_write_bytes=step.estimated_write_bytes,
+            estimated_copy_bytes=step.estimated_copy_bytes,
+            estimated_comm_bytes=step.estimated_comm_bytes,
+            required_workspace_bytes=step.required_workspace_bytes,
+            sliced_modes=tuple(sliced_modes),
+            distributed_modes=tuple(distributed_modes),
+        )
+
     def _plan_einsum_contraction(self, spec, *, sliced_modes=(), distributed_modes=(), comm_bytes=0):
         if len(spec.operands) != 2:
             raise BackendFeatureError("plan_contraction currently supports two-operand explicit einsum specs")
@@ -656,17 +673,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 reason="distributed contraction with local matmul plan",
                 fallback_reason=step.fallback_reason,
             )
-        return ContractionPlan(
-            steps=(step,),
+        return self._contraction_plan_from_step(
+            step,
             input_specs=spec.operands,
             output_modes=spec.output_modes,
-            estimated_flops=step.estimated_flops,
-            estimated_peak_bytes=step.estimated_peak_bytes,
-            estimated_read_bytes=step.estimated_read_bytes,
-            estimated_write_bytes=step.estimated_write_bytes,
-            estimated_copy_bytes=step.estimated_copy_bytes,
-            estimated_comm_bytes=step.estimated_comm_bytes,
-            required_workspace_bytes=step.required_workspace_bytes,
             sliced_modes=tuple(sliced_modes),
             distributed_modes=tuple(distributed_modes),
         )
@@ -2453,6 +2463,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
             from renormalizer.utils import profiling
 
             if profiling.should_record_op():
+                input_modes = (spec.left.modes, spec.right.modes)
+                equation = self._equation_from_modes(input_modes, spec.output_modes)
+                step = self._contraction_step_from_matmul_plan(
+                    plan,
+                    input_modes=input_modes,
+                    output_modes=spec.output_modes,
+                )
+                contraction_plan = self._contraction_plan_from_step(
+                    step,
+                    input_specs=(spec.left, spec.right),
+                    output_modes=spec.output_modes,
+                )
+
                 def operand_payload(operand):
                     info = self.array_info(operand.array)
                     return {
@@ -2476,6 +2499,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 profiling.record(
                     "contraction_plan",
                     backend=self.name,
+                    equation=equation,
+                    plan_hash=contraction_plan.plan_hash,
                     lowering=plan.kind,
                     operands=[operand_payload(spec.left), operand_payload(spec.right)],
                     left_modes=[str(mode) for mode in spec.left.modes],
