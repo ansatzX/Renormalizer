@@ -18,6 +18,7 @@ from renormalizer.backend.execution import (
     ShardingSpec,
 )
 from renormalizer.backend.factory import create_backend, is_backend_available, normalize_backend_name
+from renormalizer.utils.log import disable_stream_output
 
 
 DEFAULT_BACKENDS = ("torch",)
@@ -129,6 +130,26 @@ def _plan_comm_bytes(plan):
     return int(distributed_plan.total_comm_bytes)
 
 
+def read_jsonl(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _ranked_profile_path(path, rank, world_size):
+    path = Path(path)
+    if "{rank}" in os.fspath(path):
+        return Path(os.fspath(path).format(rank=int(rank), world_size=int(world_size)))
+    if int(world_size) <= 1:
+        return path
+    return path.with_name("{0}-rank{1}{2}".format(path.stem, int(rank), path.suffix or ".jsonl"))
+
+
 def _record_result(backend, backend_name, device, operation, plan, result, expected, rank, world_size):
     gathered = backend.gather_tensor(result)
     actual = _to_numpy(backend, gathered)
@@ -218,6 +239,79 @@ def evaluate_distributed_smoke_gate(records, *, require_world_size=None, max_abs
         "required_world_size": None if require_world_size is None else int(require_world_size),
         "max_abs_error": float(max_abs_error),
         "required_operations": sorted(EXPECTED_COLLECTIVES),
+        "failures": failures,
+    }
+
+
+def _distributed_profile_events(events):
+    return [
+        event for event in events
+        if event.get("event") == "contraction_execute"
+        and event.get("lowering") == "distributed"
+    ]
+
+
+def evaluate_distributed_profile_gate(events, *, require_world_size=None):
+    profile_events = _distributed_profile_events(events)
+    failures = []
+
+    for expected_collective in sorted({item[0] for item in EXPECTED_COLLECTIVES.values()}):
+        matches = [
+            event for event in profile_events
+            for item in event.get("communication") or []
+            if item.get("collective") == expected_collective
+        ]
+        if not matches:
+            observed_collectives = [
+                item.get("collective")
+                for event in profile_events
+                for item in event.get("communication") or []
+            ]
+            failures.append({
+                "reason": "missing distributed profile collective",
+                "collective": observed_collectives[-1] if observed_collectives else None,
+                "expected_collective": expected_collective,
+            })
+
+    for event in profile_events:
+        if require_world_size is not None and int(event.get("world_size") or 0) != int(require_world_size):
+            failures.append({
+                "reason": "unexpected world size",
+                "rank": event.get("rank"),
+                "world_size": event.get("world_size"),
+                "expected_world_size": int(require_world_size),
+            })
+        if "rank" not in event:
+            failures.append({"reason": "missing rank"})
+        if not event.get("global_shape"):
+            failures.append({"reason": "missing global shape", "rank": event.get("rank")})
+        if not event.get("local_shape"):
+            failures.append({"reason": "missing local shape", "rank": event.get("rank")})
+        if "distributed_modes" not in event:
+            failures.append({"reason": "missing distributed modes", "rank": event.get("rank")})
+        communication = event.get("communication") or []
+        if not communication:
+            failures.append({"reason": "missing communication profile", "rank": event.get("rank")})
+        for item in communication:
+            if item.get("bytes") is None or int(item.get("bytes") or 0) < 0:
+                failures.append({
+                    "reason": "invalid communication bytes",
+                    "rank": event.get("rank"),
+                    "collective": item.get("collective"),
+                })
+            if item.get("wall_s") is None or float(item.get("wall_s") or 0.0) < 0.0:
+                failures.append({
+                    "reason": "invalid communication wall time",
+                    "rank": event.get("rank"),
+                    "collective": item.get("collective"),
+                })
+
+    return {
+        "operation": "distributed_profile_gate",
+        "status": "failed" if failures else "passed",
+        "checked_count": int(len(profile_events)),
+        "required_world_size": None if require_world_size is None else int(require_world_size),
+        "required_collectives": sorted({item[0] for item in EXPECTED_COLLECTIVES.values()}),
         "failures": failures,
     }
 
@@ -397,9 +491,19 @@ def build_parser():
     parser.add_argument("--cols", type=int, default=16)
     parser.add_argument("--output", default=None, help="Optional JSONL output path.")
     parser.add_argument(
+        "--profile-output",
+        default=None,
+        help="Optional profiling JSONL path. Multi-rank runs write rank-suffixed files unless {rank} is present.",
+    )
+    parser.add_argument(
         "--distributed-gate",
         action="store_true",
         help="Fail if distributed smoke records do not cover the expected collective cases.",
+    )
+    parser.add_argument(
+        "--profile-gate",
+        action="store_true",
+        help="Fail if profiling JSONL does not contain distributed contraction communication events.",
     )
     parser.add_argument("--require-world-size", type=int, default=None)
     parser.add_argument("--max-abs-error", type=float, default=1e-9)
@@ -408,16 +512,39 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    rank, world_size = _env_rank_world()
+    profile_output = None
+    old_log_level = None
+    if args.profile_output is not None:
+        from renormalizer.utils import profiling
+        from renormalizer.utils.log import PROFILING, init_log, package_logger
+
+        old_log_level = package_logger.level
+        profile_output = _ranked_profile_path(args.profile_output, rank, world_size)
+        profile_output.parent.mkdir(parents=True, exist_ok=True)
+        init_log(PROFILING)
+        disable_stream_output()
+        profiling.register_event_output(profile_output)
     all_records = []
-    for backend_name in _parse_backend_names(args.backends):
-        records = run_distributed_smoke(
-            backend_name,
-            device=args.device,
-            rows=args.rows,
-            shared_dim=args.shared_dim,
-            cols=args.cols,
-        )
-        all_records.extend(records)
+    try:
+        for backend_name in _parse_backend_names(args.backends):
+            records = run_distributed_smoke(
+                backend_name,
+                device=args.device,
+                rows=args.rows,
+                shared_dim=args.shared_dim,
+                cols=args.cols,
+            )
+            all_records.extend(records)
+    finally:
+        if args.profile_output is not None:
+            from renormalizer.utils import profiling
+            from renormalizer.utils.log import init_log
+
+            profiling.close_event_output()
+            profiling.flush_summaries()
+            if old_log_level is not None:
+                init_log(old_log_level)
     gate_summary = None
     if args.distributed_gate:
         gate_summary = evaluate_distributed_smoke_gate(
@@ -426,12 +553,23 @@ def main(argv=None):
             max_abs_error=args.max_abs_error,
         )
         all_records.append(gate_summary)
+    profile_gate_summary = None
+    if args.profile_gate:
+        profile_gate_summary = evaluate_distributed_profile_gate(
+            read_jsonl(profile_output) if profile_output is not None else [],
+            require_world_size=args.require_world_size,
+        )
+        if profile_output is not None:
+            profile_gate_summary["profile_output"] = os.fspath(profile_output)
+        all_records.append(profile_gate_summary)
     if args.output is not None:
         write_jsonl(all_records, args.output)
     print(json.dumps({"records": all_records}, sort_keys=True))
     if any(record.get("status") == "error" for record in all_records):
         return 1
     if gate_summary is not None and gate_summary["status"] != "passed":
+        return 2
+    if profile_gate_summary is not None and profile_gate_summary["status"] != "passed":
         return 2
     return 0
 
