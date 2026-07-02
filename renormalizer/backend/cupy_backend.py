@@ -7,7 +7,7 @@ import logging
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
-from renormalizer.backend.execution import DeviceSpec
+from renormalizer.backend.execution import BackendCopyError, CopyPolicy, DeviceSpec, legacy_device_kind, parse_device_spec
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,32 @@ class CupyBackend(AbstractBackend):
         with _cupy.cuda.Device(index):
             return fn(*args, **kwargs)
 
+    def _target_cuda_index(self, device):
+        spec = parse_device_spec(device) if device is not None else self.current_device()
+        if spec is None:
+            return self._configured_cuda_index()
+        kind = legacy_device_kind(spec)
+        if kind == "cpu":
+            raise ValueError("cupy backend cannot materialize CPU backend arrays")
+        if kind != "gpu":
+            raise ValueError("cupy backend does not support device {0!r}".format(spec))
+        if spec.index is None:
+            return self._configured_cuda_index()
+        index = int(spec.index)
+        count = int(_cupy.cuda.runtime.getDeviceCount())
+        if index < 0 or index >= count:
+            raise ValueError(
+                "cupy backend CUDA device index {0} is out of range for {1} visible device(s)"
+                .format(index, count)
+            )
+        return index
+
+    def _on_cuda_index(self, index, fn, *args, **kwargs):
+        if index is None:
+            return fn(*args, **kwargs)
+        with _cupy.cuda.Device(index):
+            return fn(*args, **kwargs)
+
     def set_device(self, device):
         super().set_device(device)
         self._activate_configured_device()
@@ -117,13 +143,38 @@ class CupyBackend(AbstractBackend):
             return x
         return _cupy.asnumpy(x)
 
-    def to_host(self, x):
+    def to_host(self, x, *, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to a host NumPy array."""
-        return self.to_numpy(x)
+        copy = CopyPolicy.from_value(copy)
+        if isinstance(x, np.ndarray):
+            if copy is CopyPolicy.ALWAYS:
+                return np.array(x, copy=True)
+            return x
+        if isinstance(x, _cupy.ndarray):
+            if copy is CopyPolicy.NEVER:
+                raise BackendCopyError("to_host would require a device-to-host copy")
+            return _cupy.asnumpy(x)
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_host would require creating a host array")
+        return np.asarray(x)
 
-    def to_backend(self, x):
+    def to_backend(self, x, *, device=None, dtype=None, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to a CuPy array on the active device."""
-        return self.asarray(x)
+        copy = CopyPolicy.from_value(copy)
+        target_index = self._target_cuda_index(device)
+        if isinstance(x, _cupy.ndarray):
+            dtype_requires_copy = dtype is not None and np.dtype(dtype) != x.dtype
+            device_requires_copy = target_index is not None and int(x.device.id) != target_index
+            if copy is CopyPolicy.NEVER and (dtype_requires_copy or device_requires_copy):
+                raise BackendCopyError("to_backend would require a dtype or device copy")
+            if copy is CopyPolicy.NEVER:
+                return x
+            if copy is CopyPolicy.ALWAYS:
+                return self._on_cuda_index(target_index, _cupy.array, x, dtype=dtype, copy=True)
+            return self._on_cuda_index(target_index, _cupy.asarray, x, dtype=dtype)
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_backend would require a host-to-device copy")
+        return self._on_cuda_index(target_index, _cupy.asarray, x, dtype=dtype)
 
     def free_all_blocks(self):
         mempool = _cupy.get_default_memory_pool()

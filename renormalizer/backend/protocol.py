@@ -294,11 +294,11 @@ class BackendProtocol(Protocol):
         """Compatibility alias for converting an array to NumPy."""
         ...
 
-    def to_host(self, x: Any) -> Any:
+    def to_host(self, x: Any, **kwargs: Any) -> Any:
         """Convert a backend array to a host-resident array."""
         ...
 
-    def to_backend(self, x: Any) -> Any:
+    def to_backend(self, x: Any, **kwargs: Any) -> Any:
         """Convert an array-like object to this backend's representation."""
         ...
 

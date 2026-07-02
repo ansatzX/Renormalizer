@@ -5,7 +5,7 @@
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
-from renormalizer.backend.execution import DeviceSpec
+from renormalizer.backend.execution import BackendCopyError, CopyPolicy, DeviceSpec, legacy_device_kind, parse_device_spec
 from renormalizer.backend.mpi import TorchDistributedMixin
 
 try:
@@ -76,6 +76,40 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
                 return torch_device("cuda:{0}".format(index))
             return torch_device("cuda")
         return torch_device("cpu")
+
+    def _torch_device_for_spec(self, spec):
+        torch_device = getattr(torch, "device", None)
+        if torch_device is None:
+            return None
+        if spec is None:
+            return self._torch_device
+        kind = legacy_device_kind(spec)
+        if kind == "gpu":
+            if spec.index is not None:
+                index = int(spec.index)
+                if index < 0 or index >= torch.cuda.device_count():
+                    raise ValueError(
+                        "torch backend CUDA device index {0} is out of range for {1} visible device(s)"
+                        .format(index, torch.cuda.device_count())
+                    )
+                return torch_device("cuda:{0}".format(index))
+            return torch_device("cuda")
+        if kind == "cpu":
+            return torch_device("cpu")
+        raise ValueError("torch backend does not support device {0!r}".format(spec))
+
+    @staticmethod
+    def _tensor_matches_device_spec(x, spec):
+        if spec is None:
+            return True
+        kind = legacy_device_kind(spec)
+        if kind == "gpu":
+            if x.device.type != "cuda":
+                return False
+            return spec.index is None or x.device.index == int(spec.index)
+        if kind == "cpu":
+            return x.device.type == "cpu"
+        return False
 
     def set_device(self, device):
         super().set_device(device)
@@ -183,13 +217,52 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
             return x.detach().cpu().numpy()
         return np.asarray(x)
 
-    def to_host(self, x):
+    def to_host(self, x, *, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to a host NumPy array."""
-        return self.to_numpy(x)
+        copy = CopyPolicy.from_value(copy)
+        if isinstance(x, np.ndarray):
+            if copy is CopyPolicy.ALWAYS:
+                return np.array(x, copy=True)
+            return x
+        if isinstance(x, torch.Tensor):
+            if x.device.type != "cpu" and copy is CopyPolicy.NEVER:
+                raise BackendCopyError("to_host would require a device-to-host copy")
+            result = x.detach().cpu().numpy()
+            if copy is CopyPolicy.ALWAYS:
+                return np.array(result, copy=True)
+            return result
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_host would require creating a host array")
+        return np.asarray(x)
 
-    def to_backend(self, x):
+    def to_backend(self, x, *, device=None, dtype=None, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to a PyTorch tensor."""
-        return self.asarray(x)
+        copy = CopyPolicy.from_value(copy)
+        spec = parse_device_spec(device) if device is not None else self.current_device()
+        target_device = self._torch_device_for_spec(spec)
+        if isinstance(x, torch.Tensor):
+            target_dtype = dtype
+            dtype_requires_copy = target_dtype is not None and x.dtype != target_dtype
+            device_requires_copy = not self._tensor_matches_device_spec(x, spec)
+            if copy is CopyPolicy.NEVER and (dtype_requires_copy or device_requires_copy):
+                raise BackendCopyError("to_backend would require a dtype or device copy")
+            result = x
+            if dtype_requires_copy or device_requires_copy:
+                result = result.to(dtype=target_dtype, device=target_device)
+            if copy is CopyPolicy.ALWAYS:
+                result = result.clone()
+            return result
+        target_dtype = dtype or self._default_dtype_for(x)
+        target_is_cuda = target_device is not None and getattr(target_device, "type", None) == "cuda"
+        if copy is CopyPolicy.NEVER:
+            if target_is_cuda:
+                raise BackendCopyError("to_backend would require a host-to-device copy")
+            if not isinstance(x, np.ndarray):
+                raise BackendCopyError("to_backend would require creating a backend array")
+            default_dtype = self._default_dtype_for(x)
+            if target_dtype is not None and default_dtype is not None and target_dtype != default_dtype:
+                raise BackendCopyError("to_backend would require a dtype conversion copy")
+        return torch.as_tensor(x, dtype=target_dtype, device=target_device)
 
     @staticmethod
     def _normalize_tensordot_dims(axes):

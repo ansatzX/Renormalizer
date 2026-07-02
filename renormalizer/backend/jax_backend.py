@@ -6,7 +6,7 @@ import logging
 
 import numpy as np
 
-from renormalizer.backend.execution import DeviceSpec
+from renormalizer.backend.execution import BackendCopyError, CopyPolicy, DeviceSpec, legacy_device_kind, parse_device_spec
 
 try:
     import jax
@@ -158,6 +158,44 @@ class JaxBackend(AbstractBackend):
             return devices[index]
         return devices[0]
 
+    def _jax_device_for_spec(self, spec):
+        if spec is None:
+            return self._jax_device
+        kind = legacy_device_kind(spec)
+        if kind == "gpu":
+            devices = tuple(self._jax_devices_by_kind.get("gpu", ()))
+            if not devices:
+                raise ValueError("jax backend GPU device was requested but no JAX GPU device is available")
+            if spec.index is None:
+                return devices[0]
+            index = int(spec.index)
+            if index < 0 or index >= len(devices):
+                raise ValueError(
+                    "jax backend CUDA device index {0} is out of range for {1} visible device(s)"
+                    .format(index, len(devices))
+                )
+            return devices[index]
+        if kind == "cpu":
+            devices = tuple(self._jax_devices_by_kind.get("cpu", ()))
+            return devices[0] if devices else None
+        raise ValueError("jax backend does not support device {0!r}".format(spec))
+
+    def _jax_array_matches_spec(self, x, spec):
+        if spec is None:
+            return True
+        devices = tuple(x.devices())
+        if len(devices) != 1:
+            return False
+        device = devices[0]
+        kind = legacy_device_kind(spec)
+        if kind == "gpu":
+            if self._device_kind(device) != "gpu":
+                return False
+            return spec.index is None or getattr(device, "id", None) == int(spec.index)
+        if kind == "cpu":
+            return self._device_kind(device) == "cpu"
+        return False
+
     def _device_spec_for_selected_device(self, kind, device):
         if self.config.device_spec is not None:
             return self.config.device_spec
@@ -250,13 +288,48 @@ class JaxBackend(AbstractBackend):
             return None
         return np.asarray(x)
 
-    def to_host(self, x):
+    def to_host(self, x, *, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to a host NumPy array."""
-        return self.to_numpy(x)
+        copy = CopyPolicy.from_value(copy)
+        if isinstance(x, np.ndarray):
+            if copy is CopyPolicy.ALWAYS:
+                return np.array(x, copy=True)
+            return x
+        if isinstance(x, jnp.ndarray):
+            devices = tuple(x.devices())
+            on_cpu = len(devices) == 1 and self._device_kind(devices[0]) == "cpu"
+            if not on_cpu and copy is CopyPolicy.NEVER:
+                raise BackendCopyError("to_host would require a device-to-host copy")
+            result = np.asarray(x)
+            if copy is CopyPolicy.ALWAYS:
+                return np.array(result, copy=True)
+            return result
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_host would require creating a host array")
+        return np.asarray(x)
 
-    def to_backend(self, x):
+    def to_backend(self, x, *, device=None, dtype=None, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to the JAX backend array representation."""
-        return self._place_on_configured_device(jnp.asarray(x))
+        copy = CopyPolicy.from_value(copy)
+        spec = parse_device_spec(device) if device is not None else self.current_device()
+        target_device = self._jax_device_for_spec(spec)
+        if isinstance(x, jnp.ndarray):
+            dtype_requires_copy = dtype is not None and np.dtype(dtype) != x.dtype
+            device_requires_copy = not self._jax_array_matches_spec(x, spec)
+            if copy is CopyPolicy.NEVER and (dtype_requires_copy or device_requires_copy):
+                raise BackendCopyError("to_backend would require a dtype or device copy")
+            if copy is CopyPolicy.NEVER:
+                return x
+            result = jnp.array(x, dtype=dtype, copy=(copy is CopyPolicy.ALWAYS))
+            if device_requires_copy and target_device is not None:
+                result = jax.device_put(result, device=target_device)
+            return result
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_backend would require a host-to-device copy")
+        result = jnp.asarray(x, dtype=dtype)
+        if target_device is not None:
+            result = jax.device_put(result, device=target_device)
+        return result
 
     def sync(self):
         return None

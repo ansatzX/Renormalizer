@@ -249,13 +249,39 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def to_numpy(self, x: Any):
         return self.numpy(x)
 
-    def to_host(self, x: Any):
-        return self.to_numpy(x)
-
-    def to_backend(self, x: Any):
+    def to_host(self, x: Any, *, copy=CopyPolicy.IF_NEEDED):
+        copy = CopyPolicy.from_value(copy)
         if self.is_host_array(x):
-            return self.from_numpy(x)
-        return self.asarray(x)
+            if copy is CopyPolicy.ALWAYS:
+                return self._copy_array(x)
+            return x
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_host would require creating a host array")
+        result = self.to_numpy(x)
+        if copy is CopyPolicy.ALWAYS:
+            return _np.array(result, copy=True)
+        return result
+
+    def to_backend(self, x: Any, *, device=None, dtype=None, copy=CopyPolicy.IF_NEEDED):
+        del device
+        copy = CopyPolicy.from_value(copy)
+        dtype_requires_copy = dtype is not None and getattr(x, "dtype", None) != dtype
+        if self.is_array(x):
+            if copy is CopyPolicy.NEVER and dtype_requires_copy:
+                raise BackendCopyError("to_backend would require a dtype conversion copy")
+            if copy is CopyPolicy.ALWAYS:
+                return self.array(x, dtype=dtype, copy=True)
+            if dtype_requires_copy:
+                return self.asarray(x, dtype=dtype)
+            return x
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_backend would require creating a backend array")
+        if self.is_host_array(x):
+            result = self.from_numpy(x)
+            if dtype is not None and getattr(result, "dtype", None) != dtype:
+                result = self.asarray(result, dtype=dtype)
+            return result
+        return self.asarray(x, dtype=dtype)
 
     def _promote_tensordot_operands(self, a, b):
         if not (hasattr(a, "dtype") and hasattr(b, "dtype")):

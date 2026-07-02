@@ -299,3 +299,50 @@ def test_jax_array_info_reports_actual_indexed_cuda_device_when_available():
     assert backend.current_device() == DeviceSpec(kind="cuda", index=0, visible_id="0")
     assert info.device == DeviceSpec(kind="cuda", index=1, visible_id="1")
     assert info.is_device is True
+
+
+@pytest.mark.parametrize("backend_name", ("torch", "cupy", "jax"))
+def test_gpu_to_backend_copy_policy_rejects_host_and_dtype_copy(backend_name):
+    from renormalizer.backend import BackendConfig, BackendCopyError, CopyPolicy
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available(backend_name):
+        pytest.skip("{0} unavailable".format(backend_name))
+    try:
+        backend = create_backend(backend_name, config=BackendConfig(device="gpu", precision=64))
+    except Exception as exc:
+        pytest.skip("{0}/gpu unavailable: {1}".format(backend_name, exc))
+
+    host = np.ones((2,), dtype=np.float64)
+    with pytest.raises(BackendCopyError, match="to_backend would require"):
+        backend.to_backend(host, copy=CopyPolicy.NEVER)
+
+    device = backend.to_backend(host)
+    same = backend.to_backend(device, copy=CopyPolicy.NEVER)
+    assert same is device
+
+    with pytest.raises(BackendCopyError, match="to_backend would require"):
+        backend.to_backend(device, dtype=np.float32, copy=CopyPolicy.NEVER)
+
+
+@pytest.mark.parametrize("backend_name", ("torch", "cupy", "jax"))
+def test_gpu_to_host_copy_policy_rejects_device_to_host_copy(backend_name):
+    from renormalizer.backend import BackendConfig, BackendCopyError, CopyPolicy
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available(backend_name):
+        pytest.skip("{0} unavailable".format(backend_name))
+    try:
+        backend = create_backend(backend_name, config=BackendConfig(device="gpu", precision=64))
+    except Exception as exc:
+        pytest.skip("{0}/gpu unavailable: {1}".format(backend_name, exc))
+
+    device = backend.to_backend(np.ones((2,), dtype=np.float64))
+    with pytest.raises(BackendCopyError, match="to_host would require"):
+        backend.to_host(device, copy=CopyPolicy.NEVER)
+
+    host = backend.to_host(device)
+    same = backend.to_host(host, copy=CopyPolicy.NEVER)
+
+    assert isinstance(host, np.ndarray)
+    assert same is host

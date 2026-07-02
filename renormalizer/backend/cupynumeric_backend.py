@@ -8,6 +8,7 @@ import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
 from renormalizer.backend.config import BackendConfig
+from renormalizer.backend.execution import BackendCopyError, CopyPolicy
 
 
 def _prepare_legate_import_env(config=None):
@@ -94,18 +95,39 @@ class CupynumericBackend(AbstractBackend):
             return asnumpy(x)
         return np.asarray(x)
 
-    def to_host(self, x):
+    def to_host(self, x, *, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to a host NumPy array."""
-        return self.to_numpy(x)
-
-    def to_backend(self, x):
-        """Convert ``x`` to the cupynumeric backend representation."""
-        if self.is_array(x):
+        copy = CopyPolicy.from_value(copy)
+        if isinstance(x, np.ndarray):
+            if copy is CopyPolicy.ALWAYS:
+                return np.array(x, copy=True)
             return x
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_host would require creating a host array")
+        result = self.to_numpy(x)
+        if copy is CopyPolicy.ALWAYS:
+            return np.array(result, copy=True)
+        return result
+
+    def to_backend(self, x, *, device=None, dtype=None, copy=CopyPolicy.IF_NEEDED):
+        """Convert ``x`` to the cupynumeric backend representation."""
+        del device
+        copy = CopyPolicy.from_value(copy)
+        if self.is_array(x):
+            dtype_requires_copy = dtype is not None and getattr(x, "dtype", None) != dtype
+            if copy is CopyPolicy.NEVER and dtype_requires_copy:
+                raise BackendCopyError("to_backend would require a dtype conversion copy")
+            if copy is CopyPolicy.ALWAYS:
+                return cnp.array(x, dtype=dtype, copy=True)
+            if dtype_requires_copy:
+                return cnp.asarray(x, dtype=dtype)
+            return x
+        if copy is CopyPolicy.NEVER:
+            raise BackendCopyError("to_backend would require creating a backend array")
         try:
-            return cnp.asarray(x)
+            return cnp.asarray(x, dtype=dtype)
         except NotImplementedError as exc:
             message = str(exc)
             if "attach to array views" not in message:
                 raise
-            return cnp.asarray(np.array(x, copy=True))
+            return cnp.asarray(np.array(x, dtype=dtype, copy=True))
