@@ -715,6 +715,50 @@ def test_compute_summary_separates_roles_and_reports_derived_rates(caplog):
     assert kernel["copy_bandwidth_Bps"] == pytest.approx(25.0)
 
 
+def test_compute_summaries_derive_comm_bytes_from_communication_entries(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    profiling.flush_summaries()
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    profiling.record(
+        "contraction_execute",
+        compute_class="tensordot",
+        compute_subclass="backend_execute",
+        compute_role="kernel",
+        compute_accounting="primary",
+        backend="numpy",
+        lowering="distributed",
+        flops=200,
+        read_bytes=40,
+        write_bytes=10,
+        communication=[
+            {"collective": "alltoall", "bytes": 96, "wall_s": 0.05},
+            {"collective": "allreduce", "bytes": 32, "wall_s": 0.01},
+        ],
+        wall_s=0.2,
+    )
+
+    profiling.flush_summaries()
+
+    payloads = _profiling_payloads(caplog, profiling)
+    compute_summary = next(
+        payload for payload in payloads
+        if payload["event"] == "profile_compute_summary"
+        and payload["compute_class"] == "tensordot"
+    )
+    class_summary = next(
+        payload for payload in payloads
+        if payload["event"] == "profile_compute_class_summary"
+        and payload["compute_class"] == "tensordot"
+    )
+    assert compute_summary["total_comm_bytes"] == 128
+    assert compute_summary["comm_bandwidth_Bps"] == pytest.approx(640.0)
+    assert class_summary["total_comm_bytes"] == 128
+    assert class_summary["comm_bandwidth_Bps"] == pytest.approx(640.0)
+
+
 def test_compute_class_summary_counts_only_primary_compute(caplog):
     from renormalizer.utils.log import PROFILING
     from renormalizer.utils import profiling

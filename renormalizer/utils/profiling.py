@@ -783,6 +783,22 @@ class _ProfilingRuntime:
                 return 0.0
         return 0.0
 
+    @staticmethod
+    def _communication_bytes(payload):
+        value = _ProfilingRuntime._number(payload, "comm_bytes", "estimated_comm_bytes")
+        if value:
+            return value
+        communication = payload.get("communication")
+        if isinstance(communication, dict):
+            return _ProfilingRuntime._number(communication, "bytes")
+        if isinstance(communication, (list, tuple)):
+            total = 0.0
+            for item in communication:
+                if isinstance(item, dict):
+                    total += _ProfilingRuntime._number(item, "bytes")
+            return total
+        return 0.0
+
     def _compute_signature_payload(self, payload):
         if not payload.get("compute_class"):
             return None
@@ -827,7 +843,7 @@ class _ProfilingRuntime:
             "total_read_bytes": self._number(payload, "read_bytes"),
             "total_write_bytes": self._number(payload, "write_bytes"),
             "total_copy_bytes": self._number(payload, "copy_bytes"),
-            "total_comm_bytes": self._number(payload, "comm_bytes", "estimated_comm_bytes"),
+            "total_comm_bytes": self._communication_bytes(payload),
             "max_workspace_bytes": self._number(payload, "workspace_bytes", "required_workspace_bytes"),
             "max_peak_bytes": self._number(payload, "peak_bytes", "largest_intermediate_bytes"),
             "max_largest_intermediate_elements": self._number(
