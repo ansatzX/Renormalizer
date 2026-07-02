@@ -11,6 +11,7 @@ from functools import partial
 from itertools import product
 from collections import deque
 import logging
+import time
 
 import numpy as np
 import scipy
@@ -25,7 +26,7 @@ from renormalizer.mps.svd_qn import get_qn_mask
 from renormalizer.mps import Mpo, Mps, StackedMpo
 from renormalizer.mps.lib import Environ, cvec2cmat
 from renormalizer.mps.oe_contract_wrap import oe_contract
-from renormalizer.utils import Quantity, CompressConfig, CompressCriteria
+from renormalizer.utils import Quantity, CompressConfig, CompressCriteria, profiling
 from renormalizer.backend import PackedVectorSpec
 
 
@@ -487,6 +488,8 @@ def func_sum(funcs):
 
 def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
     nrhs = 1 if x.ndim == 1 else x.shape[1]
+    profile_enabled = profiling.should_record_op() and x.ndim == 2
+    started = time.perf_counter() if profile_enabled else None
     spec = PackedVectorSpec(
         qn_mask=qn_mask,
         center_shape=qn_mask.shape,
@@ -502,7 +505,37 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
         cout = batched_expr(cstruct) * inverse
     else:
         raise ValueError("packed RHS input must be 1D or 2D, got shape {0}".format(x.shape))
-    return asnumpy(backend.pack_masked_vectors(cout, spec))
+    result = asnumpy(backend.pack_masked_vectors(cout, spec))
+    if profile_enabled:
+        input_nbytes = int(getattr(x, "nbytes", 0))
+        output_nbytes = int(getattr(result, "nbytes", 0))
+        cstruct_nbytes = int(getattr(cstruct, "nbytes", 0))
+        cout_nbytes = int(getattr(cout, "nbytes", 0))
+        profiling.record(
+            "contraction_execute",
+            backend=backend.name,
+            equation=None,
+            lowering="batched_rhs_hop",
+            input_shapes=[tuple(x.shape)],
+            output_shape=tuple(result.shape),
+            dtype=str(getattr(result, "dtype", None)),
+            device=str(backend.current_device()),
+            flops=0,
+            read_bytes=input_nbytes,
+            write_bytes=output_nbytes,
+            copy_bytes=0,
+            workspace_bytes=max(cstruct_nbytes, cout_nbytes),
+            largest_intermediate=max(input_nbytes, output_nbytes, cstruct_nbytes, cout_nbytes),
+            num_gemm=0,
+            num_batched_gemm=1,
+            num_grouped_tasks=0,
+            num_blocks=0,
+            num_shape_buckets=0,
+            num_rhs=int(nrhs),
+            fallback_reason=None,
+            wall_s=time.perf_counter() - started,
+        )
+    return result
 
 
 def eigh_iterative(

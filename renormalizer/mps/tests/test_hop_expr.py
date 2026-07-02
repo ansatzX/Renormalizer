@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+import json
+
 import numpy as np
 
 
@@ -81,6 +83,57 @@ def test_apply_hop_to_packed_vectors_uses_batched_expression_for_matrix_rhs():
 
     assert calls == {"scalar": 0, "batched": 1}
     assert np.array_equal(result, (packed + 1.0) * 2.0)
+
+
+def test_apply_hop_to_packed_vectors_profiles_batched_rhs_execution(tmp_path):
+    from renormalizer.mps.gs import _apply_hop_to_packed_vectors
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    old_level = package_logger.level
+    event_path = tmp_path / "events.jsonl"
+    mask = np.array([[True, False, True], [False, True, False]])
+    packed = np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]])
+
+    def scalar_expr(_struct):
+        raise AssertionError("scalar expression should not be used for matrix RHS")
+
+    def batched_expr(struct):
+        return struct + 1.0
+
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = _apply_hop_to_packed_vectors(
+            packed,
+            mask,
+            scalar_expr,
+            batched_expr,
+            inverse=2.0,
+        )
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.array_equal(result, (packed + 1.0) * 2.0)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(payload for payload in payloads if payload["event"] == "contraction_execute")
+    assert event["backend"] == "numpy"
+    assert event["lowering"] == "batched_rhs_hop"
+    assert event["input_shapes"] == [[3, 2]]
+    assert event["output_shape"] == [3, 2]
+    assert event["num_rhs"] == 2
+    assert event["num_batched_gemm"] == 1
+    assert event["fallback_reason"] is None
+    assert event["wall_s"] >= 0.0
 
 
 def test_apply_hop_to_packed_vectors_keeps_scalar_expression_for_vector_rhs():
