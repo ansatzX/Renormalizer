@@ -115,7 +115,7 @@ def test_distributed_profile_gate_requires_distributed_contraction_events():
             "local_shape": [4, 32],
             "distributed_modes": ["i"],
             "communication": [
-                {"collective": "gather", "bytes": 8192, "wall_s": 0.01},
+                {"collective": "gather", "bytes": 8192, "wall_s": 0.01, "num_messages": 1, "block_size": 8192},
             ],
         },
         {
@@ -128,7 +128,7 @@ def test_distributed_profile_gate_requires_distributed_contraction_events():
             "local_shape": [32, 32],
             "distributed_modes": [],
             "communication": [
-                {"collective": "allreduce", "bytes": 8192, "wall_s": 0.02},
+                {"collective": "allreduce", "bytes": 8192, "wall_s": 0.02, "num_messages": 1, "block_size": 8192},
             ],
         },
         {
@@ -141,7 +141,7 @@ def test_distributed_profile_gate_requires_distributed_contraction_events():
             "local_shape": [32, 4],
             "distributed_modes": ["j"],
             "communication": [
-                {"collective": "allreduce", "bytes": 8192, "wall_s": 0.03},
+                {"collective": "allreduce", "bytes": 8192, "wall_s": 0.03, "num_messages": 1, "block_size": 8192},
             ],
         },
     ]
@@ -161,6 +161,45 @@ def test_distributed_profile_gate_requires_distributed_contraction_events():
             "collective": "allreduce",
             "expected_collective": "alltoall",
             "reason": "missing distributed profile collective",
+        }
+    ]
+
+
+def test_distributed_profile_gate_requires_communication_message_metadata():
+    from renormalizer.backend.distributed_smoke import evaluate_distributed_profile_gate
+
+    events = [
+        {
+            "event": "contraction_execute",
+            "lowering": "distributed",
+            "rank": 0,
+            "world_size": 8,
+            "global_shape": [32, 32],
+            "local_shape": [32, 32],
+            "distributed_modes": ["i"],
+            "communication": [
+                {"collective": "broadcast", "bytes": 8192, "wall_s": 0.01, "num_messages": 1, "block_size": 8192},
+                {"collective": "allreduce", "bytes": 8192, "wall_s": 0.02, "block_size": 8192},
+                {"collective": "alltoall", "bytes": 8192, "wall_s": 0.03, "num_messages": 1},
+                {"collective": "gather", "bytes": 8192, "wall_s": 0.04, "num_messages": 1, "block_size": 8192},
+            ],
+        }
+    ]
+
+    summary = evaluate_distributed_profile_gate(events, require_world_size=8)
+
+    assert summary["operation"] == "distributed_profile_gate"
+    assert summary["status"] == "failed"
+    assert summary["failures"] == [
+        {
+            "reason": "invalid communication num_messages",
+            "rank": 0,
+            "collective": "allreduce",
+        },
+        {
+            "reason": "invalid communication block_size",
+            "rank": 0,
+            "collective": "alltoall",
         }
     ]
 
@@ -230,7 +269,7 @@ def test_distributed_profile_cli_writes_ranked_profile_and_gates_it(monkeypatch,
                 "global_shape": [2, 3],
                 "local_shape": [2, 3],
                 "distributed_modes": [],
-                "communication": [{"collective": "broadcast", "bytes": 48, "wall_s": 0.01}],
+                "communication": [{"collective": "broadcast", "bytes": 48, "wall_s": 0.01, "num_messages": 1, "block_size": 48}],
             },
             {
                 "event": "contraction_execute",
@@ -240,7 +279,7 @@ def test_distributed_profile_cli_writes_ranked_profile_and_gates_it(monkeypatch,
                 "global_shape": [32, 32],
                 "local_shape": [4, 32],
                 "distributed_modes": ["i"],
-                "communication": [{"collective": "gather", "bytes": 8192, "wall_s": 0.01}],
+                "communication": [{"collective": "gather", "bytes": 8192, "wall_s": 0.01, "num_messages": 1, "block_size": 8192}],
             },
             {
                 "event": "contraction_execute",
@@ -250,7 +289,7 @@ def test_distributed_profile_cli_writes_ranked_profile_and_gates_it(monkeypatch,
                 "global_shape": [32, 32],
                 "local_shape": [32, 32],
                 "distributed_modes": [],
-                "communication": [{"collective": "allreduce", "bytes": 8192, "wall_s": 0.02}],
+                "communication": [{"collective": "allreduce", "bytes": 8192, "wall_s": 0.02, "num_messages": 1, "block_size": 8192}],
             },
             {
                 "event": "contraction_execute",
@@ -260,7 +299,7 @@ def test_distributed_profile_cli_writes_ranked_profile_and_gates_it(monkeypatch,
                 "global_shape": [32, 32],
                 "local_shape": [32, 4],
                 "distributed_modes": ["j"],
-                "communication": [{"collective": "alltoall", "bytes": 8192, "wall_s": 0.03}],
+                "communication": [{"collective": "alltoall", "bytes": 8192, "wall_s": 0.03, "num_messages": 1, "block_size": 8192}],
             },
         ],
     )

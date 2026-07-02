@@ -356,6 +356,18 @@ def evaluate_distributed_profile_gate(events, *, require_world_size=None):
                     "rank": event.get("rank"),
                     "collective": item.get("collective"),
                 })
+            if item.get("num_messages") is None or int(item.get("num_messages") or 0) < 1:
+                failures.append({
+                    "reason": "invalid communication num_messages",
+                    "rank": event.get("rank"),
+                    "collective": item.get("collective"),
+                })
+            if item.get("block_size") is None or int(item.get("block_size") or 0) < 0:
+                failures.append({
+                    "reason": "invalid communication block_size",
+                    "rank": event.get("rank"),
+                    "collective": item.get("collective"),
+                })
 
     return {
         "operation": "distributed_profile_gate",

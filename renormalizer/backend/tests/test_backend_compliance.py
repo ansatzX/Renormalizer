@@ -176,6 +176,8 @@ def test_backend_compliance_tensor_ops_and_linalg(backend_name, device):
     _assert_allclose(backend, backend.einsum("ik,kj->ij", left, right), left_np @ right_np)
     q, r = backend.linalg.qr(rect)
     _assert_allclose(backend, q @ r, rect_np, rtol=1e-10, atol=1e-10)
+    u, s, vh = backend.linalg.svd(rect, full_matrices=False)
+    _assert_allclose(backend, (u * s) @ vh, rect_np, rtol=1e-10, atol=1e-10)
     evals, evecs = backend.linalg.eigh(sym)
     _assert_allclose(backend, evecs @ backend.diag(evals) @ evecs.T, sym_np, rtol=1e-10, atol=1e-10)
 
