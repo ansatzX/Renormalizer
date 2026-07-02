@@ -613,6 +613,22 @@ def test_pair_contraction_lowering_reports_batched_gemm_for_same_shape_batch():
     assert plan.fallback_reason is None
 
 
+def test_plan_contraction_forbid_policy_rejects_fallback_lowering():
+    from renormalizer.backend import BackendConfig, BackendFeatureError
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class NoBatchedBackend(NumpyBackend):
+        supports_batched_matmul = False
+
+    backend = NoBatchedBackend(config=BackendConfig(fallback_policy="forbid"))
+    left = np.ones((5, 2, 3), dtype=np.float64)
+    right = np.ones((5, 3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("bik,bkj->bij", left, right)
+
+    with pytest.raises(BackendFeatureError, match="backend lacks batched_matmul"):
+        backend.plan_contraction(spec)
+
+
 def test_backend_parse_einsum_builds_explicit_ir_operands():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
