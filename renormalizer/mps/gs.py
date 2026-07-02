@@ -566,15 +566,61 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
         cstruct_nbytes = int(getattr(cstruct, "nbytes", 0))
         cout_nbytes = int(getattr(cout, "nbytes", 0))
         path_profile = _batched_rhs_path_profile(active_expr)
+
+        def device_payload(device):
+            return {
+                "kind": getattr(device, "kind", None),
+                "index": getattr(device, "index", None),
+                "local_rank": getattr(device, "local_rank", None),
+                "global_rank": getattr(device, "global_rank", None),
+                "visible_id": getattr(device, "visible_id", None),
+            }
+
+        def operand_payload(name, array, modes):
+            info = backend.array_info(array)
+            return {
+                "name": name,
+                "modes": list(modes),
+                "shape": info.shape,
+                "dtype": str(info.dtype),
+                "itemsize": info.itemsize,
+                "size": info.size,
+                "nbytes": info.nbytes,
+                "ndim": info.ndim,
+                "strides": info.strides,
+                "order": info.order,
+                "contiguous": info.contiguous,
+                "writeable": info.writeable,
+                "owns_data": info.owns_data,
+                "backend": info.backend_name,
+                "device": str(info.device),
+                "device_kind": info.device.kind,
+                "device_index": info.device.index,
+                "is_host": info.is_host,
+                "is_device": info.is_device,
+                "is_distributed": info.is_distributed,
+            }
+
+        input_modes = ("packed",) if x.ndim == 1 else ("packed", "rhs")
         profiling.record(
             "contraction_execute",
             backend=backend.name,
             equation=getattr(active_expr, "equation", None),
             lowering="batched_rhs_hop",
             input_shapes=[tuple(x.shape)],
+            input_dtypes=[str(getattr(packed, "dtype", None))],
+            operands=[
+                operand_payload("packed_rhs", packed, input_modes),
+            ],
             output_shape=tuple(result.shape),
             dtype=str(getattr(result, "dtype", None)),
             device=str(backend.current_device()),
+            device_info=device_payload(backend.current_device()),
+            center_shape=tuple(spec.center_shape),
+            packed_dim=int(spec.packed_dim),
+            qn_mask_true_count=int(np.sum(qn_mask)),
+            center_tensor_shape=tuple(getattr(cstruct, "shape", ())),
+            output_center_shape=tuple(getattr(cout, "shape", ())),
             flops=int(path_profile["flops"]),
             read_bytes=input_nbytes,
             write_bytes=output_nbytes,

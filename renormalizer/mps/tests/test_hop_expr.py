@@ -132,7 +132,26 @@ def test_apply_hop_to_packed_vectors_profiles_batched_rhs_execution(tmp_path):
     assert event["equation"] == "abc,lbk,ckr->alr"
     assert event["lowering"] == "batched_rhs_hop"
     assert event["input_shapes"] == [[3, 2]]
+    assert event["input_dtypes"] == ["float64"]
     assert event["output_shape"] == [3, 2]
+    assert event["device_info"] == {
+        "kind": "cpu",
+        "index": None,
+        "local_rank": None,
+        "global_rank": None,
+        "visible_id": None,
+    }
+    assert event["center_shape"] == [2, 3]
+    assert event["packed_dim"] == 3
+    assert event["qn_mask_true_count"] == 3
+    assert event["center_tensor_shape"] == [2, 3, 2]
+    assert event["output_center_shape"] == [2, 3, 2]
+    assert event["operands"][0]["name"] == "packed_rhs"
+    assert event["operands"][0]["modes"] == ["packed", "rhs"]
+    assert event["operands"][0]["shape"] == [3, 2]
+    assert event["operands"][0]["itemsize"] == packed.itemsize
+    assert event["operands"][0]["is_host"] is True
+    assert event["operands"][0]["is_distributed"] is False
     assert event["num_rhs"] == 2
     assert event["num_batched_gemm"] == 1
     assert event["fallback_reason"] is None
