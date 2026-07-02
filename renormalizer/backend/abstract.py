@@ -4528,6 +4528,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             desc = descs[0] if descs else None
             grouped = plan.kind == "grouped_gemm"
             if grouped:
+                fallback_reason = plan.fallback_reason or self._grouped_gemm_fallback_reason()
                 input_shapes = [
                     [tuple(getattr(item.A, "shape", ())), tuple(getattr(item.B, "shape", ()))]
                     for item in descs
@@ -4558,6 +4559,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 bucket_task_counts = [len(indices) for _, indices in sorted(shape_buckets.items())]
                 shape_bucket_payload = self._profile_shape_buckets(shape_buckets)
             else:
+                fallback_reason = plan.fallback_reason
                 input_shapes = [
                     tuple(getattr(desc.A, "shape", ())),
                     tuple(getattr(desc.B, "shape", ())),
@@ -4617,7 +4619,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 num_shape_buckets=num_shape_buckets,
                 bucket_task_counts=bucket_task_counts,
                 shape_buckets=shape_bucket_payload,
-                fallback_reason=plan.fallback_reason,
+                fallback_reason=fallback_reason,
                 wall_s=wall_s,
             )
         except Exception:

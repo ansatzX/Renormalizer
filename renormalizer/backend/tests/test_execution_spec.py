@@ -2819,6 +2819,7 @@ def test_execute_grouped_matmul_plan_records_all_descriptor_shapes(tmp_path):
     assert event["output_shape"] == [[2, 4], [2, 4]]
     assert event["num_grouped_tasks"] == 2
     assert event["num_shape_buckets"] == 1
+    assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
     assert event["bucket_task_counts"] == [2]
     assert event["shape_buckets"] == [
         {"m": 2, "n": 4, "k": 3, "task_indices": [0, 1], "task_count": 2}
