@@ -406,6 +406,39 @@ def test_replicate_tensor_and_single_process_collectives():
     assert backend.allgather(x, axis=0) is x
 
 
+def test_distributed_tensor_is_backend_array_and_reports_distributed_info():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    x = np.arange(12, dtype=np.float64).reshape(4, 3)
+    sharding = ShardingSpec(
+        global_shape=x.shape,
+        modes=("i", "j"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+
+    distributed = backend.shard_tensor(x, sharding)
+    info = backend.array_info(distributed)
+
+    assert backend.is_array(distributed) is True
+    assert backend.is_distributed_array(distributed) is True
+    assert info.shape == x.shape
+    assert info.is_distributed is True
+    assert info.device == DeviceSpec(kind="distributed", local_rank=0, global_rank=0)
+    assert info.nbytes == distributed.local_nbytes
+
+
 def test_distributed_capabilities_advertise_collective_primitives():
     from renormalizer.backend.numpy_backend import NumpyBackend
 

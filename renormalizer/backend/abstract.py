@@ -421,7 +421,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return self.make_contiguous(x, copy_policy=copy)
 
     def is_array(self, x: Any) -> bool:
-        return isinstance(x, self.ndarray)
+        return isinstance(x, self.ndarray) or self.is_distributed_array(x)
 
     def is_host_array(self, x: Any) -> bool:
         return isinstance(x, self.host_array_types)
