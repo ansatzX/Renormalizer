@@ -416,7 +416,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         xp = self.array_namespace or _np
         return xp.reshape(x, shape)
 
-    def make_contiguous(self, x: Any, *, copy_policy=CopyPolicy.IF_NEEDED):
+    def make_contiguous(self, x: Any, *, mode_groups=None, copy_policy=CopyPolicy.IF_NEEDED):
+        self._validate_mode_groups(x, mode_groups)
         copy_policy = CopyPolicy.from_value(copy_policy)
         if self._is_c_contiguous(x):
             if copy_policy is CopyPolicy.ALWAYS:
@@ -431,6 +432,30 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if ascontiguousarray is not None:
             return ascontiguousarray(x)
         return self.asarray(x)
+
+    @staticmethod
+    def _validate_mode_groups(x, mode_groups):
+        if mode_groups is None:
+            return
+        ndim = len(getattr(x, "shape", ()))
+        seen = set()
+        for group in mode_groups:
+            axes = tuple(group)
+            if not axes:
+                raise ValueError("mode_groups entries must not be empty")
+            normalized = []
+            for axis in axes:
+                axis = int(axis)
+                if axis < 0:
+                    axis += ndim
+                if axis < 0 or axis >= ndim:
+                    raise ValueError("mode_groups axes must be valid for array rank {0}".format(ndim))
+                if axis in seen:
+                    raise ValueError("mode_groups must not repeat axes")
+                normalized.append(axis)
+            if tuple(normalized) != tuple(range(normalized[0], normalized[0] + len(normalized))):
+                raise ValueError("mode_groups axes must be adjacent in logical axis order")
+            seen.update(normalized)
 
     def parse_einsum(self, equation, *operands, constants=(), optimize=None):
         return parse_einsum(equation, *operands, constants=constants, optimize=optimize)

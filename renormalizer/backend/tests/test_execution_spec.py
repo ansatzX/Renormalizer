@@ -106,6 +106,36 @@ def test_numpy_layout_transform_api_tracks_view_and_contiguous_copy():
     assert not np.shares_memory(contiguous, transposed)
 
 
+def test_make_contiguous_accepts_mode_groups_for_gemm_layout_boundary():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    x = np.arange(24, dtype=np.float64).reshape(2, 3, 4)
+    transposed = backend.permute(x, (1, 0, 2))
+
+    contiguous = backend.make_contiguous(transposed, mode_groups=((0, 1), (2,)))
+
+    assert contiguous.flags["C_CONTIGUOUS"]
+    assert np.array_equal(contiguous, transposed)
+    assert not np.shares_memory(contiguous, transposed)
+
+
+def test_make_contiguous_rejects_invalid_mode_groups():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    x = np.arange(24, dtype=np.float64).reshape(2, 3, 4)
+
+    with pytest.raises(ValueError, match="repeat"):
+        backend.make_contiguous(x, mode_groups=((0, 1), (1, 2)))
+
+    with pytest.raises(ValueError, match="valid.*rank"):
+        backend.make_contiguous(x, mode_groups=((3,),))
+
+    with pytest.raises(ValueError, match="adjacent"):
+        backend.make_contiguous(x, mode_groups=((0, 2),))
+
+
 def test_backend_synchronize_alias_delegates_to_sync():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
