@@ -852,9 +852,11 @@ class CommunicationPlan:
             raise ValueError("CommunicationPlan bytes must be non-negative")
         if local_bytes < 0:
             raise ValueError("CommunicationPlan local_bytes must be non-negative")
-        if num_messages < 0:
-            raise ValueError("CommunicationPlan num_messages must be non-negative")
+        if num_messages < 1:
+            raise ValueError("CommunicationPlan num_messages must be positive")
         block_size = local_bytes if self.block_size is None else int(self.block_size)
+        if block_size < 0:
+            raise ValueError("CommunicationPlan block_size must be non-negative")
         object.__setattr__(self, "bytes", bytes_)
         object.__setattr__(self, "local_bytes", local_bytes)
         object.__setattr__(self, "modes", tuple(self.modes))

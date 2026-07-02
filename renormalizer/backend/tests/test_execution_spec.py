@@ -4261,6 +4261,20 @@ def test_communication_plan_local_bytes_drive_per_rank_timing():
     ) == pytest.approx(3.0)
 
 
+def test_communication_plan_requires_positive_message_count():
+    from renormalizer.backend import CommunicationPlan
+
+    with pytest.raises(ValueError, match="num_messages must be positive"):
+        CommunicationPlan(kind="broadcast", bytes=64, num_messages=0)
+
+
+def test_communication_plan_rejects_negative_block_size():
+    from renormalizer.backend import CommunicationPlan
+
+    with pytest.raises(ValueError, match="block_size must be non-negative"):
+        CommunicationPlan(kind="alltoall", bytes=64, block_size=-1)
+
+
 def test_sharding_spec_can_replicate_over_unused_mesh_axes():
     from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
 
