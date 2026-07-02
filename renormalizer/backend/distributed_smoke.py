@@ -21,6 +21,11 @@ from renormalizer.backend.factory import create_backend, is_backend_available, n
 
 
 DEFAULT_BACKENDS = ("torch",)
+EXPECTED_COLLECTIVES = {
+    "row_sharded_matmul": ("gather",),
+    "contracted_sharded_allreduce": ("allreduce",),
+    "redistribute_output_alltoall": ("alltoall",),
+}
 
 
 def _env_int(name, default):
@@ -145,6 +150,75 @@ def _record_result(backend, backend_name, device, operation, plan, result, expec
         "plan_comm_bytes": _plan_comm_bytes(plan),
         "max_abs_error": error,
         "rank_local_arrays": result.rank_local_arrays is not None,
+    }
+
+
+def _gate_failure(record, reason, **extra):
+    failure = {
+        "operation": record.get("operation"),
+        "reason": reason,
+    }
+    if "backend" in record:
+        failure["backend"] = record.get("backend")
+    if "device" in record:
+        failure["device"] = record.get("device")
+    if "rank" in record:
+        failure["rank"] = record.get("rank")
+    failure.update(extra)
+    return failure
+
+
+def evaluate_distributed_smoke_gate(records, *, require_world_size=None, max_abs_error=1e-9):
+    failures = []
+    records_by_operation = {
+        record.get("operation"): record
+        for record in records
+        if record.get("operation") in EXPECTED_COLLECTIVES
+    }
+
+    for operation, expected_collectives in EXPECTED_COLLECTIVES.items():
+        record = records_by_operation.get(operation)
+        if record is None:
+            failures.append({
+                "operation": operation,
+                "reason": "missing distributed smoke record",
+            })
+            continue
+        if record.get("status") != "passed":
+            failures.append(_gate_failure(record, "distributed smoke record did not pass"))
+            continue
+        if require_world_size is not None and int(record.get("world_size") or 0) != int(require_world_size):
+            failures.append(_gate_failure(
+                record,
+                "unexpected world size",
+                world_size=record.get("world_size"),
+                expected_world_size=int(require_world_size),
+            ))
+        collectives = list(record.get("collectives") or [])
+        if collectives != list(expected_collectives):
+            failures.append(_gate_failure(
+                record,
+                "unexpected collectives",
+                collectives=collectives,
+                expected_collectives=list(expected_collectives),
+            ))
+        error = record.get("max_abs_error")
+        if error is None or float(error) > float(max_abs_error):
+            failures.append(_gate_failure(
+                record,
+                "max_abs_error above threshold",
+                max_abs_error=error,
+                threshold=float(max_abs_error),
+            ))
+
+    return {
+        "operation": "distributed_smoke_gate",
+        "status": "failed" if failures else "passed",
+        "checked_count": int(len(records_by_operation)),
+        "required_world_size": None if require_world_size is None else int(require_world_size),
+        "max_abs_error": float(max_abs_error),
+        "required_operations": sorted(EXPECTED_COLLECTIVES),
+        "failures": failures,
     }
 
 
@@ -322,6 +396,13 @@ def build_parser():
     parser.add_argument("--shared-dim", type=int, default=16)
     parser.add_argument("--cols", type=int, default=16)
     parser.add_argument("--output", default=None, help="Optional JSONL output path.")
+    parser.add_argument(
+        "--distributed-gate",
+        action="store_true",
+        help="Fail if distributed smoke records do not cover the expected collective cases.",
+    )
+    parser.add_argument("--require-world-size", type=int, default=None)
+    parser.add_argument("--max-abs-error", type=float, default=1e-9)
     return parser
 
 
@@ -337,11 +418,21 @@ def main(argv=None):
             cols=args.cols,
         )
         all_records.extend(records)
+    gate_summary = None
+    if args.distributed_gate:
+        gate_summary = evaluate_distributed_smoke_gate(
+            all_records,
+            require_world_size=args.require_world_size,
+            max_abs_error=args.max_abs_error,
+        )
+        all_records.append(gate_summary)
     if args.output is not None:
         write_jsonl(all_records, args.output)
     print(json.dumps({"records": all_records}, sort_keys=True))
     if any(record.get("status") == "error" for record in all_records):
         return 1
+    if gate_summary is not None and gate_summary["status"] != "passed":
+        return 2
     return 0
 
 
