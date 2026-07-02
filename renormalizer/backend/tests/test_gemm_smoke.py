@@ -52,6 +52,30 @@ def test_numpy_gemm_smoke_records_json_serializable_correctness():
     assert grouped["grouped_wall_s"] >= 0.0
 
 
+def test_gemm_smoke_skips_backend_incompatible_device():
+    from renormalizer.backend.gemm_smoke import run_backend_smoke
+
+    records = run_backend_smoke(
+        "numpy",
+        device="cuda",
+        batch=2,
+        small_dim=2,
+        medium_dim=2,
+        repeat=1,
+        pack_threshold=2,
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["backend"] == "numpy"
+    assert record["device"] == "cuda"
+    assert record["operation"] == "backend_create"
+    assert record["status"] == "skipped"
+    assert record["gpu_count"] >= 0
+    assert "cuda_visible_devices" in record
+    assert "does not support device" in record["error"]
+
+
 def test_time_call_uses_warmup_and_median_trial_time(monkeypatch):
     from renormalizer.backend import gemm_smoke
 

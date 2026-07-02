@@ -326,7 +326,9 @@ def run_backend_smoke(
     try:
         backend = create_backend(backend_name, config=BackendConfig(device=device))
     except Exception as exc:
-        return [_error_record(backend_name, device, "backend_create", gpu_count, "error", exc)]
+        message = str(exc)
+        status = "skipped" if "does not support device" in message else "error"
+        return [_error_record(backend_name, device, "backend_create", gpu_count, status, exc)]
 
     records = []
     for operation, fn in (

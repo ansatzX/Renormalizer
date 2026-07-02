@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import importlib.util
+import os
 
 from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.numpy_backend import NumpyBackend
@@ -36,6 +37,9 @@ _BACKEND_ADAPTERS = {
 }
 
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
 def normalize_backend_name(name):
     if name is None:
         return "numpy"
@@ -47,8 +51,15 @@ def normalize_backend_name(name):
     )
 
 
+def _experimental_cupynumeric_enabled():
+    value = os.environ.get("RENO_ENABLE_EXPERIMENTAL_CUPYNUMERIC", "")
+    return value.strip().lower() in _TRUE_VALUES
+
+
 def is_backend_available(name):
     normalized = normalize_backend_name(name)
+    if normalized == "cupynumeric" and not _experimental_cupynumeric_enabled():
+        return False
     package_name = _BACKEND_PACKAGES[normalized]
     if importlib.util.find_spec(package_name) is None:
         return False
@@ -77,6 +88,13 @@ def _raise_missing_adapter(normalized):
     )
 
 
+def _raise_experimental_cupynumeric_disabled():
+    raise ImportError(
+        "cupynumeric backend is experimental and disabled by default; set "
+        "RENO_ENABLE_EXPERIMENTAL_CUPYNUMERIC=1 to enable it for explicit probes."
+    )
+
+
 def _require_backend_package_and_adapter(normalized):
     package_name = _BACKEND_PACKAGES[normalized]
     if importlib.util.find_spec(package_name) is None:
@@ -98,6 +116,11 @@ def create_backend(name=None, *, explicit=True, config=None, **options):
         from renormalizer.backend.jax_backend import JaxBackend
         return JaxBackend(config=backend_config)
     if normalized == "cupynumeric":
+        package_name = _BACKEND_PACKAGES[normalized]
+        if importlib.util.find_spec(package_name) is None:
+            _raise_missing_backend(normalized)
+        if not _experimental_cupynumeric_enabled():
+            _raise_experimental_cupynumeric_disabled()
         _require_backend_package_and_adapter(normalized)
         from renormalizer.backend.cupynumeric_backend import CupynumericBackend
         return CupynumericBackend(config=backend_config)

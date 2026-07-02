@@ -1630,6 +1630,32 @@ def test_backend_discovery_uses_specs_without_importing_optional_modules(monkeyp
         assert module_name not in sys.modules
 
 
+def test_cupynumeric_is_experimental_and_not_available_without_opt_in(monkeypatch):
+    from renormalizer.backend import factory
+
+    monkeypatch.delenv("RENO_ENABLE_EXPERIMENTAL_CUPYNUMERIC", raising=False)
+    monkeypatch.setattr(factory.importlib.util, "find_spec", lambda name: object())
+
+    assert factory.is_backend_available("cupynumeric") is False
+    assert factory.available_backends()["cupynumeric"] is False
+
+    with pytest.raises(ImportError, match="experimental.*RENO_ENABLE_EXPERIMENTAL_CUPYNUMERIC"):
+        factory.create_backend("cupynumeric")
+
+
+def test_cupynumeric_experimental_opt_in_preserves_discovery_without_importing(monkeypatch):
+    import sys
+
+    from renormalizer.backend import factory
+
+    monkeypatch.setenv("RENO_ENABLE_EXPERIMENTAL_CUPYNUMERIC", "1")
+    monkeypatch.delitem(sys.modules, "cupynumeric", raising=False)
+    monkeypatch.setattr(factory.importlib.util, "find_spec", lambda name: object())
+
+    assert factory.is_backend_available("cupynumeric") is True
+    assert "cupynumeric" not in sys.modules
+
+
 def test_backend_discovery_helpers_are_exported_from_backend_and_legacy_facade():
     from renormalizer.backend import SUPPORTED_BACKENDS, available_backends, is_backend_available
     from renormalizer.mps import backend as legacy
