@@ -1004,6 +1004,62 @@ def test_matmul_plan_rejects_negative_estimates(field):
         MatmulPlan(**kwargs)
 
 
+def _valid_contraction_step_kwargs():
+    return {
+        "kind": "gemm",
+        "inputs": (0, 1),
+        "output": 2,
+        "input_modes": (("i", "k"), ("k", "j")),
+        "output_modes": ("i", "j"),
+    }
+
+
+def test_contraction_step_rejects_unknown_kind():
+    from renormalizer.backend import ContractionStep
+
+    kwargs = _valid_contraction_step_kwargs()
+    kwargs["kind"] = "mystery"
+
+    with pytest.raises(ValueError, match="Unknown ContractionStep kind"):
+        ContractionStep(**kwargs)
+
+
+def test_contraction_step_rejects_negative_tensor_ids():
+    from renormalizer.backend import ContractionStep
+
+    kwargs = _valid_contraction_step_kwargs()
+    kwargs["inputs"] = (0, -1)
+    with pytest.raises(ValueError, match="ContractionStep inputs must be non-negative"):
+        ContractionStep(**kwargs)
+
+    kwargs = _valid_contraction_step_kwargs()
+    kwargs["output"] = -1
+    with pytest.raises(ValueError, match="ContractionStep output must be non-negative"):
+        ContractionStep(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "estimated_flops",
+        "estimated_read_bytes",
+        "estimated_write_bytes",
+        "estimated_copy_bytes",
+        "estimated_peak_bytes",
+        "estimated_comm_bytes",
+        "required_workspace_bytes",
+    ],
+)
+def test_contraction_step_rejects_negative_estimates(field):
+    from renormalizer.backend import ContractionStep
+
+    kwargs = _valid_contraction_step_kwargs()
+    kwargs[field] = -1
+
+    with pytest.raises(ValueError, match="ContractionStep {0} must be non-negative".format(field)):
+        ContractionStep(**kwargs)
+
+
 def test_pair_contraction_lowering_reports_batched_gemm_for_same_shape_batch():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend

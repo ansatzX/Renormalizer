@@ -804,6 +804,24 @@ class MatmulPlan:
 
 @dataclass(frozen=True)
 class ContractionStep:
+    VALID_KINDS = frozenset((
+        "gemm",
+        "strided_batched_gemm",
+        "batched_gemm",
+        "grouped_gemm",
+        "fallback_tensordot",
+        "fallback_einsum",
+        "tensordot",
+        "einsum",
+        "transpose",
+        "reshape",
+        "slice",
+        "gather",
+        "redistribute",
+        "activate_distribution",
+        "distributed_contract",
+    ))
+
     kind: str
     inputs: tuple[int, ...]
     output: int
@@ -821,7 +839,31 @@ class ContractionStep:
     fallback_reason: str | None = None
 
     def __post_init__(self):
-        object.__setattr__(self, "inputs", tuple(int(index) for index in self.inputs))
+        kind = str(self.kind)
+        if kind not in self.VALID_KINDS:
+            raise ValueError("Unknown ContractionStep kind {0!r}".format(self.kind))
+        inputs = tuple(int(index) for index in self.inputs)
+        output = int(self.output)
+        if any(index < 0 for index in inputs):
+            raise ValueError("ContractionStep inputs must be non-negative")
+        if output < 0:
+            raise ValueError("ContractionStep output must be non-negative")
+        for field in (
+            "estimated_flops",
+            "estimated_read_bytes",
+            "estimated_write_bytes",
+            "estimated_copy_bytes",
+            "estimated_peak_bytes",
+            "estimated_comm_bytes",
+            "required_workspace_bytes",
+        ):
+            value = int(getattr(self, field))
+            if value < 0:
+                raise ValueError("ContractionStep {0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "inputs", inputs)
+        object.__setattr__(self, "output", output)
         object.__setattr__(self, "input_modes", tuple(tuple(modes) for modes in self.input_modes))
         object.__setattr__(self, "output_modes", tuple(self.output_modes))
 
