@@ -1261,12 +1261,28 @@ class StreamEvent:
     stream: Any = None
     token: Any = None
 
+    def __post_init__(self):
+        device = parse_device_spec(self.device)
+        if device is None:
+            raise ValueError("StreamEvent device must be explicit")
+        object.__setattr__(self, "device", device)
+
 
 @dataclass
 class Workspace:
     device: DeviceSpec
     nbytes: int
     buffer: Any
+
+    def __post_init__(self):
+        device = parse_device_spec(self.device)
+        if device is None:
+            raise ValueError("Workspace device must be explicit")
+        nbytes = int(self.nbytes)
+        if nbytes < 0:
+            raise ValueError("Workspace nbytes must be non-negative")
+        self.device = device
+        self.nbytes = nbytes
 
 
 @dataclass(frozen=True)

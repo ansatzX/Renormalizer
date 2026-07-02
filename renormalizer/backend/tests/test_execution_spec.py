@@ -5135,6 +5135,32 @@ def test_workspace_stream_and_unified_execute_api_are_explicit():
     assert np.allclose(result, left @ right)
 
 
+def test_stream_event_and_workspace_normalize_device_metadata():
+    from renormalizer.backend import StreamEvent, Workspace
+    from renormalizer.backend.execution import DeviceSpec
+
+    event = StreamEvent(device="gpu", stream="s", token="t")
+    workspace = Workspace(device="cpu", nbytes="32", buffer=np.empty(32, dtype=np.uint8))
+
+    assert event.device == DeviceSpec(kind="cuda")
+    assert workspace.device == DeviceSpec(kind="cpu")
+    assert workspace.nbytes == 32
+
+
+def test_stream_event_and_workspace_reject_invalid_metadata():
+    from renormalizer.backend import StreamEvent, Workspace
+    from renormalizer.backend.execution import DeviceSpec
+
+    with pytest.raises(ValueError, match="Unknown backend device"):
+        StreamEvent(device="quantum")
+
+    with pytest.raises(ValueError, match="Workspace nbytes must be non-negative"):
+        Workspace(device=DeviceSpec(kind="cpu"), nbytes=-1, buffer=np.empty(0, dtype=np.uint8))
+
+    with pytest.raises(ValueError, match="Unknown backend device"):
+        Workspace(device="quantum", nbytes=0, buffer=np.empty(0, dtype=np.uint8))
+
+
 def test_explicit_contract_forwards_workspace_to_unified_execute():
     from renormalizer.backend.execution import BackendFeatureError, DeviceSpec
     from renormalizer.backend.numpy_backend import NumpyBackend
