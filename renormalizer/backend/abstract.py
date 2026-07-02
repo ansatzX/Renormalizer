@@ -3612,6 +3612,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 backend=self.name,
                 equation=None,
                 lowering="block_grouped_gemm",
+                plan_hash=plan.plan_hash,
                 input_shapes=[
                     [tuple(getattr(desc.A, "shape", ())), tuple(getattr(desc.B, "shape", ()))]
                     for desc in plan.tasks
@@ -3712,6 +3713,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 backend=self.name,
                 equation=None,
                 lowering="block_grouped_gemm",
+                plan_hash=plan.plan_hash,
                 input_shapes=[
                     [tuple(getattr(desc.A, "shape", ())), tuple(getattr(desc.B, "shape", ()))]
                     for desc in plan.tasks

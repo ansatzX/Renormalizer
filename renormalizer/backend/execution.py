@@ -979,6 +979,52 @@ def _contraction_plan_hash(plan: ContractionPlan) -> str:
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
 
 
+def _block_key_hash_payload(key):
+    qn_left = getattr(key, "qn_left", None)
+    qn_right = getattr(key, "qn_right", None)
+    extra = getattr(key, "extra", None)
+    if qn_left is not None and qn_right is not None:
+        return (tuple(qn_left), tuple(qn_right), tuple(extra or ()))
+    return repr(key)
+
+
+def _grouped_gemm_plan_hash(plan) -> str:
+    payload = (
+        tuple(
+            (
+                desc.m,
+                desc.n,
+                desc.k,
+                desc.batch_shape,
+                desc.trans_a,
+                desc.trans_b,
+                desc.conj_a,
+                desc.conj_b,
+                str(getattr(desc.A, "dtype", None)),
+                str(getattr(desc.B, "dtype", None)),
+                _shape_of(desc.A),
+                _shape_of(desc.B),
+                desc.estimated_flops,
+                desc.estimated_read_bytes,
+                desc.estimated_write_bytes,
+                desc.estimated_workspace_bytes,
+            )
+            for desc in plan.tasks
+        ),
+        tuple(_block_key_hash_payload(key) for key in plan.output_blocks),
+        tuple(sorted(plan.bucketed_by_shape.items())),
+        plan.scatter_add_required,
+        plan.estimated_flops,
+        plan.estimated_read_bytes,
+        plan.estimated_write_bytes,
+        plan.estimated_workspace_bytes,
+        plan.output_modes,
+        plan.global_shape,
+        plan.backend,
+    )
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class BlockKey:
     qn_left: tuple[int, ...]
@@ -1005,6 +1051,7 @@ class GroupedGemmPlan:
     global_shape: tuple[int, ...] = ()
     block_axis_meta: Any = None
     backend: str | None = None
+    plan_hash: str = ""
 
     def __post_init__(self):
         object.__setattr__(self, "tasks", tuple(self.tasks))
@@ -1016,6 +1063,8 @@ class GroupedGemmPlan:
             for shape, indices in self.bucketed_by_shape.items()
         }
         object.__setattr__(self, "bucketed_by_shape", bucketed)
+        if not self.plan_hash:
+            object.__setattr__(self, "plan_hash", _grouped_gemm_plan_hash(self))
 
 
 def _mode_sizes(operand: TensorOperand) -> Mapping[Hashable, int]:

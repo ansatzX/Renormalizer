@@ -1390,6 +1390,76 @@ def test_lower_block_contraction_records_grouped_plan_profile(tmp_path):
     ]
 
 
+def test_block_grouped_gemm_profile_correlates_plan_and_execute_events(tmp_path):
+    from renormalizer.backend import (
+        BlockContractionSpec,
+        BlockKey,
+        BlockTensor,
+        DenseBlock,
+    )
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    event_path = tmp_path / "events.jsonl"
+    left_key = BlockKey((0,), (0,))
+    right_key = BlockKey((0,), (1,))
+    spec = BlockContractionSpec(
+        BlockTensor(
+            {left_key: DenseBlock(left_key, np.ones((2, 3)), ("i", "k"), (2, 3))},
+            global_shape=(2, 3),
+            modes=("i", "k"),
+            block_axis_meta=None,
+            backend="numpy",
+        ),
+        BlockTensor(
+            {right_key: DenseBlock(right_key, np.ones((3, 4)), ("k", "j"), (3, 4))},
+            global_shape=(3, 4),
+            modes=("k", "j"),
+            block_axis_meta=None,
+            backend="numpy",
+        ),
+        output_modes=("i", "j"),
+        qn_rule=lambda left_key, right_key: BlockKey(left_key.qn_left, right_key.qn_right),
+    )
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        plan = backend.lower_block_contraction(spec)
+        backend.execute(plan)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    events = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    plan_event = next(
+        event
+        for event in events
+        if event["event"] == "contraction_plan"
+        and event["lowering"] == "block_grouped_gemm"
+    )
+    execute_event = next(
+        event
+        for event in events
+        if event["event"] == "contraction_execute"
+        and event["lowering"] == "block_grouped_gemm"
+    )
+
+    assert isinstance(plan.plan_hash, str)
+    assert plan.plan_hash
+    assert plan_event["plan_hash"] == plan.plan_hash
+    assert execute_event["plan_hash"] == plan.plan_hash
+
+
 def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
     from renormalizer.backend import (
         BlockContractionSpec,
