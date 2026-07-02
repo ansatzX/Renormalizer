@@ -1963,6 +1963,53 @@ def test_multi_step_contraction_execute_profile_records_aggregate_event(tmp_path
     assert execute["wall_s"] >= 0.0
 
 
+def test_multi_step_contraction_plan_profile_records_aggregate_event(tmp_path):
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    middle = np.arange(12, dtype=np.float64).reshape(3, 4)
+    right = np.arange(20, dtype=np.float64).reshape(4, 5)
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        spec = backend.parse_einsum("ab,bc,cd->ad", left, middle, right, optimize="greedy")
+        plan = backend.plan_contraction(spec)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    events = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    plan_events = [
+        event
+        for event in events
+        if event["event"] == "contraction_plan" and event["plan_hash"] == plan.plan_hash
+    ]
+
+    assert len(plan_events) == 1
+    event = plan_events[0]
+    assert event["lowering"] == "multi_step"
+    assert event["step_lowerings"] == ["gemm", "gemm"]
+    assert event["equation"] == "ab,bc,cd->ad"
+    assert event["input_shapes"] == [[2, 3], [3, 4], [4, 5]]
+    assert event["output_shape"] == [2, 5]
+    assert event["flops"] == 180
+    assert event["read_bytes"] == plan.estimated_read_bytes
+    assert event["write_bytes"] == plan.estimated_write_bytes
+    assert event["num_gemm"] == 2
+
+
 def test_distributed_contract_matches_dense_for_row_sharded_matmul():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

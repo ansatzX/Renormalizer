@@ -847,7 +847,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             )
             next_output += 1
 
-        return ContractionPlan(
+        plan = ContractionPlan(
             steps=tuple(steps),
             input_specs=spec.operands,
             output_modes=spec.output_modes,
@@ -861,6 +861,84 @@ class AbstractBackend(SingleProcessDistributedMixin):
             sliced_modes=tuple(sliced_modes),
             distributed_modes=tuple(distributed_modes),
         )
+        self._record_multi_step_contraction_plan(plan, record_profile=record_profile)
+        return plan
+
+    def _record_multi_step_contraction_plan(self, plan, *, record_profile=True):
+        try:
+            from renormalizer.utils import profiling
+
+            if not record_profile or not profiling.should_record_op():
+                return
+            equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)
+            step_lowerings = [
+                getattr(step.plan, "kind", step.kind)
+                for step in plan.steps
+            ]
+
+            def operand_payload(operand):
+                info = self.array_info(operand.array)
+                return {
+                    "name": operand.name,
+                    "modes": [str(mode) for mode in operand.modes],
+                    "shape": info.shape,
+                    "dtype": str(info.dtype),
+                    "nbytes": info.nbytes,
+                    "ndim": info.ndim,
+                    "strides": info.strides,
+                    "order": info.order,
+                    "contiguous": info.contiguous,
+                    "backend": info.backend_name,
+                    "device": str(info.device),
+                    "device_kind": info.device.kind,
+                    "device_index": info.device.index,
+                    "is_host": info.is_host,
+                    "is_device": info.is_device,
+                }
+
+            profiling.record(
+                "contraction_plan",
+                backend=self.name,
+                equation=equation,
+                lowering="multi_step",
+                step_lowerings=step_lowerings,
+                plan_hash=plan.plan_hash,
+                operands=[operand_payload(operand) for operand in plan.input_specs],
+                input_modes=[[str(mode) for mode in modes] for modes in input_modes],
+                output_modes=[str(mode) for mode in output_modes],
+                input_shapes=[
+                    tuple(getattr(operand.array, "shape", ()))
+                    for operand in plan.input_specs
+                ],
+                output_shape=self._output_shape_for_contraction_plan(plan),
+                input_dtypes=[
+                    str(getattr(operand.array, "dtype", None))
+                    for operand in plan.input_specs
+                ],
+                device=str(self.current_device()),
+                flops=plan.estimated_flops,
+                read_bytes=plan.estimated_read_bytes,
+                write_bytes=plan.estimated_write_bytes,
+                copy_bytes=plan.estimated_copy_bytes,
+                workspace_bytes=plan.required_workspace_bytes,
+                peak_bytes=plan.estimated_peak_bytes,
+                num_gemm=sum(1 for lowering in step_lowerings if lowering == "gemm"),
+                num_batched_gemm=sum(
+                    1
+                    for lowering in step_lowerings
+                    if lowering in ("batched_gemm", "strided_batched_gemm")
+                ),
+                num_grouped_tasks=sum(
+                    len(getattr(step.plan, "descs", ()) or ())
+                    for step, lowering in zip(plan.steps, step_lowerings)
+                    if lowering == "grouped_gemm"
+                ),
+                num_blocks=0,
+                num_shape_buckets=0,
+                fallback_reason=next((step.fallback_reason for step in plan.steps if step.fallback_reason), None),
+            )
+        except Exception:
+            pass
 
     def _plan_einsum_contraction(
         self,
