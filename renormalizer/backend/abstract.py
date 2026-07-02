@@ -3179,6 +3179,33 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "tag": self._profile_scalar(task.tag),
         }
 
+    @staticmethod
+    def _profile_layout_spec(layout):
+        if layout is None:
+            return None
+        return {
+            "logical_shape": [int(dim) for dim in layout.logical_shape],
+            "physical_shape": (
+                [int(dim) for dim in layout.physical_shape]
+                if layout.physical_shape is not None
+                else None
+            ),
+            "logical_modes": [str(mode) for mode in layout.logical_modes],
+            "strides": [int(stride) for stride in layout.strides] if layout.strides is not None else None,
+            "order": layout.order,
+            "contiguous_groups": [
+                [int(axis) for axis in group]
+                for group in layout.contiguous_groups
+            ],
+            "requires_transpose": bool(layout.requires_transpose),
+            "transpose_perm": (
+                [int(axis) for axis in layout.transpose_perm]
+                if layout.transpose_perm is not None
+                else None
+            ),
+            "estimated_copy_bytes": int(layout.estimated_copy_bytes),
+        }
+
     def _profile_matmul_desc_operands(self, desc, index):
         left_modes = tuple(getattr(desc.layout_a, "logical_modes", ()) or ())
         right_modes = tuple(getattr(desc.layout_b, "logical_modes", ()) or ())
@@ -3200,6 +3227,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "conj_b": bool(desc.conj_b),
             "alpha": self._profile_scalar(desc.alpha),
             "beta": self._profile_scalar(desc.beta),
+            "dtype_compute": str(desc.dtype_compute),
+            "dtype_output": str(desc.dtype_output),
+            "estimated_flops": int(desc.estimated_flops),
+            "estimated_read_bytes": int(desc.estimated_read_bytes),
+            "estimated_write_bytes": int(desc.estimated_write_bytes),
+            "estimated_workspace_bytes": int(desc.estimated_workspace_bytes),
+            "layout_a": self._profile_layout_spec(desc.layout_a),
+            "layout_b": self._profile_layout_spec(desc.layout_b),
+            "layout_c": self._profile_layout_spec(desc.layout_c),
         }
 
     @classmethod

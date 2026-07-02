@@ -2954,7 +2954,7 @@ def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
 
 
 def test_execute_grouped_matmul_plan_records_all_descriptor_shapes(tmp_path):
-    from renormalizer.backend import MatmulDesc, MatmulPlan
+    from renormalizer.backend import LayoutSpec, MatmulDesc, MatmulPlan
     from renormalizer.backend.numpy_backend import NumpyBackend
     from renormalizer.utils import profiling
     from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
@@ -2964,9 +2964,53 @@ def test_execute_grouped_matmul_plan_records_all_descriptor_shapes(tmp_path):
     right0 = np.arange(12, dtype=np.float64).reshape(3, 4)
     left1 = left0 + 10.0
     right1 = right0 - 2.0
+
+    def layout(shape, modes, strides):
+        return LayoutSpec(
+            logical_shape=shape,
+            physical_shape=shape,
+            logical_modes=modes,
+            strides=strides,
+            order="C",
+            contiguous_groups=(tuple(range(len(shape))),),
+        )
+
+    layout_a = layout((2, 3), ("i", "k"), left0.strides)
+    layout_b = layout((3, 4), ("k", "j"), right0.strides)
+    layout_c = layout((2, 4), ("i", "j"), None)
     descs = (
-        MatmulDesc(left0, right0, None, 2, 4, 3, estimated_flops=48),
-        MatmulDesc(left1, right1, None, 2, 4, 3, estimated_flops=48),
+        MatmulDesc(
+            left0,
+            right0,
+            None,
+            2,
+            4,
+            3,
+            dtype_compute=np.float64,
+            dtype_output=np.float64,
+            layout_a=layout_a,
+            layout_b=layout_b,
+            layout_c=layout_c,
+            estimated_flops=48,
+            estimated_read_bytes=left0.nbytes + right0.nbytes,
+            estimated_write_bytes=2 * 4 * left0.itemsize,
+        ),
+        MatmulDesc(
+            left1,
+            right1,
+            None,
+            2,
+            4,
+            3,
+            dtype_compute=np.float64,
+            dtype_output=np.float64,
+            layout_a=layout_a,
+            layout_b=layout_b,
+            layout_c=layout_c,
+            estimated_flops=48,
+            estimated_read_bytes=left1.nbytes + right1.nbytes,
+            estimated_write_bytes=2 * 4 * left1.itemsize,
+        ),
     )
     plan = MatmulPlan(
         kind="grouped_gemm",
@@ -3027,6 +3071,45 @@ def test_execute_grouped_matmul_plan_records_all_descriptor_shapes(tmp_path):
             "conj_b": False,
             "alpha": 1.0,
             "beta": 0.0,
+            "dtype_compute": "<class 'numpy.float64'>",
+            "dtype_output": "<class 'numpy.float64'>",
+            "estimated_flops": 48,
+            "estimated_read_bytes": 144,
+            "estimated_write_bytes": 64,
+            "estimated_workspace_bytes": 0,
+            "layout_a": {
+                "logical_shape": [2, 3],
+                "physical_shape": [2, 3],
+                "logical_modes": ["i", "k"],
+                "strides": [24, 8],
+                "order": "C",
+                "contiguous_groups": [[0, 1]],
+                "requires_transpose": False,
+                "transpose_perm": None,
+                "estimated_copy_bytes": 0,
+            },
+            "layout_b": {
+                "logical_shape": [3, 4],
+                "physical_shape": [3, 4],
+                "logical_modes": ["k", "j"],
+                "strides": [32, 8],
+                "order": "C",
+                "contiguous_groups": [[0, 1]],
+                "requires_transpose": False,
+                "transpose_perm": None,
+                "estimated_copy_bytes": 0,
+            },
+            "layout_c": {
+                "logical_shape": [2, 4],
+                "physical_shape": [2, 4],
+                "logical_modes": ["i", "j"],
+                "strides": None,
+                "order": "C",
+                "contiguous_groups": [[0, 1]],
+                "requires_transpose": False,
+                "transpose_perm": None,
+                "estimated_copy_bytes": 0,
+            },
         },
         {
             "index": 1,
@@ -3040,6 +3123,45 @@ def test_execute_grouped_matmul_plan_records_all_descriptor_shapes(tmp_path):
             "conj_b": False,
             "alpha": 1.0,
             "beta": 0.0,
+            "dtype_compute": "<class 'numpy.float64'>",
+            "dtype_output": "<class 'numpy.float64'>",
+            "estimated_flops": 48,
+            "estimated_read_bytes": 144,
+            "estimated_write_bytes": 64,
+            "estimated_workspace_bytes": 0,
+            "layout_a": {
+                "logical_shape": [2, 3],
+                "physical_shape": [2, 3],
+                "logical_modes": ["i", "k"],
+                "strides": [24, 8],
+                "order": "C",
+                "contiguous_groups": [[0, 1]],
+                "requires_transpose": False,
+                "transpose_perm": None,
+                "estimated_copy_bytes": 0,
+            },
+            "layout_b": {
+                "logical_shape": [3, 4],
+                "physical_shape": [3, 4],
+                "logical_modes": ["k", "j"],
+                "strides": [32, 8],
+                "order": "C",
+                "contiguous_groups": [[0, 1]],
+                "requires_transpose": False,
+                "transpose_perm": None,
+                "estimated_copy_bytes": 0,
+            },
+            "layout_c": {
+                "logical_shape": [2, 4],
+                "physical_shape": [2, 4],
+                "logical_modes": ["i", "j"],
+                "strides": None,
+                "order": "C",
+                "contiguous_groups": [[0, 1]],
+                "requires_transpose": False,
+                "transpose_perm": None,
+                "estimated_copy_bytes": 0,
+            },
         },
     ]
 
