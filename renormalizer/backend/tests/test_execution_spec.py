@@ -1141,6 +1141,50 @@ def test_pair_contraction_lowering_reports_gemm_shape_and_costs():
     assert plan.fallback_reason is None
 
 
+def test_pair_contraction_spec_rejects_invalid_metadata():
+    from renormalizer.backend import LayoutSpec, PairContractionSpec, TensorOperand
+
+    left = TensorOperand(np.ones((2, 3)), ("i", "k"), name="left")
+    right = TensorOperand(np.ones((3, 4)), ("k", "j"), name="right")
+    output_layout = LayoutSpec(
+        logical_shape=(2, 4, 1),
+        physical_shape=(2, 4, 1),
+        logical_modes=("i", "j", "extra"),
+        strides=None,
+        order="C",
+        contiguous_groups=((0, 1, 2),),
+    )
+
+    valid = {
+        "left": left,
+        "right": right,
+        "output_modes": ("i", "j"),
+        "left_batch_modes": (),
+        "right_batch_modes": (),
+        "contracted_modes": ("k",),
+        "left_only_modes": ("i",),
+        "right_only_modes": ("j",),
+    }
+
+    with pytest.raises(ValueError, match="PairContractionSpec output_modes must be unique"):
+        PairContractionSpec(**{**valid, "output_modes": ("i", "i")})
+
+    with pytest.raises(ValueError, match="PairContractionSpec output_modes are not present in operands"):
+        PairContractionSpec(**{**valid, "output_modes": ("i", "missing")})
+
+    with pytest.raises(ValueError, match="PairContractionSpec batch modes must match"):
+        PairContractionSpec(**{**valid, "left_batch_modes": ("i",), "right_batch_modes": ("j",)})
+
+    with pytest.raises(ValueError, match="PairContractionSpec left_batch_modes are not present in left operand"):
+        PairContractionSpec(**{**valid, "left_batch_modes": ("j",), "right_batch_modes": ("j",)})
+
+    with pytest.raises(ValueError, match="PairContractionSpec contracted_modes are not present in both operands"):
+        PairContractionSpec(**{**valid, "contracted_modes": ("i",)})
+
+    with pytest.raises(ValueError, match="PairContractionSpec output_layout rank must match output_modes"):
+        PairContractionSpec(**{**valid, "output_layout": output_layout})
+
+
 @pytest.mark.parametrize("field", ["m", "n", "k"])
 def test_matmul_desc_rejects_negative_dimensions(field):
     from renormalizer.backend import MatmulDesc

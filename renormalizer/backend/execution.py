@@ -782,6 +782,89 @@ class PairContractionSpec:
     right_only_modes: tuple[Hashable, ...]
     output_layout: LayoutSpec | None = None
 
+    def __post_init__(self):
+        output_modes = tuple(self.output_modes)
+        left_batch_modes = tuple(self.left_batch_modes)
+        right_batch_modes = tuple(self.right_batch_modes)
+        contracted_modes = tuple(self.contracted_modes)
+        left_only_modes = tuple(self.left_only_modes)
+        right_only_modes = tuple(self.right_only_modes)
+
+        if len(set(output_modes)) != len(output_modes):
+            raise ValueError("PairContractionSpec output_modes must be unique")
+
+        left_modes = set(self.left.modes)
+        right_modes = set(self.right.modes)
+        operand_modes = left_modes | right_modes
+        missing_output = [mode for mode in output_modes if mode not in operand_modes]
+        if missing_output:
+            raise ValueError(
+                "PairContractionSpec output_modes are not present in operands: {0}"
+                .format(missing_output)
+            )
+        if left_batch_modes != right_batch_modes:
+            raise ValueError("PairContractionSpec batch modes must match")
+        missing_left_batch = [mode for mode in left_batch_modes if mode not in left_modes]
+        if missing_left_batch:
+            raise ValueError(
+                "PairContractionSpec left_batch_modes are not present in left operand: {0}"
+                .format(missing_left_batch)
+            )
+        missing_right_batch = [mode for mode in right_batch_modes if mode not in right_modes]
+        if missing_right_batch:
+            raise ValueError(
+                "PairContractionSpec right_batch_modes are not present in right operand: {0}"
+                .format(missing_right_batch)
+            )
+        missing_contracted = [
+            mode for mode in contracted_modes if mode not in left_modes or mode not in right_modes
+        ]
+        if missing_contracted:
+            raise ValueError(
+                "PairContractionSpec contracted_modes are not present in both operands: {0}"
+                .format(missing_contracted)
+            )
+        missing_left_only = [mode for mode in left_only_modes if mode not in left_modes]
+        if missing_left_only:
+            raise ValueError(
+                "PairContractionSpec left_only_modes are not present in left operand: {0}"
+                .format(missing_left_only)
+            )
+        missing_right_only = [mode for mode in right_only_modes if mode not in right_modes]
+        if missing_right_only:
+            raise ValueError(
+                "PairContractionSpec right_only_modes are not present in right operand: {0}"
+                .format(missing_right_only)
+            )
+        if any(mode in output_modes for mode in contracted_modes):
+            raise ValueError("PairContractionSpec contracted_modes must not appear in output_modes")
+
+        output_components = set(left_batch_modes) | set(left_only_modes) | set(right_only_modes)
+        missing_components = [mode for mode in output_modes if mode not in output_components]
+        if missing_components:
+            raise ValueError(
+                "PairContractionSpec output_modes are missing from contraction mode groups: {0}"
+                .format(missing_components)
+            )
+        extra_components = [mode for mode in output_components if mode not in output_modes]
+        if extra_components:
+            raise ValueError(
+                "PairContractionSpec contraction mode groups contain non-output modes: {0}"
+                .format(extra_components)
+            )
+        if self.output_layout is not None:
+            if len(self.output_layout.logical_shape) != len(output_modes):
+                raise ValueError("PairContractionSpec output_layout rank must match output_modes")
+            if tuple(self.output_layout.logical_modes) != output_modes:
+                raise ValueError("PairContractionSpec output_layout modes must match output_modes")
+
+        object.__setattr__(self, "output_modes", output_modes)
+        object.__setattr__(self, "left_batch_modes", left_batch_modes)
+        object.__setattr__(self, "right_batch_modes", right_batch_modes)
+        object.__setattr__(self, "contracted_modes", contracted_modes)
+        object.__setattr__(self, "left_only_modes", left_only_modes)
+        object.__setattr__(self, "right_only_modes", right_only_modes)
+
     @classmethod
     def from_operands(cls, left: TensorOperand, right: TensorOperand, output_modes):
         output_modes = tuple(output_modes)
