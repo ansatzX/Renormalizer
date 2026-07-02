@@ -2633,6 +2633,16 @@ def test_lower_block_contraction_records_grouped_plan_profile(tmp_path):
     assert event["task_operands"][0][0]["itemsize"] == 8
     assert event["task_operands"][0][0]["contiguous"] is True
     assert event["task_operands"][0][0]["is_distributed"] is False
+    assert event["task_specs"][0]["m"] == 2
+    assert event["task_specs"][0]["n"] == 4
+    assert event["task_specs"][0]["k"] == 3
+    assert event["task_specs"][0]["dtype_compute"] == "None"
+    assert event["task_specs"][0]["estimated_flops"] == 48
+    assert event["task_specs"][0]["estimated_read_bytes"] == 144
+    assert event["task_specs"][0]["estimated_write_bytes"] == 64
+    assert event["task_specs"][0]["layout_a"]["logical_modes"] == ["i", "k"]
+    assert event["task_specs"][0]["layout_b"]["logical_modes"] == ["k", "j"]
+    assert event["task_specs"][0]["layout_c"]["logical_modes"] == ["i", "j"]
 
 
 def test_block_grouped_gemm_profile_correlates_plan_and_execute_events(tmp_path):
@@ -2798,6 +2808,14 @@ def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
     assert event["task_operands"][0][1]["name"] == "task0.B"
     assert event["task_operands"][0][1]["modes"] == ["k", "j"]
     assert event["task_operands"][0][1]["shape"] == [3, 4]
+    assert event["task_specs"][0]["m"] == 2
+    assert event["task_specs"][0]["n"] == 4
+    assert event["task_specs"][0]["k"] == 3
+    assert event["task_specs"][0]["dtype_output"] == "None"
+    assert event["task_specs"][0]["estimated_flops"] == 48
+    assert event["task_specs"][0]["layout_a"]["logical_modes"] == ["i", "k"]
+    assert event["task_specs"][0]["layout_b"]["logical_modes"] == ["k", "j"]
+    assert event["task_specs"][0]["layout_c"]["logical_modes"] == ["i", "j"]
     assert event["peak_bytes"] == event["write_bytes"] + event["workspace_bytes"]
     assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
     assert event["wall_s"] >= 0.0

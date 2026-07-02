@@ -3912,6 +3912,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     self._profile_matmul_desc_operands(desc, index)
                     for index, desc in enumerate(plan.tasks)
                 ],
+                task_specs=[
+                    self._profile_matmul_desc_spec(desc, index)
+                    for index, desc in enumerate(plan.tasks)
+                ],
                 output_shape=tuple(plan.global_shape),
                 dtype=str(getattr(plan.tasks[0].A, "dtype", None)) if plan.tasks else None,
                 device=str(self.current_device()),
@@ -4029,6 +4033,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ],
                 task_operands=[
                     self._profile_matmul_desc_operands(desc, index)
+                    for index, desc in enumerate(plan.tasks)
+                ],
+                task_specs=[
+                    self._profile_matmul_desc_spec(desc, index)
                     for index, desc in enumerate(plan.tasks)
                 ],
                 output_shape=tuple(result.global_shape),
