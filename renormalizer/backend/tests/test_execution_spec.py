@@ -2388,6 +2388,11 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     assert execute["input_modes"] == [["i", "k"], ["k", "j"]]
     assert execute["output_modes"] == ["i", "j"]
     assert execute["input_dtypes"] == ["float64", "float64"]
+    assert execute["operands"][0]["modes"] == ["i", "k"]
+    assert execute["operands"][0]["shape"] == [2, 3]
+    assert execute["operands"][0]["itemsize"] == left.itemsize
+    assert execute["operands"][0]["is_host"] is True
+    assert execute["operands"][0]["is_distributed"] is False
     assert execute["peak_bytes"] == execute["write_bytes"] + execute["workspace_bytes"]
     assert execute["device_info"] == {
         "kind": "cpu",

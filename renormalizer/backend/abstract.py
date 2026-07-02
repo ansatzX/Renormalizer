@@ -4385,6 +4385,31 @@ class AbstractBackend(SingleProcessDistributedMixin):
             if not profiling.should_record_op():
                 return
             desc = plan.descs[0] if plan.descs else None
+
+            def operand_payload(array, modes):
+                info = self.array_info(array)
+                return {
+                    "modes": [str(mode) for mode in tuple(modes or ())],
+                    "shape": info.shape,
+                    "dtype": str(info.dtype),
+                    "itemsize": info.itemsize,
+                    "size": info.size,
+                    "nbytes": info.nbytes,
+                    "ndim": info.ndim,
+                    "strides": info.strides,
+                    "order": info.order,
+                    "contiguous": info.contiguous,
+                    "writeable": info.writeable,
+                    "owns_data": info.owns_data,
+                    "backend": info.backend_name,
+                    "device": str(info.device),
+                    "device_kind": info.device.kind,
+                    "device_index": info.device.index,
+                    "is_host": info.is_host,
+                    "is_device": info.is_device,
+                    "is_distributed": info.is_distributed,
+                }
+
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
@@ -4400,6 +4425,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 input_dtypes=[
                     str(getattr(desc.A, "dtype", None)),
                     str(getattr(desc.B, "dtype", None)),
+                ] if desc is not None else [],
+                operands=[
+                    operand_payload(desc.A, input_modes[0] if input_modes else ()),
+                    operand_payload(desc.B, input_modes[1] if input_modes else ()),
                 ] if desc is not None else [],
                 output_shape=tuple(getattr(result, "shape", plan.output_shape)),
                 dtype=str(getattr(result, "dtype", None)),
