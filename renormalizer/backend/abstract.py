@@ -3127,6 +3127,64 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
         return profiling.array_operand_payload(self, name, array, modes)
 
+    @staticmethod
+    def _profile_scalar(value):
+        if value is None or isinstance(value, (str, int, float, bool, complex)):
+            return value
+        item = getattr(value, "item", None)
+        if callable(item):
+            try:
+                return item()
+            except Exception:
+                pass
+        return repr(value)
+
+    @staticmethod
+    def _profile_gemm_task_modes(task, side):
+        if side == "A":
+            return ("k", "m") if task.trans_a else ("m", "k")
+        if side == "B":
+            return ("n", "k") if task.trans_b else ("k", "n")
+        raise ValueError("unknown GEMM task side {0!r}".format(side))
+
+    def _profile_gemm_task_operands(self, task, index):
+        return [
+            self._profile_array_operand(
+                "task{0}.A".format(index),
+                task.A,
+                self._profile_gemm_task_modes(task, "A"),
+            ),
+            self._profile_array_operand(
+                "task{0}.B".format(index),
+                task.B,
+                self._profile_gemm_task_modes(task, "B"),
+            ),
+        ]
+
+    def _profile_gemm_task_spec(self, task, index, *, xp=None):
+        key = gemm_task_key(task, xp=xp)
+        return {
+            "index": int(index),
+            "m": int(key[2]),
+            "n": int(key[3]),
+            "k": int(key[4]),
+            "trans_a": bool(task.trans_a),
+            "trans_b": bool(task.trans_b),
+            "conj_a": bool(task.conj_a),
+            "conj_b": bool(task.conj_b),
+            "alpha": self._profile_scalar(task.alpha),
+            "beta": self._profile_scalar(task.beta),
+            "tag": self._profile_scalar(task.tag),
+        }
+
+    def _profile_matmul_desc_operands(self, desc, index):
+        left_modes = tuple(getattr(desc.layout_a, "logical_modes", ()) or ())
+        right_modes = tuple(getattr(desc.layout_b, "logical_modes", ()) or ())
+        return [
+            self._profile_array_operand("task{0}.A".format(index), desc.A, left_modes),
+            self._profile_array_operand("task{0}.B".format(index), desc.B, right_modes),
+        ]
+
     @classmethod
     def _profile_sharding(cls, sharding):
         if sharding is None:
@@ -3783,30 +3841,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 for key in sorted(set(plan.output_blocks), key=lambda key: self._block_sort_key((key, None)))
             ]
 
-            def task_operand_payload(array, layout):
-                info = self.array_info(array)
-                return {
-                    "modes": [str(mode) for mode in tuple(getattr(layout, "logical_modes", ()) or ())],
-                    "shape": info.shape,
-                    "dtype": str(info.dtype),
-                    "itemsize": info.itemsize,
-                    "size": info.size,
-                    "nbytes": info.nbytes,
-                    "ndim": info.ndim,
-                    "strides": info.strides,
-                    "order": info.order,
-                    "contiguous": info.contiguous,
-                    "writeable": info.writeable,
-                    "owns_data": info.owns_data,
-                    "backend": info.backend_name,
-                    "device": str(info.device),
-                    "device_kind": info.device.kind,
-                    "device_index": info.device.index,
-                    "is_host": info.is_host,
-                    "is_device": info.is_device,
-                    "is_distributed": info.is_distributed,
-                }
-
             profiling.record(
                 "contraction_plan",
                 backend=self.name,
@@ -3822,11 +3856,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     for desc in plan.tasks
                 ],
                 task_operands=[
-                    [
-                        task_operand_payload(desc.A, desc.layout_a),
-                        task_operand_payload(desc.B, desc.layout_b),
-                    ]
-                    for desc in plan.tasks
+                    self._profile_matmul_desc_operands(desc, index)
+                    for index, desc in enumerate(plan.tasks)
                 ],
                 output_shape=tuple(plan.global_shape),
                 dtype=str(getattr(plan.tasks[0].A, "dtype", None)) if plan.tasks else None,
@@ -3933,6 +3964,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 input_dtypes=[
                     [str(getattr(desc.A, "dtype", None)), str(getattr(desc.B, "dtype", None))]
                     for desc in plan.tasks
+                ],
+                task_operands=[
+                    self._profile_matmul_desc_operands(desc, index)
+                    for index, desc in enumerate(plan.tasks)
                 ],
                 output_shape=tuple(result.global_shape),
                 dtype=str(getattr(next(iter(result.blocks.values())).array, "dtype", None)) if result.blocks else None,
@@ -4356,6 +4391,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     input_dtypes=[
                         [str(getattr(task.A, "dtype", None)), str(getattr(task.B, "dtype", None))]
                         for task in converted
+                    ],
+                    task_operands=[
+                        self._profile_gemm_task_operands(task, index)
+                        for index, task in enumerate(converted)
+                    ],
+                    task_specs=[
+                        self._profile_gemm_task_spec(task, index, xp=xp)
+                        for index, task in enumerate(converted)
                     ],
                     output_shape=[tuple(getattr(item, "shape", ())) for item in result],
                     dtype=str(getattr(result[0], "dtype", None)) if result else None,

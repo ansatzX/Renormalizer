@@ -1162,6 +1162,28 @@ def test_grouped_gemm_profile_records_one_input_shape_pair_per_task(tmp_path):
         ["float64", "float64"],
         ["float64", "float64"],
     ]
+    assert event["task_operands"][0][0]["name"] == "task0.A"
+    assert event["task_operands"][0][0]["modes"] == ["m", "k"]
+    assert event["task_operands"][0][0]["shape"] == [2, 3]
+    assert event["task_operands"][0][0]["itemsize"] == tasks[0].A.itemsize
+    assert event["task_operands"][0][0]["is_host"] is True
+    assert event["task_operands"][0][0]["is_distributed"] is False
+    assert event["task_operands"][0][1]["name"] == "task0.B"
+    assert event["task_operands"][0][1]["modes"] == ["k", "n"]
+    assert event["task_operands"][0][1]["shape"] == [3, 4]
+    assert event["task_specs"][0] == {
+        "index": 0,
+        "m": 2,
+        "n": 4,
+        "k": 3,
+        "trans_a": False,
+        "trans_b": False,
+        "conj_a": False,
+        "conj_b": False,
+        "alpha": 1.0,
+        "beta": 0.0,
+        "tag": None,
+    }
 
 
 def test_torch_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
@@ -1778,6 +1800,12 @@ def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
         ["float64", "float64"],
         ["float64", "float64"],
     ]
+    assert event["task_operands"][0][0]["name"] == "task0.A"
+    assert event["task_operands"][0][0]["modes"] == ["i", "k"]
+    assert event["task_operands"][0][0]["shape"] == [2, 3]
+    assert event["task_operands"][0][1]["name"] == "task0.B"
+    assert event["task_operands"][0][1]["modes"] == ["k", "j"]
+    assert event["task_operands"][0][1]["shape"] == [3, 4]
     assert event["peak_bytes"] == event["write_bytes"] + event["workspace_bytes"]
     assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
     assert event["wall_s"] >= 0.0
