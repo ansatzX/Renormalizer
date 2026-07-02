@@ -267,6 +267,59 @@ def test_profiling_helpers_summarize_contract_expression_path():
     ]
 
 
+def test_profiling_device_payload_normalizes_backend_device_spec():
+    from renormalizer.backend import DeviceSpec
+    from renormalizer.utils import profiling
+
+    payload = profiling.device_payload(
+        DeviceSpec(
+            kind="cuda",
+            index=1,
+            local_rank=2,
+            global_rank=10,
+            visible_id="GPU-1",
+        )
+    )
+
+    assert payload == {
+        "kind": "cuda",
+        "index": 1,
+        "local_rank": 2,
+        "global_rank": 10,
+        "visible_id": "GPU-1",
+    }
+
+
+def test_profiling_array_operand_payload_uses_backend_array_info():
+    import numpy as np
+
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+
+    backend = NumpyBackend()
+    array = np.arange(6, dtype=np.float64).reshape(3, 2)
+    payload = profiling.array_operand_payload(
+        backend,
+        "packed_rhs",
+        array,
+        ("packed", "rhs"),
+    )
+
+    assert payload["name"] == "packed_rhs"
+    assert payload["modes"] == ["packed", "rhs"]
+    assert payload["shape"] == (3, 2)
+    assert payload["dtype"] == "float64"
+    assert payload["itemsize"] == array.itemsize
+    assert payload["size"] == array.size
+    assert payload["nbytes"] == array.nbytes
+    assert payload["ndim"] == 2
+    assert payload["backend"] == "numpy"
+    assert payload["device_kind"] == "cpu"
+    assert payload["is_host"] is True
+    assert payload["is_device"] is False
+    assert payload["is_distributed"] is False
+
+
 def test_profiling_helpers_build_svd_qn_block_payload():
     import numpy as np
 

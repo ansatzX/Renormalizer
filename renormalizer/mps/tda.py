@@ -28,40 +28,6 @@ def _tda_multi_hop(x, hop):
     started = time.perf_counter() if should_profile else None
     result = np.stack([hop(x[:, i]) for i in range(x.shape[1])], axis=1)
     if should_profile:
-        def device_payload(device):
-            return {
-                "kind": getattr(device, "kind", None),
-                "index": getattr(device, "index", None),
-                "local_rank": getattr(device, "local_rank", None),
-                "global_rank": getattr(device, "global_rank", None),
-                "visible_id": getattr(device, "visible_id", None),
-            }
-
-        def operand_payload(name, array, modes):
-            info = backend.array_info(array)
-            return {
-                "name": name,
-                "modes": list(modes),
-                "shape": info.shape,
-                "dtype": str(info.dtype),
-                "itemsize": info.itemsize,
-                "size": info.size,
-                "nbytes": info.nbytes,
-                "ndim": info.ndim,
-                "strides": info.strides,
-                "order": info.order,
-                "contiguous": info.contiguous,
-                "writeable": info.writeable,
-                "owns_data": info.owns_data,
-                "backend": info.backend_name,
-                "device": str(info.device),
-                "device_kind": info.device.kind,
-                "device_index": info.device.index,
-                "is_host": info.is_host,
-                "is_device": info.is_device,
-                "is_distributed": info.is_distributed,
-            }
-
         profiling.record(
             "contraction_execute",
             backend=backend.name,
@@ -70,12 +36,12 @@ def _tda_multi_hop(x, hop):
             input_shapes=[tuple(x.shape)],
             input_dtypes=[str(getattr(x, "dtype", None))],
             operands=[
-                operand_payload("packed_rhs", x, ("packed", "rhs")),
+                profiling.array_operand_payload(backend, "packed_rhs", x, ("packed", "rhs")),
             ],
             output_shape=tuple(result.shape),
             dtype=str(getattr(result, "dtype", None)),
             device=str(backend.current_device()),
-            device_info=device_payload(backend.current_device()),
+            device_info=profiling.device_payload(backend.current_device()),
             flops=0,
             read_bytes=int(getattr(x, "nbytes", 0)),
             write_bytes=int(getattr(result, "nbytes", 0)),

@@ -112,6 +112,42 @@ def array_backend_names(values):
     return [array_backend_name(value) for value in values if hasattr(value, "shape")]
 
 
+def device_payload(device):
+    return {
+        "kind": getattr(device, "kind", None),
+        "index": getattr(device, "index", None),
+        "local_rank": getattr(device, "local_rank", None),
+        "global_rank": getattr(device, "global_rank", None),
+        "visible_id": getattr(device, "visible_id", None),
+    }
+
+
+def array_operand_payload(backend, name, array, modes):
+    info = backend.array_info(array)
+    return {
+        "name": name,
+        "modes": [str(mode) for mode in modes],
+        "shape": info.shape,
+        "dtype": str(info.dtype),
+        "itemsize": info.itemsize,
+        "size": info.size,
+        "nbytes": info.nbytes,
+        "ndim": info.ndim,
+        "strides": info.strides,
+        "order": info.order,
+        "contiguous": info.contiguous,
+        "writeable": info.writeable,
+        "owns_data": info.owns_data,
+        "backend": info.backend_name,
+        "device": str(info.device),
+        "device_kind": getattr(info.device, "kind", None),
+        "device_index": getattr(info.device, "index", None),
+        "is_host": info.is_host,
+        "is_device": info.is_device,
+        "is_distributed": info.is_distributed,
+    }
+
+
 def operand_shape(value):
     if hasattr(value, "shape"):
         return tuple(value.shape)
