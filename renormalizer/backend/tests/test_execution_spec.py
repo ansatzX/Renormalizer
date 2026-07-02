@@ -1409,6 +1409,59 @@ def test_matmul_plan_hash_includes_descriptor_semantics():
         assert plan_for(changed_desc).plan_hash != base_hash
 
 
+def test_matmul_plan_hash_includes_descriptor_layouts():
+    from dataclasses import replace
+
+    from renormalizer.backend import LayoutSpec, MatmulDesc, MatmulPlan
+
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    row_major = LayoutSpec(
+        logical_shape=(2, 3),
+        physical_shape=(2, 3),
+        logical_modes=("i", "k"),
+        strides=(24, 8),
+        order="C",
+        contiguous_groups=((0, 1),),
+    )
+    transposed = LayoutSpec(
+        logical_shape=(2, 3),
+        physical_shape=(3, 2),
+        logical_modes=("i", "k"),
+        strides=(8, 24),
+        order="C",
+        contiguous_groups=((0,), (1,)),
+        requires_transpose=True,
+        transpose_perm=(1, 0),
+        estimated_copy_bytes=left.nbytes,
+    )
+    desc = MatmulDesc(
+        left,
+        right,
+        None,
+        m=2,
+        n=4,
+        k=3,
+        layout_a=row_major,
+    )
+
+    def plan_for(item):
+        return MatmulPlan(
+            kind="gemm",
+            descs=(item,),
+            pre_ops=(),
+            post_ops=(),
+            output_shape=(2, 4),
+            copy_bytes=0,
+            workspace_bytes=0,
+            estimated_flops=48,
+            estimated_time_s=None,
+            reason="layout hash test",
+        )
+
+    assert plan_for(replace(desc, layout_a=transposed)).plan_hash != plan_for(desc).plan_hash
+
+
 def _valid_contraction_step_kwargs():
     return {
         "kind": "gemm",
