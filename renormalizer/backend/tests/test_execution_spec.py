@@ -2620,16 +2620,59 @@ def test_plan_contraction_rejects_target_devices_without_distribution():
         )
 
 
-def test_plan_contraction_does_not_silently_ignore_target_devices():
-    from renormalizer.backend import BackendFeatureError, DeviceSpec
+def test_plan_contraction_target_devices_builds_distributed_plan():
+    from renormalizer.backend import DeviceSpec, DistributedContractionPlan
     from renormalizer.backend.numpy_backend import NumpyBackend
 
     backend = NumpyBackend()
-    left = np.ones((2, 3), dtype=np.float64)
-    right = np.ones((3, 4), dtype=np.float64)
+    left = np.arange(24, dtype=np.float64).reshape(6, 4)
+    right = np.arange(20, dtype=np.float64).reshape(4, 5)
     spec = backend.parse_einsum("ik,kj->ij", left, right)
 
-    with pytest.raises(BackendFeatureError, match="target_devices.*not implemented.*DeviceMesh"):
+    plan = backend.plan_contraction(
+        spec,
+        allow_distribution=True,
+        target_devices=(DeviceSpec(kind="cuda", index=0), DeviceSpec(kind="cuda", index=1)),
+    )
+    distributed_plan = plan.steps[0].plan
+    result = backend.execute(plan)
+
+    assert isinstance(distributed_plan, DistributedContractionPlan)
+    assert plan.distributed_modes
+    assert distributed_plan.output_sharding.mesh.backend == "numpy"
+    assert distributed_plan.output_sharding.mesh.shape == (2,)
+    assert tuple(device.kind for device in distributed_plan.output_sharding.mesh.devices) == ("cuda", "cuda")
+    assert tuple(device.index for device in distributed_plan.output_sharding.mesh.devices) == (0, 1)
+    assert result.mesh.world_size == 2
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
+def test_plan_contraction_rejects_target_devices_with_explicit_distributed_spec():
+    from renormalizer.backend import BackendFeatureError, DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+    )
+    left = np.ones((4, 3), dtype=np.float64)
+    right = np.ones((3, 2), dtype=np.float64)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(backend.shard_tensor(left, left_spec), right),
+    )
+
+    with pytest.raises(BackendFeatureError, match="target_devices cannot be combined"):
         backend.plan_contraction(
             spec,
             allow_distribution=True,

@@ -18,6 +18,7 @@ from renormalizer.backend.execution import (
     ContractionStep,
     CopyPolicy,
     CostEstimate,
+    DeviceMesh,
     DeviceSpec,
     DistributedContractionPlan,
     DistributedContractionSpec,
@@ -933,8 +934,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
         target_devices=None,
     ):
         self._validate_plan_prefer(prefer)
-        self._validate_plan_target_devices(target_devices, allow_distribution=allow_distribution)
+        target_device_specs = self._validate_plan_target_devices(
+            target_devices,
+            allow_distribution=allow_distribution,
+        )
         if isinstance(spec, DistributedContractionSpec):
+            if target_device_specs is not None:
+                raise BackendFeatureError(
+                    "target_devices cannot be combined with DistributedContractionSpec; "
+                    "use the DistributedContractionSpec sharding instead"
+                )
             input_modes, output_modes = parse_einsum_equation(spec.equation)
             sizes = self._mode_sizes_from_equation(input_modes, spec.operands)
             output_shape = self._output_shape_from_sizes(output_modes, sizes)
@@ -1076,11 +1085,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     distributed_modes=active_distributed_modes,
                 ), memory_limit=memory_limit, allow_slicing=allow_slicing)
             return self._enforce_plan_memory_limit(plan, memory_limit=memory_limit, allow_slicing=allow_slicing)
-        return self._enforce_plan_memory_limit(
-            self._plan_einsum_contraction(spec),
-            memory_limit=memory_limit,
-            allow_slicing=allow_slicing,
-        )
+        plan = self._plan_einsum_contraction(spec)
+        if target_device_specs is not None:
+            mesh = self._mesh_from_target_devices(target_device_specs)
+            distributed_plan = self.plan_distributed_contraction_path(
+                plan,
+                mesh,
+                memory_limit_per_device=memory_limit,
+            )
+            return self._wrap_distributed_contraction_plan(plan, distributed_plan)
+        return self._enforce_plan_memory_limit(plan, memory_limit=memory_limit, allow_slicing=allow_slicing)
 
     @staticmethod
     def _validate_plan_prefer(prefer):
@@ -1089,15 +1103,61 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def _validate_plan_target_devices(self, target_devices, *, allow_distribution):
         if target_devices is None:
-            return
+            return None
         devices = tuple(parse_device_spec(device) for device in target_devices)
         if not devices:
             raise ValueError("target_devices must not be empty")
         if not allow_distribution:
             raise BackendFeatureError("target_devices require allow_distribution=True")
-        raise BackendFeatureError(
-            "target_devices planning is not implemented; build a DeviceMesh and call "
-            "plan_distributed_contraction_path"
+        return devices
+
+    def _mesh_from_target_devices(self, devices):
+        devices = tuple(devices)
+        return DeviceMesh(
+            devices=devices,
+            shape=(len(devices),),
+            axis_names=("rank",),
+            backend=self.name,
+            local_rank=0,
+            global_rank=0,
+        )
+
+    @staticmethod
+    def _wrap_distributed_contraction_plan(path, distributed_plan):
+        step = path.steps[0]
+        output_sharding = distributed_plan.output_sharding
+        distributed_modes = tuple(output_sharding.sharded_modes) if output_sharding is not None else ()
+        comm_bytes = int(distributed_plan.total_comm_bytes or distributed_plan.estimated_comm_bytes)
+        wrapped_step = ContractionStep(
+            kind=step.kind,
+            inputs=step.inputs,
+            output=step.output,
+            input_modes=step.input_modes,
+            output_modes=step.output_modes,
+            plan=distributed_plan,
+            estimated_flops=step.estimated_flops,
+            estimated_read_bytes=step.estimated_read_bytes,
+            estimated_write_bytes=step.estimated_write_bytes,
+            estimated_copy_bytes=step.estimated_copy_bytes,
+            estimated_peak_bytes=distributed_plan.peak_local_bytes or step.estimated_peak_bytes,
+            estimated_comm_bytes=comm_bytes,
+            required_workspace_bytes=step.required_workspace_bytes,
+            reason=step.reason,
+            fallback_reason=step.fallback_reason,
+        )
+        return ContractionPlan(
+            steps=(wrapped_step,),
+            input_specs=path.input_specs,
+            output_modes=path.output_modes,
+            estimated_flops=path.estimated_flops,
+            estimated_peak_bytes=distributed_plan.peak_local_bytes or path.estimated_peak_bytes,
+            estimated_read_bytes=path.estimated_read_bytes,
+            estimated_write_bytes=path.estimated_write_bytes,
+            estimated_copy_bytes=path.estimated_copy_bytes,
+            estimated_comm_bytes=comm_bytes,
+            required_workspace_bytes=path.required_workspace_bytes,
+            sliced_modes=path.sliced_modes,
+            distributed_modes=distributed_modes,
         )
 
     def _enforce_plan_memory_limit(self, plan, *, memory_limit=None, allow_slicing=True):
