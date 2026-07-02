@@ -2480,6 +2480,40 @@ def test_plan_contraction_does_not_silently_ignore_unsatisfied_slicing_limit():
         backend.plan_contraction(spec, memory_limit=63, allow_slicing=True)
 
 
+def test_plan_contraction_rejects_target_devices_without_distribution():
+    from renormalizer.backend import BackendFeatureError, DeviceSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    with pytest.raises(BackendFeatureError, match="target_devices.*allow_distribution=True"):
+        backend.plan_contraction(
+            spec,
+            allow_distribution=False,
+            target_devices=(DeviceSpec(kind="cuda", index=0), DeviceSpec(kind="cuda", index=1)),
+        )
+
+
+def test_plan_contraction_does_not_silently_ignore_target_devices():
+    from renormalizer.backend import BackendFeatureError, DeviceSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    with pytest.raises(BackendFeatureError, match="target_devices.*not implemented.*DeviceMesh"):
+        backend.plan_contraction(
+            spec,
+            allow_distribution=True,
+            target_devices=(DeviceSpec(kind="cuda", index=0), DeviceSpec(kind="cuda", index=1)),
+        )
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

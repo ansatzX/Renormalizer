@@ -742,7 +742,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         allow_distribution=False,
         target_devices=None,
     ):
-        del prefer, target_devices
+        del prefer
+        self._validate_plan_target_devices(target_devices, allow_distribution=allow_distribution)
         if isinstance(spec, DistributedContractionSpec):
             input_modes, output_modes = parse_einsum_equation(spec.equation)
             sizes = self._mode_sizes_from_equation(input_modes, spec.operands)
@@ -889,6 +890,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
             self._plan_einsum_contraction(spec),
             memory_limit=memory_limit,
             allow_slicing=allow_slicing,
+        )
+
+    def _validate_plan_target_devices(self, target_devices, *, allow_distribution):
+        if target_devices is None:
+            return
+        devices = tuple(parse_device_spec(device) for device in target_devices)
+        if not devices:
+            raise ValueError("target_devices must not be empty")
+        if not allow_distribution:
+            raise BackendFeatureError("target_devices require allow_distribution=True")
+        raise BackendFeatureError(
+            "target_devices planning is not implemented; build a DeviceMesh and call "
+            "plan_distributed_contraction_path"
         )
 
     def _enforce_plan_memory_limit(self, plan, *, memory_limit=None, allow_slicing=True):
