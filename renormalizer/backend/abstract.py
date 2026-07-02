@@ -681,8 +681,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             raise BackendFeatureError("plan_contraction currently supports two-operand explicit einsum specs")
         pair_spec = PairContractionSpec.from_operands(spec.operands[0], spec.operands[1], spec.output_modes)
         matmul_plan = self.lower_pair_contraction_to_matmul(pair_spec, record_profile=record_profile)
-        if matmul_plan.fallback_reason is not None and self.fallback_policy is FallbackPolicy.FORBID:
-            raise BackendFeatureError(matmul_plan.fallback_reason)
+        self._handle_plan_fallback(matmul_plan)
         step = self._contraction_step_from_matmul_plan(
             matmul_plan,
             input_modes=(spec.operands[0].modes, spec.operands[1].modes),

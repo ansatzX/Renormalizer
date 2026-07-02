@@ -629,6 +629,25 @@ def test_plan_contraction_forbid_policy_rejects_fallback_lowering():
         backend.plan_contraction(spec)
 
 
+def test_plan_contraction_warn_policy_warns_for_fallback_lowering():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class NoBatchedBackend(NumpyBackend):
+        supports_batched_matmul = False
+
+    backend = NoBatchedBackend(config=BackendConfig(fallback_policy="warn"))
+    left = np.ones((5, 2, 3), dtype=np.float64)
+    right = np.ones((5, 3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("bik,bkj->bij", left, right)
+
+    with pytest.warns(RuntimeWarning, match="backend lacks batched_matmul"):
+        plan = backend.plan_contraction(spec)
+
+    assert plan.steps[0].plan.kind == "fallback_tensordot"
+    assert plan.steps[0].fallback_reason == "backend lacks batched_matmul for batch shape (5,)"
+
+
 def test_backend_parse_einsum_builds_explicit_ir_operands():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
