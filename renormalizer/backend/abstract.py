@@ -2060,6 +2060,59 @@ class AbstractBackend(SingleProcessDistributedMixin):
             raise BackendFeatureError("sliced contraction plan has no slices to execute")
         return result
 
+    def _record_sliced_contraction_execute(self, plan, result, wall_s):
+        try:
+            from renormalizer.utils import profiling
+
+            if not profiling.should_record_op():
+                return
+            step = plan.steps[0] if plan.steps else None
+            sliced_plan = step.plan if step is not None else None
+            base_plan = sliced_plan.base_plan if isinstance(sliced_plan, SlicedContractionPlan) else None
+            base_step = base_plan.steps[0] if base_plan is not None and base_plan.steps else None
+            base_lowering = getattr(getattr(base_step, "plan", None), "kind", getattr(base_step, "kind", None))
+            equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)
+            profiling.record(
+                "contraction_execute",
+                backend=self.name,
+                equation=equation,
+                lowering="slice",
+                plan_hash=plan.plan_hash,
+                input_modes=input_modes,
+                output_modes=output_modes,
+                input_shapes=[
+                    tuple(getattr(operand.array, "shape", ()))
+                    for operand in plan.input_specs
+                ],
+                output_shape=tuple(getattr(result, "shape", ())),
+                dtype=str(getattr(result, "dtype", None)),
+                device=str(self.current_device()),
+                flops=plan.estimated_flops,
+                read_bytes=plan.estimated_read_bytes,
+                write_bytes=plan.estimated_write_bytes,
+                copy_bytes=plan.estimated_copy_bytes,
+                workspace_bytes=plan.required_workspace_bytes,
+                peak_bytes=plan.estimated_peak_bytes,
+                largest_intermediate=getattr(result, "nbytes", None),
+                num_gemm=len(sliced_plan.output_slices) if base_lowering == "gemm" else 0,
+                num_batched_gemm=len(sliced_plan.output_slices) if base_lowering in ("batched_gemm", "strided_batched_gemm") else 0,
+                num_grouped_tasks=0,
+                num_blocks=0,
+                num_shape_buckets=0,
+                fallback_reason=getattr(step, "fallback_reason", None),
+                sliced_modes=[str(mode) for mode in plan.sliced_modes],
+                num_slices=len(sliced_plan.output_slices),
+                base_lowering=base_lowering,
+                slice_output_axis=sliced_plan.output_axis,
+                slice_output_shapes=[
+                    self._local_shape_for_slices(tuple(getattr(result, "shape", ())), output_slice)
+                    for output_slice in sliced_plan.output_slices
+                ],
+                wall_s=wall_s,
+            )
+        except Exception:
+            pass
+
     @staticmethod
     def _mode_token(mode):
         return str(mode)
@@ -2094,6 +2147,24 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     output_modes=output_modes,
                 )
             if isinstance(inner_plan, SlicedContractionPlan):
+                try:
+                    from renormalizer.utils import profiling
+
+                    should_profile = profiling.should_record_op()
+                except Exception:
+                    should_profile = False
+                if should_profile:
+                    import time
+
+                    started = time.perf_counter()
+                    result = self._execute_sliced_contraction_plan(
+                        inner_plan,
+                        stream=stream,
+                        workspace=workspace,
+                    )
+                    wall_s = time.perf_counter() - started
+                    self._record_sliced_contraction_execute(plan, result, wall_s)
+                    return result
                 return self._execute_sliced_contraction_plan(
                     inner_plan,
                     stream=stream,
