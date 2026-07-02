@@ -108,6 +108,47 @@ def test_oe_contract_profiling_records_operand_array_backends(caplog, monkeypatc
     assert event["operand_array_backends"] == ["numpy", "numpy"]
 
 
+def test_oe_contract_uses_backend_contract(monkeypatch, caplog, tmp_path):
+    from renormalizer.mps import oe_contract_wrap
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import PROFILING
+
+    class FakeBackend:
+        name = "fake"
+        memory_errors = (MemoryError,)
+        ndarray = (np.ndarray,)
+
+        def __init__(self):
+            self.contract_calls = []
+
+        def contract(self, *args, **kwargs):
+            self.contract_calls.append((args, dict(kwargs)))
+            return np.full((2, 2), 7.0)
+
+    fake_backend = FakeBackend()
+    monkeypatch.setattr(oe_contract_wrap, "backend", fake_backend)
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    a = np.ones((2, 2))
+    b = np.ones((2, 2))
+    try:
+        result = oe_contract("ij,jk->ik", a, b, optimize="greedy")
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert len(fake_backend.contract_calls) == 1
+    assert fake_backend.contract_calls[0][0] == ("ij,jk->ik", a, b)
+    assert fake_backend.contract_calls[0][1]["optimize"] == "greedy"
+    assert np.all(result == 7.0)
+
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "oe_contract")
+    assert event["backend"] == "fake"
+    assert event["output_shape"] == [2, 2]
+
+
 def test_oe_contract_expression_profiling_records_operand_array_backends(caplog, monkeypatch, tmp_path):
     from renormalizer.utils import profiling
     from renormalizer.utils.log import PROFILING

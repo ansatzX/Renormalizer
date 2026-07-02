@@ -96,6 +96,7 @@ class BackendProxy:
     can_reshape_view = _delegate_backend_method("can_reshape_view")
     make_contiguous = _delegate_backend_method("make_contiguous")
     parse_einsum = _delegate_backend_method("parse_einsum")
+    contract = _delegate_backend_method("contract")
     contract_expression = _delegate_backend_method("contract_expression")
     contract_path = _delegate_backend_method("contract_path")
     plan_contraction = _delegate_backend_method("plan_contraction")

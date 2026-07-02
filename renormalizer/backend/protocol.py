@@ -62,6 +62,7 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "can_reshape_view",
     "make_contiguous",
     "parse_einsum",
+    "contract",
     "contract_expression",
     "contract_path",
     "plan_contraction",
@@ -358,6 +359,10 @@ class BackendProtocol(Protocol):
 
     def parse_einsum(self, equation: str, *operands: Any, **kwargs: Any) -> Any:
         """Parse an explicit einsum equation into backend contraction IR."""
+        ...
+
+    def contract(self, *args: Any, **kwargs: Any) -> Any:
+        """Execute an opt_einsum contraction through this backend."""
         ...
 
     def contract_expression(self, *args: Any, **kwargs: Any) -> Any:

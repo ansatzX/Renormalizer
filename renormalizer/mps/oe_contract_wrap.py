@@ -2,8 +2,6 @@
 import logging
 import time
 
-import opt_einsum as oe
-
 from renormalizer.mps.backend import backend, xp
 from renormalizer.utils import profiling
 
@@ -50,7 +48,7 @@ def oe_contract(*args, **kwargs):
     profile_enabled = profiling.should_record_op()
     started = time.perf_counter() if profile_enabled else None
     try:
-        result = oe.contract(*args, **kwargs)
+        result = backend.contract(*args, **kwargs)
     except active_memory_errors() as e:
         logger.fatal("Out of memory error calling oe.contract")
         log_error(e, args, kwargs)

@@ -477,6 +477,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def parse_einsum(self, equation, *operands, constants=(), optimize=None):
         return parse_einsum(equation, *operands, constants=constants, optimize=optimize)
 
+    def contract(self, *args, **kwargs):
+        import opt_einsum as oe
+
+        if kwargs.get("backend") is None:
+            kwargs = dict(kwargs)
+            kwargs["backend"] = self.opt_einsum_name
+        return oe.contract(*args, **kwargs)
+
     def contract_expression(self, *args, **kwargs):
         import opt_einsum as oe
 
