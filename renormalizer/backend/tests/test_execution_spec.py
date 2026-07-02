@@ -1837,6 +1837,44 @@ def test_explicit_multi_operand_contract_uses_planner_and_executor():
     assert np.allclose(result, np.einsum("ab,bc,cd->ad", left, middle, right))
 
 
+def test_multi_constant_contract_expression_uses_planner_and_executor():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class RecordingBackend(NumpyBackend):
+        def __init__(self):
+            super().__init__()
+            self.plan_calls = []
+            self.execute_calls = []
+
+        def plan_contraction(self, spec, **kwargs):
+            self.plan_calls.append(spec)
+            return super().plan_contraction(spec, **kwargs)
+
+        def execute(self, plan, **kwargs):
+            self.execute_calls.append(plan)
+            return super().execute(plan, **kwargs)
+
+    backend = RecordingBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    middle = np.arange(12, dtype=np.float64).reshape(3, 4)
+    right = np.arange(20, dtype=np.float64).reshape(4, 5)
+
+    expr = backend.contract_expression(
+        "ab,bc,cd->ad",
+        left,
+        middle,
+        right.shape,
+        constants=[0, 1],
+        optimize="greedy",
+    )
+    result = expr(right)
+
+    assert len(backend.plan_calls) == 1
+    assert len(backend.execute_calls) == 1
+    assert len(backend.execute_calls[0].steps) == 2
+    assert np.allclose(result, np.einsum("ab,bc,cd->ad", left, middle, right))
+
+
 def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     from renormalizer.backend.numpy_backend import NumpyBackend
     from renormalizer.utils import profiling

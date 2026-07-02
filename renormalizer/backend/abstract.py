@@ -662,7 +662,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @staticmethod
     def _contract_expression_is_plannable(args, kwargs):
-        if len(args) != 3 or not isinstance(args[0], str):
+        if len(args) < 3 or not isinstance(args[0], str):
             return False
         equation = "".join(args[0].split())
         if "->" not in equation or "..." in equation:
@@ -671,9 +671,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             constants = tuple(int(index) for index in (kwargs.get("constants") or ()))
         except TypeError:
             return False
-        if len(constants) > 1:
-            return False
-        if any(index < 0 or index >= 2 for index in constants):
+        operand_count = len(args) - 1
+        if any(index < 0 or index >= operand_count for index in constants):
             return False
         supported_kwargs = {"optimize", "constants"}
         return all(key in supported_kwargs for key in kwargs)
