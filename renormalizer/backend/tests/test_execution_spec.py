@@ -2454,6 +2454,32 @@ def test_execute_auto_distributed_dense_plan_places_inputs_before_contracting():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_plan_contraction_rejects_plan_exceeding_memory_limit_without_slicing():
+    from renormalizer.backend import BackendFeatureError
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    with pytest.raises(BackendFeatureError, match="memory_limit.*63.*peak.*64"):
+        backend.plan_contraction(spec, memory_limit=63, allow_slicing=False)
+
+
+def test_plan_contraction_does_not_silently_ignore_unsatisfied_slicing_limit():
+    from renormalizer.backend import BackendFeatureError
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    with pytest.raises(BackendFeatureError, match="slicing.*not implemented.*memory_limit.*63"):
+        backend.plan_contraction(spec, memory_limit=63, allow_slicing=True)
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

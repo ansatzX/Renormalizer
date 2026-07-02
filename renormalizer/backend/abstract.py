@@ -742,7 +742,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         allow_distribution=False,
         target_devices=None,
     ):
-        del memory_limit, prefer, allow_slicing, target_devices
+        del prefer, target_devices
         if isinstance(spec, DistributedContractionSpec):
             input_modes, output_modes = parse_einsum_equation(spec.equation)
             sizes = self._mode_sizes_from_equation(input_modes, spec.operands)
@@ -870,7 +870,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     reason=step.reason,
                     fallback_reason=step.fallback_reason,
                 )
-                return ContractionPlan(
+                return self._enforce_plan_memory_limit(ContractionPlan(
                     steps=(step,),
                     input_specs=plan.input_specs,
                     output_modes=plan.output_modes,
@@ -883,9 +883,32 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     required_workspace_bytes=plan.required_workspace_bytes,
                     sliced_modes=plan.sliced_modes,
                     distributed_modes=active_distributed_modes,
-                )
+                ), memory_limit=memory_limit, allow_slicing=allow_slicing)
+            return self._enforce_plan_memory_limit(plan, memory_limit=memory_limit, allow_slicing=allow_slicing)
+        return self._enforce_plan_memory_limit(
+            self._plan_einsum_contraction(spec),
+            memory_limit=memory_limit,
+            allow_slicing=allow_slicing,
+        )
+
+    def _enforce_plan_memory_limit(self, plan, *, memory_limit=None, allow_slicing=True):
+        if memory_limit is None:
             return plan
-        return self._plan_einsum_contraction(spec)
+        limit = int(memory_limit)
+        if limit < 0:
+            raise ValueError("memory_limit must be non-negative")
+        peak = int(getattr(plan, "estimated_peak_bytes", 0) or 0)
+        if peak <= limit:
+            return plan
+        if allow_slicing:
+            raise BackendFeatureError(
+                "slicing planner is not implemented for memory_limit {0}; plan peak is {1} bytes"
+                .format(limit, peak)
+            )
+        raise BackendFeatureError(
+            "memory_limit {0} bytes is below contraction plan peak {1} bytes"
+            .format(limit, peak)
+        )
 
     @staticmethod
     def _rate_seconds(amount, rate):
