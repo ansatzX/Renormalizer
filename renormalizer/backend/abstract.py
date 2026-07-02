@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+from dataclasses import replace
 from typing import Any
 
 import numpy as _np
@@ -57,6 +58,17 @@ from renormalizer.backend.gemm import (
 )
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
 from renormalizer.backend.transforms import UnavailableTransforms
+
+
+class _ShapeOnlyArray:
+    def __init__(self, shape, dtype, itemsize):
+        self.shape = tuple(int(dim) for dim in shape)
+        self.dtype = dtype
+        self.ndim = len(self.shape)
+        self.size = 1
+        for dim in self.shape:
+            self.size *= int(dim)
+        self.nbytes = int(self.size) * int(itemsize or 0)
 
 
 class _BackendContractExpression:
@@ -727,11 +739,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return oe.contract_path(*args, **kwargs)
 
     @staticmethod
-    def _contraction_step_from_matmul_plan(plan, input_modes, output_modes):
+    def _contraction_step_from_matmul_plan(plan, input_modes, output_modes, *, inputs=(0, 1), output=2):
         return ContractionStep(
             kind=plan.kind,
-            inputs=(0, 1),
-            output=2,
+            inputs=tuple(inputs),
+            output=int(output),
             input_modes=tuple(tuple(modes) for modes in input_modes),
             output_modes=tuple(output_modes),
             plan=plan,
@@ -763,6 +775,93 @@ class AbstractBackend(SingleProcessDistributedMixin):
             distributed_modes=tuple(distributed_modes),
         )
 
+    def _shape_only_operand(self, shape, modes, left_operand, right_operand, *, name):
+        itemsize = max(
+            self._operand_itemsize(left_operand.array),
+            self._operand_itemsize(right_operand.array),
+            1,
+        )
+        dtype = getattr(left_operand.array, "dtype", None) or getattr(right_operand.array, "dtype", None)
+        array = _ShapeOnlyArray(shape, dtype, itemsize)
+        return TensorOperand(array, tuple(modes), name=name)
+
+    def _multi_operand_contraction_plan(
+        self,
+        spec,
+        *,
+        sliced_modes=(),
+        distributed_modes=(),
+        comm_bytes=0,
+        record_profile=True,
+    ):
+        import opt_einsum as oe
+
+        equation = self._equation_from_modes(
+            tuple(operand.modes for operand in spec.operands),
+            spec.output_modes,
+        )
+        _, contraction_list = oe.contract_path(
+            equation,
+            *(operand.array for operand in spec.operands),
+            optimize=spec.optimize,
+            einsum_call=True,
+        )
+        current_operands = list(spec.operands)
+        steps = []
+        next_output = len(spec.operands)
+        for step_index, contraction in enumerate(contraction_list):
+            indices, _, einsum_str, _, _ = contraction
+            _, output_text = einsum_str.split("->", 1)
+            output_modes = tuple(output_text)
+            selected = tuple(current_operands[int(index)] for index in indices)
+            if len(selected) != 2:
+                raise BackendFeatureError("multi-step contraction currently supports pairwise opt_einsum steps")
+            pair_spec = PairContractionSpec.from_operands(selected[0], selected[1], output_modes)
+            matmul_plan = self.lower_pair_contraction_to_matmul(pair_spec, record_profile=record_profile)
+            self._handle_plan_fallback(matmul_plan)
+            step = self._contraction_step_from_matmul_plan(
+                matmul_plan,
+                input_modes=(selected[0].modes, selected[1].modes),
+                output_modes=output_modes,
+                inputs=indices,
+                output=next_output,
+            )
+            if comm_bytes and step_index == len(contraction_list) - 1:
+                step = replace(
+                    step,
+                    kind="distributed_contract",
+                    estimated_comm_bytes=comm_bytes,
+                    reason="distributed contraction with local multi-step matmul plan",
+                )
+            steps.append(step)
+            for index in sorted((int(index) for index in indices), reverse=True):
+                del current_operands[index]
+            current_operands.append(
+                self._shape_only_operand(
+                    matmul_plan.output_shape,
+                    output_modes,
+                    selected[0],
+                    selected[1],
+                    name="intermediate{0}".format(step_index),
+                )
+            )
+            next_output += 1
+
+        return ContractionPlan(
+            steps=tuple(steps),
+            input_specs=spec.operands,
+            output_modes=spec.output_modes,
+            estimated_flops=sum(step.estimated_flops for step in steps),
+            estimated_peak_bytes=max((step.estimated_peak_bytes for step in steps), default=0),
+            estimated_read_bytes=sum(step.estimated_read_bytes for step in steps),
+            estimated_write_bytes=sum(step.estimated_write_bytes for step in steps),
+            estimated_copy_bytes=sum(step.estimated_copy_bytes for step in steps),
+            estimated_comm_bytes=sum(step.estimated_comm_bytes for step in steps),
+            required_workspace_bytes=max((step.required_workspace_bytes for step in steps), default=0),
+            sliced_modes=tuple(sliced_modes),
+            distributed_modes=tuple(distributed_modes),
+        )
+
     def _plan_einsum_contraction(
         self,
         spec,
@@ -773,7 +872,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
         record_profile=True,
     ):
         if len(spec.operands) != 2:
-            raise BackendFeatureError("plan_contraction currently supports two-operand explicit einsum specs")
+            return self._multi_operand_contraction_plan(
+                spec,
+                sliced_modes=sliced_modes,
+                distributed_modes=distributed_modes,
+                comm_bytes=comm_bytes,
+                record_profile=record_profile,
+            )
         pair_spec = PairContractionSpec.from_operands(spec.operands[0], spec.operands[1], spec.output_modes)
         matmul_plan = self.lower_pair_contraction_to_matmul(pair_spec, record_profile=record_profile)
         self._handle_plan_fallback(matmul_plan)
@@ -2338,6 +2443,41 @@ class AbstractBackend(SingleProcessDistributedMixin):
             pass
 
     @staticmethod
+    def _matmul_plan_with_operands(plan, left, right):
+        descs = tuple(replace(desc, A=left, B=right) for desc in plan.descs)
+        return replace(plan, descs=descs)
+
+    def _execute_multi_step_contraction_plan(self, plan, *, stream=None, workspace=None):
+        operands = [operand.array for operand in plan.input_specs]
+        for step in plan.steps:
+            step_operands = tuple(operands[int(index)] for index in step.inputs)
+            if len(step_operands) != 2:
+                raise BackendFeatureError("multi-step contraction execution expects pairwise steps")
+            if isinstance(step.plan, MatmulPlan):
+                step_plan = self._matmul_plan_with_operands(step.plan, step_operands[0], step_operands[1])
+                result = self.execute_matmul_plan(
+                    step_plan,
+                    stream=stream,
+                    workspace=workspace,
+                    plan_hash=plan.plan_hash,
+                    record_profile=False,
+                    equation=self._equation_from_modes(step.input_modes, step.output_modes),
+                    input_modes=step.input_modes,
+                    output_modes=step.output_modes,
+                )
+            elif step.plan is not None:
+                result = self.execute(step.plan, stream=stream, workspace=workspace)
+            else:
+                equation = self._equation_from_modes(step.input_modes, step.output_modes)
+                result = self._execute_einsum(equation, step_operands)
+            for index in sorted((int(index) for index in step.inputs), reverse=True):
+                del operands[index]
+            operands.append(result)
+        if len(operands) != 1:
+            raise BackendFeatureError("multi-step contraction execution did not reduce to one output")
+        return operands[0]
+
+    @staticmethod
     def _mode_token(mode):
         return str(mode)
 
@@ -2357,7 +2497,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         if isinstance(plan, ContractionPlan):
             if len(plan.steps) != 1:
-                raise BackendFeatureError("execute currently supports single-step ContractionPlan objects")
+                return self._execute_multi_step_contraction_plan(plan, stream=stream, workspace=workspace)
             inner_plan = plan.steps[0].plan
             if isinstance(inner_plan, MatmulPlan):
                 equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)

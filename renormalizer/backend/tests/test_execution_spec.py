@@ -1782,6 +1782,31 @@ def test_plan_contraction_returns_dense_gemm_step_for_pair_einsum():
     assert step.estimated_comm_bytes == 0
 
 
+def test_plan_contraction_returns_multi_step_gemm_path_for_three_operand_einsum():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    middle = np.arange(12, dtype=np.float64).reshape(3, 4)
+    right = np.arange(20, dtype=np.float64).reshape(4, 5)
+    spec = backend.parse_einsum("ab,bc,cd->ad", left, middle, right, optimize="greedy")
+
+    plan = backend.plan_contraction(spec, allow_distribution=False)
+    result = backend.execute(plan)
+
+    assert len(plan.steps) == 2
+    assert [step.kind for step in plan.steps] == ["gemm", "gemm"]
+    assert plan.steps[0].inputs == (2, 1)
+    assert plan.steps[0].input_modes == (("c", "d"), ("b", "c"))
+    assert plan.steps[0].output_modes == ("d", "b")
+    assert plan.steps[1].inputs == (1, 0)
+    assert plan.steps[1].input_modes == (("d", "b"), ("a", "b"))
+    assert plan.steps[1].output_modes == ("a", "d")
+    assert plan.estimated_flops == 180
+    assert plan.output_modes == ("a", "d")
+    assert np.allclose(result, np.einsum("ab,bc,cd->ad", left, middle, right))
+
+
 def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     from renormalizer.backend.numpy_backend import NumpyBackend
     from renormalizer.utils import profiling
