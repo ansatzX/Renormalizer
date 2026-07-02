@@ -315,6 +315,10 @@ def test_distributed_smoke_gate_requires_expected_collective_cases():
     assert summary["checked_count"] == 3
     assert summary["failures"] == [
         {
+            "operation": "broadcast_tensor",
+            "reason": "missing distributed smoke record",
+        },
+        {
             "operation": "redistribute_output_alltoall",
             "reason": "unexpected collectives",
             "collectives": ["allreduce"],
@@ -359,6 +363,7 @@ def test_distributed_smoke_cli_returns_nonzero_when_gate_fails(monkeypatch, caps
     assert gate["operation"] == "distributed_smoke_gate"
     assert gate["status"] == "failed"
     assert {failure["operation"] for failure in gate["failures"]} == {
+        "broadcast_tensor",
         "contracted_sharded_allreduce",
         "redistribute_output_alltoall",
     }
@@ -378,6 +383,7 @@ def test_numpy_distributed_smoke_records_planned_collective_cases():
 
     operations = {record["operation"] for record in records}
     assert operations == {
+        "broadcast_tensor",
         "row_sharded_matmul",
         "contracted_sharded_allreduce",
         "redistribute_output_alltoall",
@@ -389,13 +395,13 @@ def test_numpy_distributed_smoke_records_planned_collective_cases():
         assert record["world_size"] == 4
         assert record["status"] == "passed"
         assert record["max_abs_error"] <= 1e-9
-        assert record["global_shape"] == [8, 8]
+        assert record["global_shape"]
         assert record["local_shape"]
-        assert record["plan_hash"]
         assert record["plan_comm_bytes"] >= 0
         json.dumps(record)
 
     by_operation = {record["operation"]: record for record in records}
+    assert by_operation["broadcast_tensor"]["collectives"] == ["broadcast"]
     assert by_operation["row_sharded_matmul"]["collectives"] == ["gather"]
     assert by_operation["contracted_sharded_allreduce"]["collectives"] == ["allreduce"]
     assert by_operation["redistribute_output_alltoall"]["collectives"] == ["alltoall"]

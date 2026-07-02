@@ -23,10 +23,12 @@ from renormalizer.utils.log import disable_stream_output
 
 DEFAULT_BACKENDS = ("torch",)
 EXPECTED_COLLECTIVES = {
+    "broadcast_tensor": ("broadcast",),
     "row_sharded_matmul": ("gather",),
     "contracted_sharded_allreduce": ("allreduce",),
     "redistribute_output_alltoall": ("alltoall",),
 }
+EXPECTED_PROFILE_COLLECTIVES = ("allreduce", "alltoall", "gather")
 
 
 def _env_int(name, default):
@@ -303,7 +305,7 @@ def evaluate_distributed_profile_gate(events, *, require_world_size=None):
     profile_events = _distributed_profile_events(events)
     failures = []
 
-    for expected_collective in sorted({item[0] for item in EXPECTED_COLLECTIVES.values()}):
+    for expected_collective in EXPECTED_PROFILE_COLLECTIVES:
         matches = [
             event for event in profile_events
             for item in event.get("communication") or []
@@ -359,7 +361,7 @@ def evaluate_distributed_profile_gate(events, *, require_world_size=None):
         "status": "failed" if failures else "passed",
         "checked_count": int(len(profile_events)),
         "required_world_size": None if require_world_size is None else int(require_world_size),
-        "required_collectives": sorted({item[0] for item in EXPECTED_COLLECTIVES.values()}),
+        "required_collectives": list(EXPECTED_PROFILE_COLLECTIVES),
         "failures": failures,
     }
 
@@ -530,6 +532,31 @@ def _redistribute_output_case(backend, backend_name, device, mesh, left_np, righ
     )
 
 
+def _broadcast_case(backend, backend_name, device, rank, world_size):
+    root = 0
+    expected = np.arange(6, dtype=np.float64).reshape(2, 3)
+    local = expected if int(rank) == root else np.zeros_like(expected)
+    value = backend.to_backend(local)
+    result = backend.broadcast(value, root=root)
+    _sync_backend(backend, result)
+    actual = _to_numpy(backend, result)
+    return {
+        "backend": backend_name,
+        "device": device,
+        "device_spec": str(backend.current_device()),
+        "operation": "broadcast_tensor",
+        "status": "passed",
+        "rank": int(rank),
+        "world_size": int(world_size),
+        "root": int(root),
+        "global_shape": list(expected.shape),
+        "local_shape": list(expected.shape),
+        "collectives": ["broadcast"],
+        "plan_comm_bytes": int(expected.nbytes),
+        "max_abs_error": float(np.max(np.abs(actual - expected))),
+    }
+
+
 def run_distributed_smoke(
     backend_name,
     *,
@@ -567,6 +594,7 @@ def run_distributed_smoke(
         left_np, right_np = _make_inputs(rows, shared_dim, cols)
 
         return [
+            _broadcast_case(backend, backend_name, backend_device, rank, world_size),
             _row_sharded_case(backend, backend_name, backend_device, mesh, left_np, right_np, rank, world_size),
             _contracted_sharded_case(backend, backend_name, backend_device, mesh, left_np, right_np, rank, world_size),
             _redistribute_output_case(backend, backend_name, backend_device, mesh, left_np, right_np, rank, world_size),
