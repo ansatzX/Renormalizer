@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,7 @@ EXPECTED_COLLECTIVES = {
     "contracted_sharded_allreduce": ("allreduce",),
     "redistribute_output_alltoall": ("alltoall",),
 }
-EXPECTED_PROFILE_COLLECTIVES = ("allreduce", "alltoall", "gather")
+EXPECTED_PROFILE_COLLECTIVES = ("broadcast", "allreduce", "alltoall", "gather")
 
 
 def _env_int(name, default):
@@ -533,13 +534,59 @@ def _redistribute_output_case(backend, backend_name, device, mesh, left_np, righ
 
 
 def _broadcast_case(backend, backend_name, device, rank, world_size):
+    from renormalizer.utils import profiling
+
     root = 0
     expected = np.arange(6, dtype=np.float64).reshape(2, 3)
     local = expected if int(rank) == root else np.zeros_like(expected)
     value = backend.to_backend(local)
+    profile_enabled = profiling.should_record_op()
+    started = time.perf_counter() if profile_enabled else None
     result = backend.broadcast(value, root=root)
     _sync_backend(backend, result)
     actual = _to_numpy(backend, result)
+    wall_s = time.perf_counter() - started if profile_enabled else None
+    if profile_enabled:
+        profiling.record(
+            "contraction_execute",
+            backend=backend_name,
+            operation="broadcast_tensor",
+            equation=None,
+            lowering="distributed",
+            input_shapes=[list(expected.shape)],
+            output_shape=list(expected.shape),
+            input_dtypes=[str(expected.dtype)],
+            dtype=str(expected.dtype),
+            device=str(backend.current_device()),
+            global_shape=list(expected.shape),
+            local_shape=list(expected.shape),
+            distributed_modes=[],
+            rank=int(rank),
+            world_size=int(world_size),
+            flops=0,
+            read_bytes=int(expected.nbytes),
+            write_bytes=int(expected.nbytes),
+            copy_bytes=0,
+            workspace_bytes=0,
+            peak_bytes=int(expected.nbytes),
+            largest_intermediate=int(expected.nbytes),
+            num_gemm=0,
+            num_batched_gemm=0,
+            num_grouped_tasks=0,
+            num_blocks=0,
+            num_shape_buckets=0,
+            fallback_reason=None,
+            communication=[
+                {
+                    "collective": "broadcast",
+                    "bytes": int(expected.nbytes),
+                    "num_messages": 1,
+                    "block_size": int(expected.nbytes),
+                    "wall_s": wall_s,
+                }
+            ],
+            wall_s=wall_s,
+        )
     return {
         "backend": backend_name,
         "device": device,

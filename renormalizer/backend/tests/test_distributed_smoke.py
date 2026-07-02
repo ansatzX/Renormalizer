@@ -154,6 +154,11 @@ def test_distributed_profile_gate_requires_distributed_contraction_events():
     assert summary["failures"] == [
         {
             "collective": "allreduce",
+            "expected_collective": "broadcast",
+            "reason": "missing distributed profile collective",
+        },
+        {
+            "collective": "allreduce",
             "expected_collective": "alltoall",
             "reason": "missing distributed profile collective",
         }
@@ -171,6 +176,16 @@ def test_distributed_profile_cli_writes_ranked_profile_and_gates_it(monkeypatch,
         distributed_smoke,
         "run_distributed_smoke",
         lambda *args, **kwargs: [
+            {
+                "backend": "torch",
+                "device": "cuda:3",
+                "operation": "broadcast_tensor",
+                "status": "passed",
+                "rank": 3,
+                "world_size": 8,
+                "collectives": ["broadcast"],
+                "max_abs_error": 0.0,
+            },
             {
                 "backend": "torch",
                 "device": "cuda:3",
@@ -207,6 +222,16 @@ def test_distributed_profile_cli_writes_ranked_profile_and_gates_it(monkeypatch,
         distributed_smoke,
         "read_jsonl",
         lambda path: [
+            {
+                "event": "contraction_execute",
+                "lowering": "distributed",
+                "rank": 3,
+                "world_size": 8,
+                "global_shape": [2, 3],
+                "local_shape": [2, 3],
+                "distributed_modes": [],
+                "communication": [{"collective": "broadcast", "bytes": 48, "wall_s": 0.01}],
+            },
             {
                 "event": "contraction_execute",
                 "lowering": "distributed",
@@ -405,3 +430,42 @@ def test_numpy_distributed_smoke_records_planned_collective_cases():
     assert by_operation["row_sharded_matmul"]["collectives"] == ["gather"]
     assert by_operation["contracted_sharded_allreduce"]["collectives"] == ["allreduce"]
     assert by_operation["redistribute_output_alltoall"]["collectives"] == ["alltoall"]
+
+
+def test_numpy_distributed_smoke_records_broadcast_profile_event(tmp_path):
+    from renormalizer.backend.distributed_smoke import run_distributed_smoke
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    event_path = tmp_path / "profile.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+        run_distributed_smoke(
+            "numpy",
+            device="cpu",
+            rows=8,
+            shared_dim=4,
+            cols=8,
+            world_size=4,
+        )
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    events = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        event.get("event") == "contraction_execute"
+        and event.get("lowering") == "distributed"
+        and any(
+            item.get("collective") == "broadcast"
+            for item in event.get("communication") or []
+        )
+        for event in events
+    )
