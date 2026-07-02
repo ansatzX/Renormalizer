@@ -535,9 +535,53 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def parse_einsum(self, equation, *operands, constants=(), optimize=None):
         return parse_einsum(equation, *operands, constants=constants, optimize=optimize)
 
+    @staticmethod
+    def _explicit_contract_is_plannable(args, kwargs):
+        if len(args) != 3 or not isinstance(args[0], str):
+            return False
+        equation = "".join(args[0].split())
+        if "->" not in equation or "..." in equation:
+            return False
+        supported_kwargs = {
+            "optimize",
+            "memory_limit",
+            "prefer",
+            "allow_slicing",
+            "allow_distribution",
+            "target_devices",
+        }
+        for key, value in kwargs.items():
+            if key == "backend" and value is None:
+                continue
+            if key == "out" and value is None:
+                continue
+            if key not in supported_kwargs:
+                return False
+        return True
+
+    def _execute_explicit_planned_contract(self, args, kwargs):
+        equation, left, right = args
+        optimize = kwargs.get("optimize")
+        spec = self.parse_einsum(equation, left, right, optimize=optimize)
+        plan_kwargs = {
+            key: kwargs[key]
+            for key in (
+                "memory_limit",
+                "prefer",
+                "allow_slicing",
+                "allow_distribution",
+                "target_devices",
+            )
+            if key in kwargs
+        }
+        plan = self.plan_contraction(spec, **plan_kwargs)
+        return self.execute(plan)
+
     def contract(self, *args, **kwargs):
         import opt_einsum as oe
 
+        if self._explicit_contract_is_plannable(args, kwargs):
+            return self._execute_explicit_planned_contract(args, kwargs)
         if kwargs.get("backend") is None:
             kwargs = dict(kwargs)
             kwargs["backend"] = self.opt_einsum_name
