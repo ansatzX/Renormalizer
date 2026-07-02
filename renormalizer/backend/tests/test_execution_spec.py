@@ -2380,6 +2380,7 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     assert execute["input_modes"] == [["i", "k"], ["k", "j"]]
     assert execute["output_modes"] == ["i", "j"]
     assert execute["input_dtypes"] == ["float64", "float64"]
+    assert execute["peak_bytes"] == execute["write_bytes"] + execute["workspace_bytes"]
     assert execute["device_info"] == {
         "kind": "cpu",
         "index": None,
@@ -3455,6 +3456,7 @@ def test_execute_auto_distributed_profile_preserves_plan_identity_and_estimates(
     assert event["write_bytes"] == dense_path.estimated_write_bytes
     assert event["copy_bytes"] == dense_path.estimated_copy_bytes
     assert event["workspace_bytes"] == dense_path.required_workspace_bytes
+    assert event["peak_bytes"] == dense_path.estimated_peak_bytes
     assert event["estimated_compute_s"] == pytest.approx(step.estimated_compute_s)
     assert event["estimated_comm_s"] == pytest.approx(step.estimated_comm_s)
     assert event["estimated_total_s"] == pytest.approx(step.estimated_total_s)
