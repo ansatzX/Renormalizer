@@ -2639,6 +2639,32 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 getattr(step.plan, "kind", step.kind)
                 for step in plan.steps
             ]
+
+            def operand_payload(operand):
+                info = self.array_info(operand.array)
+                return {
+                    "name": operand.name,
+                    "modes": [str(mode) for mode in operand.modes],
+                    "shape": info.shape,
+                    "dtype": str(info.dtype),
+                    "itemsize": info.itemsize,
+                    "size": info.size,
+                    "nbytes": info.nbytes,
+                    "ndim": info.ndim,
+                    "strides": info.strides,
+                    "order": info.order,
+                    "contiguous": info.contiguous,
+                    "writeable": info.writeable,
+                    "owns_data": info.owns_data,
+                    "backend": info.backend_name,
+                    "device": str(info.device),
+                    "device_kind": info.device.kind,
+                    "device_index": info.device.index,
+                    "is_host": info.is_host,
+                    "is_device": info.is_device,
+                    "is_distributed": info.is_distributed,
+                }
+
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
@@ -2652,6 +2678,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     tuple(getattr(operand.array, "shape", ()))
                     for operand in plan.input_specs
                 ],
+                operands=[operand_payload(operand) for operand in plan.input_specs],
                 input_dtypes=[
                     str(getattr(operand.array, "dtype", None))
                     for operand in plan.input_specs

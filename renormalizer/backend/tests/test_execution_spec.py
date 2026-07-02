@@ -2445,6 +2445,11 @@ def test_multi_step_contraction_execute_profile_records_aggregate_event(tmp_path
     assert execute["equation"] == "ab,bc,cd->ad"
     assert execute["input_shapes"] == [[2, 3], [3, 4], [4, 5]]
     assert execute["input_dtypes"] == ["float64", "float64", "float64"]
+    assert execute["operands"][0]["modes"] == ["a", "b"]
+    assert execute["operands"][0]["shape"] == [2, 3]
+    assert execute["operands"][0]["itemsize"] == left.itemsize
+    assert execute["operands"][0]["is_host"] is True
+    assert execute["operands"][0]["is_distributed"] is False
     assert execute["output_shape"] == [2, 5]
     assert execute["flops"] == 180
     assert execute["read_bytes"] == plan.estimated_read_bytes
