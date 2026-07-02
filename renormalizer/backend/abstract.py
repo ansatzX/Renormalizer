@@ -316,10 +316,65 @@ class AbstractBackend(SingleProcessDistributedMixin):
             target = _np.result_type(a.dtype, b.dtype)
         return xp.asarray(a, dtype=target), xp.asarray(b, dtype=target)
 
+    @staticmethod
+    def _normalize_tensordot_axes(axes, a_ndim, b_ndim):
+        if isinstance(axes, (int, _np.integer)):
+            axes = int(axes)
+            if axes < 0:
+                raise ValueError("tensordot axes must be non-negative when given as an integer")
+            if axes > a_ndim or axes > b_ndim:
+                raise ValueError("tensordot axes exceeds input rank")
+            return tuple(range(a_ndim - axes, a_ndim)), tuple(range(axes))
+        if not (isinstance(axes, (tuple, list)) and len(axes) == 2):
+            raise ValueError("tensordot axes must be an integer or a pair of axis lists")
+        left_axes, right_axes = axes
+        if isinstance(left_axes, (int, _np.integer)):
+            left_axes = (int(left_axes),)
+        else:
+            left_axes = tuple(int(axis) for axis in left_axes)
+        if isinstance(right_axes, (int, _np.integer)):
+            right_axes = (int(right_axes),)
+        else:
+            right_axes = tuple(int(axis) for axis in right_axes)
+
+        def normalize(axis_values, ndim, side):
+            normalized = []
+            for axis in axis_values:
+                if axis < 0:
+                    axis += ndim
+                if axis < 0 or axis >= ndim:
+                    raise ValueError("{0} tensordot axis {1} is out of range for rank {2}".format(side, axis, ndim))
+                normalized.append(axis)
+            if len(set(normalized)) != len(normalized):
+                raise ValueError("{0} tensordot axes must be unique".format(side))
+            return tuple(normalized)
+
+        left_axes = normalize(left_axes, a_ndim, "left")
+        right_axes = normalize(right_axes, b_ndim, "right")
+        if len(left_axes) != len(right_axes):
+            raise ValueError("tensordot axis lists must have the same length")
+        return left_axes, right_axes
+
+    @classmethod
+    def _tensordot_contract_modes(cls, a_ndim, b_ndim, axes):
+        left_axes, right_axes = cls._normalize_tensordot_axes(axes, a_ndim, b_ndim)
+        left_modes = list(range(a_ndim))
+        right_modes = [None] * b_ndim
+        for left_axis, right_axis in zip(left_axes, right_axes):
+            right_modes[right_axis] = left_modes[left_axis]
+        next_mode = a_ndim
+        for axis in range(b_ndim):
+            if right_modes[axis] is None:
+                right_modes[axis] = next_mode
+                next_mode += 1
+        output_modes = [left_modes[axis] for axis in range(a_ndim) if axis not in left_axes]
+        output_modes.extend(right_modes[axis] for axis in range(b_ndim) if axis not in right_axes)
+        return left_modes, right_modes, output_modes
+
     def tensordot(self, a, b, axes=2):
-        xp = self.array_namespace or _np
         a, b = self._promote_tensordot_operands(a, b)
-        return xp.tensordot(a, b, axes)
+        left_modes, right_modes, output_modes = self._tensordot_contract_modes(a.ndim, b.ndim, axes)
+        return self.contract(a, left_modes, b, right_modes, output_modes)
 
     def einsum(self, subscripts, *operands, **kwargs):
         return self.contract(subscripts, *operands, **kwargs)

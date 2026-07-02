@@ -335,8 +335,7 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
         return (left_axes, right_axes)
 
     def tensordot(self, a, b, axes=2):
-        a, b = self._promote_tensordot_operands(a, b)
-        return torch.tensordot(a, b, dims=self._normalize_tensordot_dims(axes))
+        return super().tensordot(a, b, axes=axes)
 
 
 class _TorchRandomProxy:

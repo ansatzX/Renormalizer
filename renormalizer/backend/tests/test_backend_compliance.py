@@ -104,6 +104,35 @@ def test_backend_compliance_tensor_ops_and_linalg(backend_name, device):
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_tensordot_routes_through_contract(monkeypatch, backend_name, device):
+    backend = _backend_or_skip(backend_name, device)
+    left_np = np.arange(2 * 3 * 4, dtype=np.float64).reshape(2, 3, 4)
+    right_np = np.arange(4 * 3 * 5, dtype=np.float64).reshape(4, 3, 5)
+    left = backend.to_backend(left_np)
+    right = backend.to_backend(right_np)
+    original_contract = backend.contract
+    calls = []
+
+    def counting_contract(*args, **kwargs):
+        calls.append((args, dict(kwargs)))
+        return original_contract(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "contract", counting_contract)
+
+    result = backend.tensordot(left, right, axes=([2, 1], [0, 1]))
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] is left
+    assert args[2] is right
+    assert list(args[1]) == [0, 1, 2]
+    assert list(args[3]) == [2, 1, 3]
+    assert list(args[4]) == [0, 3]
+    assert kwargs == {}
+    _assert_allclose(backend, result, np.tensordot(left_np, right_np, axes=([2, 1], [0, 1])))
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
 def test_backend_compliance_contract_uses_backend_execution(backend_name, device):
     backend = _backend_or_skip(backend_name, device)
     left_np = np.arange(6, dtype=np.float64).reshape(2, 3)
