@@ -2094,24 +2094,26 @@ def test_distributed_contract_records_communication_profile(tmp_path):
         {
             "collective": "redistribute",
             "bytes": 96,
+            "local_bytes": 48,
             "modes": ["j"],
             "num_messages": 1,
-            "block_size": 96,
+            "block_size": 48,
             "wall_s": 0.0,
         },
         {
             "collective": "gather",
             "bytes": 160,
+            "local_bytes": 96,
             "modes": ["i"],
             "num_messages": 1,
-            "block_size": 160,
+            "block_size": 96,
             "wall_s": 0.0,
         },
     ]
     assert event["comm_bytes"] == 256
     assert event["wall_s"] >= 0.0
     communications = plan.steps[0].plan.steps[0].communication
-    assert [(item.num_messages, item.block_size) for item in communications] == [(1, 96), (1, 160)]
+    assert [(item.num_messages, item.block_size) for item in communications] == [(1, 48), (1, 96)]
 
 
 def test_distributed_contract_profile_measures_reduce_scatter_wall_time(tmp_path):
@@ -2400,9 +2402,10 @@ def test_plan_distributed_contraction_path_reports_communication_totals():
     assert distributed_path.steps[0].local_contraction_plan is distributed_path.steps[0].local_step.plan
     assert distributed_path.steps[0].communication_plan == distributed_path.steps[0].communication[0]
     assert [item.kind for item in distributed_path.steps[0].communication] == ["redistribute", "gather"]
-    assert [(item.num_messages, item.block_size) for item in distributed_path.steps[0].communication] == [(1, 96), (1, 160)]
-    assert distributed_path.steps[0].estimated_comm_s == pytest.approx(3.7)
-    assert distributed_path.steps[0].estimated_total_s == pytest.approx(3.7)
+    assert [(item.bytes, item.local_bytes) for item in distributed_path.steps[0].communication] == [(96, 48), (160, 96)]
+    assert [(item.num_messages, item.block_size) for item in distributed_path.steps[0].communication] == [(1, 48), (1, 96)]
+    assert distributed_path.steps[0].estimated_comm_s == pytest.approx(2.3)
+    assert distributed_path.steps[0].estimated_total_s == pytest.approx(2.3)
     left_state, right_state = distributed_path.steps[0].input_states
     assert left_state.tensor_id == 0
     assert left_state.shape == left.shape

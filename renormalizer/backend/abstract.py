@@ -906,6 +906,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     seen.add(mode)
         return tuple(items), tuple(seen)
 
+    def _input_redistribution_local_bytes(self, operands, items):
+        total = 0
+        for index, _ in items:
+            operand = operands[index]
+            if isinstance(operand, DistributedTensor):
+                total += int(operand.local_nbytes)
+            else:
+                total += self._array_nbytes(operand)
+        return total
+
     def _redistribute_incompatible_input_operands(
         self,
         operands,
@@ -997,6 +1007,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     self._prod_shape(spec.operands[index].global_shape) * self._operand_itemsize(spec.operands[index])
                     for index, _ in input_redistribution_items
                 )
+                input_redistribution_local_bytes = self._input_redistribution_local_bytes(
+                    spec.operands,
+                    input_redistribution_items,
+                )
                 active_distributed_modes = tuple(
                     mode for mode in distributed_modes if mode not in set(input_redistribution_modes)
                 )
@@ -1005,6 +1019,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     tuple(reduced_distributed_modes) + tuple(output_sharding.sharded_modes if output_sharding is not None else ())
                 ))
                 output_comm_bytes = plan.estimated_comm_bytes
+                output_comm_local_bytes = self._output_communication_local_bytes(
+                    output_sharding,
+                    itemsize,
+                    output_comm_bytes,
+                )
                 total_comm_bytes = output_comm_bytes + input_redistribution_bytes
                 states = tuple(
                     self._distribution_state_for_operand(index, operand, modes)
@@ -1027,6 +1046,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                             CommunicationPlan(
                                 kind="redistribute",
                                 bytes=input_redistribution_bytes,
+                                local_bytes=input_redistribution_local_bytes,
                                 modes=input_redistribution_modes,
                                 reason="redistribute incompatible input sharding before contraction",
                             ),
@@ -1046,6 +1066,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                                 else "gather"
                             ),
                             bytes=output_comm_bytes,
+                            local_bytes=output_comm_local_bytes,
                             modes=reduce_scatter_modes if reduce_scatter_required else reduced_distributed_modes or active_distributed_modes,
                             reason=(
                                 "sum partial outputs and scatter to requested output sharding"
@@ -1350,6 +1371,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return 0
         local_shape = self._local_shape_for_slices(sharding.global_shape, local_slices)
         return self._prod_shape(local_shape) * int(itemsize)
+
+    def _output_communication_local_bytes(self, output_sharding, itemsize, total_bytes):
+        if output_sharding is None:
+            return int(total_bytes)
+        local_bytes = self._local_nbytes_for_sharding(output_sharding, itemsize)
+        return int(local_bytes or total_bytes)
 
     @staticmethod
     def _local_shape_for_slices(global_shape, local_slices):
@@ -2371,6 +2398,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     {
                         "collective": item.kind,
                         "bytes": int(item.bytes),
+                        "local_bytes": int(getattr(item, "local_bytes", item.bytes)),
                         "modes": [str(mode) for mode in item.modes],
                         "num_messages": int(item.num_messages),
                         "block_size": int(item.block_size),
