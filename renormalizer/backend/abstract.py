@@ -2447,7 +2447,75 @@ class AbstractBackend(SingleProcessDistributedMixin):
         descs = tuple(replace(desc, A=left, B=right) for desc in plan.descs)
         return replace(plan, descs=descs)
 
+    def _record_multi_step_contraction_execute(self, plan, result, wall_s):
+        try:
+            from renormalizer.utils import profiling
+
+            if not profiling.should_record_op():
+                return
+            equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)
+            step_lowerings = [
+                getattr(step.plan, "kind", step.kind)
+                for step in plan.steps
+            ]
+            profiling.record(
+                "contraction_execute",
+                backend=self.name,
+                equation=equation,
+                lowering="multi_step",
+                step_lowerings=step_lowerings,
+                plan_hash=plan.plan_hash,
+                input_modes=input_modes,
+                output_modes=output_modes,
+                input_shapes=[
+                    tuple(getattr(operand.array, "shape", ()))
+                    for operand in plan.input_specs
+                ],
+                output_shape=tuple(getattr(result, "shape", ())),
+                dtype=str(getattr(result, "dtype", None)),
+                device=str(self.current_device()),
+                flops=plan.estimated_flops,
+                read_bytes=plan.estimated_read_bytes,
+                write_bytes=plan.estimated_write_bytes,
+                copy_bytes=plan.estimated_copy_bytes,
+                workspace_bytes=plan.required_workspace_bytes,
+                peak_bytes=plan.estimated_peak_bytes,
+                largest_intermediate=max(
+                    [int(getattr(result, "nbytes", 0) or 0)]
+                    + [int(step.estimated_write_bytes or 0) for step in plan.steps]
+                ),
+                num_gemm=sum(1 for lowering in step_lowerings if lowering == "gemm"),
+                num_batched_gemm=sum(
+                    1
+                    for lowering in step_lowerings
+                    if lowering in ("batched_gemm", "strided_batched_gemm")
+                ),
+                num_grouped_tasks=sum(
+                    len(getattr(step.plan, "descs", ()) or ())
+                    for step, lowering in zip(plan.steps, step_lowerings)
+                    if lowering == "grouped_gemm"
+                ),
+                num_blocks=0,
+                num_shape_buckets=0,
+                fallback_reason=next((step.fallback_reason for step in plan.steps if step.fallback_reason), None),
+                wall_s=wall_s,
+            )
+        except Exception:
+            pass
+
     def _execute_multi_step_contraction_plan(self, plan, *, stream=None, workspace=None):
+        try:
+            from renormalizer.utils import profiling
+
+            should_profile = profiling.should_record_op()
+        except Exception:
+            should_profile = False
+        if should_profile:
+            import time
+
+            started = time.perf_counter()
+        else:
+            started = None
         operands = [operand.array for operand in plan.input_specs]
         for step in plan.steps:
             step_operands = tuple(operands[int(index)] for index in step.inputs)
@@ -2475,7 +2543,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
             operands.append(result)
         if len(operands) != 1:
             raise BackendFeatureError("multi-step contraction execution did not reduce to one output")
-        return operands[0]
+        result = operands[0]
+        if started is not None:
+            self._record_multi_step_contraction_execute(plan, result, time.perf_counter() - started)
+        return result
 
     @staticmethod
     def _mode_token(mode):

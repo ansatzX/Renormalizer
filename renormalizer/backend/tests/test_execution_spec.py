@@ -1913,6 +1913,56 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     assert execute["output_modes"] == ["i", "j"]
 
 
+def test_multi_step_contraction_execute_profile_records_aggregate_event(tmp_path):
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    middle = np.arange(12, dtype=np.float64).reshape(3, 4)
+    right = np.arange(20, dtype=np.float64).reshape(4, 5)
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        spec = backend.parse_einsum("ab,bc,cd->ad", left, middle, right, optimize="greedy")
+        plan = backend.plan_contraction(spec)
+        result = backend.execute(plan)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(result, np.einsum("ab,bc,cd->ad", left, middle, right))
+    events = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    execute_events = [
+        event
+        for event in events
+        if event["event"] == "contraction_execute" and event["plan_hash"] == plan.plan_hash
+    ]
+
+    assert len(execute_events) == 1
+    execute = execute_events[0]
+    assert execute["lowering"] == "multi_step"
+    assert execute["step_lowerings"] == ["gemm", "gemm"]
+    assert execute["equation"] == "ab,bc,cd->ad"
+    assert execute["input_shapes"] == [[2, 3], [3, 4], [4, 5]]
+    assert execute["output_shape"] == [2, 5]
+    assert execute["flops"] == 180
+    assert execute["read_bytes"] == plan.estimated_read_bytes
+    assert execute["write_bytes"] == plan.estimated_write_bytes
+    assert execute["num_gemm"] == 2
+    assert execute["num_batched_gemm"] == 0
+    assert execute["wall_s"] >= 0.0
+
+
 def test_distributed_contract_matches_dense_for_row_sharded_matmul():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend
