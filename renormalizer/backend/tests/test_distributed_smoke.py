@@ -3,6 +3,104 @@
 import json
 
 
+def test_distributed_speed_gate_requires_speedup_over_slicing():
+    from renormalizer.backend.distributed_smoke import evaluate_distributed_speed_gate
+
+    records = [
+        {
+            "operation": "row_sharded_speed_benchmark",
+            "status": "passed",
+            "rank": 0,
+            "world_size": 8,
+            "speedup_vs_slicing": 0.95,
+            "distributed_wall_s": 0.19,
+            "slicing_wall_s": 0.18,
+            "max_abs_error": 0.0,
+        }
+    ]
+
+    summary = evaluate_distributed_speed_gate(records, min_speedup=1.01, require_world_size=8)
+
+    assert summary["operation"] == "distributed_speed_gate"
+    assert summary["status"] == "failed"
+    assert summary["checked_count"] == 1
+    assert summary["failures"] == [
+        {
+            "operation": "row_sharded_speed_benchmark",
+            "rank": 0,
+            "reason": "speedup below threshold",
+            "speedup_vs_slicing": 0.95,
+        }
+    ]
+
+
+def test_distributed_speed_cli_returns_nonzero_when_gate_fails(monkeypatch, capsys):
+    from renormalizer.backend import distributed_smoke
+
+    monkeypatch.setattr(distributed_smoke, "run_distributed_smoke", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        distributed_smoke,
+        "run_distributed_speed_smoke",
+        lambda *args, **kwargs: [
+            {
+                "operation": "row_sharded_speed_benchmark",
+                "status": "passed",
+                "rank": 0,
+                "world_size": 8,
+                "speedup_vs_slicing": 0.5,
+                "distributed_wall_s": 2.0,
+                "slicing_wall_s": 1.0,
+                "max_abs_error": 0.0,
+            }
+        ],
+    )
+
+    rc = distributed_smoke.main([
+        "--backends",
+        "torch",
+        "--device",
+        "cuda",
+        "--speed-benchmark",
+        "--speed-gate",
+        "--min-speedup",
+        "1.01",
+        "--require-world-size",
+        "8",
+    ])
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    gate = payload["records"][-1]
+    assert gate["operation"] == "distributed_speed_gate"
+    assert gate["status"] == "failed"
+    assert gate["failures"][0]["reason"] == "speedup below threshold"
+
+
+def test_distributed_speed_smoke_skips_single_process_runtime():
+    from renormalizer.backend.distributed_smoke import run_distributed_speed_smoke
+
+    records = run_distributed_speed_smoke(
+        "numpy",
+        device="cpu",
+        rows=8,
+        shared_dim=8,
+        cols=8,
+        rank=0,
+        world_size=1,
+        repeat=1,
+        warmup=0,
+        trials=1,
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["operation"] == "row_sharded_speed_benchmark"
+    assert record["status"] == "skipped"
+    assert record["rank"] == 0
+    assert record["world_size"] == 1
+    assert "world_size > 1" in record["error"]
+
+
 def test_distributed_profile_gate_requires_distributed_contraction_events():
     from renormalizer.backend.distributed_smoke import evaluate_distributed_profile_gate
 

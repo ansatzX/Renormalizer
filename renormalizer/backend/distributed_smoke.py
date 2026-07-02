@@ -99,6 +99,54 @@ def _to_numpy(backend, value):
     return np.asarray(backend.to_numpy(value))
 
 
+def _sync_value(value):
+    block_until_ready = getattr(value, "block_until_ready", None)
+    if block_until_ready is not None:
+        block_until_ready()
+
+
+def _sync_backend(backend, value=None):
+    try:
+        if value is not None:
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    _sync_value(item)
+            else:
+                _sync_value(value)
+        backend.sync()
+    except Exception:
+        pass
+
+
+def _run_repeated(repeat, fn):
+    result = None
+    for _ in range(int(repeat)):
+        result = fn()
+    return result
+
+
+def _time_call(backend, repeat, fn, *, warmup=0, trials=1):
+    import time
+
+    repeat = int(repeat)
+    warmup = max(0, int(warmup))
+    trials = max(1, int(trials))
+    _sync_backend(backend)
+    result = None
+    for _ in range(warmup):
+        result = _run_repeated(repeat, fn)
+        _sync_backend(backend, result)
+
+    samples = []
+    for _ in range(trials):
+        _sync_backend(backend)
+        started = time.perf_counter()
+        result = _run_repeated(repeat, fn)
+        _sync_backend(backend, result)
+        samples.append(float(time.perf_counter() - started))
+    return result, float(np.median(samples)), samples
+
+
 def _make_inputs(rows, shared_dim, cols):
     left = np.arange(int(rows) * int(shared_dim), dtype=np.float64).reshape(int(rows), int(shared_dim))
     right = np.arange(int(shared_dim) * int(cols), dtype=np.float64).reshape(int(shared_dim), int(cols))
@@ -316,6 +364,59 @@ def evaluate_distributed_profile_gate(events, *, require_world_size=None):
     }
 
 
+def _speed_records(records):
+    return [
+        record for record in records
+        if record.get("operation") == "row_sharded_speed_benchmark"
+    ]
+
+
+def evaluate_distributed_speed_gate(records, *, min_speedup=1.0, require_world_size=None, max_abs_error=1e-9):
+    speed_records = _speed_records(records)
+    failures = []
+    if not speed_records:
+        failures.append({
+            "operation": "row_sharded_speed_benchmark",
+            "reason": "missing distributed speed benchmark record",
+        })
+    for record in speed_records:
+        if record.get("status") != "passed":
+            failures.append(_gate_failure(record, "distributed speed benchmark did not pass"))
+            continue
+        if require_world_size is not None and int(record.get("world_size") or 0) != int(require_world_size):
+            failures.append(_gate_failure(
+                record,
+                "unexpected world size",
+                world_size=record.get("world_size"),
+                expected_world_size=int(require_world_size),
+            ))
+        error = record.get("max_abs_error")
+        if error is None or float(error) > float(max_abs_error):
+            failures.append(_gate_failure(
+                record,
+                "max_abs_error above threshold",
+                max_abs_error=error,
+                threshold=float(max_abs_error),
+            ))
+        speedup = record.get("speedup_vs_slicing")
+        if speedup is None or float(speedup) < float(min_speedup):
+            failures.append(_gate_failure(
+                record,
+                "speedup below threshold",
+                speedup_vs_slicing=speedup,
+            ))
+
+    return {
+        "operation": "distributed_speed_gate",
+        "status": "failed" if failures else "passed",
+        "checked_count": int(len(speed_records)),
+        "min_speedup": float(min_speedup),
+        "required_world_size": None if require_world_size is None else int(require_world_size),
+        "max_abs_error": float(max_abs_error),
+        "failures": failures,
+    }
+
+
 def _close_distributed_runtime(backend):
     dist = getattr(backend, "_distributed", None)
     if dist is None:
@@ -474,6 +575,129 @@ def run_distributed_smoke(
         _close_distributed_runtime(backend)
 
 
+def run_distributed_speed_smoke(
+    backend_name,
+    *,
+    device="cuda",
+    rows=1024,
+    shared_dim=1024,
+    cols=1024,
+    rank=None,
+    world_size=None,
+    repeat=3,
+    warmup=1,
+    trials=3,
+):
+    backend_name = normalize_backend_name(backend_name)
+    if not is_backend_available(backend_name):
+        return [
+            {
+                "backend": backend_name,
+                "device": device,
+                "operation": "backend_import",
+                "status": "skipped",
+                "error": "backend is not available",
+            }
+        ]
+    rank, world_size = _env_rank_world(rank=rank, world_size=world_size)
+    if world_size < 1:
+        raise ValueError("world_size must be positive")
+    if world_size == 1:
+        return [
+            {
+                "backend": backend_name,
+                "device": device,
+                "operation": "row_sharded_speed_benchmark",
+                "status": "skipped",
+                "rank": int(rank),
+                "world_size": int(world_size),
+                "error": "distributed speed benchmark requires world_size > 1",
+            }
+        ]
+    if rows < world_size or shared_dim < world_size or cols < world_size:
+        raise ValueError("rows, shared_dim, and cols must be at least world_size")
+
+    backend_device = _device_for_rank(device, rank)
+    backend = create_backend(backend_name, config=BackendConfig(device=backend_device, precision=64))
+    try:
+        if getattr(backend, "is_distributed", False):
+            rank = int(backend.rank)
+            world_size = int(backend.size)
+        mesh = _mesh_for_runtime(backend_name, backend_device, rank, world_size)
+        left_np, right_np = _make_inputs(rows, shared_dim, cols)
+        left = backend.to_backend(left_np)
+        right = backend.to_backend(right_np)
+        left_spec = ShardingSpec(
+            global_shape=left_np.shape,
+            modes=("i", "k"),
+            mesh=mesh,
+            ranks_per_mode={"i": world_size},
+            mode_to_mesh_axis={"i": "rank"},
+        )
+        spec = DistributedContractionSpec(
+            equation="ik,kj->ij",
+            operands=(backend.shard_tensor(left, left_spec), right),
+        )
+        plan = backend.plan_contraction(spec, allow_distribution=True)
+        distributed_plan = _distributed_plan(plan)
+        output_sharding = distributed_plan.output_sharding if distributed_plan is not None else None
+        if output_sharding is None:
+            raise RuntimeError("row-sharded speed benchmark requires an output sharding plan")
+        output_slices = output_sharding.local_slices[int(rank)]
+
+        def distributed_fn():
+            return backend.distributed_contract(spec, plan=plan)
+
+        def slicing_fn():
+            full = backend.matmul(left, right)
+            return full[tuple(output_slices)]
+
+        distributed_result, distributed_wall_s, distributed_samples = _time_call(
+            backend,
+            repeat,
+            distributed_fn,
+            warmup=warmup,
+            trials=trials,
+        )
+        slicing_result, slicing_wall_s, slicing_samples = _time_call(
+            backend,
+            repeat,
+            slicing_fn,
+            warmup=warmup,
+            trials=trials,
+        )
+        del slicing_result
+        expected_local = left_np[output_slices[0], :] @ right_np[:, output_slices[1]]
+        actual_local = _to_numpy(backend, distributed_result.local_array)
+        error = float(np.max(np.abs(actual_local - expected_local)))
+        return [
+            {
+                "backend": backend_name,
+                "device": backend_device,
+                "device_spec": str(backend.current_device()),
+                "operation": "row_sharded_speed_benchmark",
+                "status": "passed",
+                "rank": int(rank),
+                "world_size": int(world_size),
+                "shape": [int(rows), int(shared_dim), int(cols)],
+                "local_shape": [int(dim) for dim in distributed_result.local_shape],
+                "output_sharded_modes": [str(mode) for mode in distributed_result.sharding.sharded_modes],
+                "collectives": _collectives(plan),
+                "repeat": int(repeat),
+                "warmup": int(warmup),
+                "trials": int(trials),
+                "distributed_wall_s": float(distributed_wall_s),
+                "distributed_wall_s_samples": distributed_samples,
+                "slicing_wall_s": float(slicing_wall_s),
+                "slicing_wall_s_samples": slicing_samples,
+                "speedup_vs_slicing": float(slicing_wall_s / distributed_wall_s) if distributed_wall_s > 0 else None,
+                "max_abs_error": error,
+            }
+        ]
+    finally:
+        _close_distributed_runtime(backend)
+
+
 def write_jsonl(records, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,6 +713,12 @@ def build_parser():
     parser.add_argument("--rows", type=int, default=16)
     parser.add_argument("--shared-dim", type=int, default=16)
     parser.add_argument("--cols", type=int, default=16)
+    parser.add_argument("--speed-rows", type=int, default=1024)
+    parser.add_argument("--speed-shared-dim", type=int, default=1024)
+    parser.add_argument("--speed-cols", type=int, default=1024)
+    parser.add_argument("--speed-repeat", type=int, default=3)
+    parser.add_argument("--speed-warmup", type=int, default=1)
+    parser.add_argument("--speed-trials", type=int, default=3)
     parser.add_argument("--output", default=None, help="Optional JSONL output path.")
     parser.add_argument(
         "--profile-output",
@@ -505,6 +735,17 @@ def build_parser():
         action="store_true",
         help="Fail if profiling JSONL does not contain distributed contraction communication events.",
     )
+    parser.add_argument(
+        "--speed-benchmark",
+        action="store_true",
+        help="Benchmark row-sharded distributed matmul against full dense matmul plus local slicing.",
+    )
+    parser.add_argument(
+        "--speed-gate",
+        action="store_true",
+        help="Fail if the distributed speed benchmark does not beat the slicing baseline.",
+    )
+    parser.add_argument("--min-speedup", type=float, default=1.0)
     parser.add_argument("--require-world-size", type=int, default=None)
     parser.add_argument("--max-abs-error", type=float, default=1e-9)
     return parser
@@ -536,6 +777,19 @@ def main(argv=None):
                 cols=args.cols,
             )
             all_records.extend(records)
+            if args.speed_benchmark:
+                all_records.extend(
+                    run_distributed_speed_smoke(
+                        backend_name,
+                        device=args.device,
+                        rows=args.speed_rows,
+                        shared_dim=args.speed_shared_dim,
+                        cols=args.speed_cols,
+                        repeat=args.speed_repeat,
+                        warmup=args.speed_warmup,
+                        trials=args.speed_trials,
+                    )
+                )
     finally:
         if args.profile_output is not None:
             from renormalizer.utils import profiling
@@ -562,6 +816,15 @@ def main(argv=None):
         if profile_output is not None:
             profile_gate_summary["profile_output"] = os.fspath(profile_output)
         all_records.append(profile_gate_summary)
+    speed_gate_summary = None
+    if args.speed_gate:
+        speed_gate_summary = evaluate_distributed_speed_gate(
+            all_records,
+            min_speedup=args.min_speedup,
+            require_world_size=args.require_world_size,
+            max_abs_error=args.max_abs_error,
+        )
+        all_records.append(speed_gate_summary)
     if args.output is not None:
         write_jsonl(all_records, args.output)
     print(json.dumps({"records": all_records}, sort_keys=True))
@@ -570,6 +833,8 @@ def main(argv=None):
     if gate_summary is not None and gate_summary["status"] != "passed":
         return 2
     if profile_gate_summary is not None and profile_gate_summary["status"] != "passed":
+        return 2
+    if speed_gate_summary is not None and speed_gate_summary["status"] != "passed":
         return 2
     return 0
 
