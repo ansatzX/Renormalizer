@@ -180,6 +180,12 @@ def test_backend_protocol_capability_flags_are_explicit():
         "supports_block_sparse",
         "supports_packed_blocks",
         "supports_scatter_add",
+        "supports_distributed_array",
+        "supports_allreduce",
+        "supports_broadcast",
+        "supports_allgather",
+        "supports_reduce_scatter",
+        "supports_alltoall",
         "supports_point_to_point",
     )
 
@@ -197,8 +203,38 @@ def test_backend_capability_flags_mirror_capability_fields():
     assert backend.supports_fp32 is backend.capabilities.fp32
     assert backend.supports_fp64 is backend.capabilities.fp64
     assert backend.supports_mixed_precision is backend.capabilities.mixed_precision
+    assert backend.supports_distributed_array is backend.capabilities.distributed_array
     assert backend.supports_strided_batched_gemm is backend.capabilities.strided_batched_gemm
     assert backend.supports_point_to_point is backend.capabilities.point_to_point
+
+
+def test_backend_collective_capability_flags_are_size_gated():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class CollectiveBackend(NumpyBackend):
+        @property
+        def size(self):
+            return 2
+
+        @property
+        def is_distributed(self):
+            return True
+
+    single = NumpyBackend()
+    collective = CollectiveBackend()
+
+    assert single.supports_allreduce is True
+    assert single.capabilities.allreduce is False
+    assert single.capabilities.broadcast is False
+    assert single.capabilities.allgather is False
+    assert single.capabilities.reduce_scatter is False
+    assert single.capabilities.alltoall is False
+
+    assert collective.capabilities.allreduce is collective.supports_allreduce
+    assert collective.capabilities.broadcast is collective.supports_broadcast
+    assert collective.capabilities.allgather is collective.supports_allgather
+    assert collective.capabilities.reduce_scatter is collective.supports_reduce_scatter
+    assert collective.capabilities.alltoall is collective.supports_alltoall
 
 
 def test_device_spec_parses_cpu_and_indexed_cuda_aliases():

@@ -172,6 +172,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_block_sparse = True
     supports_packed_blocks = False
     supports_scatter_add = True
+    supports_distributed_array = True
+    supports_allreduce = True
+    supports_broadcast = True
+    supports_allgather = True
+    supports_reduce_scatter = True
+    supports_alltoall = True
     supports_point_to_point = False
     host_array_types = (_np.ndarray,)
     device_array_types = ()
@@ -257,12 +263,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
             packed_blocks=self.supports_packed_blocks,
             scatter_add=self.supports_scatter_add,
             distributed=self.is_distributed,
-            distributed_array=True,
-            allreduce=self.size > 1,
-            broadcast=self.size > 1,
-            allgather=self.size > 1,
-            reduce_scatter=self.size > 1,
-            alltoall=self.size > 1,
+            distributed_array=self.supports_distributed_array,
+            allreduce=bool(self.supports_allreduce and self.size > 1),
+            broadcast=bool(self.supports_broadcast and self.size > 1),
+            allgather=bool(self.supports_allgather and self.size > 1),
+            reduce_scatter=bool(self.supports_reduce_scatter and self.size > 1),
+            alltoall=bool(self.supports_alltoall and self.size > 1),
             point_to_point=bool(self.supports_point_to_point and self.size > 1),
         )
 

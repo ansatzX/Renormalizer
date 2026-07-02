@@ -34,6 +34,12 @@ _BACKEND_PROTOCOL_RUNTIME_ATTRS = (
     "supports_block_sparse",
     "supports_packed_blocks",
     "supports_scatter_add",
+    "supports_distributed_array",
+    "supports_allreduce",
+    "supports_broadcast",
+    "supports_allgather",
+    "supports_reduce_scatter",
+    "supports_alltoall",
     "supports_point_to_point",
     "host_array_types",
     "device_array_types",
@@ -247,6 +253,24 @@ class BackendProtocol(Protocol):
 
     supports_scatter_add: bool
     """Whether backend scatter-add/update primitives are available."""
+
+    supports_distributed_array: bool
+    """Whether backend distributed tensor wrapper APIs are available."""
+
+    supports_allreduce: bool
+    """Whether allreduce communication primitives are available when distributed."""
+
+    supports_broadcast: bool
+    """Whether broadcast communication primitives are available when distributed."""
+
+    supports_allgather: bool
+    """Whether allgather communication primitives are available when distributed."""
+
+    supports_reduce_scatter: bool
+    """Whether reduce-scatter communication primitives are available when distributed."""
+
+    supports_alltoall: bool
+    """Whether all-to-all communication primitives are available when distributed."""
 
     supports_point_to_point: bool
     """Whether distributed point-to-point communication primitives are available."""
