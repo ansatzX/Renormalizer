@@ -488,7 +488,7 @@ def test_trace_mode_keeps_log_concise_with_summary(caplog, monkeypatch, tmp_path
     assert event["input_shapes"] == [[2, 3], [3, 4]]
 
 
-def test_trace_summary_excludes_large_grouped_gemm_task_metadata(caplog, tmp_path):
+def test_trace_summary_excludes_large_execution_metadata(caplog, tmp_path):
     from renormalizer.utils.log import PROFILING
     from renormalizer.utils import profiling
 
@@ -514,6 +514,26 @@ def test_trace_summary_excludes_large_grouped_gemm_task_metadata(caplog, tmp_pat
                     "k": 3,
                 },
             ],
+            operands=[
+                {"name": "operand0", "shape": (2, 3), "dtype": "float64"},
+                {"name": "operand1", "shape": (3, 4), "dtype": "float64"},
+            ],
+            communication=[
+                {
+                    "collective": "alltoall",
+                    "bytes": 96,
+                    "num_messages": 2,
+                    "block_size": 48,
+                    "wall_s": 0.01,
+                },
+            ],
+            input_states=[
+                {"tensor_id": 0, "local_shape": (1, 3), "local_nbytes": 24},
+            ],
+            output_state={"tensor_id": 2, "local_shape": (1, 4), "local_nbytes": 32},
+            output_block_keys=[{"qn_left": (0,), "qn_right": (1,), "extra": ()}],
+            unique_output_block_keys=[{"qn_left": (0,), "qn_right": (1,), "extra": ()}],
+            result_block_shapes=[{"qn_left": (0,), "qn_right": (1,), "extra": (), "shape": (2, 4)}],
             wall_s=0.25,
         )
         profiling.flush_summaries()
@@ -523,14 +543,27 @@ def test_trace_summary_excludes_large_grouped_gemm_task_metadata(caplog, tmp_pat
     event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "contraction_execute")
     assert event["task_operands"][0][0]["name"] == "task0.A"
     assert event["task_specs"][0]["m"] == 2
+    assert event["operands"][0]["name"] == "operand0"
+    assert event["communication"][0]["collective"] == "alltoall"
+    assert event["output_state"]["tensor_id"] == 2
 
     log_payloads = _profiling_payloads(caplog, profiling)
     summary = next(
         payload for payload in log_payloads
         if payload["event"] == "profile_summary" and payload["source_event"] == "contraction_execute"
     )
-    assert "task_operands" not in summary["signature"]
-    assert "task_specs" not in summary["signature"]
+    for field in (
+        "task_operands",
+        "task_specs",
+        "operands",
+        "communication",
+        "input_states",
+        "output_state",
+        "output_block_keys",
+        "unique_output_block_keys",
+        "result_block_shapes",
+    ):
+        assert field not in summary["signature"]
 
 
 def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
