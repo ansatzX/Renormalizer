@@ -135,6 +135,43 @@ def test_legacy_backend_constants_are_not_used_in_core_call_sites():
         assert "OE_BACKEND" not in text
 
 
+def test_legacy_backend_metadata_helpers_track_active_backend():
+    import importlib
+
+    legacy_backend = importlib.import_module("renormalizer.mps.backend")
+
+    class FakeArray:
+        pass
+
+    class FakeBackend:
+        device = "gpu"
+        opt_einsum_name = "fake-oe"
+        memory_errors = (ArithmeticError,)
+        ndarray = (FakeArray,)
+
+    manager = object.__getattribute__(legacy_backend.backend, "_manager")
+    previous = manager.current
+    try:
+        manager.current = FakeBackend()
+
+        assert legacy_backend.use_gpu() is True
+        assert legacy_backend.oe_backend() == "fake-oe"
+        assert legacy_backend.memory_errors() == (ArithmeticError,)
+        assert legacy_backend.array_types() == (FakeArray,)
+    finally:
+        manager.current = previous
+
+
+def test_zero_temperature_cv_uses_dynamic_oe_backend_selection():
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[3]
+    text = (repo / "renormalizer" / "cv" / "zerot.py").read_text(encoding="utf-8")
+
+    assert "USE_GPU" not in text
+    assert "oe_backend()" in text
+
+
 def test_backend_protocol_and_conversion_surface():
     import renormalizer as r
     from renormalizer.backend import BackendProtocol
@@ -1603,6 +1640,20 @@ def test_matrix_contract_helpers_follow_backend_conversion_boundary():
     assert asnumpy(right_xp).shape == right.shape
     assert np.allclose(asnumpy(td), np.tensordot(left.array, right.array, axes=([-1], [0])))
     assert np.allclose(asnumpy(contracted), np.einsum("abc,cde->abde", left.array, right.array))
+
+
+def test_multi_tensor_contract_expands_legacy_implicit_output_axes():
+    from renormalizer.mps.matrix import asnumpy, multi_tensor_contract
+
+    left = np.arange(2 * 3 * 4 * 5.0).reshape(2, 3, 4, 5)
+    right = np.arange(6 * 7 * 2.0).reshape(6, 7, 2)
+    path = [([0, 1], "abc, efa -> bcdef")]
+
+    contracted = multi_tensor_contract(path, left, right)
+
+    expected = np.tensordot(left, right, axes=([0], [2]))
+    assert contracted.shape == (3, 4, 5, 6, 7)
+    assert np.allclose(asnumpy(contracted), expected)
 
 
 def test_cupy_backend_compute_boundaries_when_available():

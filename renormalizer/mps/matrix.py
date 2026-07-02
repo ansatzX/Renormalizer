@@ -332,6 +332,7 @@ def multi_tensor_contract(path, *operands: [List[Union[Matrix, np.ndarray, xp.nd
         input_str, results_str = ipath[1].split("->")
         input_str = input_str.split(",")
         input_str = [x.replace(" ", "") for x in input_str]
+        results_str = results_str.replace(" ", "")
         results_set = set(results_str)
         inputs_set = set(input_str[0] + input_str[1])
         idx_removed = inputs_set - (inputs_set & results_set)
@@ -342,6 +343,7 @@ def multi_tensor_contract(path, *operands: [List[Union[Matrix, np.ndarray, xp.nd
             operands[ipath[0][1]],
             input_str[1],
             idx_removed,
+            output_modes=results_str,
         )
 
         for x in sorted(ipath[0], reverse=True):
@@ -358,19 +360,76 @@ def pair_tensor_contract(
     view_right: Union[Matrix, np.ndarray, xp.ndarray],
     input_right,
     idx_removed,
+    output_modes=None,
 ):
     left_array = asxp(view_left)
     right_array = asxp(view_right)
     removed = set(idx_removed)
-    output_modes = tuple(mode for mode in input_left if mode not in removed)
-    output_modes += tuple(mode for mode in input_right if mode not in removed)
-    equation = "{0},{1}->{2}".format(input_left, input_right, "".join(output_modes))
+    input_left, input_right, output_modes = _expand_pair_contract_modes(
+        input_left,
+        input_right,
+        removed,
+        left_array,
+        right_array,
+        output_modes=output_modes,
+    )
+    equation = "{0},{1}->{2}".format("".join(input_left), "".join(input_right), "".join(output_modes))
     spec = backend.parse_einsum(equation, left_array, right_array)
     if profiling.should_record_op():
         plan = backend.plan_contraction(spec)
     else:
         plan = _cached_pair_contraction_plan(equation, spec, left_array, right_array)
     return backend.execute(plan)
+
+
+def _expand_pair_contract_modes(input_left, input_right, removed, left_array, right_array, output_modes=None):
+    input_left = tuple(str(input_left).replace(" ", ""))
+    input_right = tuple(str(input_right).replace(" ", ""))
+    removed = set(removed)
+    left_rank = len(getattr(left_array, "shape", ()))
+    right_rank = len(getattr(right_array, "shape", ()))
+    if len(input_left) > left_rank:
+        raise ValueError("left contraction labels exceed array rank")
+    if len(input_right) > right_rank:
+        raise ValueError("right contraction labels exceed array rank")
+
+    left_contract_positions = tuple(index for index, mode in enumerate(input_left) if mode in removed)
+    right_contract_positions = tuple(index for index, mode in enumerate(input_right) if mode in removed)
+    left_uncontracted_count = left_rank - len(left_contract_positions)
+    right_uncontracted_count = right_rank - len(right_contract_positions)
+
+    if output_modes is None:
+        output_modes = tuple(mode for mode in input_left if mode not in removed)
+        output_modes += tuple(mode for mode in input_right if mode not in removed)
+    else:
+        output_modes = tuple(str(output_modes).replace(" ", ""))
+    expected_output_rank = left_uncontracted_count + right_uncontracted_count
+    if len(output_modes) != expected_output_rank:
+        raise ValueError(
+            "pair contraction output labels have rank {0}, expected {1}".format(
+                len(output_modes),
+                expected_output_rank,
+            )
+        )
+
+    left_output_modes = output_modes[:left_uncontracted_count]
+    right_output_modes = output_modes[left_uncontracted_count:]
+
+    def expand(modes, rank, output):
+        output_iter = iter(output)
+        expanded = []
+        for axis in range(rank):
+            if axis < len(modes) and modes[axis] in removed:
+                expanded.append(modes[axis])
+            else:
+                expanded.append(next(output_iter))
+        return tuple(expanded)
+
+    return (
+        expand(input_left, left_rank, left_output_modes),
+        expand(input_right, right_rank, right_output_modes),
+        output_modes,
+    )
 
 
 def _array_plan_cache_key(array):
