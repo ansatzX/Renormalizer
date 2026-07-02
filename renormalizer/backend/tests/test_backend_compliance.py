@@ -199,6 +199,38 @@ def test_backend_compliance_contract_expression_uses_backend_execution(backend_n
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_contract_expression_uses_planner_and_executor(monkeypatch, backend_name, device):
+    backend = _backend_or_skip(backend_name, device)
+    left_np = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right_np = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left = backend.to_backend(left_np)
+    right = backend.to_backend(right_np)
+    plan_calls = []
+    execute_calls = []
+    original_plan_contraction = backend.plan_contraction
+    original_execute = backend.execute
+
+    def counting_plan_contraction(spec, **kwargs):
+        plan_calls.append(spec)
+        return original_plan_contraction(spec, **kwargs)
+
+    def counting_execute(plan, **kwargs):
+        execute_calls.append(plan)
+        return original_execute(plan, **kwargs)
+
+    monkeypatch.setattr(backend, "plan_contraction", counting_plan_contraction)
+    monkeypatch.setattr(backend, "execute", counting_execute)
+
+    expr = backend.contract_expression("ik,kj->ij", left_np.shape, right_np.shape, optimize="greedy")
+    result = expr(left, right)
+
+    assert len(plan_calls) == 1
+    assert len(execute_calls) == 1
+    assert execute_calls[0].steps[0].kind == "gemm"
+    _assert_allclose(backend, result, left_np @ right_np)
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
 def test_backend_compliance_contract_path_uses_backend_surface(backend_name, device):
     backend = _backend_or_skip(backend_name, device)
 
