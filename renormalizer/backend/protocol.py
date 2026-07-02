@@ -298,11 +298,11 @@ class BackendProtocol(Protocol):
         """Compatibility alias for converting an array to NumPy."""
         ...
 
-    def to_host(self, x: Any, **kwargs: Any) -> Any:
+    def to_host(self, x: Any, *, copy: Any = None) -> Any:
         """Convert a backend array to a host-resident array."""
         ...
 
-    def to_backend(self, x: Any, **kwargs: Any) -> Any:
+    def to_backend(self, x: Any, *, device: Any = None, dtype: Any = None, copy: Any = None) -> Any:
         """Convert an array-like object to this backend's representation."""
         ...
 
@@ -314,11 +314,11 @@ class BackendProtocol(Protocol):
         """Execute an einsum contraction through the backend boundary."""
         ...
 
-    def astype(self, x: Any, dtype: Any, **kwargs: Any) -> Any:
+    def astype(self, x: Any, dtype: Any, *, copy: Any = None) -> Any:
         """Convert dtype using an explicit copy policy."""
         ...
 
-    def ascontiguousarray(self, x: Any, **kwargs: Any) -> Any:
+    def ascontiguousarray(self, x: Any, *, copy: Any = None) -> Any:
         """Return a contiguous backend array using an explicit copy policy."""
         ...
 
@@ -346,7 +346,7 @@ class BackendProtocol(Protocol):
         """Return backend layout metadata for an array."""
         ...
 
-    def permute(self, x: Any, perm: Any, **kwargs: Any) -> Any:
+    def permute(self, x: Any, perm: Any, *, copy_policy: Any = None) -> Any:
         """Return an array with axes reordered by ``perm``."""
         ...
 
@@ -358,11 +358,11 @@ class BackendProtocol(Protocol):
         """Return whether ``reshape_view`` can satisfy the requested shape."""
         ...
 
-    def make_contiguous(self, x: Any, **kwargs: Any) -> Any:
+    def make_contiguous(self, x: Any, *, mode_groups: Any = None, copy_policy: Any = None) -> Any:
         """Return a C-contiguous backend array using an explicit copy policy."""
         ...
 
-    def parse_einsum(self, equation: str, *operands: Any, **kwargs: Any) -> Any:
+    def parse_einsum(self, equation: str, *operands: Any, constants: Any = (), optimize: Any = None) -> Any:
         """Parse an explicit einsum equation into backend contraction IR."""
         ...
 

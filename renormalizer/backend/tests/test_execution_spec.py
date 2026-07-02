@@ -109,6 +109,53 @@ def test_backend_protocol_execution_primitive_signatures_are_explicit():
     assert_no_var_keyword(grouped_signature)
 
 
+def test_backend_protocol_copy_and_layout_signatures_are_explicit():
+    import inspect
+
+    from renormalizer.backend.protocol import BackendProtocol
+
+    def assert_keyword_only(signature, name):
+        assert name in signature.parameters
+        assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+    def assert_no_var_keyword(signature):
+        assert not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
+    to_host_signature = inspect.signature(BackendProtocol.to_host)
+    assert_keyword_only(to_host_signature, "copy")
+    assert_no_var_keyword(to_host_signature)
+
+    to_backend_signature = inspect.signature(BackendProtocol.to_backend)
+    for name in ("device", "dtype", "copy"):
+        assert_keyword_only(to_backend_signature, name)
+    assert_no_var_keyword(to_backend_signature)
+
+    astype_signature = inspect.signature(BackendProtocol.astype)
+    assert_keyword_only(astype_signature, "copy")
+    assert_no_var_keyword(astype_signature)
+
+    ascontiguous_signature = inspect.signature(BackendProtocol.ascontiguousarray)
+    assert_keyword_only(ascontiguous_signature, "copy")
+    assert_no_var_keyword(ascontiguous_signature)
+
+    permute_signature = inspect.signature(BackendProtocol.permute)
+    assert_keyword_only(permute_signature, "copy_policy")
+    assert_no_var_keyword(permute_signature)
+
+    make_contiguous_signature = inspect.signature(BackendProtocol.make_contiguous)
+    for name in ("mode_groups", "copy_policy"):
+        assert_keyword_only(make_contiguous_signature, name)
+    assert_no_var_keyword(make_contiguous_signature)
+
+    parse_einsum_signature = inspect.signature(BackendProtocol.parse_einsum)
+    for name in ("constants", "optimize"):
+        assert_keyword_only(parse_einsum_signature, name)
+    assert_no_var_keyword(parse_einsum_signature)
+
+
 def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
     from renormalizer.backend.execution import DeviceSpec, parse_device_spec
 
