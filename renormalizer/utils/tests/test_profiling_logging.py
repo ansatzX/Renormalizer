@@ -578,6 +578,76 @@ def test_trace_summary_excludes_large_execution_metadata(caplog, tmp_path):
         assert field not in summary["signature"]
 
 
+def test_compute_events_emit_class_level_summary_rows(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    profiling.flush_summaries()
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    profiling.record(
+        "tensordot",
+        compute_class="tensordot",
+        compute_subclass="direct_tensordot",
+        backend="numpy",
+        input_shapes=[(2, 3), (3, 4)],
+        output_shape=(2, 4),
+        flops_estimate=48,
+        read_bytes=144,
+        write_bytes=64,
+        wall_s=0.1,
+    )
+    profiling.record(
+        "tensordot",
+        compute_class="tensordot",
+        compute_subclass="direct_tensordot",
+        backend="numpy",
+        input_shapes=[(4, 5), (5, 6)],
+        output_shape=(4, 6),
+        flops_estimate=240,
+        read_bytes=320,
+        write_bytes=192,
+        wall_s=0.2,
+    )
+    profiling.record(
+        "svd_qn",
+        compute_class="svd",
+        compute_subclass="svd_qn",
+        backend="numpy",
+        flops_estimate=512,
+        read_bytes=256,
+        write_bytes=384,
+        wall_s=0.4,
+    )
+
+    profiling.flush_summaries()
+
+    payloads = _profiling_payloads(caplog, profiling)
+    compute_summaries = [
+        payload for payload in payloads
+        if payload["event"] == "profile_compute_summary"
+    ]
+    td_summary = next(
+        payload for payload in compute_summaries
+        if payload["compute_class"] == "tensordot"
+    )
+    svd_summary = next(
+        payload for payload in compute_summaries
+        if payload["compute_class"] == "svd"
+    )
+    assert td_summary["compute_subclass"] == "direct_tensordot"
+    assert td_summary["backend"] == "numpy"
+    assert td_summary["call_count"] == 2
+    assert td_summary["source_events"] == ["tensordot"]
+    assert td_summary["total_wall_s"] == pytest.approx(0.3)
+    assert td_summary["total_flops_estimate"] == 288
+    assert td_summary["total_read_bytes"] == 464
+    assert td_summary["total_write_bytes"] == 256
+    assert "input_shapes" not in td_summary
+    assert svd_summary["call_count"] == 1
+    assert svd_summary["total_flops_estimate"] == 512
+
+
 def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
     import numpy as np
 

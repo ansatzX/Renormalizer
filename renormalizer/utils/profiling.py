@@ -516,6 +516,7 @@ class _ProfilingRuntime:
         self._scope_stack = contextvars.ContextVar("renormalizer_profiling_scope", default=())
         self._summary_lock = threading.Lock()
         self._summaries = {}
+        self._compute_summaries = {}
         self._overhead_lock = threading.Lock()
         self._overhead = dict(_OVERHEAD_TEMPLATE)
         self._event_output = None
@@ -647,6 +648,7 @@ class _ProfilingRuntime:
     def _record_summary(self, payload):
         started = self.perf_counter()
         signature = self._signature_payload(payload)
+        compute_signature = self._compute_signature_payload(payload)
         try:
             key = self._json.dumps(self._to_jsonable(signature), sort_keys=True, separators=(",", ":"))
             wall_s = payload.get("wall_s")
@@ -663,13 +665,76 @@ class _ProfilingRuntime:
                         "min_wall_s": wall_s,
                         "max_wall_s": wall_s,
                     }
-                    return
-                item["call_count"] += 1
-                item["total_wall_s"] += wall_s
-                item["min_wall_s"] = min(item["min_wall_s"], wall_s)
-                item["max_wall_s"] = max(item["max_wall_s"], wall_s)
+                else:
+                    item["call_count"] += 1
+                    item["total_wall_s"] += wall_s
+                    item["min_wall_s"] = min(item["min_wall_s"], wall_s)
+                    item["max_wall_s"] = max(item["max_wall_s"], wall_s)
+                if compute_signature is not None:
+                    self._record_compute_summary_unlocked(payload, compute_signature, wall_s)
         finally:
             self._bump_overhead("summary_overhead_s", self.perf_counter() - started)
+
+    @staticmethod
+    def _number(payload, *names):
+        for name in names:
+            value = payload.get(name)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    def _compute_signature_payload(self, payload):
+        if not payload.get("compute_class"):
+            return None
+        keys = (
+            "compute_class",
+            "compute_subclass",
+            "backend",
+            "stage",
+            "method",
+            "lowering",
+            "device",
+            "device_kind",
+        )
+        return {
+            key: payload[key]
+            for key in keys
+            if key in payload and payload[key] is not None
+        }
+
+    def _record_compute_summary_unlocked(self, payload, signature, wall_s):
+        key = self._json.dumps(self._to_jsonable(signature), sort_keys=True, separators=(",", ":"))
+        source_event = payload.get("event")
+        flops = self._number(payload, "flops_estimate", "flops")
+        read_bytes = self._number(payload, "read_bytes")
+        write_bytes = self._number(payload, "write_bytes")
+        item = self._compute_summaries.get(key)
+        if item is None:
+            self._compute_summaries[key] = {
+                "signature": signature,
+                "source_events": {str(source_event)} if source_event is not None else set(),
+                "call_count": 1,
+                "total_wall_s": wall_s,
+                "min_wall_s": wall_s,
+                "max_wall_s": wall_s,
+                "total_flops_estimate": flops,
+                "total_read_bytes": read_bytes,
+                "total_write_bytes": write_bytes,
+            }
+            return
+        if source_event is not None:
+            item["source_events"].add(str(source_event))
+        item["call_count"] += 1
+        item["total_wall_s"] += wall_s
+        item["min_wall_s"] = min(item["min_wall_s"], wall_s)
+        item["max_wall_s"] = max(item["max_wall_s"], wall_s)
+        item["total_flops_estimate"] += flops
+        item["total_read_bytes"] += read_bytes
+        item["total_write_bytes"] += write_bytes
 
     def register_event_output(self, file_path, mode="w") -> None:
         self.close_event_output()
@@ -700,13 +765,16 @@ class _ProfilingRuntime:
         if not enabled():
             with self._summary_lock:
                 self._summaries.clear()
+                self._compute_summaries.clear()
             self._reset_overhead()
             self.flush_event_output()
             return
         with self._summary_lock:
             items = list(self._summaries.values())
             self._summaries.clear()
-        if not items and not self._has_overhead_activity():
+            compute_items = list(self._compute_summaries.values())
+            self._compute_summaries.clear()
+        if not items and not compute_items and not self._has_overhead_activity():
             self.flush_event_output()
             return
         for item in items:
@@ -721,6 +789,28 @@ class _ProfilingRuntime:
                 "mean_wall_s": item["total_wall_s"] / call_count if call_count else None,
                 "min_wall_s": item["min_wall_s"],
                 "max_wall_s": item["max_wall_s"],
+            }
+            text = self._json.dumps(self._to_jsonable(payload), sort_keys=True, separators=(",", ":"))
+            logger.profiling("%s%s", LOG_PREFIX, text)
+            self._bump_overhead("summary_rows_logged", 1)
+        for item in sorted(
+            compute_items,
+            key=lambda row: self._json.dumps(self._to_jsonable(row["signature"]), sort_keys=True),
+        ):
+            signature = item["signature"]
+            call_count = item["call_count"]
+            payload = {
+                "event": "profile_compute_summary",
+                **signature,
+                "source_events": sorted(item["source_events"]),
+                "call_count": call_count,
+                "total_wall_s": item["total_wall_s"],
+                "mean_wall_s": item["total_wall_s"] / call_count if call_count else None,
+                "min_wall_s": item["min_wall_s"],
+                "max_wall_s": item["max_wall_s"],
+                "total_flops_estimate": int(item["total_flops_estimate"]),
+                "total_read_bytes": int(item["total_read_bytes"]),
+                "total_write_bytes": int(item["total_write_bytes"]),
             }
             text = self._json.dumps(self._to_jsonable(payload), sort_keys=True, separators=(",", ":"))
             logger.profiling("%s%s", LOG_PREFIX, text)
