@@ -768,6 +768,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @staticmethod
     def _contraction_step_from_matmul_plan(plan, input_modes, output_modes, *, inputs=(0, 1), output=2):
+        write_bytes = sum(desc.estimated_write_bytes for desc in plan.descs)
         return ContractionStep(
             kind=plan.kind,
             inputs=tuple(inputs),
@@ -777,9 +778,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
             plan=plan,
             estimated_flops=plan.estimated_flops,
             estimated_read_bytes=sum(desc.estimated_read_bytes for desc in plan.descs),
-            estimated_write_bytes=sum(desc.estimated_write_bytes for desc in plan.descs),
+            estimated_write_bytes=write_bytes,
             estimated_copy_bytes=plan.copy_bytes,
-            estimated_peak_bytes=max((desc.estimated_write_bytes for desc in plan.descs), default=0),
+            estimated_peak_bytes=write_bytes + plan.workspace_bytes,
             estimated_comm_bytes=0,
             required_workspace_bytes=plan.workspace_bytes,
             reason=plan.reason,
