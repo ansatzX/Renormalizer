@@ -145,9 +145,81 @@ def expression_contraction_list_summary(expr):
             for contraction in contraction_list
             if len(contraction) > 4
         ],
+        "contraction_steps": [],
         "flop_count": None,
         "largest_intermediate": None,
     }
+
+
+def _einsum_shape_map(equation, shapes):
+    if "->" not in equation or "..." in equation:
+        return None, None
+    input_text, output_modes = equation.split("->", 1)
+    input_modes = input_text.split(",")
+    if len(input_modes) != len(shapes):
+        return None, None
+    mode_sizes = {}
+    for modes, shape in zip(input_modes, shapes):
+        if len(modes) != len(shape):
+            return None, None
+        for mode, size in zip(modes, shape):
+            previous = mode_sizes.setdefault(mode, int(size))
+            if previous != int(size):
+                return None, None
+    return mode_sizes, output_modes
+
+
+def _shape_for_modes(modes, mode_sizes):
+    shape = []
+    for mode in modes:
+        if mode not in mode_sizes:
+            return None
+        shape.append(int(mode_sizes[mode]))
+    return shape
+
+
+def _build_contraction_steps(equation, shapes, contraction_list, path, path_info):
+    mode_sizes, _ = _einsum_shape_map(equation, shapes)
+    if mode_sizes is None:
+        return []
+
+    scale_list = list(getattr(path_info, "scale_list", []) or [])
+    size_list = list(getattr(path_info, "size_list", []) or [])
+    steps = []
+    for index, contraction in enumerate(contraction_list):
+        if len(contraction) < 4:
+            continue
+        operand_positions, contracted_modes, step_equation, remaining_modes = contraction[:4]
+        if "->" not in step_equation:
+            continue
+        step_input_text, step_output_modes = step_equation.split("->", 1)
+        step_input_modes = step_input_text.split(",")
+        input_shapes = [_shape_for_modes(modes, mode_sizes) for modes in step_input_modes]
+        output_shape = _shape_for_modes(step_output_modes, mode_sizes)
+        remaining_shapes = [_shape_for_modes(modes, mode_sizes) for modes in remaining_modes]
+        if output_shape is None or any(shape is None for shape in input_shapes + remaining_shapes):
+            continue
+        path_item = path[index] if index < len(path) else operand_positions
+        step = {
+            "step": int(index),
+            "path": [int(item) for item in path_item],
+            "operand_positions": [int(item) for item in operand_positions],
+            "input_modes": [str(modes) for modes in step_input_modes],
+            "input_shapes": input_shapes,
+            "output_modes": str(step_output_modes),
+            "output_shape": output_shape,
+            "remaining_modes": [str(modes) for modes in remaining_modes],
+            "remaining_shapes": remaining_shapes,
+            "contracted_modes": [str(mode) for mode in sorted(contracted_modes)],
+        }
+        if len(contraction) > 4:
+            step["contraction_type"] = str(contraction[4])
+        if index < len(scale_list):
+            step["scaling"] = json_int(scale_list[index])
+        if index < len(size_list):
+            step["size"] = json_int(size_list[index])
+        steps.append(step)
+    return steps
 
 
 def contract_expression_path_summary(contract_path, args, kwargs, expr):
@@ -173,6 +245,13 @@ def contract_expression_path_summary(contract_path, args, kwargs, expr):
     summary["path"] = [[int(index) for index in item] for item in path]
     summary["flop_count"] = json_int(getattr(path_info, "opt_cost", None))
     summary["largest_intermediate"] = json_int(getattr(path_info, "largest_intermediate", None))
+    summary["contraction_steps"] = _build_contraction_steps(
+        args[0],
+        shapes,
+        getattr(path_info, "contraction_list", None) or getattr(expr, "contraction_list", None) or [],
+        summary["path"],
+        path_info,
+    )
     return summary
 
 
@@ -352,6 +431,7 @@ class _ProfilingRuntime:
             "wall_s",
             "path",
             "contraction_types",
+            "contraction_steps",
             "blocks",
         }
         return {

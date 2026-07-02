@@ -233,6 +233,38 @@ def test_profiling_helpers_summarize_contract_expression_path():
     assert summary["flop_count"] >= 1
     assert summary["largest_intermediate"] >= 1
     assert summary["contraction_types"] == ["GEMM", "GEMM"]
+    assert summary["contraction_steps"] == [
+        {
+            "step": 0,
+            "path": [1, 2],
+            "operand_positions": [2, 1],
+            "input_modes": ["cd", "bc"],
+            "input_shapes": [[4, 5], [3, 4]],
+            "output_modes": "db",
+            "output_shape": [5, 3],
+            "remaining_modes": ["ab", "db"],
+            "remaining_shapes": [[2, 3], [5, 3]],
+            "contracted_modes": ["c"],
+            "contraction_type": "GEMM",
+            "scaling": 3,
+            "size": 15,
+        },
+        {
+            "step": 1,
+            "path": [0, 1],
+            "operand_positions": [1, 0],
+            "input_modes": ["db", "ab"],
+            "input_shapes": [[5, 3], [2, 3]],
+            "output_modes": "ad",
+            "output_shape": [2, 5],
+            "remaining_modes": ["ad"],
+            "remaining_shapes": [[2, 5]],
+            "contracted_modes": ["b"],
+            "contraction_type": "GEMM",
+            "scaling": 3,
+            "size": 10,
+        },
+    ]
 
 
 def test_profiling_helpers_build_svd_qn_block_payload():
@@ -388,12 +420,16 @@ def test_trace_mode_keeps_log_concise_with_summary(caplog, monkeypatch, tmp_path
 
     log_payloads = _profiling_payloads(caplog, profiling)
     assert not [payload for payload in log_payloads if payload["event"] == "tensordot"]
-    summary = next(payload for payload in log_payloads if payload["event"] == "profile_summary")
+    summary = next(
+        payload for payload in log_payloads
+        if payload["event"] == "profile_summary" and payload["source_event"] == "tensordot"
+    )
     assert summary["source_event"] == "tensordot"
     assert summary["call_count"] == 1
     overhead = next(payload for payload in log_payloads if payload["event"] == "profile_overhead")
-    assert overhead["events_written"] == 1
-    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "tensordot")
+    jsonl_payloads = _jsonl_payloads(event_path)
+    assert overhead["events_written"] == len(jsonl_payloads)
+    event = next(payload for payload in jsonl_payloads if payload["event"] == "tensordot")
     assert event["input_shapes"] == [[2, 3], [3, 4]]
 
 
@@ -451,6 +487,13 @@ def test_oe_contract_expression_records_path_summary_in_jsonl(caplog, tmp_path):
     assert event["flop_count"] >= 1
     assert event["largest_intermediate"] >= 1
     assert event["contraction_types"] == ["GEMM", "GEMM"]
+    assert event["contraction_steps"][0]["input_modes"] == ["cd", "bc"]
+    assert event["contraction_steps"][0]["input_shapes"] == [[4, 5], [3, 4]]
+    assert event["contraction_steps"][0]["output_modes"] == "db"
+    assert event["contraction_steps"][0]["output_shape"] == [5, 3]
+    assert event["contraction_steps"][1]["input_modes"] == ["db", "ab"]
+    assert event["contraction_steps"][1]["output_modes"] == "ad"
+    assert event["contraction_steps"][1]["remaining_shapes"] == [[2, 5]]
 
 
 def test_hop_expr_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
@@ -578,7 +621,10 @@ def test_op_events_are_summarized_by_default(caplog, monkeypatch):
 
     profiling.flush_summaries()
     payloads = _profiling_payloads(caplog, profiling)
-    summary = next(payload for payload in payloads if payload["event"] == "profile_summary")
+    summary = next(
+        payload for payload in payloads
+        if payload["event"] == "profile_summary" and payload["source_event"] == "tensordot"
+    )
     assert summary["source_event"] == "tensordot"
     assert summary["call_count"] == 1
     assert summary["total_wall_s"] >= 0
@@ -601,7 +647,10 @@ def test_operation_events_are_not_written_to_jsonl_without_registered_output(cap
 
     payloads = _profiling_payloads(caplog, profiling)
     assert not [payload for payload in payloads if payload["event"] == "tensordot"]
-    summary = next(payload for payload in payloads if payload["event"] == "profile_summary")
+    summary = next(
+        payload for payload in payloads
+        if payload["event"] == "profile_summary" and payload["source_event"] == "tensordot"
+    )
     assert summary["source_event"] == "tensordot"
     overhead = next(payload for payload in payloads if payload["event"] == "profile_overhead")
     assert overhead["events_written"] == 0
