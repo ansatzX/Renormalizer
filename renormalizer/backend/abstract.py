@@ -3631,7 +3631,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 num_grouped_tasks=len(plan.tasks),
                 num_blocks=len(unique_output_keys),
                 num_shape_buckets=len(plan.bucketed_by_shape),
-                fallback_reason=None,
+                fallback_reason=self._grouped_gemm_fallback_reason(),
                 output_modes=[str(mode) for mode in plan.output_modes],
                 global_shape=tuple(plan.global_shape),
                 scatter_add_required=bool(plan.scatter_add_required),
@@ -3732,7 +3732,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 num_grouped_tasks=len(plan.tasks),
                 num_blocks=len(result.blocks),
                 num_shape_buckets=len(plan.bucketed_by_shape),
-                fallback_reason=None,
+                fallback_reason=self._grouped_gemm_fallback_reason(),
                 output_modes=[str(mode) for mode in plan.output_modes],
                 global_shape=tuple(result.global_shape),
                 scatter_add_required=bool(plan.scatter_add_required),
@@ -4162,10 +4162,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 flop_copy_ratio=flop_copy_ratio,
             )
 
-    def _handle_grouped_gemm_fallback(self):
+    def _grouped_gemm_fallback_reason(self):
         if self.supports_grouped_gemm:
             return None
         reason = "native grouped_gemm unavailable; used bucketed fallback"
+        return reason
+
+    def _handle_grouped_gemm_fallback(self):
+        reason = self._grouped_gemm_fallback_reason()
+        if reason is None:
+            return None
         if self.fallback_policy is FallbackPolicy.FORBID:
             raise BackendFeatureError(reason)
         if self.fallback_policy is FallbackPolicy.WARN:

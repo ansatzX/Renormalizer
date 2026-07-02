@@ -1531,7 +1531,7 @@ def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
         {"extra": [], "qn_left": [0], "qn_right": [1]},
     ]
     assert event["result_block_shapes"] == [{"extra": [], "qn_left": [0], "qn_right": [1], "shape": [2, 4]}]
-    assert event["fallback_reason"] is None
+    assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
     assert event["wall_s"] >= 0.0
 
 
