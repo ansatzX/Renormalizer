@@ -2367,6 +2367,13 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     assert execute["equation"] == "ik,kj->ij"
     assert execute["input_modes"] == [["i", "k"], ["k", "j"]]
     assert execute["output_modes"] == ["i", "j"]
+    assert execute["device_info"] == {
+        "kind": "cpu",
+        "index": None,
+        "local_rank": None,
+        "global_rank": None,
+        "visible_id": None,
+    }
 
 
 def test_multi_step_contraction_execute_profile_records_aggregate_event(tmp_path):
