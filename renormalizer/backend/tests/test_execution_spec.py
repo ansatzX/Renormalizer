@@ -4316,6 +4316,31 @@ def test_hardware_model_rejects_negative_physical_parameters(field):
         HardwareModel(**{field: -1})
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "flops",
+        "read_bytes",
+        "write_bytes",
+        "copy_bytes",
+        "comm_bytes",
+        "workspace_bytes",
+        "peak_bytes",
+        "compute_s",
+        "memory_s",
+        "copy_s",
+        "comm_s",
+        "total_s",
+        "estimated_time_s",
+    ],
+)
+def test_cost_estimate_rejects_negative_values(field):
+    from renormalizer.backend import CostEstimate
+
+    with pytest.raises(ValueError, match="{0} must be non-negative".format(field)):
+        CostEstimate(**{field: -1})
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

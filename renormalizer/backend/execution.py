@@ -1198,8 +1198,33 @@ class CostEstimate:
     estimated_time_s: float | None = None
 
     def __post_init__(self):
+        for field in (
+            "flops",
+            "read_bytes",
+            "write_bytes",
+            "copy_bytes",
+            "comm_bytes",
+            "workspace_bytes",
+            "peak_bytes",
+        ):
+            value = int(getattr(self, field))
+            if value < 0:
+                raise ValueError("{0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
+
+        for field in ("compute_s", "memory_s", "copy_s", "comm_s", "total_s"):
+            value = float(getattr(self, field))
+            if value < 0:
+                raise ValueError("{0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
+
         if self.estimated_time_s is None:
-            object.__setattr__(self, "estimated_time_s", self.total_s)
+            estimated_time_s = self.total_s
+        else:
+            estimated_time_s = float(self.estimated_time_s)
+        if estimated_time_s < 0:
+            raise ValueError("estimated_time_s must be non-negative")
+        object.__setattr__(self, "estimated_time_s", estimated_time_s)
 
 
 def _contraction_plan_hash(plan: ContractionPlan) -> str:
