@@ -904,6 +904,42 @@ def test_pair_contraction_lowering_reports_gemm_shape_and_costs():
     assert plan.fallback_reason is None
 
 
+@pytest.mark.parametrize("field", ["m", "n", "k"])
+def test_matmul_desc_rejects_negative_dimensions(field):
+    from renormalizer.backend import MatmulDesc
+
+    values = {"m": 2, "n": 3, "k": 4}
+    values[field] = -1
+
+    with pytest.raises(ValueError, match="MatmulDesc {0} must be non-negative".format(field)):
+        MatmulDesc(None, None, None, **values)
+
+
+def test_matmul_desc_rejects_negative_batch_dimensions():
+    from renormalizer.backend import MatmulDesc
+
+    with pytest.raises(ValueError, match="MatmulDesc batch_shape dimensions must be non-negative"):
+        MatmulDesc(None, None, None, 2, 3, 4, batch_shape=(5, -1))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "estimated_flops",
+        "estimated_read_bytes",
+        "estimated_write_bytes",
+        "estimated_workspace_bytes",
+    ],
+)
+def test_matmul_desc_rejects_negative_estimates(field):
+    from renormalizer.backend import MatmulDesc
+
+    kwargs = {field: -1}
+
+    with pytest.raises(ValueError, match="MatmulDesc {0} must be non-negative".format(field)):
+        MatmulDesc(None, None, None, 2, 3, 4, **kwargs)
+
+
 def test_pair_contraction_lowering_reports_batched_gemm_for_same_shape_batch():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend

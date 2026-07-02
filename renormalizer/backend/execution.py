@@ -714,6 +714,27 @@ class MatmulDesc:
     estimated_write_bytes: int = 0
     estimated_workspace_bytes: int = 0
 
+    def __post_init__(self):
+        for field in ("m", "n", "k"):
+            value = int(getattr(self, field))
+            if value < 0:
+                raise ValueError("MatmulDesc {0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
+        batch_shape = tuple(int(dim) for dim in self.batch_shape)
+        if any(dim < 0 for dim in batch_shape):
+            raise ValueError("MatmulDesc batch_shape dimensions must be non-negative")
+        object.__setattr__(self, "batch_shape", batch_shape)
+        for field in (
+            "estimated_flops",
+            "estimated_read_bytes",
+            "estimated_write_bytes",
+            "estimated_workspace_bytes",
+        ):
+            value = int(getattr(self, field))
+            if value < 0:
+                raise ValueError("MatmulDesc {0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
+
 
 @dataclass(frozen=True)
 class LayoutTransform:
