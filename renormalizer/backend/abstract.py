@@ -3713,6 +3713,31 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 key
                 for key in sorted(set(plan.output_blocks), key=lambda key: self._block_sort_key((key, None)))
             ]
+
+            def task_operand_payload(array, layout):
+                info = self.array_info(array)
+                return {
+                    "modes": [str(mode) for mode in tuple(getattr(layout, "logical_modes", ()) or ())],
+                    "shape": info.shape,
+                    "dtype": str(info.dtype),
+                    "itemsize": info.itemsize,
+                    "size": info.size,
+                    "nbytes": info.nbytes,
+                    "ndim": info.ndim,
+                    "strides": info.strides,
+                    "order": info.order,
+                    "contiguous": info.contiguous,
+                    "writeable": info.writeable,
+                    "owns_data": info.owns_data,
+                    "backend": info.backend_name,
+                    "device": str(info.device),
+                    "device_kind": info.device.kind,
+                    "device_index": info.device.index,
+                    "is_host": info.is_host,
+                    "is_device": info.is_device,
+                    "is_distributed": info.is_distributed,
+                }
+
             profiling.record(
                 "contraction_plan",
                 backend=self.name,
@@ -3725,6 +3750,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ],
                 input_dtypes=[
                     [str(getattr(desc.A, "dtype", None)), str(getattr(desc.B, "dtype", None))]
+                    for desc in plan.tasks
+                ],
+                task_operands=[
+                    [
+                        task_operand_payload(desc.A, desc.layout_a),
+                        task_operand_payload(desc.B, desc.layout_b),
+                    ]
                     for desc in plan.tasks
                 ],
                 output_shape=tuple(plan.global_shape),

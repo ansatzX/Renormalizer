@@ -1626,6 +1626,11 @@ def test_lower_block_contraction_records_grouped_plan_profile(tmp_path):
         ["float64", "float64"],
         ["float64", "float64"],
     ]
+    assert event["task_operands"][0][0]["modes"] == ["i", "k"]
+    assert event["task_operands"][0][0]["shape"] == [2, 3]
+    assert event["task_operands"][0][0]["itemsize"] == 8
+    assert event["task_operands"][0][0]["contiguous"] is True
+    assert event["task_operands"][0][0]["is_distributed"] is False
 
 
 def test_block_grouped_gemm_profile_correlates_plan_and_execute_events(tmp_path):
