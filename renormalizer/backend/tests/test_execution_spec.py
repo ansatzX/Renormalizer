@@ -1363,6 +1363,52 @@ def test_matmul_plan_rejects_negative_estimates(field):
         MatmulPlan(**kwargs)
 
 
+def test_matmul_plan_hash_includes_descriptor_semantics():
+    from dataclasses import replace
+
+    from renormalizer.backend import MatmulDesc, MatmulPlan
+
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    out = np.zeros((2, 4), dtype=np.float64)
+    desc = MatmulDesc(
+        left,
+        right,
+        out,
+        m=2,
+        n=4,
+        k=3,
+        alpha=1.0,
+        beta=0.0,
+        dtype_compute=np.float64,
+        dtype_output=np.float64,
+    )
+
+    def plan_for(item):
+        return MatmulPlan(
+            kind="gemm",
+            descs=(item,),
+            pre_ops=(),
+            post_ops=(),
+            output_shape=(2, 4),
+            copy_bytes=0,
+            workspace_bytes=0,
+            estimated_flops=48,
+            estimated_time_s=None,
+            reason="hash test",
+        )
+
+    base_hash = plan_for(desc).plan_hash
+
+    for changed_desc in (
+        replace(desc, alpha=2.0),
+        replace(desc, beta=1.0),
+        replace(desc, dtype_compute=np.float32),
+        replace(desc, dtype_output=np.float32),
+    ):
+        assert plan_for(changed_desc).plan_hash != base_hash
+
+
 def _valid_contraction_step_kwargs():
     return {
         "kind": "gemm",
@@ -2327,6 +2373,31 @@ def _valid_grouped_gemm_plan_kwargs():
         "global_shape": (2, 4),
         "backend": "numpy",
     }
+
+
+def test_grouped_gemm_plan_hash_includes_task_semantics():
+    from dataclasses import replace
+
+    from renormalizer.backend import GroupedGemmPlan
+
+    kwargs = _valid_grouped_gemm_plan_kwargs()
+    desc = kwargs["tasks"][0]
+    desc = replace(
+        desc,
+        C=np.zeros((2, 4), dtype=np.float64),
+        dtype_compute=np.float64,
+        dtype_output=np.float64,
+    )
+    kwargs["tasks"] = (desc,)
+    base_hash = GroupedGemmPlan(**kwargs).plan_hash
+
+    for changed_desc in (
+        replace(desc, alpha=2.0),
+        replace(desc, beta=1.0),
+        replace(desc, dtype_compute=np.float32),
+        replace(desc, dtype_output=np.float32),
+    ):
+        assert GroupedGemmPlan(**{**kwargs, "tasks": (changed_desc,)}).plan_hash != base_hash
 
 
 def test_grouped_gemm_plan_rejects_inconsistent_task_metadata():

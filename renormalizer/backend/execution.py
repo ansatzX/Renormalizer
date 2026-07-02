@@ -1577,31 +1577,37 @@ def _layout_transform_hash_payload(transform):
     )
 
 
+def _matmul_desc_hash_payload(desc):
+    return (
+        desc.m,
+        desc.n,
+        desc.k,
+        desc.batch_shape,
+        desc.trans_a,
+        desc.trans_b,
+        desc.conj_a,
+        desc.conj_b,
+        desc.alpha,
+        desc.beta,
+        str(desc.dtype_compute),
+        str(desc.dtype_output),
+        str(getattr(desc.A, "dtype", None)),
+        str(getattr(desc.B, "dtype", None)),
+        _shape_of(desc.A),
+        _shape_of(desc.B),
+        _shape_of(desc.C) if desc.C is not None else None,
+        str(getattr(desc.C, "dtype", None)) if desc.C is not None else None,
+        desc.estimated_flops,
+        desc.estimated_read_bytes,
+        desc.estimated_write_bytes,
+        desc.estimated_workspace_bytes,
+    )
+
+
 def _matmul_plan_hash(plan: MatmulPlan) -> str:
     payload = (
         plan.kind,
-        tuple(
-            (
-                desc.m,
-                desc.n,
-                desc.k,
-                desc.batch_shape,
-                desc.trans_a,
-                desc.trans_b,
-                desc.conj_a,
-                desc.conj_b,
-                str(getattr(desc.A, "dtype", None)),
-                str(getattr(desc.B, "dtype", None)),
-                _shape_of(desc.A),
-                _shape_of(desc.B),
-                _shape_of(desc.C) if desc.C is not None else None,
-                desc.estimated_flops,
-                desc.estimated_read_bytes,
-                desc.estimated_write_bytes,
-                desc.estimated_workspace_bytes,
-            )
-            for desc in plan.descs
-        ),
+        tuple(_matmul_desc_hash_payload(desc) for desc in plan.descs),
         tuple(_layout_transform_hash_payload(transform) for transform in plan.pre_ops),
         tuple(_layout_transform_hash_payload(transform) for transform in plan.post_ops),
         plan.output_shape,
@@ -1626,27 +1632,7 @@ def _block_key_hash_payload(key):
 
 def _grouped_gemm_plan_hash(plan) -> str:
     payload = (
-        tuple(
-            (
-                desc.m,
-                desc.n,
-                desc.k,
-                desc.batch_shape,
-                desc.trans_a,
-                desc.trans_b,
-                desc.conj_a,
-                desc.conj_b,
-                str(getattr(desc.A, "dtype", None)),
-                str(getattr(desc.B, "dtype", None)),
-                _shape_of(desc.A),
-                _shape_of(desc.B),
-                desc.estimated_flops,
-                desc.estimated_read_bytes,
-                desc.estimated_write_bytes,
-                desc.estimated_workspace_bytes,
-            )
-            for desc in plan.tasks
-        ),
+        tuple(_matmul_desc_hash_payload(desc) for desc in plan.tasks),
         tuple(_block_key_hash_payload(key) for key in plan.output_blocks),
         tuple(sorted(plan.bucketed_by_shape.items())),
         plan.scatter_add_required,
