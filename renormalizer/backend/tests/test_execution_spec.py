@@ -1517,6 +1517,48 @@ def test_contraction_plan_rejects_inconsistent_step_metadata():
         ContractionPlan(**kwargs)
 
 
+def test_contraction_plan_hash_includes_nested_step_plan_identity():
+    from dataclasses import replace
+
+    from renormalizer.backend import MatmulDesc, MatmulPlan, TensorOperand
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    desc = MatmulDesc(left, right, None, m=2, n=4, k=3, alpha=1.0)
+
+    def nested_plan_for(item):
+        return NumpyBackend._contraction_plan_from_step(
+            NumpyBackend._contraction_step_from_matmul_plan(
+                MatmulPlan(
+                    kind="gemm",
+                    descs=(item,),
+                    pre_ops=(),
+                    post_ops=(),
+                    output_shape=(2, 4),
+                    copy_bytes=0,
+                    workspace_bytes=0,
+                    estimated_flops=48,
+                    estimated_time_s=None,
+                    reason="nested hash test",
+                ),
+                (("i", "k"), ("k", "j")),
+                ("i", "j"),
+            ),
+            (
+                TensorOperand(left, ("i", "k")),
+                TensorOperand(right, ("k", "j")),
+            ),
+            ("i", "j"),
+        )
+
+    base_plan = nested_plan_for(desc)
+    changed_plan = nested_plan_for(replace(desc, alpha=2.0))
+
+    assert changed_plan.steps[0].plan.plan_hash != base_plan.steps[0].plan.plan_hash
+    assert changed_plan.plan_hash != base_plan.plan_hash
+
+
 def _valid_sliced_contraction_plan_kwargs():
     from renormalizer.backend import ContractionPlan
 

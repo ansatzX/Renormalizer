@@ -1555,6 +1555,10 @@ def _contraction_plan_hash(plan: ContractionPlan) -> str:
                 step.estimated_write_bytes,
                 step.estimated_copy_bytes,
                 step.estimated_comm_bytes,
+                step.required_workspace_bytes,
+                step.reason,
+                step.fallback_reason,
+                _nested_step_plan_hash_payload(step.plan),
             )
             for step in plan.steps
         ),
@@ -1565,6 +1569,15 @@ def _contraction_plan_hash(plan: ContractionPlan) -> str:
         plan.distributed_modes,
     )
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
+
+
+def _nested_step_plan_hash_payload(plan):
+    if plan is None:
+        return None
+    plan_hash = getattr(plan, "plan_hash", None)
+    if plan_hash:
+        return (type(plan).__name__, str(plan_hash))
+    return (type(plan).__name__, repr(plan))
 
 
 def _layout_transform_hash_payload(transform):
