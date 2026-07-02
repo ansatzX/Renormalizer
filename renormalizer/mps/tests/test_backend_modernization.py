@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import json
 import os
 
 import numpy as np
@@ -1736,6 +1737,54 @@ def test_multi_tensor_contract_expands_legacy_implicit_output_axes():
     expected = np.tensordot(left, right, axes=([0], [2]))
     assert contracted.shape == (3, 4, 5, 6, 7)
     assert np.allclose(asnumpy(contracted), expected)
+
+
+def test_multi_tensor_contract_profiles_parent_trace_for_pair_steps(tmp_path):
+    from renormalizer.mps.matrix import asnumpy, multi_tensor_contract
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    old_level = package_logger.level
+    event_path = tmp_path / "events.jsonl"
+    left = np.arange(6.0).reshape(2, 3)
+    middle = np.arange(12.0).reshape(3, 4)
+    right = np.arange(20.0).reshape(4, 5)
+    path = [
+        ([0, 1], "ab,bc->ac"),
+        ([1, 0], "ac,cd->ad"),
+    ]
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        contracted = multi_tensor_contract(path, left, middle, right)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(asnumpy(contracted), left @ middle @ right)
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    trace = next(payload for payload in payloads if payload["event"] == "multi_tensor_contract")
+    executes = [payload for payload in payloads if payload["event"] == "contraction_execute"]
+
+    assert trace["backend"] == "numpy"
+    assert trace["contraction_count"] == 2
+    assert trace["input_shapes"] == [[2, 3], [3, 4], [4, 5]]
+    assert trace["output_shape"] == [2, 5]
+    assert trace["path_steps"] == [
+        {"indices": [0, 1], "equation": "ab,bc->ac"},
+        {"indices": [1, 0], "equation": "ac,cd->ad"},
+    ]
+    assert trace["wall_s"] >= 0.0
+    assert len(executes) == 2
+    assert all(event["span_id"] == trace["span_id"] for event in executes)
+    assert all(event["span_name"] == "multi_tensor_contract" for event in executes)
 
 
 def test_cupy_backend_compute_boundaries_when_available():

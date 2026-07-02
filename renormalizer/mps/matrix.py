@@ -330,7 +330,22 @@ def multi_tensor_contract(path, *operands: [List[Union[Matrix, np.ndarray, xp.nd
     outtensor = tensorlib.multi_tensor_contract(path, MPSconj[isite], intensor,
             MPO[isite], MPS[isite])
     """
+    if not profiling.should_record_op():
+        return _multi_tensor_contract_impl(path, operands)
+    started = time.perf_counter()
+    initial_operands = tuple(operands)
+    with profiling.span("multi_tensor_contract", backend=backend.name, contraction_count=len(path)):
+        result = _multi_tensor_contract_impl(path, operands)
+        profiling.record(
+            "multi_tensor_contract",
+            backend=backend.name,
+            **profiling.multi_tensor_contract_payload(path, initial_operands, result),
+            wall_s=time.perf_counter() - started,
+        )
+        return result
 
+
+def _multi_tensor_contract_impl(path, operands):
     operands = list(operands)
     for ipath in path:
 

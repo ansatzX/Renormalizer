@@ -43,6 +43,7 @@ _TRACE_EVENTS = frozenset({
     "tree_copy_connection",
     "ttns_copy",
     "ttns_to_complex",
+    "multi_tensor_contract",
     "ttno_build_summary",
     "ttn_environ_build",
     "ttn_environ_update",
@@ -532,6 +533,28 @@ def tree_total_bytes(tree) -> int:
     return int(sum(getattr(node.tensor, "nbytes", 0) for node in tree))
 
 
+def multi_tensor_contract_payload(path, operands, result):
+    path_steps = []
+    for indices, equation in path:
+        path_steps.append({
+            "indices": [int(index) for index in indices],
+            "equation": str(equation).replace(" ", ""),
+        })
+    return {
+        "contraction_count": len(path_steps),
+        "path_steps": path_steps,
+        "input_shapes": array_shapes(operands),
+        "input_dtypes": array_dtype_names(operands),
+        "operand_array_types": array_type_names(operands),
+        "operand_array_backends": array_backend_names(operands),
+        "output_shape": array_shape(result),
+        "output_dtype": str(getattr(result, "dtype", None)),
+        "output_backend": array_backend_name(result) if hasattr(result, "shape") else None,
+        "read_bytes": array_total_bytes(operands),
+        "write_bytes": int(getattr(result, "nbytes", 0)),
+    }
+
+
 class _ProfilingRuntime:
     def __init__(self):
         import contextvars
@@ -654,6 +677,7 @@ class _ProfilingRuntime:
             "parent_span_id",
             "wall_s",
             "path",
+            "path_steps",
             "contraction_types",
             "contraction_steps",
             "shape_buckets",
