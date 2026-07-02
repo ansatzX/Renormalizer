@@ -344,6 +344,12 @@ def evaluate_distributed_profile_gate(events, *, require_world_size=None):
         if not communication:
             failures.append({"reason": "missing communication profile", "rank": event.get("rank")})
         for item in communication:
+            if item.get("collective") not in EXPECTED_PROFILE_COLLECTIVES:
+                failures.append({
+                    "reason": "unexpected distributed profile collective",
+                    "rank": event.get("rank"),
+                    "collective": item.get("collective"),
+                })
             if item.get("bytes") is None or int(item.get("bytes") or 0) < 0:
                 failures.append({
                     "reason": "invalid communication bytes",

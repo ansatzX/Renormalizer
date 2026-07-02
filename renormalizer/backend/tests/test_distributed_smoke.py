@@ -204,6 +204,41 @@ def test_distributed_profile_gate_requires_communication_message_metadata():
     ]
 
 
+def test_distributed_profile_gate_rejects_unexpected_collective_names():
+    from renormalizer.backend.distributed_smoke import evaluate_distributed_profile_gate
+
+    events = [
+        {
+            "event": "contraction_execute",
+            "lowering": "distributed",
+            "rank": 0,
+            "world_size": 8,
+            "global_shape": [32, 32],
+            "local_shape": [32, 32],
+            "distributed_modes": ["i"],
+            "communication": [
+                {"collective": "broadcast", "bytes": 8192, "wall_s": 0.01, "num_messages": 1, "block_size": 8192},
+                {"collective": "allreduce", "bytes": 8192, "wall_s": 0.02, "num_messages": 1, "block_size": 8192},
+                {"collective": "alltoall", "bytes": 8192, "wall_s": 0.03, "num_messages": 1, "block_size": 8192},
+                {"collective": "gather", "bytes": 8192, "wall_s": 0.04, "num_messages": 1, "block_size": 8192},
+                {"collective": "mystery", "bytes": 8192, "wall_s": 0.05, "num_messages": 1, "block_size": 8192},
+            ],
+        }
+    ]
+
+    summary = evaluate_distributed_profile_gate(events, require_world_size=8)
+
+    assert summary["operation"] == "distributed_profile_gate"
+    assert summary["status"] == "failed"
+    assert summary["failures"] == [
+        {
+            "reason": "unexpected distributed profile collective",
+            "rank": 0,
+            "collective": "mystery",
+        }
+    ]
+
+
 def test_distributed_profile_cli_writes_ranked_profile_and_gates_it(monkeypatch, capsys, tmp_path):
     from renormalizer.backend import distributed_smoke
 
