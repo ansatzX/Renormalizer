@@ -28,15 +28,54 @@ def _tda_multi_hop(x, hop):
     started = time.perf_counter() if should_profile else None
     result = np.stack([hop(x[:, i]) for i in range(x.shape[1])], axis=1)
     if should_profile:
+        def device_payload(device):
+            return {
+                "kind": getattr(device, "kind", None),
+                "index": getattr(device, "index", None),
+                "local_rank": getattr(device, "local_rank", None),
+                "global_rank": getattr(device, "global_rank", None),
+                "visible_id": getattr(device, "visible_id", None),
+            }
+
+        def operand_payload(name, array, modes):
+            info = backend.array_info(array)
+            return {
+                "name": name,
+                "modes": list(modes),
+                "shape": info.shape,
+                "dtype": str(info.dtype),
+                "itemsize": info.itemsize,
+                "size": info.size,
+                "nbytes": info.nbytes,
+                "ndim": info.ndim,
+                "strides": info.strides,
+                "order": info.order,
+                "contiguous": info.contiguous,
+                "writeable": info.writeable,
+                "owns_data": info.owns_data,
+                "backend": info.backend_name,
+                "device": str(info.device),
+                "device_kind": info.device.kind,
+                "device_index": info.device.index,
+                "is_host": info.is_host,
+                "is_device": info.is_device,
+                "is_distributed": info.is_distributed,
+            }
+
         profiling.record(
             "contraction_execute",
             backend=backend.name,
             equation=None,
             lowering="fallback_rhs_loop",
             input_shapes=[tuple(x.shape)],
+            input_dtypes=[str(getattr(x, "dtype", None))],
+            operands=[
+                operand_payload("packed_rhs", x, ("packed", "rhs")),
+            ],
             output_shape=tuple(result.shape),
             dtype=str(getattr(result, "dtype", None)),
             device=str(backend.current_device()),
+            device_info=device_payload(backend.current_device()),
             flops=0,
             read_bytes=int(getattr(x, "nbytes", 0)),
             write_bytes=int(getattr(result, "nbytes", 0)),
@@ -52,6 +91,7 @@ def _tda_multi_hop(x, hop):
             num_blocks=0,
             num_shape_buckets=0,
             num_rhs=int(x.shape[1]),
+            num_rhs_loop_calls=int(x.shape[1]),
             fallback_reason="tda matmat rebuilds ket-dependent environments per RHS",
             wall_s=time.perf_counter() - started,
         )

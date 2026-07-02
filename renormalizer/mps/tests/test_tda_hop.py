@@ -44,8 +44,23 @@ def test_tda_multi_hop_records_matrix_rhs_loop_fallback(caplog, tmp_path):
     )
     assert event["lowering"] == "fallback_rhs_loop"
     assert event["input_shapes"] == [[3, 2]]
+    assert event["input_dtypes"] == ["float64"]
     assert event["output_shape"] == [3, 2]
+    assert event["device_info"] == {
+        "kind": "cpu",
+        "index": None,
+        "local_rank": None,
+        "global_rank": None,
+        "visible_id": None,
+    }
+    assert event["operands"][0]["name"] == "packed_rhs"
+    assert event["operands"][0]["modes"] == ["packed", "rhs"]
+    assert event["operands"][0]["shape"] == [3, 2]
+    assert event["operands"][0]["itemsize"] == x.itemsize
+    assert event["operands"][0]["is_host"] is True
+    assert event["operands"][0]["is_distributed"] is False
     assert event["num_rhs"] == 2
+    assert event["num_rhs_loop_calls"] == 2
     assert event["num_batched_gemm"] == 0
     assert event["fallback_reason"] == "tda matmat rebuilds ket-dependent environments per RHS"
     assert event["wall_s"] >= 0.0
