@@ -534,12 +534,16 @@ def test_numpy_distributed_smoke_records_broadcast_profile_event(tmp_path):
         for line in event_path.read_text().splitlines()
         if line.strip()
     ]
-    assert any(
-        event.get("event") == "contraction_execute"
+    event = next(
+        event
+        for event in events
+        if event.get("event") == "contraction_execute"
         and event.get("lowering") == "distributed"
         and any(
             item.get("collective") == "broadcast"
             for item in event.get("communication") or []
         )
-        for event in events
     )
+    assert event["compute_class"] == "tensordot"
+    assert event["compute_subclass"] == "backend_execute"
+    assert event["compute_role"] == "kernel"

@@ -71,6 +71,24 @@ _OVERHEAD_TEMPLATE = {
 _runtime = None
 _default_event_output_path = None
 
+COMPUTE_CLASS_TENSORDOT = "tensordot"
+COMPUTE_CLASS_OE = "oe"
+COMPUTE_CLASS_SVD = "svd"
+COMPUTE_ROLE_COMPOSITE = "composite"
+COMPUTE_ROLE_KERNEL = "kernel"
+
+
+def compute_payload(compute_class, compute_subclass, compute_role):
+    return {
+        "compute_class": str(compute_class),
+        "compute_subclass": str(compute_subclass),
+        "compute_role": str(compute_role),
+    }
+
+
+def contraction_execute_compute_payload():
+    return compute_payload(COMPUTE_CLASS_TENSORDOT, "backend_execute", COMPUTE_ROLE_KERNEL)
+
 
 def enabled() -> bool:
     return logger.isEnabledFor(PROFILING)
@@ -164,8 +182,7 @@ def tensordot_compute_payload(left, right, axes, result):
     k = _prod(left_contract_shape) if left_contract_shape == right_contract_shape else 0
     flops = 2 * m * n * k if k else 0
     return {
-        "compute_class": "tensordot",
-        "compute_subclass": "direct_tensordot",
+        **compute_payload(COMPUTE_CLASS_TENSORDOT, "api_tensordot", COMPUTE_ROLE_COMPOSITE),
         "input_dtypes": array_dtype_names((left, right)),
         "output_dtype": str(getattr(result, "dtype", None)),
         "left_free_shape": left_free_shape,
@@ -412,8 +429,7 @@ def contract_path_summary(contract_path, args, kwargs):
 def oe_compute_payload(subclass, operands, result, path_summary=None):
     path_summary = path_summary or {}
     return {
-        "compute_class": "oe",
-        "compute_subclass": subclass,
+        **compute_payload(COMPUTE_CLASS_OE, subclass, COMPUTE_ROLE_COMPOSITE),
         "input_dtypes": array_dtype_names(operands),
         "output_dtype": str(getattr(result, "dtype", None)),
         "flops_estimate": json_int(path_summary.get("flop_count")) or 0,
@@ -468,8 +484,7 @@ def svd_qn_compute_payload(mode, coef_array, coef_matrix, blocks, outputs):
     )
     output_arrays = tuple(array for array in outputs if hasattr(array, "shape"))
     return {
-        "compute_class": "svd",
-        "compute_subclass": _decomposition_subclass(mode),
+        **compute_payload(COMPUTE_CLASS_SVD, _decomposition_subclass(mode), COMPUTE_ROLE_KERNEL),
         "input_dtype": str(getattr(coef_array, "dtype", None)),
         "output_dtype": str(getattr(output_arrays[0], "dtype", None)) if output_arrays else None,
         "flops_estimate": int(block_flops or decomposition_flops_estimate(getattr(coef_matrix, "shape", ()), mode)),
@@ -706,6 +721,7 @@ class _ProfilingRuntime:
         keys = (
             "compute_class",
             "compute_subclass",
+            "compute_role",
             "backend",
             "stage",
             "method",
@@ -725,6 +741,10 @@ class _ProfilingRuntime:
         flops = self._number(payload, "flops_estimate", "flops")
         read_bytes = self._number(payload, "read_bytes")
         write_bytes = self._number(payload, "write_bytes")
+        copy_bytes = self._number(payload, "copy_bytes")
+        comm_bytes = self._number(payload, "comm_bytes", "estimated_comm_bytes")
+        workspace_bytes = self._number(payload, "workspace_bytes", "required_workspace_bytes")
+        peak_bytes = self._number(payload, "peak_bytes", "largest_intermediate")
         item = self._compute_summaries.get(key)
         if item is None:
             self._compute_summaries[key] = {
@@ -737,6 +757,10 @@ class _ProfilingRuntime:
                 "total_flops_estimate": flops,
                 "total_read_bytes": read_bytes,
                 "total_write_bytes": write_bytes,
+                "total_copy_bytes": copy_bytes,
+                "total_comm_bytes": comm_bytes,
+                "max_workspace_bytes": workspace_bytes,
+                "max_peak_bytes": peak_bytes,
             }
             return
         if source_event is not None:
@@ -748,6 +772,10 @@ class _ProfilingRuntime:
         item["total_flops_estimate"] += flops
         item["total_read_bytes"] += read_bytes
         item["total_write_bytes"] += write_bytes
+        item["total_copy_bytes"] += copy_bytes
+        item["total_comm_bytes"] += comm_bytes
+        item["max_workspace_bytes"] = max(item["max_workspace_bytes"], workspace_bytes)
+        item["max_peak_bytes"] = max(item["max_peak_bytes"], peak_bytes)
 
     def register_event_output(self, file_path, mode="w") -> None:
         self.close_event_output()
@@ -812,18 +840,43 @@ class _ProfilingRuntime:
         ):
             signature = item["signature"]
             call_count = item["call_count"]
+            total_wall_s = item["total_wall_s"]
+            total_flops = item["total_flops_estimate"]
+            total_read_bytes = item["total_read_bytes"]
+            total_write_bytes = item["total_write_bytes"]
+            total_memory_bytes = total_read_bytes + total_write_bytes
+            total_copy_bytes = item["total_copy_bytes"]
+            total_comm_bytes = item["total_comm_bytes"]
+
+            def rate(value):
+                return value / total_wall_s if total_wall_s > 0 else None
+
             payload = {
                 "event": "profile_compute_summary",
                 **signature,
                 "source_events": sorted(item["source_events"]),
                 "call_count": call_count,
-                "total_wall_s": item["total_wall_s"],
-                "mean_wall_s": item["total_wall_s"] / call_count if call_count else None,
+                "total_wall_s": total_wall_s,
+                "mean_wall_s": total_wall_s / call_count if call_count else None,
                 "min_wall_s": item["min_wall_s"],
                 "max_wall_s": item["max_wall_s"],
-                "total_flops_estimate": int(item["total_flops_estimate"]),
-                "total_read_bytes": int(item["total_read_bytes"]),
-                "total_write_bytes": int(item["total_write_bytes"]),
+                "total_flops_estimate": int(total_flops),
+                "total_read_bytes": int(total_read_bytes),
+                "total_write_bytes": int(total_write_bytes),
+                "total_memory_bytes": int(total_memory_bytes),
+                "total_copy_bytes": int(total_copy_bytes),
+                "total_comm_bytes": int(total_comm_bytes),
+                "max_workspace_bytes": int(item["max_workspace_bytes"]),
+                "max_peak_bytes": int(item["max_peak_bytes"]),
+                "flops_per_s_estimate": rate(total_flops),
+                "read_bandwidth_Bps": rate(total_read_bytes),
+                "write_bandwidth_Bps": rate(total_write_bytes),
+                "memory_bandwidth_Bps": rate(total_memory_bytes),
+                "copy_bandwidth_Bps": rate(total_copy_bytes),
+                "comm_bandwidth_Bps": rate(total_comm_bytes),
+                "arithmetic_intensity_flops_per_byte": (
+                    total_flops / total_memory_bytes if total_memory_bytes > 0 else None
+                ),
             }
             text = self._json.dumps(self._to_jsonable(payload), sort_keys=True, separators=(",", ":"))
             logger.profiling("%s%s", LOG_PREFIX, text)

@@ -568,6 +568,7 @@ def _broadcast_case(backend, backend_name, device, rank, world_size):
         profiling.record(
             "contraction_execute",
             backend=backend_name,
+            **profiling.contraction_execute_compute_payload(),
             operation="broadcast_tensor",
             equation=None,
             lowering="distributed",

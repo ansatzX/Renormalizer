@@ -31,6 +31,7 @@ def _tda_multi_hop(x, hop):
         profiling.record(
             "contraction_execute",
             backend=backend.name,
+            **profiling.contraction_execute_compute_payload(),
             equation=None,
             lowering="fallback_rhs_loop",
             input_shapes=[tuple(x.shape)],

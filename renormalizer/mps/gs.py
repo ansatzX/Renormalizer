@@ -571,6 +571,7 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
         profiling.record(
             "contraction_execute",
             backend=backend.name,
+            **profiling.contraction_execute_compute_payload(),
             equation=getattr(active_expr, "equation", None),
             lowering="batched_rhs_hop",
             input_shapes=[tuple(x.shape)],

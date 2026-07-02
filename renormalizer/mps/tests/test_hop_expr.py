@@ -131,6 +131,9 @@ def test_apply_hop_to_packed_vectors_profiles_batched_rhs_execution(tmp_path):
     assert event["backend"] == "numpy"
     assert event["equation"] == "abc,lbk,ckr->alr"
     assert event["lowering"] == "batched_rhs_hop"
+    assert event["compute_class"] == "tensordot"
+    assert event["compute_subclass"] == "backend_execute"
+    assert event["compute_role"] == "kernel"
     assert event["input_shapes"] == [[3, 2]]
     assert event["input_dtypes"] == ["float64"]
     assert event["output_shape"] == [3, 2]

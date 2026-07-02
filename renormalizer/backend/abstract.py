@@ -2565,6 +2565,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
+                **profiling.contraction_execute_compute_payload(),
                 equation=equation,
                 lowering="slice",
                 plan_hash=plan.plan_hash,
@@ -2629,6 +2630,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
+                **profiling.contraction_execute_compute_payload(),
                 equation=equation,
                 lowering="multi_step",
                 step_lowerings=step_lowerings,
@@ -3454,6 +3456,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
+                **profiling.contraction_execute_compute_payload(),
                 equation=spec.equation,
                 lowering="distributed",
                 plan_hash=plan_hash,
@@ -4055,6 +4058,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
+                **profiling.contraction_execute_compute_payload(),
                 equation=None,
                 lowering="block_grouped_gemm",
                 plan_hash=plan.plan_hash,
@@ -4491,6 +4495,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 profiling.record(
                     "contraction_execute",
                     backend=self.name,
+                    **profiling.contraction_execute_compute_payload(),
                     equation=None,
                     lowering="grouped_gemm",
                     input_shapes=[
@@ -4673,6 +4678,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
+                **profiling.contraction_execute_compute_payload(),
                 equation=equation,
                 lowering=plan.kind,
                 plan_hash=plan_hash or getattr(plan, "plan_hash", ""),

@@ -2064,6 +2064,9 @@ def test_grouped_gemm_profile_records_one_input_shape_pair_per_task(tmp_path):
         ["float64", "float64"],
         ["float64", "float64"],
     ]
+    assert event["compute_class"] == "tensordot"
+    assert event["compute_subclass"] == "backend_execute"
+    assert event["compute_role"] == "kernel"
     assert event["task_operands"][0][0]["name"] == "task0.A"
     assert event["task_operands"][0][0]["modes"] == ["m", "k"]
     assert event["task_operands"][0][0]["shape"] == [2, 3]
@@ -3937,6 +3940,9 @@ def test_multi_step_contraction_execute_profile_records_aggregate_event(tmp_path
     assert len(execute_events) == 1
     execute = execute_events[0]
     assert execute["lowering"] == "multi_step"
+    assert execute["compute_class"] == "tensordot"
+    assert execute["compute_subclass"] == "backend_execute"
+    assert execute["compute_role"] == "kernel"
     assert execute["step_lowerings"] == ["gemm", "gemm"]
     assert execute["equation"] == "ab,bc,cd->ad"
     assert execute["input_shapes"] == [[2, 3], [3, 4], [4, 5]]

@@ -43,6 +43,9 @@ def test_tda_multi_hop_records_matrix_rhs_loop_fallback(caplog, tmp_path):
         if payload["event"] == "contraction_execute"
     )
     assert event["lowering"] == "fallback_rhs_loop"
+    assert event["compute_class"] == "tensordot"
+    assert event["compute_subclass"] == "backend_execute"
+    assert event["compute_role"] == "kernel"
     assert event["input_shapes"] == [[3, 2]]
     assert event["input_dtypes"] == ["float64"]
     assert event["output_shape"] == [3, 2]

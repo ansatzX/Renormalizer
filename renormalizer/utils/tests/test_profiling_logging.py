@@ -398,7 +398,8 @@ def test_tensordot_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch,
     assert event["axes"] == [[1], [0]]
     assert event["output_shape"] == [2, 4]
     assert event["compute_class"] == "tensordot"
-    assert event["compute_subclass"] == "direct_tensordot"
+    assert event["compute_subclass"] == "api_tensordot"
+    assert event["compute_role"] == "composite"
     assert event["m"] == 2
     assert event["n"] == 4
     assert event["k"] == 3
@@ -648,6 +649,71 @@ def test_compute_events_emit_class_level_summary_rows(caplog):
     assert svd_summary["total_flops_estimate"] == 512
 
 
+def test_compute_summary_separates_roles_and_reports_derived_rates(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    profiling.flush_summaries()
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    profiling.record(
+        "tensordot",
+        compute_class="tensordot",
+        compute_subclass="api_tensordot",
+        compute_role="composite",
+        backend="numpy",
+        flops_estimate=100,
+        read_bytes=30,
+        write_bytes=20,
+        wall_s=0.1,
+    )
+    profiling.record(
+        "contraction_execute",
+        compute_class="tensordot",
+        compute_subclass="backend_execute",
+        compute_role="kernel",
+        backend="numpy",
+        lowering="gemm",
+        flops=200,
+        read_bytes=40,
+        write_bytes=10,
+        copy_bytes=5,
+        comm_bytes=0,
+        wall_s=0.2,
+    )
+
+    profiling.flush_summaries()
+
+    payloads = _profiling_payloads(caplog, profiling)
+    summaries = [
+        payload for payload in payloads
+        if payload["event"] == "profile_compute_summary"
+        and payload["compute_class"] == "tensordot"
+    ]
+    assert {(payload["compute_role"], payload["compute_subclass"]) for payload in summaries} == {
+        ("composite", "api_tensordot"),
+        ("kernel", "backend_execute"),
+    }
+
+    composite = next(payload for payload in summaries if payload["compute_role"] == "composite")
+    assert composite["total_wall_s"] == pytest.approx(0.1)
+    assert composite["total_flops_estimate"] == 100
+    assert composite["total_read_bytes"] == 30
+    assert composite["total_write_bytes"] == 20
+    assert composite["total_memory_bytes"] == 50
+    assert composite["flops_per_s_estimate"] == pytest.approx(1000.0)
+    assert composite["read_bandwidth_Bps"] == pytest.approx(300.0)
+    assert composite["write_bandwidth_Bps"] == pytest.approx(200.0)
+    assert composite["memory_bandwidth_Bps"] == pytest.approx(500.0)
+    assert composite["arithmetic_intensity_flops_per_byte"] == pytest.approx(2.0)
+
+    kernel = next(payload for payload in summaries if payload["compute_role"] == "kernel")
+    assert kernel["lowering"] == "gemm"
+    assert kernel["total_flops_estimate"] == 200
+    assert kernel["total_copy_bytes"] == 5
+    assert kernel["copy_bandwidth_Bps"] == pytest.approx(25.0)
+
+
 def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
     import numpy as np
 
@@ -674,6 +740,7 @@ def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatc
     assert event["output_shape"] == [2, 4]
     assert event["compute_class"] == "oe"
     assert event["compute_subclass"] == "oe_contract"
+    assert event["compute_role"] == "composite"
     assert event["input_dtypes"] == ["float64", "float64"]
     assert event["output_dtype"] == "float64"
     assert event["flops_estimate"] >= 1
@@ -707,6 +774,7 @@ def test_oe_contract_expression_records_path_summary_in_jsonl(caplog, tmp_path):
     assert event["path"] == [[1, 2], [0, 1]]
     assert event["compute_class"] == "oe"
     assert event["compute_subclass"] == "oe_expression_execute"
+    assert event["compute_role"] == "composite"
     assert event["input_dtypes"] == ["float64", "float64", "float64"]
     assert event["output_dtype"] == "float64"
     assert event["flops_estimate"] >= 1
@@ -781,6 +849,7 @@ def test_svd_qn_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tm
     assert event["mode"] == "QR"
     assert event["compute_class"] == "svd"
     assert event["compute_subclass"] == "qr_qn"
+    assert event["compute_role"] == "kernel"
     assert event["input_dtype"] == "float64"
     assert event["output_dtype"] == "float64"
     assert event["read_bytes"] == 2 * 2 * 8
@@ -830,6 +899,7 @@ def test_eigh_qn_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, t
     event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "eigh_qn")
     assert event["compute_class"] == "svd"
     assert event["compute_subclass"] == "eigh_qn"
+    assert event["compute_role"] == "kernel"
     assert event["system"] == "L"
     assert event["dm_shape"] == [2, 2]
     assert event["matrix_shape"] == [2, 2]
