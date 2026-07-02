@@ -22,7 +22,12 @@ _BACKEND_PROTOCOL_RUNTIME_ATTRS = (
     "supports_functional_update",
     "supports_batched_matmul",
     "supports_grouped_gemm",
+    "supports_streams",
+    "supports_events",
     "supports_memory_pool",
+    "supports_block_sparse",
+    "supports_packed_blocks",
+    "supports_scatter_add",
     "host_array_types",
     "device_array_types",
     "ndarray",
@@ -200,8 +205,23 @@ class BackendProtocol(Protocol):
     supports_grouped_gemm: bool
     """Whether native grouped GEMM is available, excluding bucketed fallback."""
 
+    supports_streams: bool
+    """Whether backend stream primitives are available."""
+
+    supports_events: bool
+    """Whether backend event primitives are available."""
+
     supports_memory_pool: bool
     """Whether native backend memory-pool hooks are available."""
+
+    supports_block_sparse: bool
+    """Whether backend block-sparse planning/execution APIs are available."""
+
+    supports_packed_blocks: bool
+    """Whether native packed-block storage is available."""
+
+    supports_scatter_add: bool
+    """Whether backend scatter-add/update primitives are available."""
 
     host_array_types: Tuple[Type[Any], ...]
     """Array classes that are already resident on host memory."""

@@ -156,6 +156,30 @@ def test_backend_protocol_copy_and_layout_signatures_are_explicit():
     assert_no_var_keyword(parse_einsum_signature)
 
 
+def test_backend_protocol_capability_flags_are_explicit():
+    from renormalizer.backend.protocol import BackendProtocol
+
+    required = (
+        "supports_cpu",
+        "supports_gpu",
+        "supports_autodiff",
+        "supports_jit",
+        "supports_sparse",
+        "supports_functional_update",
+        "supports_batched_matmul",
+        "supports_grouped_gemm",
+        "supports_streams",
+        "supports_events",
+        "supports_memory_pool",
+        "supports_block_sparse",
+        "supports_packed_blocks",
+        "supports_scatter_add",
+    )
+
+    for name in required:
+        assert name in BackendProtocol.__annotations__
+
+
 def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
     from renormalizer.backend.execution import DeviceSpec, parse_device_spec
 
