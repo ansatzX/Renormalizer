@@ -1656,6 +1656,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
             for index, operand in enumerate(path.input_specs)
         )
         local_step = self._local_step_for_activate_distribution(path, output_sharding)
+        activation_local_bytes = int(
+            local_step.estimated_read_bytes or activation_bytes
+        )
         output_shape = self._output_shape_for_contraction_plan(path)
         itemsize = max((self._operand_itemsize(operand.array) for operand in path.input_specs), default=0)
         step_plan = DistributedStepPlan(
@@ -1673,6 +1676,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 CommunicationPlan(
                     kind="activate_distribution",
                     bytes=activation_bytes,
+                    local_bytes=activation_local_bytes,
                     modes=output_sharding.sharded_modes,
                     reason="activate automatic output-mode distribution for dense contraction plan",
                 ),

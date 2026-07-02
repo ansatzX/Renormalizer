@@ -2523,7 +2523,11 @@ def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan
     assert [item.kind for item in distributed_path.steps[0].communication] == ["activate_distribution"]
     assert distributed_path.total_comm_bytes == left.nbytes + right.nbytes
     assert distributed_path.total_redistribute_bytes == left.nbytes + right.nbytes
-    assert distributed_path.steps[0].estimated_comm_s == pytest.approx((left.nbytes + right.nbytes) / 80.0 + 0.25)
+    assert [
+        (item.bytes, item.local_bytes)
+        for item in distributed_path.steps[0].communication
+    ] == [(left.nbytes + right.nbytes, 352)]
+    assert distributed_path.steps[0].estimated_comm_s == pytest.approx(352 / 80.0 + 0.25)
     left_state, right_state = distributed_path.steps[0].input_states
     assert left_state.tensor_id == 0
     assert left_state.shape == left.shape
@@ -2632,6 +2636,8 @@ def test_execute_auto_distributed_profile_preserves_plan_identity_and_estimates(
     assert event["estimated_comm_s"] == pytest.approx(step.estimated_comm_s)
     assert event["estimated_total_s"] == pytest.approx(step.estimated_total_s)
     assert event["communication"][0]["collective"] == "activate_distribution"
+    assert event["communication"][0]["bytes"] == left.nbytes + right.nbytes
+    assert event["communication"][0]["local_bytes"] == 352
 
 
 def test_execute_auto_distributed_dense_plan_places_inputs_before_contracting():
@@ -2847,8 +2853,8 @@ def test_estimate_distributed_contraction_reports_local_work_and_communication_c
     assert estimate.peak_bytes == 96
     assert estimate.compute_s == pytest.approx(2.4)
     assert estimate.memory_s == pytest.approx(2.0)
-    assert estimate.comm_s == pytest.approx(1.64)
-    assert estimate.total_s == pytest.approx(6.04)
+    assert estimate.comm_s == pytest.approx(1.16)
+    assert estimate.total_s == pytest.approx(5.56)
 
 
 def test_estimate_target_device_contraction_uses_distributed_local_cost():
@@ -2876,8 +2882,8 @@ def test_estimate_target_device_contraction_uses_distributed_local_cost():
     assert estimate.peak_bytes == 96
     assert estimate.compute_s == pytest.approx(2.4)
     assert estimate.memory_s == pytest.approx(2.0)
-    assert estimate.comm_s == pytest.approx(1.64)
-    assert estimate.total_s == pytest.approx(6.04)
+    assert estimate.comm_s == pytest.approx(1.16)
+    assert estimate.total_s == pytest.approx(5.56)
 
 
 def test_estimate_redistribute_records_communication_cost():
