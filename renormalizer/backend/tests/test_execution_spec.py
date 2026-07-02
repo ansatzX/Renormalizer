@@ -2726,6 +2726,8 @@ def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
         output_modes=("i", "j"),
     )
     plan = backend.lower_pair_contraction_to_matmul(spec)
+    assert isinstance(plan.plan_hash, str)
+    assert plan.plan_hash
     event_path = tmp_path / "events.jsonl"
     old_level = package_logger.level
     try:
@@ -2751,6 +2753,7 @@ def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
     event = executes[0]
     assert event["backend"] == "numpy"
     assert event["lowering"] == "gemm"
+    assert event["plan_hash"] == plan.plan_hash
     assert event["input_shapes"] == [[2, 3], [3, 4]]
     assert event["output_shape"] == [2, 4]
     assert event["dtype"] == "float64"

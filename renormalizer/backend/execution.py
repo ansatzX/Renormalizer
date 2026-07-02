@@ -1030,6 +1030,7 @@ class MatmulPlan:
     estimated_time_s: float | None
     reason: str
     fallback_reason: str | None = None
+    plan_hash: str = ""
 
     def __post_init__(self):
         kind = str(self.kind)
@@ -1051,6 +1052,8 @@ class MatmulPlan:
         object.__setattr__(self, "pre_ops", tuple(self.pre_ops))
         object.__setattr__(self, "post_ops", tuple(self.post_ops))
         object.__setattr__(self, "output_shape", output_shape)
+        if not self.plan_hash:
+            object.__setattr__(self, "plan_hash", _matmul_plan_hash(self))
 
 
 @dataclass(frozen=True)
@@ -1560,6 +1563,54 @@ def _contraction_plan_hash(plan: ContractionPlan) -> str:
         plan.estimated_peak_bytes,
         plan.sliced_modes,
         plan.distributed_modes,
+    )
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
+
+
+def _layout_transform_hash_payload(transform):
+    return (
+        transform.kind,
+        transform.input_shape,
+        transform.output_shape,
+        transform.copy_bytes,
+        transform.reason,
+    )
+
+
+def _matmul_plan_hash(plan: MatmulPlan) -> str:
+    payload = (
+        plan.kind,
+        tuple(
+            (
+                desc.m,
+                desc.n,
+                desc.k,
+                desc.batch_shape,
+                desc.trans_a,
+                desc.trans_b,
+                desc.conj_a,
+                desc.conj_b,
+                str(getattr(desc.A, "dtype", None)),
+                str(getattr(desc.B, "dtype", None)),
+                _shape_of(desc.A),
+                _shape_of(desc.B),
+                _shape_of(desc.C) if desc.C is not None else None,
+                desc.estimated_flops,
+                desc.estimated_read_bytes,
+                desc.estimated_write_bytes,
+                desc.estimated_workspace_bytes,
+            )
+            for desc in plan.descs
+        ),
+        tuple(_layout_transform_hash_payload(transform) for transform in plan.pre_ops),
+        tuple(_layout_transform_hash_payload(transform) for transform in plan.post_ops),
+        plan.output_shape,
+        plan.copy_bytes,
+        plan.workspace_bytes,
+        plan.estimated_flops,
+        plan.estimated_time_s,
+        plan.reason,
+        plan.fallback_reason,
     )
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
 
