@@ -1303,6 +1303,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return self.estimate_matmul(plan, hw)
         if isinstance(plan, DistributedContractionPlan):
             return self._estimate_distributed_contraction(plan, hw)
+        distributed_plan = self._distributed_plan_from_contraction_plan(plan)
+        if distributed_plan is not None:
+            return self._estimate_distributed_contraction(distributed_plan, hw)
         peak_bytes = int(plan.estimated_peak_bytes or max((step.estimated_peak_bytes for step in plan.steps), default=0))
         return self._make_cost_estimate(
             hw,

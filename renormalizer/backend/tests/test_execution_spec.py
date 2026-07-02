@@ -2758,6 +2758,35 @@ def test_estimate_distributed_contraction_reports_local_work_and_communication_c
     assert estimate.total_s == pytest.approx(6.04)
 
 
+def test_estimate_target_device_contraction_uses_distributed_local_cost():
+    from renormalizer.backend import DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((4, 3), dtype=np.float64)
+    right = np.ones((3, 2), dtype=np.float64)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+    hw = HardwareModel(flop_per_s=10.0, memory_bandwidth_Bps=64.0, network_bandwidth_Bps=100.0, latency_s=0.2)
+    plan = backend.plan_contraction(
+        spec,
+        allow_distribution=True,
+        target_devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+    )
+
+    estimate = backend.estimate_contraction(plan, hw)
+
+    assert plan.distributed_modes == ("i",)
+    assert estimate.flops == 48
+    assert estimate.read_bytes == 96
+    assert estimate.write_bytes == 32
+    assert estimate.comm_bytes == 144
+    assert estimate.peak_bytes == 96
+    assert estimate.compute_s == pytest.approx(2.4)
+    assert estimate.memory_s == pytest.approx(2.0)
+    assert estimate.comm_s == pytest.approx(1.64)
+    assert estimate.total_s == pytest.approx(6.04)
+
+
 def test_estimate_redistribute_records_communication_cost():
     from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend
