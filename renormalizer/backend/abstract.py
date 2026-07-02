@@ -920,31 +920,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 for step in plan.steps
             ]
 
-            def operand_payload(operand):
-                info = self.array_info(operand.array)
-                return {
-                    "name": operand.name,
-                    "modes": [str(mode) for mode in operand.modes],
-                    "shape": info.shape,
-                    "dtype": str(info.dtype),
-                    "itemsize": info.itemsize,
-                    "size": info.size,
-                    "nbytes": info.nbytes,
-                    "ndim": info.ndim,
-                    "strides": info.strides,
-                    "order": info.order,
-                    "contiguous": info.contiguous,
-                    "writeable": info.writeable,
-                    "owns_data": info.owns_data,
-                    "backend": info.backend_name,
-                    "device": str(info.device),
-                    "device_kind": info.device.kind,
-                    "device_index": info.device.index,
-                    "is_host": info.is_host,
-                    "is_device": info.is_device,
-                    "is_distributed": info.is_distributed,
-                }
-
             profiling.record(
                 "contraction_plan",
                 backend=self.name,
@@ -952,7 +927,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 lowering="multi_step",
                 step_lowerings=step_lowerings,
                 plan_hash=plan.plan_hash,
-                operands=[operand_payload(operand) for operand in plan.input_specs],
+                operands=[self._profile_tensor_operand(operand) for operand in plan.input_specs],
                 input_modes=[[str(mode) for mode in modes] for modes in input_modes],
                 output_modes=[str(mode) for mode in output_modes],
                 input_shapes=[
@@ -1692,31 +1667,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
             equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)
             output_shape = self._output_shape_for_contraction_plan(plan)
 
-            def operand_payload(operand):
-                info = self.array_info(operand.array)
-                return {
-                    "name": operand.name,
-                    "modes": [str(mode) for mode in operand.modes],
-                    "shape": info.shape,
-                    "dtype": str(info.dtype),
-                    "itemsize": info.itemsize,
-                    "size": info.size,
-                    "nbytes": info.nbytes,
-                    "ndim": info.ndim,
-                    "strides": info.strides,
-                    "order": info.order,
-                    "contiguous": info.contiguous,
-                    "writeable": info.writeable,
-                    "owns_data": info.owns_data,
-                    "backend": info.backend_name,
-                    "device": str(info.device),
-                    "device_kind": info.device.kind,
-                    "device_index": info.device.index,
-                    "is_host": info.is_host,
-                    "is_device": info.is_device,
-                    "is_distributed": info.is_distributed,
-                }
-
             profiling.record(
                 "contraction_plan",
                 backend=self.name,
@@ -1729,7 +1679,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     tuple(getattr(operand.array, "shape", ()))
                     for operand in plan.input_specs
                 ],
-                operands=[operand_payload(operand) for operand in plan.input_specs],
+                operands=[self._profile_tensor_operand(operand) for operand in plan.input_specs],
                 input_dtypes=[
                     str(getattr(operand.array, "dtype", None))
                     for operand in plan.input_specs
@@ -2590,31 +2540,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
             base_lowering = getattr(getattr(base_step, "plan", None), "kind", getattr(base_step, "kind", None))
             equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)
 
-            def operand_payload(operand):
-                info = self.array_info(operand.array)
-                return {
-                    "name": operand.name,
-                    "modes": [str(mode) for mode in operand.modes],
-                    "shape": info.shape,
-                    "dtype": str(info.dtype),
-                    "itemsize": info.itemsize,
-                    "size": info.size,
-                    "nbytes": info.nbytes,
-                    "ndim": info.ndim,
-                    "strides": info.strides,
-                    "order": info.order,
-                    "contiguous": info.contiguous,
-                    "writeable": info.writeable,
-                    "owns_data": info.owns_data,
-                    "backend": info.backend_name,
-                    "device": str(info.device),
-                    "device_kind": info.device.kind,
-                    "device_index": info.device.index,
-                    "is_host": info.is_host,
-                    "is_device": info.is_device,
-                    "is_distributed": info.is_distributed,
-                }
-
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
@@ -2627,7 +2552,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     tuple(getattr(operand.array, "shape", ()))
                     for operand in plan.input_specs
                 ],
-                operands=[operand_payload(operand) for operand in plan.input_specs],
+                operands=[self._profile_tensor_operand(operand) for operand in plan.input_specs],
                 input_dtypes=[
                     str(getattr(operand.array, "dtype", None))
                     for operand in plan.input_specs
@@ -2679,31 +2604,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 for step in plan.steps
             ]
 
-            def operand_payload(operand):
-                info = self.array_info(operand.array)
-                return {
-                    "name": operand.name,
-                    "modes": [str(mode) for mode in operand.modes],
-                    "shape": info.shape,
-                    "dtype": str(info.dtype),
-                    "itemsize": info.itemsize,
-                    "size": info.size,
-                    "nbytes": info.nbytes,
-                    "ndim": info.ndim,
-                    "strides": info.strides,
-                    "order": info.order,
-                    "contiguous": info.contiguous,
-                    "writeable": info.writeable,
-                    "owns_data": info.owns_data,
-                    "backend": info.backend_name,
-                    "device": str(info.device),
-                    "device_kind": info.device.kind,
-                    "device_index": info.device.index,
-                    "is_host": info.is_host,
-                    "is_device": info.is_device,
-                    "is_distributed": info.is_distributed,
-                }
-
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
@@ -2717,7 +2617,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     tuple(getattr(operand.array, "shape", ()))
                     for operand in plan.input_specs
                 ],
-                operands=[operand_payload(operand) for operand in plan.input_specs],
+                operands=[self._profile_tensor_operand(operand) for operand in plan.input_specs],
                 input_dtypes=[
                     str(getattr(operand.array, "dtype", None))
                     for operand in plan.input_specs
@@ -3208,13 +3108,24 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @staticmethod
     def _profile_device(device):
-        return {
-            "kind": getattr(device, "kind", None),
-            "index": getattr(device, "index", None),
-            "local_rank": getattr(device, "local_rank", None),
-            "global_rank": getattr(device, "global_rank", None),
-            "visible_id": getattr(device, "visible_id", None),
-        }
+        from renormalizer.utils import profiling
+
+        return profiling.device_payload(device)
+
+    def _profile_tensor_operand(self, operand):
+        from renormalizer.utils import profiling
+
+        return profiling.array_operand_payload(
+            self,
+            operand.name,
+            operand.array,
+            operand.modes,
+        )
+
+    def _profile_array_operand(self, name, array, modes):
+        from renormalizer.utils import profiling
+
+        return profiling.array_operand_payload(self, name, array, modes)
 
     @classmethod
     def _profile_sharding(cls, sharding):
@@ -3277,31 +3188,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
             if not distributed_modes and output_state is not None:
                 distributed_modes = tuple(getattr(output_state, "distributed_modes", ()))
 
-            def operand_payload(index, operand):
-                info = self.array_info(operand)
-                return {
-                    "name": "operand{0}".format(index),
-                    "modes": [str(mode) for mode in input_modes[index]],
-                    "shape": info.shape,
-                    "dtype": str(info.dtype),
-                    "itemsize": info.itemsize,
-                    "size": info.size,
-                    "nbytes": info.nbytes,
-                    "ndim": info.ndim,
-                    "strides": info.strides,
-                    "order": info.order,
-                    "contiguous": info.contiguous,
-                    "writeable": info.writeable,
-                    "owns_data": info.owns_data,
-                    "backend": info.backend_name,
-                    "device": str(info.device),
-                    "device_kind": info.device.kind,
-                    "device_index": info.device.index,
-                    "is_host": info.is_host,
-                    "is_device": info.is_device,
-                    "is_distributed": info.is_distributed,
-                }
-
             profiling.record(
                 "contraction_plan",
                 backend=self.name,
@@ -3313,7 +3199,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 output_modes=[str(mode) for mode in output_modes],
                 input_shapes=[tuple(self._operand_global_shape(operand)) for operand in spec.operands],
                 operands=[
-                    operand_payload(index, operand)
+                    self._profile_array_operand(
+                        "operand{0}".format(index),
+                        operand,
+                        input_modes[index],
+                    )
                     for index, operand in enumerate(spec.operands)
                 ],
                 input_dtypes=[str(self._operand_dtype(operand)) for operand in spec.operands],
@@ -3430,31 +3320,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 distributed_modes = tuple(getattr(output_state, "distributed_modes", ()))
             input_modes, output_modes = parse_einsum_equation(spec.equation)
 
-            def operand_payload(index, operand):
-                info = self.array_info(operand)
-                return {
-                    "name": "operand{0}".format(index),
-                    "modes": [str(mode) for mode in input_modes[index]],
-                    "shape": info.shape,
-                    "dtype": str(info.dtype),
-                    "itemsize": info.itemsize,
-                    "size": info.size,
-                    "nbytes": info.nbytes,
-                    "ndim": info.ndim,
-                    "strides": info.strides,
-                    "order": info.order,
-                    "contiguous": info.contiguous,
-                    "writeable": info.writeable,
-                    "owns_data": info.owns_data,
-                    "backend": info.backend_name,
-                    "device": str(info.device),
-                    "device_kind": info.device.kind,
-                    "device_index": info.device.index,
-                    "is_host": info.is_host,
-                    "is_device": info.is_device,
-                    "is_distributed": info.is_distributed,
-                }
-
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
@@ -3466,7 +3331,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 output_modes=[str(mode) for mode in output_modes],
                 input_shapes=[tuple(self._operand_global_shape(operand)) for operand in spec.operands],
                 operands=[
-                    operand_payload(index, operand)
+                    self._profile_array_operand(
+                        "operand{0}".format(index),
+                        operand,
+                        input_modes[index],
+                    )
                     for index, operand in enumerate(spec.operands)
                 ],
                 input_dtypes=[str(self._operand_dtype(operand)) for operand in spec.operands],
@@ -3734,38 +3603,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     output_modes=spec.output_modes,
                 )
 
-                def operand_payload(operand):
-                    info = self.array_info(operand.array)
-                    return {
-                        "name": operand.name,
-                        "modes": [str(mode) for mode in operand.modes],
-                        "shape": info.shape,
-                        "dtype": str(info.dtype),
-                        "itemsize": info.itemsize,
-                        "size": info.size,
-                        "nbytes": info.nbytes,
-                        "ndim": info.ndim,
-                        "strides": info.strides,
-                        "order": info.order,
-                        "contiguous": info.contiguous,
-                        "writeable": info.writeable,
-                        "owns_data": info.owns_data,
-                        "backend": info.backend_name,
-                        "device": str(info.device),
-                        "device_kind": info.device.kind,
-                        "device_index": info.device.index,
-                        "is_host": info.is_host,
-                        "is_device": info.is_device,
-                        "is_distributed": info.is_distributed,
-                    }
-
                 profiling.record(
                     "contraction_plan",
                     backend=self.name,
                     equation=equation,
                     plan_hash=contraction_plan.plan_hash,
                     lowering=plan.kind,
-                    operands=[operand_payload(spec.left), operand_payload(spec.right)],
+                    operands=[
+                        self._profile_tensor_operand(spec.left),
+                        self._profile_tensor_operand(spec.right),
+                    ],
                     left_modes=[str(mode) for mode in spec.left.modes],
                     right_modes=[str(mode) for mode in spec.right.modes],
                     output_modes=[str(mode) for mode in spec.output_modes],
@@ -4608,30 +4455,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 return
             desc = plan.descs[0] if plan.descs else None
 
-            def operand_payload(array, modes):
-                info = self.array_info(array)
-                return {
-                    "modes": [str(mode) for mode in tuple(modes or ())],
-                    "shape": info.shape,
-                    "dtype": str(info.dtype),
-                    "itemsize": info.itemsize,
-                    "size": info.size,
-                    "nbytes": info.nbytes,
-                    "ndim": info.ndim,
-                    "strides": info.strides,
-                    "order": info.order,
-                    "contiguous": info.contiguous,
-                    "writeable": info.writeable,
-                    "owns_data": info.owns_data,
-                    "backend": info.backend_name,
-                    "device": str(info.device),
-                    "device_kind": info.device.kind,
-                    "device_index": info.device.index,
-                    "is_host": info.is_host,
-                    "is_device": info.is_device,
-                    "is_distributed": info.is_distributed,
-                }
-
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
@@ -4649,8 +4472,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     str(getattr(desc.B, "dtype", None)),
                 ] if desc is not None else [],
                 operands=[
-                    operand_payload(desc.A, input_modes[0] if input_modes else ()),
-                    operand_payload(desc.B, input_modes[1] if input_modes else ()),
+                    self._profile_array_operand(
+                        "operand0",
+                        desc.A,
+                        input_modes[0] if input_modes else (),
+                    ),
+                    self._profile_array_operand(
+                        "operand1",
+                        desc.B,
+                        input_modes[1] if input_modes else (),
+                    ),
                 ] if desc is not None else [],
                 output_shape=tuple(getattr(result, "shape", plan.output_shape)),
                 dtype=str(getattr(result, "dtype", None)),

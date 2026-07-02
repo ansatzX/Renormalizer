@@ -2388,6 +2388,8 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     assert execute["input_modes"] == [["i", "k"], ["k", "j"]]
     assert execute["output_modes"] == ["i", "j"]
     assert execute["input_dtypes"] == ["float64", "float64"]
+    assert execute["operands"][0]["name"] == "operand0"
+    assert execute["operands"][1]["name"] == "operand1"
     assert execute["operands"][0]["modes"] == ["i", "k"]
     assert execute["operands"][0]["shape"] == [2, 3]
     assert execute["operands"][0]["itemsize"] == left.itemsize
