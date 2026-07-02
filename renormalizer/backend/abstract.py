@@ -1042,6 +1042,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return tuple(operand.global_shape)
         return tuple(int(dim) for dim in getattr(operand, "shape", ()))
 
+    @staticmethod
+    def _operand_dtype(operand):
+        if isinstance(operand, DistributedTensor):
+            return getattr(operand, "dtype", None)
+        return getattr(operand, "dtype", None)
+
     def _operand_itemsize(self, operand):
         if isinstance(operand, DistributedTensor):
             size = self._prod_shape(operand.local_shape)
@@ -3205,6 +3211,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 lowering="distributed",
                 plan_hash=plan_hash,
                 input_shapes=[tuple(self._operand_global_shape(operand)) for operand in spec.operands],
+                input_dtypes=[str(self._operand_dtype(operand)) for operand in spec.operands],
                 output_shape=tuple(result.global_shape),
                 dtype=str(getattr(result, "dtype", None)),
                 device=str(self.current_device()),

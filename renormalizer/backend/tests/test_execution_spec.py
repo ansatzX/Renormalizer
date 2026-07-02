@@ -2811,6 +2811,7 @@ def test_distributed_contract_records_communication_profile(tmp_path):
     assert event["backend"] == "numpy"
     assert event["equation"] == "ik,kj->ij"
     assert event["lowering"] == "distributed"
+    assert event["input_dtypes"] == ["float64", "float64"]
     assert event["local_lowering"] == "gemm"
     assert event["num_gemm"] == 1
     assert event["num_batched_gemm"] == 0
