@@ -2888,9 +2888,9 @@ def test_estimate_redistribute_records_communication_cost():
 
     assert estimate.comm_bytes == 160
     assert estimate.copy_bytes == 160
-    assert estimate.peak_bytes == 160
-    assert estimate.comm_s == pytest.approx(2.25)
-    assert estimate.total_s == pytest.approx(2.25)
+    assert estimate.peak_bytes == 96
+    assert estimate.comm_s == pytest.approx(1.45)
+    assert estimate.total_s == pytest.approx(1.45)
 
 
 def test_communication_plan_message_count_contributes_latency():

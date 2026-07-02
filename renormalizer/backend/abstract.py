@@ -1354,13 +1354,35 @@ class AbstractBackend(SingleProcessDistributedMixin):
         )
 
     def estimate_redistribute(self, src, dst, tensor_shape, hw=None, *, itemsize=8):
+        hw = HardwareModel() if hw is None else hw
         nbytes = self._prod_shape(tensor_shape) * int(itemsize)
-        movement_bytes = 0 if src == dst else nbytes
-        return self._make_cost_estimate(
-            hw,
-            copy_bytes=movement_bytes,
-            comm_bytes=movement_bytes,
-            peak_bytes=movement_bytes,
+        movement_bytes = 0 if self._sharding_specs_equivalent(src, dst) else nbytes
+        src_local_bytes = (
+            self._local_nbytes_for_sharding(src, itemsize)
+            if isinstance(src, ShardingSpec)
+            else nbytes
+        )
+        dst_local_bytes = (
+            self._local_nbytes_for_sharding(dst, itemsize)
+            if isinstance(dst, ShardingSpec)
+            else nbytes
+        )
+        local_movement_bytes = 0 if movement_bytes == 0 else max(
+            int(src_local_bytes or nbytes),
+            int(dst_local_bytes or nbytes),
+        )
+        copy_s = self._rate_seconds(local_movement_bytes, self._hardware_copy_bandwidth(hw))
+        comm_s = self._rate_seconds(local_movement_bytes, self._hardware_comm_bandwidth(hw))
+        if local_movement_bytes and hw.latency_s:
+            comm_s += float(hw.latency_s)
+        total_s = copy_s + comm_s
+        return CostEstimate(
+            copy_bytes=int(movement_bytes),
+            comm_bytes=int(movement_bytes),
+            peak_bytes=int(local_movement_bytes),
+            copy_s=copy_s,
+            comm_s=comm_s,
+            total_s=total_s,
         )
 
     def _local_nbytes_for_sharding(self, sharding, itemsize):
