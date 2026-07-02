@@ -50,11 +50,11 @@ class NumpyBackend(AbstractBackend):
     def to_host(self, x, *, copy=CopyPolicy.IF_NEEDED):
         """Convert ``x`` to a host NumPy array."""
         copy = CopyPolicy.from_value(copy)
+        if copy is CopyPolicy.NEVER and not isinstance(x, np.ndarray):
+            raise BackendCopyError("to_host would require creating a NumPy array")
         result = self.to_numpy(x)
         if copy is CopyPolicy.ALWAYS:
             return np.array(result, copy=True)
-        if copy is CopyPolicy.NEVER and not isinstance(x, np.ndarray):
-            raise BackendCopyError("to_host would require creating a NumPy array")
         return result
 
     def to_backend(self, x, *, device=None, dtype=None, copy=CopyPolicy.IF_NEEDED):

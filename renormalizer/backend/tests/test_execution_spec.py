@@ -339,6 +339,27 @@ def test_numpy_copy_policy_rejects_required_copy_and_allows_explicit_copy():
         backend.to_backend([1.0, 2.0], copy=CopyPolicy.NEVER)
 
 
+def test_numpy_to_host_never_copy_policy_rejects_before_materializing_array_like():
+    from renormalizer.backend.execution import BackendCopyError, CopyPolicy
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class ArrayLike:
+        def __init__(self):
+            self.array_calls = 0
+
+        def __array__(self, dtype=None):
+            self.array_calls += 1
+            return np.asarray([1.0, 2.0], dtype=dtype)
+
+    backend = NumpyBackend()
+    source = ArrayLike()
+
+    with pytest.raises(BackendCopyError, match="to_host would require"):
+        backend.to_host(source, copy=CopyPolicy.NEVER)
+
+    assert source.array_calls == 0
+
+
 def test_numpy_layout_transform_api_tracks_view_and_contiguous_copy():
     from renormalizer.backend.execution import BackendCopyError
     from renormalizer.backend.numpy_backend import NumpyBackend
