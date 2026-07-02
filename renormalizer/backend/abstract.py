@@ -35,6 +35,7 @@ from renormalizer.backend.execution import (
     MatmulPlan,
     PairContractionSpec,
     ShardingSpec,
+    SlicedContractionPlan,
     StreamEvent,
     TensorOperand,
     Workspace,
@@ -1195,6 +1196,123 @@ class AbstractBackend(SingleProcessDistributedMixin):
             distributed_modes=distributed_modes,
         )
 
+    def _slice_shape_nbytes(self, shape, slices, itemsize):
+        local_shape = self._local_shape_for_slices(tuple(int(dim) for dim in shape), tuple(slices))
+        return self._prod_shape(local_shape) * int(itemsize or 0)
+
+    def _sliced_read_bytes(self, plan, operand_slices):
+        total = 0
+        for slices_for_step in operand_slices:
+            for operand, slices in zip(plan.input_specs, slices_for_step):
+                total += self._slice_shape_nbytes(
+                    self._operand_global_shape(operand.array),
+                    slices,
+                    self._operand_itemsize(operand.array),
+                )
+        return int(total)
+
+    def _build_output_slicing_plan(self, plan, *, memory_limit, peak):
+        if len(plan.steps) != 1 or len(plan.input_specs) != 2:
+            raise BackendFeatureError(
+                "slicing planner currently supports single-step two-operand contraction plans"
+            )
+        if not isinstance(plan.steps[0].plan, MatmulPlan):
+            raise BackendFeatureError(
+                "slicing planner currently supports dense MatmulPlan contractions"
+            )
+        output_shape = self._output_shape_for_contraction_plan(plan)
+        output_size = self._prod_shape(output_shape)
+        if output_size <= 0 or peak <= 0:
+            raise BackendFeatureError("cannot slice empty contraction output")
+        if memory_limit <= 0:
+            raise BackendFeatureError(
+                "memory_limit {0} bytes cannot hold one output slice from peak {1} bytes"
+                .format(memory_limit, peak)
+            )
+        candidates = sorted(
+            tuple(zip(plan.output_modes, output_shape)),
+            key=lambda item: (int(item[1]) >= 2, int(item[1])),
+            reverse=True,
+        )
+        for sliced_mode, mode_dim in candidates:
+            mode_dim = int(mode_dim)
+            if mode_dim <= 1:
+                continue
+            chunk = max(1, int(memory_limit) * mode_dim // int(peak))
+            chunk = min(mode_dim, chunk)
+            while chunk > 1 and ((int(peak) * chunk + mode_dim - 1) // mode_dim) > memory_limit:
+                chunk -= 1
+            if ((int(peak) * chunk + mode_dim - 1) // mode_dim) > memory_limit:
+                continue
+            output_axis = tuple(plan.output_modes).index(sliced_mode)
+            output_slices = []
+            operand_slices = []
+            max_slice_peak = 0
+            for start in range(0, mode_dim, chunk):
+                stop = min(mode_dim, start + chunk)
+                output_slice = [slice(None)] * len(output_shape)
+                output_slice[output_axis] = slice(start, stop)
+                output_slice = tuple(output_slice)
+                output_slices.append(output_slice)
+                slice_len = stop - start
+                max_slice_peak = max(
+                    max_slice_peak,
+                    (int(peak) * slice_len + mode_dim - 1) // mode_dim,
+                )
+                per_operand = []
+                for operand in plan.input_specs:
+                    slices = [slice(None)] * len(operand.modes)
+                    if sliced_mode in operand.modes:
+                        slices[tuple(operand.modes).index(sliced_mode)] = slice(start, stop)
+                    per_operand.append(tuple(slices))
+                operand_slices.append(tuple(per_operand))
+            estimated_peak = max(int(max_slice_peak), int(plan.required_workspace_bytes or 0))
+            if estimated_peak > memory_limit:
+                continue
+            sliced_plan = SlicedContractionPlan(
+                base_plan=plan,
+                sliced_mode=sliced_mode,
+                output_axis=output_axis,
+                output_slices=tuple(output_slices),
+                operand_slices=tuple(operand_slices),
+            )
+            base_step = plan.steps[0]
+            step = ContractionStep(
+                kind="slice",
+                inputs=base_step.inputs,
+                output=base_step.output,
+                input_modes=base_step.input_modes,
+                output_modes=base_step.output_modes,
+                plan=sliced_plan,
+                estimated_flops=plan.estimated_flops,
+                estimated_read_bytes=self._sliced_read_bytes(plan, tuple(operand_slices)),
+                estimated_write_bytes=plan.estimated_write_bytes,
+                estimated_copy_bytes=plan.estimated_copy_bytes,
+                estimated_peak_bytes=estimated_peak,
+                estimated_comm_bytes=plan.estimated_comm_bytes,
+                required_workspace_bytes=plan.required_workspace_bytes,
+                reason="slice output mode {0!r} to satisfy memory_limit {1}".format(sliced_mode, memory_limit),
+                fallback_reason=base_step.fallback_reason,
+            )
+            return ContractionPlan(
+                steps=(step,),
+                input_specs=plan.input_specs,
+                output_modes=plan.output_modes,
+                estimated_flops=plan.estimated_flops,
+                estimated_peak_bytes=estimated_peak,
+                estimated_read_bytes=step.estimated_read_bytes,
+                estimated_write_bytes=plan.estimated_write_bytes,
+                estimated_copy_bytes=plan.estimated_copy_bytes,
+                estimated_comm_bytes=plan.estimated_comm_bytes,
+                required_workspace_bytes=plan.required_workspace_bytes,
+                sliced_modes=(sliced_mode,),
+                distributed_modes=plan.distributed_modes,
+            )
+        raise BackendFeatureError(
+            "slicing planner could not satisfy memory_limit {0}; plan peak is {1} bytes"
+            .format(memory_limit, peak)
+        )
+
     def _enforce_plan_memory_limit(self, plan, *, memory_limit=None, allow_slicing=True):
         if memory_limit is None:
             return plan
@@ -1205,10 +1323,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if peak <= limit:
             return plan
         if allow_slicing:
-            raise BackendFeatureError(
-                "slicing planner is not implemented for memory_limit {0}; plan peak is {1} bytes"
-                .format(limit, peak)
-            )
+            return self._build_output_slicing_plan(plan, memory_limit=limit, peak=peak)
         raise BackendFeatureError(
             "memory_limit {0} bytes is below contraction plan peak {1} bytes"
             .format(limit, peak)
@@ -1922,6 +2037,29 @@ class AbstractBackend(SingleProcessDistributedMixin):
         )
         return self.distributed_contract(spec, plan=plan)
 
+    def _execute_sliced_contraction_plan(self, plan, *, stream=None, workspace=None):
+        base_plan = plan.base_plan
+        equation = self._einsum_equation_from_plan(base_plan)
+        output_shape = self._output_shape_for_contraction_plan(base_plan)
+        result = None
+        for output_slice, operand_slices in zip(plan.output_slices, plan.operand_slices):
+            operands = tuple(
+                operand.array[tuple(slices)]
+                for operand, slices in zip(base_plan.input_specs, operand_slices)
+            )
+            local_result = self._execute_local_contraction_plan(
+                equation,
+                operands,
+                stream=stream,
+                workspace=workspace,
+            )
+            if result is None:
+                result = self._zeros_backend(output_shape, getattr(local_result, "dtype", None))
+            result = self._slice_set(result, output_slice, local_result)
+        if result is None:
+            raise BackendFeatureError("sliced contraction plan has no slices to execute")
+        return result
+
     @staticmethod
     def _mode_token(mode):
         return str(mode)
@@ -1954,6 +2092,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     equation=equation,
                     input_modes=input_modes,
                     output_modes=output_modes,
+                )
+            if isinstance(inner_plan, SlicedContractionPlan):
+                return self._execute_sliced_contraction_plan(
+                    inner_plan,
+                    stream=stream,
+                    workspace=workspace,
                 )
             return self.execute(inner_plan, stream=stream, workspace=workspace)
         if isinstance(plan, MatmulPlan):

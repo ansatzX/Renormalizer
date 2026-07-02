@@ -2689,17 +2689,23 @@ def test_plan_contraction_rejects_plan_exceeding_memory_limit_without_slicing():
         backend.plan_contraction(spec, memory_limit=63, allow_slicing=False)
 
 
-def test_plan_contraction_does_not_silently_ignore_unsatisfied_slicing_limit():
-    from renormalizer.backend import BackendFeatureError
+def test_plan_contraction_slices_output_to_satisfy_memory_limit():
+    from renormalizer.backend import SlicedContractionPlan
     from renormalizer.backend.numpy_backend import NumpyBackend
 
     backend = NumpyBackend()
-    left = np.ones((2, 3), dtype=np.float64)
-    right = np.ones((3, 4), dtype=np.float64)
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
     spec = backend.parse_einsum("ik,kj->ij", left, right)
 
-    with pytest.raises(BackendFeatureError, match="slicing.*not implemented.*memory_limit.*63"):
-        backend.plan_contraction(spec, memory_limit=63, allow_slicing=True)
+    plan = backend.plan_contraction(spec, memory_limit=63, allow_slicing=True)
+
+    assert plan.sliced_modes
+    assert plan.estimated_peak_bytes <= 63
+    assert plan.steps[0].kind == "slice"
+    assert isinstance(plan.steps[0].plan, SlicedContractionPlan)
+    assert plan.steps[0].plan.base_plan.estimated_peak_bytes == 64
+    assert np.allclose(backend.execute(plan), left @ right)
 
 
 def test_plan_contraction_rejects_target_devices_without_distribution():

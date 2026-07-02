@@ -772,6 +772,24 @@ class ContractionPlan:
 
 
 @dataclass(frozen=True)
+class SlicedContractionPlan:
+    base_plan: ContractionPlan
+    sliced_mode: Hashable
+    output_axis: int
+    output_slices: tuple[tuple[slice, ...], ...]
+    operand_slices: tuple[tuple[tuple[slice, ...], ...], ...]
+
+    def __post_init__(self):
+        object.__setattr__(self, "output_axis", int(self.output_axis))
+        object.__setattr__(self, "output_slices", tuple(tuple(item) for item in self.output_slices))
+        object.__setattr__(
+            self,
+            "operand_slices",
+            tuple(tuple(tuple(slices) for slices in item) for item in self.operand_slices),
+        )
+
+
+@dataclass(frozen=True)
 class DistributedContractionSpec:
     equation: str
     operands: tuple[Any, ...]
