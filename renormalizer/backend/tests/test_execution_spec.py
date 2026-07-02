@@ -261,6 +261,19 @@ def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
         parse_device_spec("quantum:0")
 
 
+def test_device_spec_rejects_negative_device_metadata():
+    from renormalizer.backend.execution import DeviceSpec, parse_device_spec
+
+    with pytest.raises(ValueError, match="DeviceSpec index must be non-negative"):
+        DeviceSpec(kind="cuda", index=-1)
+    with pytest.raises(ValueError, match="DeviceSpec local_rank must be non-negative"):
+        DeviceSpec(kind="cuda", local_rank=-1)
+    with pytest.raises(ValueError, match="DeviceSpec global_rank must be non-negative"):
+        DeviceSpec(kind="cuda", global_rank=-1)
+    with pytest.raises(ValueError, match="DeviceSpec index must be non-negative"):
+        parse_device_spec("cuda:-1")
+
+
 def test_backend_config_keeps_legacy_device_kind_and_exposes_device_spec():
     from renormalizer.backend import BackendConfig
     from renormalizer.backend.execution import DeviceSpec, FallbackPolicy

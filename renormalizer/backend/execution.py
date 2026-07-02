@@ -63,6 +63,24 @@ class DeviceSpec:
     global_rank: int | None = None
     visible_id: str | None = None
 
+    def __post_init__(self):
+        kind = str(self.kind).lower()
+        index = None if self.index is None else int(self.index)
+        local_rank = None if self.local_rank is None else int(self.local_rank)
+        global_rank = None if self.global_rank is None else int(self.global_rank)
+        if index is not None and index < 0:
+            raise ValueError("DeviceSpec index must be non-negative")
+        if local_rank is not None and local_rank < 0:
+            raise ValueError("DeviceSpec local_rank must be non-negative")
+        if global_rank is not None and global_rank < 0:
+            raise ValueError("DeviceSpec global_rank must be non-negative")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "index", index)
+        object.__setattr__(self, "local_rank", local_rank)
+        object.__setattr__(self, "global_rank", global_rank)
+        if self.visible_id is not None:
+            object.__setattr__(self, "visible_id", str(self.visible_id))
+
 
 def parse_device_spec(device) -> DeviceSpec | None:
     if device is None:
