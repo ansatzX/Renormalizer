@@ -2251,6 +2251,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return (type(key).__name__, repr(key))
 
     @staticmethod
+    def _profile_block_key(key):
+        qn_left = getattr(key, "qn_left", None)
+        qn_right = getattr(key, "qn_right", None)
+        extra = getattr(key, "extra", None)
+        if qn_left is not None and qn_right is not None:
+            return {
+                "qn_left": list(qn_left),
+                "qn_right": list(qn_right),
+                "extra": list(extra or ()),
+            }
+        return {"repr": repr(key)}
+
+    @staticmethod
     def _is_zero_sized_block(block):
         shape = tuple(int(dim) for dim in getattr(block, "shape", getattr(block.array, "shape", ())))
         if shape:
@@ -2330,6 +2343,17 @@ class AbstractBackend(SingleProcessDistributedMixin):
         self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         if len(plan.tasks) != len(plan.output_blocks):
             raise ValueError("GroupedGemmPlan tasks and output_blocks must have the same length")
+        try:
+            from renormalizer.utils import profiling
+
+            should_profile = profiling.should_record_op()
+        except Exception:
+            profiling = None
+            should_profile = False
+        if should_profile:
+            import time
+
+            started = time.perf_counter()
         flat_outputs = {}
         task_groups = {}
         tasks = []
@@ -2372,13 +2396,58 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 modes=tuple(plan.output_modes),
                 shape=tuple(getattr(array, "shape", ())),
             )
-        return BlockTensor(
+        result = BlockTensor(
             blocks=blocks,
             global_shape=tuple(plan.global_shape),
             modes=tuple(plan.output_modes),
             block_axis_meta=plan.block_axis_meta,
             backend=self.name,
         )
+        if should_profile:
+            profiling.record(
+                "contraction_execute",
+                backend=self.name,
+                equation=None,
+                lowering="block_grouped_gemm",
+                input_shapes=[
+                    [tuple(getattr(desc.A, "shape", ())), tuple(getattr(desc.B, "shape", ()))]
+                    for desc in plan.tasks
+                ],
+                output_shape=tuple(result.global_shape),
+                dtype=str(getattr(next(iter(result.blocks.values())).array, "dtype", None)) if result.blocks else None,
+                device=str(self.current_device()),
+                flops=int(plan.estimated_flops),
+                read_bytes=int(plan.estimated_read_bytes),
+                write_bytes=int(plan.estimated_write_bytes),
+                copy_bytes=0,
+                workspace_bytes=int(plan.estimated_workspace_bytes),
+                largest_intermediate=max((self._array_nbytes(block.array) for block in result.blocks.values()), default=0),
+                num_gemm=0,
+                num_batched_gemm=0,
+                num_grouped_tasks=len(plan.tasks),
+                num_blocks=len(result.blocks),
+                num_shape_buckets=len(plan.bucketed_by_shape),
+                fallback_reason=None,
+                output_modes=[str(mode) for mode in plan.output_modes],
+                global_shape=tuple(result.global_shape),
+                scatter_add_required=bool(plan.scatter_add_required),
+                output_block_keys=[self._profile_block_key(key) for key in plan.output_blocks],
+                unique_output_block_keys=[
+                    self._profile_block_key(key)
+                    for key, _block in sorted(result.blocks.items(), key=self._block_sort_key)
+                ],
+                result_block_shapes=[
+                    {
+                        **self._profile_block_key(key),
+                        "shape": tuple(block.shape),
+                    }
+                    for key, block in sorted(result.blocks.items(), key=self._block_sort_key)
+                ],
+                bucket_task_counts=[len(indices) for indices in plan.bucketed_by_shape.values()],
+                pack_threshold=pack_threshold,
+                wall_s=time.perf_counter() - started,
+            )
+        return result
 
     def _desc_mode_groups(self, desc):
         if desc.layout_a is None or desc.layout_b is None or desc.layout_c is None:

@@ -914,6 +914,78 @@ def test_execute_grouped_gemm_plan_accumulates_sparse_output_blocks():
     assert result.blocks[out_key].shape == (2, 4)
 
 
+def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
+    from renormalizer.backend import (
+        BlockContractionSpec,
+        BlockKey,
+        BlockTensor,
+        DenseBlock,
+    )
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    event_path = tmp_path / "events.jsonl"
+    out_key = BlockKey((0,), (1,))
+    left_blocks = {
+        BlockKey((0,), (0,)): DenseBlock(BlockKey((0,), (0,)), np.ones((2, 3)), ("i", "k"), (2, 3)),
+        BlockKey((0,), (2,)): DenseBlock(BlockKey((0,), (2,)), np.full((2, 3), 2.0), ("i", "k"), (2, 3)),
+    }
+    right_blocks = {
+        BlockKey((0,), (1,)): DenseBlock(BlockKey((0,), (1,)), np.full((3, 4), 3.0), ("k", "j"), (3, 4)),
+        BlockKey((2,), (1,)): DenseBlock(BlockKey((2,), (1,)), np.ones((3, 4)), ("k", "j"), (3, 4)),
+    }
+    spec = BlockContractionSpec(
+        BlockTensor(left_blocks, global_shape=(2, 3), modes=("i", "k"), block_axis_meta=None, backend="numpy"),
+        BlockTensor(right_blocks, global_shape=(3, 4), modes=("k", "j"), block_axis_meta=None, backend="numpy"),
+        output_modes=("i", "j"),
+        qn_rule=lambda left_key, right_key: (
+            BlockKey(left_key.qn_left, right_key.qn_right)
+            if left_key.qn_right == right_key.qn_left
+            else None
+        ),
+    )
+    plan = backend.lower_block_contraction(spec)
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = backend.execute_grouped_gemm_plan(plan, pack_threshold=2)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert tuple(result.blocks) == (out_key,)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(payload for payload in payloads if payload.get("lowering") == "block_grouped_gemm")
+    assert event["backend"] == "numpy"
+    assert event["output_modes"] == ["i", "j"]
+    assert event["global_shape"] == [2, 4]
+    assert event["num_grouped_tasks"] == 2
+    assert event["num_blocks"] == 1
+    assert event["num_shape_buckets"] == 1
+    assert event["scatter_add_required"] is True
+    assert event["output_block_keys"] == [
+        {"extra": [], "qn_left": [0], "qn_right": [1]},
+        {"extra": [], "qn_left": [0], "qn_right": [1]},
+    ]
+    assert event["unique_output_block_keys"] == [
+        {"extra": [], "qn_left": [0], "qn_right": [1]},
+    ]
+    assert event["result_block_shapes"] == [{"extra": [], "qn_left": [0], "qn_right": [1], "shape": [2, 4]}]
+    assert event["fallback_reason"] is None
+    assert event["wall_s"] >= 0.0
+
+
 def test_torch_block_contraction_lowering_accepts_tensor_size_method_when_available():
     from renormalizer.backend import (
         BlockContractionSpec,
