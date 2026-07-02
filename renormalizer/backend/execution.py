@@ -1170,6 +1170,15 @@ class CommunicationPlan:
 
 @dataclass(frozen=True)
 class DistributedStepPlan:
+    VALID_KINDS = frozenset((
+        "activate_distribution",
+        "keep_distribution",
+        "redistribute",
+        "distributed_contract",
+        "gather",
+        "replicate",
+    ))
+
     local_step: ContractionStep
     input_states: tuple[DistributionState, ...]
     output_sharding: ShardingSpec | None
@@ -1179,6 +1188,19 @@ class DistributedStepPlan:
     estimated_comm_s: float = 0.0
     estimated_total_s: float = 0.0
     kind: str = "distributed_contract"
+
+    def __post_init__(self):
+        kind = str(self.kind)
+        if kind not in self.VALID_KINDS:
+            raise ValueError("Unknown DistributedStepPlan kind {0!r}".format(self.kind))
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "input_states", tuple(self.input_states))
+        object.__setattr__(self, "communication", tuple(self.communication))
+        for field in ("estimated_compute_s", "estimated_comm_s", "estimated_total_s"):
+            value = float(getattr(self, field))
+            if value < 0:
+                raise ValueError("DistributedStepPlan {0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
 
     @property
     def local_contraction_plan(self):
@@ -1204,6 +1226,27 @@ class DistributedContractionPlan:
     total_redistribute_bytes: int = 0
     total_allreduce_bytes: int = 0
     total_gather_bytes: int = 0
+
+    def __post_init__(self):
+        steps = tuple(self.steps)
+        if not steps:
+            raise ValueError("DistributedContractionPlan steps must be non-empty")
+        object.__setattr__(self, "steps", steps)
+        if self.equation is not None:
+            object.__setattr__(self, "equation", str(self.equation))
+        for field in (
+            "estimated_comm_bytes",
+            "peak_local_bytes",
+            "total_flops",
+            "total_comm_bytes",
+            "total_redistribute_bytes",
+            "total_allreduce_bytes",
+            "total_gather_bytes",
+        ):
+            value = int(getattr(self, field))
+            if value < 0:
+                raise ValueError("DistributedContractionPlan {0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
 
 
 @dataclass(frozen=True)

@@ -3986,6 +3986,112 @@ def test_distribution_state_rejects_inconsistent_mode_and_sharding_metadata():
         DistributionState(**{**kwargs, "distributed_modes": (), "replicated_modes": ("i", "j")})
 
 
+def _valid_distributed_step_plan_kwargs():
+    from renormalizer.backend import ContractionStep, DistributionState
+
+    left = DistributionState(
+        operand_index=0,
+        tensor_id=0,
+        modes=("i", "k"),
+        sharding=None,
+        shape=(2, 3),
+        distributed_modes=(),
+        replicated_modes=("i", "k"),
+        local_shape=(2, 3),
+        local_nbytes=48,
+    )
+    right = DistributionState(
+        operand_index=1,
+        tensor_id=1,
+        modes=("k", "j"),
+        sharding=None,
+        shape=(3, 4),
+        distributed_modes=(),
+        replicated_modes=("k", "j"),
+        local_shape=(3, 4),
+        local_nbytes=96,
+    )
+    output = DistributionState(
+        operand_index=2,
+        tensor_id=2,
+        modes=("i", "j"),
+        sharding=None,
+        shape=(2, 4),
+        distributed_modes=(),
+        replicated_modes=("i", "j"),
+        local_shape=(2, 4),
+        local_nbytes=64,
+    )
+    return {
+        "local_step": ContractionStep(**_valid_contraction_step_kwargs()),
+        "input_states": (left, right),
+        "output_sharding": None,
+        "output_state": output,
+    }
+
+
+def test_distributed_step_plan_rejects_unknown_kind():
+    from renormalizer.backend import DistributedStepPlan
+
+    kwargs = _valid_distributed_step_plan_kwargs()
+
+    with pytest.raises(ValueError, match="Unknown DistributedStepPlan kind"):
+        DistributedStepPlan(**{**kwargs, "kind": "mystery"})
+
+
+@pytest.mark.parametrize("field", ["estimated_compute_s", "estimated_comm_s", "estimated_total_s"])
+def test_distributed_step_plan_rejects_negative_estimates(field):
+    from renormalizer.backend import DistributedStepPlan
+
+    kwargs = _valid_distributed_step_plan_kwargs()
+    kwargs[field] = -1
+
+    with pytest.raises(ValueError, match="DistributedStepPlan {0} must be non-negative".format(field)):
+        DistributedStepPlan(**kwargs)
+
+
+def _valid_distributed_contraction_plan_kwargs():
+    from renormalizer.backend import ContractionPlan, DistributedStepPlan
+
+    return {
+        "path": ContractionPlan(**_valid_contraction_plan_kwargs()),
+        "steps": (DistributedStepPlan(**_valid_distributed_step_plan_kwargs()),),
+        "output_sharding": None,
+    }
+
+
+def test_distributed_contraction_plan_rejects_empty_steps():
+    from renormalizer.backend import DistributedContractionPlan
+
+    kwargs = _valid_distributed_contraction_plan_kwargs()
+    kwargs["steps"] = ()
+
+    with pytest.raises(ValueError, match="DistributedContractionPlan steps must be non-empty"):
+        DistributedContractionPlan(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "estimated_comm_bytes",
+        "peak_local_bytes",
+        "total_flops",
+        "total_comm_bytes",
+        "total_redistribute_bytes",
+        "total_allreduce_bytes",
+        "total_gather_bytes",
+    ],
+)
+def test_distributed_contraction_plan_rejects_negative_estimates(field):
+    from renormalizer.backend import DistributedContractionPlan
+
+    kwargs = _valid_distributed_contraction_plan_kwargs()
+    kwargs[field] = -1
+
+    with pytest.raises(ValueError, match="DistributedContractionPlan {0} must be non-negative".format(field)):
+        DistributedContractionPlan(**kwargs)
+
+
 def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionPlan, HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend
