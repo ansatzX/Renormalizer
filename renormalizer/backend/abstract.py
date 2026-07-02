@@ -30,6 +30,7 @@ from renormalizer.backend.execution import (
     DenseBlock,
     GroupedGemmPlan,
     HardwareModel,
+    LayoutSpec,
     MatmulDesc,
     MatmulPlan,
     PairContractionSpec,
@@ -463,6 +464,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return array_info_for_backend(self, x, self._device_spec_for_array(x))
 
     def layout(self, x: Any):
+        if self.is_distributed_array(x):
+            local_layout = layout_from_array(x.local_array, x.modes)
+            return LayoutSpec(
+                logical_shape=tuple(x.global_shape),
+                physical_shape=tuple(x.local_shape),
+                logical_modes=tuple(x.modes),
+                strides=local_layout.strides,
+                order="distributed",
+                contiguous_groups=local_layout.contiguous_groups,
+                requires_transpose=local_layout.requires_transpose,
+                transpose_perm=local_layout.transpose_perm,
+                estimated_copy_bytes=local_layout.estimated_copy_bytes,
+            )
         return layout_from_array(x)
 
     def permute(self, x: Any, perm, *, copy_policy=CopyPolicy.IF_NEEDED):

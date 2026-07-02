@@ -439,6 +439,38 @@ def test_distributed_tensor_is_backend_array_and_reports_distributed_info():
     assert info.nbytes == distributed.local_nbytes
 
 
+def test_distributed_tensor_layout_reports_logical_and_local_physical_shape():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    x = np.arange(12, dtype=np.float64).reshape(4, 3)
+    sharding = ShardingSpec(
+        global_shape=x.shape,
+        modes=("i", "j"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+
+    distributed = backend.shard_tensor(x, sharding)
+    layout = backend.layout(distributed)
+
+    assert layout.logical_shape == x.shape
+    assert layout.physical_shape == distributed.local_shape
+    assert layout.logical_modes == ("i", "j")
+    assert layout.order == "distributed"
+    assert layout.estimated_copy_bytes == 0
+
+
 def test_distributed_capabilities_advertise_collective_primitives():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
