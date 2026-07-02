@@ -1186,8 +1186,8 @@ def test_grouped_gemm_profile_records_one_input_shape_pair_per_task(tmp_path):
     }
 
 
-def test_torch_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
-    from renormalizer.backend import BackendConfig, BackendFeatureError
+def test_torch_grouped_gemm_uses_backend_bucketed_primitive_when_available():
+    from renormalizer.backend import BackendConfig
     from renormalizer.backend.factory import create_backend, is_backend_available
     from renormalizer.backend.gemm import GemmTask
 
@@ -1204,8 +1204,8 @@ def test_torch_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
 
     results = backend.grouped_gemm(tasks, pack_threshold=2)
 
-    assert backend.supports_grouped_gemm is False
-    assert backend.capabilities.grouped_gemm is False
+    assert backend.supports_grouped_gemm is True
+    assert backend.capabilities.grouped_gemm is True
     assert [tuple(result.shape) for result in results] == [(4, 4), (4, 4)]
     assert np.allclose(backend.to_numpy(results[0]), a_np[0] @ b_np[0])
     assert np.allclose(backend.to_numpy(results[1]), a_np[1] @ b_np[1])
@@ -1215,8 +1215,9 @@ def test_torch_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
         GemmTask(strict_backend.to_backend(a_np[index]), strict_backend.to_backend(b_np[index]), tag=index)
         for index in range(2)
     ]
-    with pytest.raises(BackendFeatureError, match="native grouped_gemm unavailable"):
-        strict_backend.grouped_gemm(strict_tasks, pack_threshold=2)
+    strict_results = strict_backend.grouped_gemm(strict_tasks, pack_threshold=2)
+    assert np.allclose(strict_backend.to_numpy(strict_results[0]), a_np[0] @ b_np[0])
+    assert np.allclose(strict_backend.to_numpy(strict_results[1]), a_np[1] @ b_np[1])
 
 
 def test_torch_contraction_execute_supports_full_axis_permutation_when_available():
@@ -1262,8 +1263,8 @@ def test_torch_array_info_and_layout_report_contiguous_strides_when_available():
     assert layout.contiguous_groups == ((0, 1),)
 
 
-def test_cupy_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
-    from renormalizer.backend import BackendConfig, BackendFeatureError
+def test_cupy_grouped_gemm_uses_backend_bucketed_primitive_when_available():
+    from renormalizer.backend import BackendConfig
     from renormalizer.backend.factory import create_backend, is_backend_available
     from renormalizer.backend.gemm import GemmTask
 
@@ -1283,8 +1284,8 @@ def test_cupy_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
 
     results = backend.grouped_gemm(tasks, pack_threshold=2)
 
-    assert backend.supports_grouped_gemm is False
-    assert backend.capabilities.grouped_gemm is False
+    assert backend.supports_grouped_gemm is True
+    assert backend.capabilities.grouped_gemm is True
     assert [tuple(result.shape) for result in results] == [(4, 4), (4, 4)]
     assert np.allclose(backend.to_numpy(results[0]), a_np[0] @ b_np[0])
     assert np.allclose(backend.to_numpy(results[1]), a_np[1] @ b_np[1])
@@ -1294,8 +1295,9 @@ def test_cupy_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
         GemmTask(strict_backend.to_backend(a_np[index]), strict_backend.to_backend(b_np[index]), tag=index)
         for index in range(2)
     ]
-    with pytest.raises(BackendFeatureError, match="native grouped_gemm unavailable"):
-        strict_backend.grouped_gemm(strict_tasks, pack_threshold=2)
+    strict_results = strict_backend.grouped_gemm(strict_tasks, pack_threshold=2)
+    assert np.allclose(strict_backend.to_numpy(strict_results[0]), a_np[0] @ b_np[0])
+    assert np.allclose(strict_backend.to_numpy(strict_results[1]), a_np[1] @ b_np[1])
 
 
 def test_should_batch_uses_copy_to_flop_heuristic():

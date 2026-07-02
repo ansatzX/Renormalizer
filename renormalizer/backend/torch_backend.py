@@ -31,6 +31,7 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
     supports_device_index = True
     supports_streams = True
     supports_events = True
+    supports_grouped_gemm = True
 
     def __init__(self, config=None):
         if torch is None:
@@ -336,6 +337,14 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
 
     def tensordot(self, a, b, axes=2):
         return super().tensordot(a, b, axes=axes)
+
+    def grouped_gemm(self, tasks, *, pack_threshold=4, stream=None, workspace=None):
+        return super().grouped_gemm(
+            tasks,
+            pack_threshold=pack_threshold,
+            stream=stream,
+            workspace=workspace,
+        )
 
 
 class _TorchRandomProxy:

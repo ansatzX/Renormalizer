@@ -42,6 +42,7 @@ class CupyBackend(AbstractBackend):
     supports_streams = True
     supports_events = True
     supports_memory_pool = True
+    supports_grouped_gemm = True
     host_array_types = (np.ndarray,)
 
     def __init__(self, config=None):
@@ -234,3 +235,11 @@ class CupyBackend(AbstractBackend):
                 _cupy.cuda.Device(index).synchronize()
             return None
         return self.sync()
+
+    def grouped_gemm(self, tasks, *, pack_threshold=4, stream=None, workspace=None):
+        return super().grouped_gemm(
+            tasks,
+            pack_threshold=pack_threshold,
+            stream=stream,
+            workspace=workspace,
+        )
