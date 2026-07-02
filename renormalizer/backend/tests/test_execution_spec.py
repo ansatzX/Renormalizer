@@ -6,6 +6,45 @@ import numpy as np
 import pytest
 
 
+def test_backend_protocol_planning_and_execution_signatures_are_explicit():
+    import inspect
+
+    from renormalizer.backend.protocol import BackendProtocol
+
+    def assert_keyword_only(signature, name):
+        assert name in signature.parameters
+        assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+    plan_signature = inspect.signature(BackendProtocol.plan_contraction)
+    for name in (
+        "memory_limit",
+        "prefer",
+        "allow_slicing",
+        "allow_distribution",
+        "target_devices",
+    ):
+        assert_keyword_only(plan_signature, name)
+    assert not any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in plan_signature.parameters.values()
+    )
+
+    workspace_signature = inspect.signature(BackendProtocol.allocate_workspace)
+    assert_keyword_only(workspace_signature, "device")
+    assert not any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in workspace_signature.parameters.values()
+    )
+
+    execute_signature = inspect.signature(BackendProtocol.execute)
+    assert_keyword_only(execute_signature, "stream")
+    assert_keyword_only(execute_signature, "workspace")
+    assert not any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in execute_signature.parameters.values()
+    )
+
+
 def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
     from renormalizer.backend.execution import DeviceSpec, parse_device_spec
 

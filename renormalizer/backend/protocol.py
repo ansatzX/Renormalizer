@@ -378,7 +378,17 @@ class BackendProtocol(Protocol):
         """Plan an opt_einsum contraction path through the backend surface."""
         ...
 
-    def plan_contraction(self, spec: Any, **kwargs: Any) -> Any:
+    def plan_contraction(
+        self,
+        spec: Any,
+        *,
+        memory_limit: Any = None,
+        prefer: str = "balanced",
+        allow_slicing: bool = True,
+        allow_distribution: bool = False,
+        target_devices: Any = None,
+        record_profile: bool = True,
+    ) -> Any:
         """Plan an explicit contraction into backend execution steps."""
         ...
 
@@ -414,7 +424,7 @@ class BackendProtocol(Protocol):
         """Wait for a backend event from the given stream."""
         ...
 
-    def allocate_workspace(self, nbytes: int, **kwargs: Any) -> Any:
+    def allocate_workspace(self, nbytes: int, *, device: Any = None) -> Any:
         """Allocate a backend-resident workspace buffer."""
         ...
 
@@ -422,7 +432,7 @@ class BackendProtocol(Protocol):
         """Release a workspace buffer."""
         ...
 
-    def execute(self, plan: Any, **kwargs: Any) -> Any:
+    def execute(self, plan: Any, *, stream: Any = None, workspace: Any = None) -> Any:
         """Execute a backend plan through the unified plan executor."""
         ...
 
