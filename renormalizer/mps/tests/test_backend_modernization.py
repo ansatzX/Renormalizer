@@ -64,8 +64,15 @@ def test_matrix_stays_host_numpy_and_asxp_uses_backend_boundary():
 
     mat = Matrix([[1.0, 2.0], [3.0, 4.0]])
 
+    assert Matrix.is_legacy_host_container is True
+    assert Matrix.is_backend_execution_tensor is False
+    assert Matrix.execution_role == "legacy_host_container"
+    assert mat.is_legacy_host_container is True
+    assert mat.is_backend_execution_tensor is False
     assert isinstance(mat.array, np.ndarray)
     assert isinstance(asnumpy(mat), np.ndarray)
+    assert r.backend.is_host_array(mat.array)
+    assert not r.backend.is_array(mat)
 
     xp_array = asxp(mat)
     assert r.backend.is_array(xp_array)

@@ -38,6 +38,10 @@ def _to_numpy_dtype(dtype):
 
 
 class Matrix:
+    # Matrix is a legacy host-resident container; backend arrays are the hot-path execution tensors.
+    is_legacy_host_container = True
+    is_backend_execution_tensor = False
+    execution_role = "legacy_host_container"
 
     def __init__(self, array, dtype=None):
         assert array is not None
