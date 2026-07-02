@@ -1613,6 +1613,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             int(src_local_bytes or nbytes),
             int(dst_local_bytes or nbytes),
         )
+        self._validate_cost_model_peak_memory_limit(hw, local_movement_bytes)
         copy_s = self._rate_seconds(local_movement_bytes, self._hardware_copy_bandwidth(hw))
         comm_s = self._rate_seconds(local_movement_bytes, self._hardware_comm_bandwidth(hw))
         if local_movement_bytes and hw.latency_s:

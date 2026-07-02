@@ -3226,6 +3226,44 @@ def test_estimate_redistribute_records_communication_cost():
     assert estimate.total_s == pytest.approx(1.45)
 
 
+def test_estimate_redistribute_rejects_peak_memory_limit_violation():
+    from renormalizer.backend import BackendFeatureError, DeviceMesh, DeviceSpec, HardwareModel, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    row_spec = ShardingSpec(
+        global_shape=(5, 4),
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"row": 2},
+        mode_to_mesh_axis={"row": "rank"},
+    )
+    col_spec = ShardingSpec(
+        global_shape=(5, 4),
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"col": 2},
+        mode_to_mesh_axis={"col": "rank"},
+    )
+
+    with pytest.raises(BackendFeatureError, match="max_memory.*95.*peak.*96"):
+        backend.estimate_redistribute(
+            row_spec,
+            col_spec,
+            (5, 4),
+            HardwareModel(max_memory_bytes=95),
+            itemsize=8,
+        )
+
+
 def test_communication_plan_message_count_contributes_latency():
     from renormalizer.backend import CommunicationPlan, HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend
