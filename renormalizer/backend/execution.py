@@ -1065,14 +1065,62 @@ class DistributionState:
     local_nbytes: int = 0
 
     def __post_init__(self):
-        object.__setattr__(self, "operand_index", int(self.operand_index))
-        object.__setattr__(self, "tensor_id", int(self.operand_index) if self.tensor_id is None else int(self.tensor_id))
-        object.__setattr__(self, "modes", tuple(self.modes))
-        object.__setattr__(self, "shape", tuple(int(dim) for dim in self.shape))
-        object.__setattr__(self, "distributed_modes", tuple(self.distributed_modes))
-        object.__setattr__(self, "replicated_modes", tuple(self.replicated_modes))
-        object.__setattr__(self, "local_shape", tuple(int(dim) for dim in self.local_shape))
-        object.__setattr__(self, "local_nbytes", int(self.local_nbytes))
+        operand_index = int(self.operand_index)
+        tensor_id = int(operand_index) if self.tensor_id is None else int(self.tensor_id)
+        modes = tuple(self.modes)
+        shape = tuple(int(dim) for dim in self.shape)
+        distributed_modes = tuple(self.distributed_modes)
+        replicated_modes = tuple(self.replicated_modes)
+        local_shape = tuple(int(dim) for dim in self.local_shape)
+        local_nbytes = int(self.local_nbytes)
+
+        if operand_index < 0:
+            raise ValueError("DistributionState operand_index must be non-negative")
+        if tensor_id < 0:
+            raise ValueError("DistributionState tensor_id must be non-negative")
+        if any(dim < 0 for dim in shape):
+            raise ValueError("DistributionState shape dimensions must be non-negative")
+        if len(modes) != len(shape):
+            raise ValueError("DistributionState modes must match shape rank")
+        if any(dim < 0 for dim in local_shape):
+            raise ValueError("DistributionState local_shape dimensions must be non-negative")
+        if len(local_shape) != len(shape):
+            raise ValueError("DistributionState local_shape must match shape rank")
+        if local_nbytes < 0:
+            raise ValueError("DistributionState local_nbytes must be non-negative")
+
+        mode_set = set(modes)
+        if set(distributed_modes) - mode_set:
+            raise ValueError("DistributionState distributed_modes contain modes not present in modes")
+        if set(replicated_modes) - mode_set:
+            raise ValueError("DistributionState replicated_modes contain modes not present in modes")
+        if set(distributed_modes) & set(replicated_modes):
+            raise ValueError("DistributionState distributed_modes and replicated_modes must not overlap")
+        if set(distributed_modes) | set(replicated_modes) != mode_set:
+            raise ValueError("DistributionState distributed_modes and replicated_modes must cover all modes")
+
+        if self.sharding is not None:
+            if tuple(self.sharding.global_shape) != shape:
+                raise ValueError("DistributionState sharding global_shape must match shape")
+            if tuple(self.sharding.modes) != modes:
+                raise ValueError("DistributionState sharding modes must match modes")
+            expected_distributed = tuple(mode for mode in modes if mode in self.sharding.sharded_modes)
+            expected_replicated = tuple(mode for mode in modes if mode not in self.sharding.sharded_modes)
+            if distributed_modes != expected_distributed:
+                raise ValueError("DistributionState distributed_modes must match sharding sharded_modes")
+            if replicated_modes != expected_replicated:
+                raise ValueError("DistributionState replicated_modes must match sharding replicated_modes")
+        elif distributed_modes:
+            raise ValueError("DistributionState without sharding cannot have distributed_modes")
+
+        object.__setattr__(self, "operand_index", operand_index)
+        object.__setattr__(self, "tensor_id", tensor_id)
+        object.__setattr__(self, "modes", modes)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "distributed_modes", distributed_modes)
+        object.__setattr__(self, "replicated_modes", replicated_modes)
+        object.__setattr__(self, "local_shape", local_shape)
+        object.__setattr__(self, "local_nbytes", local_nbytes)
 
 
 @dataclass(frozen=True)

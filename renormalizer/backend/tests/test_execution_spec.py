@@ -3889,6 +3889,103 @@ def test_plan_distributed_contraction_path_uses_cost_model_memory_limit():
         )
 
 
+def _valid_distribution_state_kwargs():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    sharding = ShardingSpec(
+        global_shape=(4, 3),
+        modes=("i", "j"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    return {
+        "operand_index": 0,
+        "tensor_id": 0,
+        "modes": ("i", "j"),
+        "sharding": sharding,
+        "shape": (4, 3),
+        "distributed_modes": ("i",),
+        "replicated_modes": ("j",),
+        "local_shape": (2, 3),
+        "local_nbytes": 48,
+    }
+
+
+def test_distribution_state_rejects_invalid_identity_and_shape_metadata():
+    from renormalizer.backend import DistributionState
+
+    kwargs = _valid_distribution_state_kwargs()
+
+    with pytest.raises(ValueError, match="DistributionState operand_index must be non-negative"):
+        DistributionState(**{**kwargs, "operand_index": -1})
+
+    with pytest.raises(ValueError, match="DistributionState tensor_id must be non-negative"):
+        DistributionState(**{**kwargs, "tensor_id": -1})
+
+    with pytest.raises(ValueError, match="DistributionState shape dimensions must be non-negative"):
+        DistributionState(**{**kwargs, "shape": (-1, 3)})
+
+    with pytest.raises(ValueError, match="DistributionState modes must match shape rank"):
+        DistributionState(**{**kwargs, "modes": ("i",)})
+
+    with pytest.raises(ValueError, match="DistributionState local_shape dimensions must be non-negative"):
+        DistributionState(**{**kwargs, "local_shape": (-1, 3)})
+
+    with pytest.raises(ValueError, match="DistributionState local_shape must match shape rank"):
+        DistributionState(**{**kwargs, "local_shape": (2,)})
+
+    with pytest.raises(ValueError, match="DistributionState local_nbytes must be non-negative"):
+        DistributionState(**{**kwargs, "local_nbytes": -1})
+
+
+def test_distribution_state_rejects_inconsistent_mode_and_sharding_metadata():
+    from renormalizer.backend import DistributionState, ShardingSpec
+
+    kwargs = _valid_distribution_state_kwargs()
+
+    with pytest.raises(ValueError, match="DistributionState distributed_modes contain modes not present in modes"):
+        DistributionState(**{**kwargs, "distributed_modes": ("missing",)})
+
+    with pytest.raises(ValueError, match="DistributionState distributed_modes and replicated_modes must not overlap"):
+        DistributionState(**{**kwargs, "replicated_modes": ("i", "j")})
+
+    with pytest.raises(ValueError, match="DistributionState distributed_modes and replicated_modes must cover all modes"):
+        DistributionState(**{**kwargs, "replicated_modes": ()})
+
+    mesh = kwargs["sharding"].mesh
+    shape_mismatch = ShardingSpec(
+        global_shape=(5, 3),
+        modes=("i", "j"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    with pytest.raises(ValueError, match="DistributionState sharding global_shape must match shape"):
+        DistributionState(**{**kwargs, "sharding": shape_mismatch})
+
+    mode_mismatch = ShardingSpec(
+        global_shape=(4, 3),
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"row": 2},
+        mode_to_mesh_axis={"row": "rank"},
+    )
+    with pytest.raises(ValueError, match="DistributionState sharding modes must match modes"):
+        DistributionState(**{**kwargs, "sharding": mode_mismatch})
+
+    with pytest.raises(ValueError, match="DistributionState distributed_modes must match sharding sharded_modes"):
+        DistributionState(**{**kwargs, "distributed_modes": (), "replicated_modes": ("i", "j")})
+
+
 def test_plan_distributed_contraction_path_activates_distribution_for_dense_plan():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionPlan, HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend
