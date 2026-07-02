@@ -2533,6 +2533,15 @@ def test_grouped_gemm_plan_rejects_inconsistent_task_metadata():
     with pytest.raises(ValueError, match="GroupedGemmPlan bucket task indices out of range"):
         GroupedGemmPlan(**{**kwargs, "bucketed_by_shape": {(2, 4, 3): (1,)}})
 
+    with pytest.raises(ValueError, match="GroupedGemmPlan bucketed_by_shape must cover each task exactly once"):
+        GroupedGemmPlan(**{**kwargs, "bucketed_by_shape": {}})
+
+    with pytest.raises(ValueError, match="GroupedGemmPlan bucket shape must match task descriptor"):
+        GroupedGemmPlan(**{**kwargs, "bucketed_by_shape": {(2, 5, 3): (0,)}})
+
+    with pytest.raises(ValueError, match="GroupedGemmPlan bucketed_by_shape must cover each task exactly once"):
+        GroupedGemmPlan(**{**kwargs, "bucketed_by_shape": {(2, 4, 3): (0, 0)}})
+
     with pytest.raises(ValueError, match="GroupedGemmPlan output_modes must match global_shape rank"):
         GroupedGemmPlan(**{**kwargs, "output_modes": ("i",), "global_shape": (2, 4)})
 

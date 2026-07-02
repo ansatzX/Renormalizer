@@ -1737,6 +1737,17 @@ class GroupedGemmPlan:
                 raise ValueError("GroupedGemmPlan bucket shapes must be non-negative")
             if any(index < 0 or index >= len(tasks) for index in indices):
                 raise ValueError("GroupedGemmPlan bucket task indices out of range")
+            for index in indices:
+                task_shape = (tasks[index].m, tasks[index].n, tasks[index].k)
+                if shape != task_shape:
+                    raise ValueError("GroupedGemmPlan bucket shape must match task descriptor")
+        bucket_indices = [
+            index
+            for indices in bucketed.values()
+            for index in indices
+        ]
+        if sorted(bucket_indices) != list(range(len(tasks))):
+            raise ValueError("GroupedGemmPlan bucketed_by_shape must cover each task exactly once")
         object.__setattr__(self, "tasks", tasks)
         object.__setattr__(self, "output_blocks", output_blocks)
         object.__setattr__(self, "output_modes", output_modes)
