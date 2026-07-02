@@ -2973,6 +2973,89 @@ def test_distributed_contract_records_communication_profile(tmp_path):
     assert [(item.num_messages, item.block_size) for item in communications] == [(1, 48), (1, 96)]
 
 
+def test_distributed_contraction_plan_records_planner_profile_event(tmp_path):
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(15, dtype=np.float64).reshape(5, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    right_spec = ShardingSpec(
+        global_shape=right.shape,
+        modes=("k", "j"),
+        mesh=mesh,
+        ranks_per_mode={"j": 2},
+        mode_to_mesh_axis={"j": "rank"},
+    )
+    contract_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(backend.shard_tensor(left, left_spec), backend.shard_tensor(right, right_spec)),
+    )
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        plan = backend.plan_contraction(contract_spec, allow_distribution=True)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    events = [
+        payload
+        for payload in payloads
+        if payload["event"] == "contraction_plan" and payload["lowering"] == "distributed"
+    ]
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["backend"] == "numpy"
+    assert event["equation"] == "ik,kj->ij"
+    assert event["plan_hash"] == plan.plan_hash
+    assert event["local_plan_hash"] == plan.steps[0].plan.path.plan_hash
+    assert event["input_modes"] == [["i", "k"], ["k", "j"]]
+    assert event["output_modes"] == ["i", "j"]
+    assert event["input_shapes"] == [[5, 3], [3, 4]]
+    assert event["output_shape"] == [5, 4]
+    assert event["input_dtypes"] == ["float64", "float64"]
+    assert event["operands"][0]["is_distributed"] is True
+    assert event["operands"][0]["device_kind"] == "distributed"
+    assert event["distributed_modes"] == ["i"]
+    assert event["local_lowering"] == "gemm"
+    assert event["comm_bytes"] == 256
+    assert event["communication"][0]["collective"] == "redistribute"
+    assert event["communication"][0]["bytes"] == 96
+    assert event["communication"][1]["collective"] == "gather"
+    assert event["communication"][1]["bytes"] == 160
+    assert event["input_states"][0]["distributed_modes"] == ["i"]
+    assert event["input_states"][1]["distributed_modes"] == ["j"]
+    assert event["output_state"]["distributed_modes"] == ["i"]
+
+
 def test_distributed_contract_profile_measures_reduce_scatter_wall_time(tmp_path):
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

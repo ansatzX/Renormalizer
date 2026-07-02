@@ -1449,7 +1449,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     reason=step.reason,
                     fallback_reason=step.fallback_reason,
                 )
-                return self._enforce_plan_memory_limit(ContractionPlan(
+                wrapped_plan = ContractionPlan(
                     steps=(step,),
                     input_specs=plan.input_specs,
                     output_modes=plan.output_modes,
@@ -1462,7 +1462,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     required_workspace_bytes=plan.required_workspace_bytes,
                     sliced_modes=plan.sliced_modes,
                     distributed_modes=active_distributed_modes,
-                ), memory_limit=memory_limit, allow_slicing=allow_slicing)
+                )
+                wrapped_plan = self._enforce_plan_memory_limit(
+                    wrapped_plan,
+                    memory_limit=memory_limit,
+                    allow_slicing=allow_slicing,
+                )
+                self._record_distributed_contraction_plan(spec, wrapped_plan)
+                return wrapped_plan
             return self._enforce_plan_memory_limit(plan, memory_limit=memory_limit, allow_slicing=allow_slicing)
         plan = self._plan_einsum_contraction(spec)
         if target_device_specs is not None:
@@ -1472,7 +1479,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 mesh,
                 memory_limit_per_device=memory_limit,
             )
-            return self._wrap_distributed_contraction_plan(plan, distributed_plan)
+            wrapped_plan = self._wrap_distributed_contraction_plan(plan, distributed_plan)
+            self._record_distributed_contraction_plan(
+                self._distributed_spec_from_plan(distributed_plan),
+                wrapped_plan,
+            )
+            return wrapped_plan
         plan = self._apply_contraction_plan_preference(
             plan,
             prefer=prefer,
@@ -3240,6 +3252,124 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "local_nbytes": int(state.local_nbytes),
             "sharding": cls._profile_sharding(state.sharding),
         }
+
+    def _record_distributed_contraction_plan(self, spec, plan):
+        try:
+            from renormalizer.utils import profiling
+
+            if not profiling.should_record_op():
+                return
+            distributed_plan = self._distributed_plan_from_contraction_plan(plan)
+            if distributed_plan is None:
+                return
+            distributed_step = distributed_plan.steps[0] if distributed_plan.steps else None
+            communication = distributed_step.communication if distributed_step is not None else ()
+            input_states = distributed_step.input_states if distributed_step is not None else ()
+            output_state = distributed_step.output_state if distributed_step is not None else None
+            local_profile = self._local_contraction_profile(
+                distributed_step.local_contraction_plan if distributed_step is not None else None,
+                distributed_step.local_step if distributed_step is not None else None,
+            )
+            input_modes, output_modes = parse_einsum_equation(spec.equation)
+            sizes = self._mode_sizes_from_equation(input_modes, spec.operands)
+            output_shape = self._output_shape_from_sizes(output_modes, sizes)
+            distributed_modes = tuple(getattr(plan, "distributed_modes", ()))
+            if not distributed_modes and output_state is not None:
+                distributed_modes = tuple(getattr(output_state, "distributed_modes", ()))
+
+            def operand_payload(index, operand):
+                info = self.array_info(operand)
+                return {
+                    "name": "operand{0}".format(index),
+                    "modes": [str(mode) for mode in input_modes[index]],
+                    "shape": info.shape,
+                    "dtype": str(info.dtype),
+                    "itemsize": info.itemsize,
+                    "size": info.size,
+                    "nbytes": info.nbytes,
+                    "ndim": info.ndim,
+                    "strides": info.strides,
+                    "order": info.order,
+                    "contiguous": info.contiguous,
+                    "writeable": info.writeable,
+                    "owns_data": info.owns_data,
+                    "backend": info.backend_name,
+                    "device": str(info.device),
+                    "device_kind": info.device.kind,
+                    "device_index": info.device.index,
+                    "is_host": info.is_host,
+                    "is_device": info.is_device,
+                    "is_distributed": info.is_distributed,
+                }
+
+            profiling.record(
+                "contraction_plan",
+                backend=self.name,
+                equation=spec.equation,
+                lowering="distributed",
+                plan_hash=plan.plan_hash,
+                local_plan_hash=distributed_plan.path.plan_hash,
+                input_modes=[[str(mode) for mode in modes] for modes in input_modes],
+                output_modes=[str(mode) for mode in output_modes],
+                input_shapes=[tuple(self._operand_global_shape(operand)) for operand in spec.operands],
+                operands=[
+                    operand_payload(index, operand)
+                    for index, operand in enumerate(spec.operands)
+                ],
+                input_dtypes=[str(self._operand_dtype(operand)) for operand in spec.operands],
+                output_shape=output_shape,
+                device=str(self.current_device()),
+                device_info=self._profile_device(self.current_device()),
+                flops=int(getattr(plan, "estimated_flops", 0)),
+                read_bytes=int(getattr(plan, "estimated_read_bytes", 0)),
+                write_bytes=int(getattr(plan, "estimated_write_bytes", 0)),
+                copy_bytes=int(getattr(plan, "estimated_copy_bytes", 0)),
+                workspace_bytes=int(getattr(plan, "required_workspace_bytes", 0)),
+                peak_bytes=int(getattr(plan, "estimated_peak_bytes", 0)),
+                local_lowering=local_profile["local_lowering"],
+                num_gemm=local_profile["num_gemm"],
+                num_batched_gemm=local_profile["num_batched_gemm"],
+                num_grouped_tasks=local_profile["num_grouped_tasks"],
+                num_blocks=local_profile["num_blocks"],
+                num_shape_buckets=local_profile["num_shape_buckets"],
+                local_flops=local_profile["local_flops"],
+                local_read_bytes=local_profile["local_read_bytes"],
+                local_write_bytes=local_profile["local_write_bytes"],
+                local_copy_bytes=local_profile["local_copy_bytes"],
+                local_workspace_bytes=local_profile["local_workspace_bytes"],
+                local_peak_bytes=local_profile["local_peak_bytes"],
+                fallback_reason=local_profile["fallback_reason"],
+                distributed_modes=[str(mode) for mode in distributed_modes],
+                distributed_step_kind=getattr(distributed_step, "kind", None),
+                estimated_compute_s=float(getattr(distributed_step, "estimated_compute_s", 0.0)),
+                estimated_comm_s=float(getattr(distributed_step, "estimated_comm_s", 0.0)),
+                estimated_total_s=float(getattr(distributed_step, "estimated_total_s", 0.0)),
+                input_states=[
+                    self._profile_distribution_state(state)
+                    for state in input_states
+                ],
+                output_state=self._profile_distribution_state(output_state),
+                communication=[
+                    {
+                        "collective": item.kind,
+                        "bytes": int(item.bytes),
+                        "local_bytes": int(getattr(item, "local_bytes", item.bytes)),
+                        "modes": [str(mode) for mode in item.modes],
+                        "num_messages": int(item.num_messages),
+                        "block_size": int(item.block_size),
+                    }
+                    for item in communication
+                ],
+                comm_bytes=int(
+                    distributed_plan.total_comm_bytes
+                    or distributed_plan.estimated_comm_bytes
+                ),
+                redistribute_bytes=int(distributed_plan.total_redistribute_bytes),
+                allreduce_bytes=int(distributed_plan.total_allreduce_bytes),
+                gather_bytes=int(distributed_plan.total_gather_bytes),
+            )
+        except Exception:
+            pass
 
     def _record_distributed_contraction_execute(self, spec, plan, result, wall_s, communication_timings=None):
         try:
