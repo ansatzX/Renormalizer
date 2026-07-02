@@ -38,7 +38,6 @@ class CupyBackend(AbstractBackend):
     memory_errors = (MemoryError,)
     opt_einsum_name = "cupy"
     supports_gpu = True
-    supports_grouped_gemm = True
     supports_streams = True
     supports_events = True
     host_array_types = (np.ndarray,)

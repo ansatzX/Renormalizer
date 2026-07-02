@@ -28,7 +28,6 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
     memory_errors = (MemoryError,)
     opt_einsum_name = "torch"
     supports_gpu = True
-    supports_grouped_gemm = True
     supports_streams = True
     supports_events = True
 

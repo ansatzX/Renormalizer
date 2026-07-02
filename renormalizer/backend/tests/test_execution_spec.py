@@ -982,15 +982,15 @@ def test_grouped_gemm_profile_records_one_input_shape_pair_per_task(tmp_path):
     ]
 
 
-def test_torch_grouped_gemm_is_backend_primitive_when_available():
-    from renormalizer.backend import BackendConfig
+def test_torch_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
+    from renormalizer.backend import BackendConfig, BackendFeatureError
     from renormalizer.backend.factory import create_backend, is_backend_available
     from renormalizer.backend.gemm import GemmTask
 
     if not is_backend_available("torch"):
         pytest.skip("torch unavailable")
 
-    backend = create_backend("torch", config=BackendConfig(device="cpu", fallback_policy="forbid"))
+    backend = create_backend("torch", config=BackendConfig(device="cpu", fallback_policy="record"))
     a_np = np.arange(2 * 4 * 4, dtype=np.float64).reshape(2, 4, 4)
     b_np = np.arange(2 * 4 * 4, dtype=np.float64).reshape(2, 4, 4)
     tasks = [
@@ -1000,11 +1000,19 @@ def test_torch_grouped_gemm_is_backend_primitive_when_available():
 
     results = backend.grouped_gemm(tasks, pack_threshold=2)
 
-    assert backend.supports_grouped_gemm is True
-    assert backend.capabilities.grouped_gemm is True
+    assert backend.supports_grouped_gemm is False
+    assert backend.capabilities.grouped_gemm is False
     assert [tuple(result.shape) for result in results] == [(4, 4), (4, 4)]
     assert np.allclose(backend.to_numpy(results[0]), a_np[0] @ b_np[0])
     assert np.allclose(backend.to_numpy(results[1]), a_np[1] @ b_np[1])
+
+    strict_backend = create_backend("torch", config=BackendConfig(device="cpu", fallback_policy="forbid"))
+    strict_tasks = [
+        GemmTask(strict_backend.to_backend(a_np[index]), strict_backend.to_backend(b_np[index]), tag=index)
+        for index in range(2)
+    ]
+    with pytest.raises(BackendFeatureError, match="native grouped_gemm unavailable"):
+        strict_backend.grouped_gemm(strict_tasks, pack_threshold=2)
 
 
 def test_torch_contraction_execute_supports_full_axis_permutation_when_available():

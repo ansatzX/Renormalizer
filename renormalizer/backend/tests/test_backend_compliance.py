@@ -400,6 +400,17 @@ def test_backend_compliance_grouped_gemm_fallback_policy(backend_name, device):
             backend.grouped_gemm([task])
 
 
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_grouped_gemm_capability_requires_native_override(backend_name, device):
+    from renormalizer.backend.abstract import AbstractBackend
+
+    backend = _backend_or_skip(backend_name, device)
+
+    if type(backend).grouped_gemm is AbstractBackend.grouped_gemm:
+        assert backend.capabilities.grouped_gemm is False
+        assert backend.supports_grouped_gemm is False
+
+
 def test_torch_backend_honors_indexed_cuda_device_when_available():
     try:
         import torch
