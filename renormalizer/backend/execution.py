@@ -447,18 +447,46 @@ class DistributedTensor:
     rank_local_arrays: dict[int, Any] | None = None
 
     def __post_init__(self):
-        self.global_shape = tuple(int(dim) for dim in self.global_shape)
-        self.modes = tuple(self.modes)
+        global_shape = tuple(int(dim) for dim in self.global_shape)
+        modes = tuple(self.modes)
+        if any(dim < 0 for dim in global_shape):
+            raise ValueError("DistributedTensor global_shape dimensions must be non-negative")
+        if len(modes) != len(global_shape):
+            raise ValueError("DistributedTensor modes must match global_shape rank")
+        if tuple(self.sharding.global_shape) != global_shape:
+            raise ValueError("DistributedTensor sharding global_shape must match global_shape")
+        if tuple(self.sharding.modes) != modes:
+            raise ValueError("DistributedTensor sharding modes must match modes")
+        if self.mesh != self.sharding.mesh:
+            raise ValueError("DistributedTensor mesh must match sharding mesh")
+        self.global_shape = global_shape
+        self.modes = modes
         if self.dtype is None:
             self.dtype = getattr(self.local_array, "dtype", None)
         if not self.local_shape:
-            self.local_shape = _shape_of(self.local_array)
+            local_shape = _shape_of(self.local_array)
         else:
-            self.local_shape = tuple(int(dim) for dim in self.local_shape)
+            local_shape = tuple(int(dim) for dim in self.local_shape)
+        if any(dim < 0 for dim in local_shape):
+            raise ValueError("DistributedTensor local_shape dimensions must be non-negative")
+        if len(local_shape) != len(global_shape):
+            raise ValueError("DistributedTensor local_shape must match global_shape rank")
+        self.local_shape = local_shape
         if not self.local_nbytes:
-            self.local_nbytes = _nbytes_of(self.local_array)
+            local_nbytes = _nbytes_of(self.local_array)
+        else:
+            local_nbytes = int(self.local_nbytes)
+        if local_nbytes < 0:
+            raise ValueError("DistributedTensor local_nbytes must be non-negative")
+        self.local_nbytes = local_nbytes
         if self.rank_local_arrays is not None:
-            self.rank_local_arrays = {int(rank): array for rank, array in self.rank_local_arrays.items()}
+            rank_local_arrays = {int(rank): array for rank, array in self.rank_local_arrays.items()}
+            unknown_ranks = set(rank_local_arrays) - set(self.sharding.local_slices)
+            if unknown_ranks:
+                raise ValueError(
+                    "DistributedTensor rank_local_arrays ranks must be present in sharding local_slices"
+                )
+            self.rank_local_arrays = rank_local_arrays
 
     @property
     def shape(self):

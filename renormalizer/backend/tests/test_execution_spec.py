@@ -891,6 +891,95 @@ def test_distributed_tensor_layout_reports_logical_and_local_physical_shape():
     assert layout.estimated_copy_bytes == 0
 
 
+def _valid_distributed_tensor_kwargs():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
+
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    sharding = ShardingSpec(
+        global_shape=(4, 3),
+        modes=("i", "j"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    return {
+        "local_array": np.arange(6, dtype=np.float64).reshape(2, 3),
+        "global_shape": (4, 3),
+        "modes": ("i", "j"),
+        "sharding": sharding,
+        "mesh": mesh,
+    }
+
+
+def test_distributed_tensor_rejects_inconsistent_global_metadata():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedTensor, ShardingSpec
+
+    kwargs = _valid_distributed_tensor_kwargs()
+
+    with pytest.raises(ValueError, match="DistributedTensor global_shape dimensions must be non-negative"):
+        DistributedTensor(**{**kwargs, "global_shape": (-1, 3)})
+
+    with pytest.raises(ValueError, match="DistributedTensor modes must match global_shape rank"):
+        DistributedTensor(**{**kwargs, "modes": ("i",)})
+
+    mesh = kwargs["mesh"]
+    shape_mismatch = ShardingSpec(
+        global_shape=(5, 3),
+        modes=("i", "j"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    with pytest.raises(ValueError, match="DistributedTensor sharding global_shape must match global_shape"):
+        DistributedTensor(**{**kwargs, "sharding": shape_mismatch})
+
+    mode_mismatch = ShardingSpec(
+        global_shape=(4, 3),
+        modes=("row", "col"),
+        mesh=mesh,
+        ranks_per_mode={"row": 2},
+        mode_to_mesh_axis={"row": "rank"},
+    )
+    with pytest.raises(ValueError, match="DistributedTensor sharding modes must match modes"):
+        DistributedTensor(**{**kwargs, "sharding": mode_mismatch})
+
+    other_mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="other",
+        local_rank=0,
+        global_rank=0,
+    )
+    with pytest.raises(ValueError, match="DistributedTensor mesh must match sharding mesh"):
+        DistributedTensor(**{**kwargs, "mesh": other_mesh})
+
+
+def test_distributed_tensor_rejects_invalid_local_metadata():
+    from renormalizer.backend import DistributedTensor
+
+    kwargs = _valid_distributed_tensor_kwargs()
+
+    with pytest.raises(ValueError, match="DistributedTensor local_shape dimensions must be non-negative"):
+        DistributedTensor(**{**kwargs, "local_shape": (-1, 3)})
+
+    with pytest.raises(ValueError, match="DistributedTensor local_shape must match global_shape rank"):
+        DistributedTensor(**{**kwargs, "local_shape": (2,)})
+
+    with pytest.raises(ValueError, match="DistributedTensor local_nbytes must be non-negative"):
+        DistributedTensor(**{**kwargs, "local_nbytes": -1})
+
+    with pytest.raises(ValueError, match="DistributedTensor rank_local_arrays ranks must be present in sharding local_slices"):
+        DistributedTensor(**{**kwargs, "rank_local_arrays": {2: np.zeros((2, 3))}})
+
+
 def test_distributed_capabilities_advertise_collective_primitives():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
