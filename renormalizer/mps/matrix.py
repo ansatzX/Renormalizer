@@ -241,7 +241,7 @@ def ones(shape, dtype=None):
 
 
 def einsum(subscripts, *operands):
-    return Matrix(np.einsum(subscripts, *[o.array for o in operands]))
+    return Matrix(backend.contract(subscripts, *[asxp(operand) for operand in operands]))
 
 
 def _normalized_tensordot_axes(axes, a_ndim, b_ndim):

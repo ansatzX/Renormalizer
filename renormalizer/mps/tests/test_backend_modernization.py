@@ -1649,6 +1649,30 @@ def test_matrix_contract_helpers_follow_backend_conversion_boundary():
     assert np.allclose(asnumpy(contracted), np.einsum("abc,cde->abde", left.array, right.array))
 
 
+def test_matrix_einsum_uses_backend_contract(monkeypatch):
+    from renormalizer.mps import matrix
+
+    current_backend = matrix.backend.current
+    original_contract = current_backend.contract
+    calls = []
+
+    def counting_contract(*args, **kwargs):
+        calls.append((args, dict(kwargs)))
+        return original_contract(*args, **kwargs)
+
+    monkeypatch.setattr(current_backend, "contract", counting_contract)
+    left = matrix.Matrix(np.arange(6.0).reshape(2, 3))
+    right = matrix.Matrix(np.arange(12.0).reshape(3, 4))
+
+    result = matrix.einsum("ik,kj->ij", left, right)
+
+    assert len(calls) == 1
+    assert calls[0][0][0] == "ik,kj->ij"
+    assert len(calls[0][0][1:]) == 2
+    assert isinstance(result, matrix.Matrix)
+    assert np.allclose(result.array, left.array @ right.array)
+
+
 def test_multi_tensor_contract_expands_legacy_implicit_output_axes():
     from renormalizer.mps.matrix import asnumpy, multi_tensor_contract
 
