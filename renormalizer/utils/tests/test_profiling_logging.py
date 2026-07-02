@@ -340,6 +340,8 @@ def test_tensordot_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch,
     assert not [payload for payload in log_payloads if payload["event"] == "tensordot"]
     event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "tensordot")
     assert event["input_shapes"] == [[2, 3], [3, 4]]
+    assert event["operand_array_types"] == ["numpy.ndarray", "numpy.ndarray"]
+    assert event["operand_array_backends"] == ["numpy", "numpy"]
     assert event["axes"] == [[1], [0]]
     assert event["output_shape"] == [2, 4]
     assert event["backend"] == "numpy"
