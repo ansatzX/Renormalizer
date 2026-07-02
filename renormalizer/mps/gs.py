@@ -497,6 +497,7 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
         nrhs=int(nrhs),
     )
     packed = asxp(x)
+    active_expr = expr if x.ndim == 1 else batched_expr
     if x.ndim == 1:
         cstruct = backend.unpack_masked_vectors(packed, spec)
         cout = expr(cstruct) * inverse
@@ -514,7 +515,7 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
         profiling.record(
             "contraction_execute",
             backend=backend.name,
-            equation=None,
+            equation=getattr(active_expr, "equation", None),
             lowering="batched_rhs_hop",
             input_shapes=[tuple(x.shape)],
             output_shape=tuple(result.shape),

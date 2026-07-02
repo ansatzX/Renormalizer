@@ -72,6 +72,7 @@ def oe_contract_expression(*args, **kwargs):
     update_kwargs(args, kwargs)
     expr = backend.contract_expression(*args, **kwargs)
     path_summary = None
+    equation = profiling.first_string(args)
 
     def expr_wrapped(matrix: xp.ndarray, *args2, **kwargs2):
         nonlocal path_summary
@@ -101,4 +102,5 @@ def oe_contract_expression(*args, **kwargs):
                 wall_s=time.perf_counter() - started,
             )
         return result
+    expr_wrapped.equation = equation
     return expr_wrapped

@@ -101,6 +101,8 @@ def test_apply_hop_to_packed_vectors_profiles_batched_rhs_execution(tmp_path):
     def batched_expr(struct):
         return struct + 1.0
 
+    batched_expr.equation = "abc,lbk,ckr->alr"
+
     try:
         init_log(PROFILING)
         profiling.register_event_output(event_path)
@@ -127,6 +129,7 @@ def test_apply_hop_to_packed_vectors_profiles_batched_rhs_execution(tmp_path):
     ]
     event = next(payload for payload in payloads if payload["event"] == "contraction_execute")
     assert event["backend"] == "numpy"
+    assert event["equation"] == "abc,lbk,ckr->alr"
     assert event["lowering"] == "batched_rhs_hop"
     assert event["input_shapes"] == [[3, 2]]
     assert event["output_shape"] == [3, 2]

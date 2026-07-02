@@ -47,6 +47,13 @@ def test_oe_contract_expression():
         )
 
 
+def test_oe_contract_expression_exposes_equation_metadata():
+    a = np.ones((2, 3))
+    expr = oe_contract_expression("ik,kj->ij", a, (3, 4), constants=[0])
+
+    assert expr.equation == "ik,kj->ij"
+
+
 def test_oe_contract_wrap_uses_active_backend_metadata():
     import renormalizer as r
     from renormalizer.mps import oe_contract_wrap
