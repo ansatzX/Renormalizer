@@ -104,6 +104,29 @@ def test_backend_compliance_tensor_ops_and_linalg(backend_name, device):
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_astype_copy_policy(backend_name, device):
+    from renormalizer.backend import BackendCopyError, CopyPolicy
+
+    backend = _backend_or_skip(backend_name, device)
+    x_np = np.array([1.0, 2.0], dtype=np.float64)
+    x = backend.to_backend(x_np)
+
+    same = backend.astype(x, backend.real_dtype, copy=CopyPolicy.NEVER)
+    copied = backend.astype(x, backend.real_dtype, copy=CopyPolicy.ALWAYS)
+
+    assert same is x
+    assert copied is not x
+    _assert_allclose(backend, copied, x_np)
+
+    with pytest.raises(BackendCopyError, match="astype would require"):
+        backend.astype(x, backend.complex_dtype, copy=CopyPolicy.NEVER)
+
+    converted = backend.astype(x, backend.complex_dtype)
+    assert np.issubdtype(backend.to_numpy(converted).dtype, np.complexfloating)
+    _assert_allclose(backend, converted, x_np.astype(np.complex128))
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
 def test_backend_compliance_profiling_execute_event(tmp_path, backend_name, device):
     from renormalizer.utils import profiling
     from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger

@@ -301,10 +301,26 @@ class AbstractBackend(SingleProcessDistributedMixin):
         a, b = self._promote_tensordot_operands(a, b)
         return xp.tensordot(a, b, axes)
 
+    @staticmethod
+    def _dtype_matches(actual, requested):
+        if requested is None:
+            return True
+        if actual == requested:
+            return True
+        try:
+            return _np.dtype(actual) == _np.dtype(requested)
+        except Exception:
+            return False
+
     def astype(self, x: Any, dtype, *, copy=CopyPolicy.IF_NEEDED):
         copy = CopyPolicy.from_value(copy)
-        if copy is CopyPolicy.NEVER and getattr(x, "dtype", None) != dtype:
+        dtype_matches = self._dtype_matches(getattr(x, "dtype", None), dtype)
+        if copy is CopyPolicy.NEVER and not dtype_matches:
             raise BackendCopyError("astype would require a copy")
+        if dtype_matches and copy is not CopyPolicy.ALWAYS:
+            return x
+        if copy is CopyPolicy.ALWAYS:
+            return self.array(x, dtype=dtype, copy=True)
         return self.asarray(x, dtype=dtype)
 
     def ascontiguousarray(self, x: Any, *, copy=CopyPolicy.IF_NEEDED):
