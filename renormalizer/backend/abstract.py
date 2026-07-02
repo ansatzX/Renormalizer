@@ -1468,6 +1468,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 .format(limit, workspace_bytes)
             )
 
+    @staticmethod
+    def _validate_cost_model_peak_memory_limit(hw, peak_bytes):
+        if hw is None or getattr(hw, "max_memory_bytes", None) is None:
+            return
+        limit = int(hw.max_memory_bytes)
+        peak_bytes = int(peak_bytes or 0)
+        if peak_bytes > limit:
+            raise BackendFeatureError(
+                "max_memory {0} bytes is below plan peak; requires {1} bytes"
+                .format(limit, peak_bytes)
+            )
+
     def _make_cost_estimate(
         self,
         hw,
@@ -1482,6 +1494,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
     ):
         hw = HardwareModel() if hw is None else hw
         self._validate_cost_model_workspace_limit(hw, workspace_bytes)
+        self._validate_cost_model_peak_memory_limit(hw, peak_bytes)
         compute_s = self._rate_seconds(flops, self._hardware_flop_rate(hw))
         memory_s = self._rate_seconds(read_bytes + write_bytes, self._hardware_memory_bandwidth(hw))
         copy_s = self._rate_seconds(copy_bytes, self._hardware_copy_bandwidth(hw))
@@ -1538,6 +1551,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         copy_bytes = sum(int(step.estimated_copy_bytes) for step in local_steps)
         workspace_bytes = max((int(step.required_workspace_bytes) for step in local_steps), default=0)
         self._validate_cost_model_workspace_limit(hw, workspace_bytes)
+        self._validate_cost_model_peak_memory_limit(hw, plan.peak_local_bytes)
         local_flops = sum(int(step.estimated_flops) for step in local_steps)
         communication = tuple(item for step in plan.steps for item in step.communication)
 
