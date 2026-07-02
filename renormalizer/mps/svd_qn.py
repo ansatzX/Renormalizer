@@ -246,6 +246,7 @@ def svd_qn(
                 blocks=blocks,
                 output_rank=int(u.shape[1]),
                 full_matrices=full_matrices,
+                **profiling.svd_qn_compute_payload("QR", coef_array, coef_matrix, blocks, (u, v)),
                 wall_s=time.perf_counter() - started,
             )
         return u, new_qnl, v, new_qnr
@@ -274,6 +275,7 @@ def svd_qn(
             output_rank=int(u.shape[1]),
             singular_value_count=int(len(su)),
             full_matrices=full_matrices,
+            **profiling.svd_qn_compute_payload("SVD", coef_array, coef_matrix, blocks, (u, su, v, sv)),
             wall_s=time.perf_counter() - started,
         )
     return u, su, new_qnl, v, sv, new_qnr

@@ -397,6 +397,18 @@ def test_tensordot_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch,
     assert event["operand_array_backends"] == ["numpy", "numpy"]
     assert event["axes"] == [[1], [0]]
     assert event["output_shape"] == [2, 4]
+    assert event["compute_class"] == "tensordot"
+    assert event["compute_subclass"] == "direct_tensordot"
+    assert event["m"] == 2
+    assert event["n"] == 4
+    assert event["k"] == 3
+    assert event["left_free_shape"] == [2]
+    assert event["right_free_shape"] == [4]
+    assert event["contracted_shape"] == [3]
+    assert event["equivalent_gemm"] is True
+    assert event["flops_estimate"] == 48
+    assert event["read_bytes"] == 2 * 3 * 8 + 3 * 4 * 8
+    assert event["write_bytes"] == 2 * 4 * 8
     assert event["backend"] == "numpy"
     assert event["wall_s"] >= 0
 
@@ -590,6 +602,13 @@ def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatc
     assert event["equation"] == "ab,bc->ac"
     assert event["input_shapes"] == [[2, 3], [3, 4]]
     assert event["output_shape"] == [2, 4]
+    assert event["compute_class"] == "oe"
+    assert event["compute_subclass"] == "oe_contract"
+    assert event["input_dtypes"] == ["float64", "float64"]
+    assert event["output_dtype"] == "float64"
+    assert event["flops_estimate"] >= 1
+    assert event["read_bytes"] == 2 * 3 * 8 + 3 * 4 * 8
+    assert event["write_bytes"] == 2 * 4 * 8
     assert event["optimize"] == "greedy"
     assert event["wall_s"] >= 0
 
@@ -616,6 +635,13 @@ def test_oe_contract_expression_records_path_summary_in_jsonl(caplog, tmp_path):
     assert result.shape == (2, 5)
     event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "oe_contract_expression")
     assert event["path"] == [[1, 2], [0, 1]]
+    assert event["compute_class"] == "oe"
+    assert event["compute_subclass"] == "oe_expression_execute"
+    assert event["input_dtypes"] == ["float64", "float64", "float64"]
+    assert event["output_dtype"] == "float64"
+    assert event["flops_estimate"] >= 1
+    assert event["read_bytes"] == 2 * 3 * 8 + 3 * 4 * 8 + 4 * 5 * 8
+    assert event["write_bytes"] == 2 * 5 * 8
     assert event["contraction_count"] == 2
     assert event["flop_count"] >= 1
     assert event["largest_intermediate"] >= 1
@@ -683,6 +709,13 @@ def test_svd_qn_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tm
     assert not [payload for payload in log_payloads if payload["event"] == "svd_qn"]
     event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "svd_qn")
     assert event["mode"] == "QR"
+    assert event["compute_class"] == "svd"
+    assert event["compute_subclass"] == "qr_qn"
+    assert event["input_dtype"] == "float64"
+    assert event["output_dtype"] == "float64"
+    assert event["read_bytes"] == 2 * 2 * 8
+    assert event["write_bytes"] >= 2 * 2 * 8
+    assert event["flops_estimate"] > 0
     assert event["system"] == "L"
     assert event["coef_shape"] == [2, 2]
     assert event["matrix_shape"] == [2, 2]

@@ -278,12 +278,11 @@ def tensordot(a: Union[Matrix, np.ndarray], b: Union[Matrix, np.ndarray, xp.ndar
         "tensordot",
         backend=backend.name,
         input_shapes=[tuple(a_arr.shape), tuple(b_arr.shape)],
-        input_dtypes=[str(getattr(a_arr, "dtype", None)), str(getattr(b_arr, "dtype", None))],
         operand_array_types=profiling.array_type_names((a_arr, b_arr)),
         operand_array_backends=profiling.array_backend_names((a_arr, b_arr)),
         axes=(left_axes, right_axes),
         output_shape=tuple(result.shape),
-        output_dtype=str(getattr(result, "dtype", None)),
+        **profiling.tensordot_compute_payload(a_arr, b_arr, axes, result),
         wall_s=time.perf_counter() - started,
     )
     return result

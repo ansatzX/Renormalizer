@@ -112,6 +112,74 @@ def array_backend_names(values):
     return [array_backend_name(value) for value in values if hasattr(value, "shape")]
 
 
+def array_dtype_names(values):
+    return [str(getattr(value, "dtype", None)) for value in values if hasattr(value, "shape")]
+
+
+def _prod(values):
+    result = 1
+    for value in values:
+        result *= int(value)
+    return int(result)
+
+
+def _normalize_axes(axes, left_ndim, right_ndim):
+    if isinstance(axes, int):
+        if axes < 0:
+            raise ValueError("tensordot axes must be non-negative when given as an integer")
+        left_axes = list(range(left_ndim - axes, left_ndim))
+        right_axes = list(range(axes))
+    else:
+        left_axes, right_axes = axes
+        if isinstance(left_axes, int):
+            left_axes = [left_axes]
+        else:
+            left_axes = list(left_axes)
+        if isinstance(right_axes, int):
+            right_axes = [right_axes]
+        else:
+            right_axes = list(right_axes)
+
+    def normalize(axis, ndim):
+        axis = int(axis)
+        return axis + ndim if axis < 0 else axis
+
+    return [normalize(axis, left_ndim) for axis in left_axes], [normalize(axis, right_ndim) for axis in right_axes]
+
+
+def tensordot_compute_payload(left, right, axes, result):
+    left_shape = tuple(int(dim) for dim in getattr(left, "shape", ()))
+    right_shape = tuple(int(dim) for dim in getattr(right, "shape", ()))
+    left_axes, right_axes = _normalize_axes(axes, len(left_shape), len(right_shape))
+    left_axis_set = set(left_axes)
+    right_axis_set = set(right_axes)
+    left_free_shape = tuple(dim for index, dim in enumerate(left_shape) if index not in left_axis_set)
+    right_free_shape = tuple(dim for index, dim in enumerate(right_shape) if index not in right_axis_set)
+    left_contract_shape = tuple(left_shape[index] for index in left_axes)
+    right_contract_shape = tuple(right_shape[index] for index in right_axes)
+    contracted_shape = left_contract_shape if left_contract_shape == right_contract_shape else ()
+    m = _prod(left_free_shape)
+    n = _prod(right_free_shape)
+    k = _prod(left_contract_shape) if left_contract_shape == right_contract_shape else 0
+    flops = 2 * m * n * k if k else 0
+    return {
+        "compute_class": "tensordot",
+        "compute_subclass": "direct_tensordot",
+        "input_dtypes": array_dtype_names((left, right)),
+        "output_dtype": str(getattr(result, "dtype", None)),
+        "left_free_shape": left_free_shape,
+        "right_free_shape": right_free_shape,
+        "contracted_shape": contracted_shape,
+        "m": int(m),
+        "n": int(n),
+        "k": int(k),
+        "equivalent_gemm": bool(k or left_contract_shape == right_contract_shape),
+        "flops_estimate": int(flops),
+        "read_bytes": array_total_bytes((left, right)),
+        "write_bytes": int(getattr(result, "nbytes", 0)),
+    }
+
+
 def device_payload(device):
     return {
         "kind": getattr(device, "kind", None),
@@ -293,6 +361,66 @@ def contract_expression_path_summary(contract_path, args, kwargs, expr):
     return summary
 
 
+def contract_path_summary(contract_path, args, kwargs):
+    summary = {
+        "path": [],
+        "contraction_count": 0,
+        "contraction_types": [],
+        "contraction_steps": [],
+        "flop_count": None,
+        "largest_intermediate": None,
+    }
+    if not args or not isinstance(args[0], str):
+        return summary
+
+    shapes = []
+    for operand in args[1:]:
+        shape = operand_shape(operand)
+        if shape is None:
+            return summary
+        shapes.append(shape)
+
+    path_kwargs = {"shapes": True, "optimize": kwargs.get("optimize")}
+    if "memory_limit" in kwargs:
+        path_kwargs["memory_limit"] = kwargs["memory_limit"]
+    try:
+        path, path_info = contract_path(args[0], *shapes, **path_kwargs)
+    except Exception:
+        return summary
+
+    contraction_list = getattr(path_info, "contraction_list", None) or []
+    summary["path"] = [[int(index) for index in item] for item in path]
+    summary["contraction_count"] = len(contraction_list)
+    summary["contraction_types"] = [
+        str(contraction[4])
+        for contraction in contraction_list
+        if len(contraction) > 4
+    ]
+    summary["flop_count"] = json_int(getattr(path_info, "opt_cost", None))
+    summary["largest_intermediate"] = json_int(getattr(path_info, "largest_intermediate", None))
+    summary["contraction_steps"] = _build_contraction_steps(
+        args[0],
+        shapes,
+        contraction_list,
+        summary["path"],
+        path_info,
+    )
+    return summary
+
+
+def oe_compute_payload(subclass, operands, result, path_summary=None):
+    path_summary = path_summary or {}
+    return {
+        "compute_class": "oe",
+        "compute_subclass": subclass,
+        "input_dtypes": array_dtype_names(operands),
+        "output_dtype": str(getattr(result, "dtype", None)),
+        "flops_estimate": json_int(path_summary.get("flop_count")) or 0,
+        "read_bytes": array_total_bytes(operands),
+        "write_bytes": int(getattr(result, "nbytes", 0)),
+    }
+
+
 def qn_to_profile_list(qn):
     if hasattr(qn, "tolist"):
         qn = qn.tolist()
@@ -314,6 +442,35 @@ def svd_qn_block_payload(nl, nr, lset, rset, block, rank):
         "right_size": int(len(rset)),
         "block_shape": tuple(block.shape),
         "rank": int(rank),
+    }
+
+
+def decomposition_flops_estimate(shape, mode):
+    if len(shape) != 2:
+        return 0
+    m, n = (int(shape[0]), int(shape[1]))
+    r = min(m, n)
+    if r <= 0:
+        return 0
+    if str(mode).upper() == "QR":
+        return int(max(0, 2 * m * n * r - (2 * r * r * r) // 3))
+    return int(4 * m * n * r + (8 * r * r * r) // 3)
+
+
+def svd_qn_compute_payload(mode, coef_array, coef_matrix, blocks, outputs):
+    block_flops = sum(
+        decomposition_flops_estimate(block.get("block_shape", ()), mode)
+        for block in (blocks or [])
+    )
+    output_arrays = tuple(array for array in outputs if hasattr(array, "shape"))
+    return {
+        "compute_class": "svd",
+        "compute_subclass": "qr_qn" if str(mode).upper() == "QR" else "svd_qn",
+        "input_dtype": str(getattr(coef_array, "dtype", None)),
+        "output_dtype": str(getattr(output_arrays[0], "dtype", None)) if output_arrays else None,
+        "flops_estimate": int(block_flops or decomposition_flops_estimate(getattr(coef_matrix, "shape", ()), mode)),
+        "read_bytes": int(getattr(coef_array, "nbytes", 0)),
+        "write_bytes": array_total_bytes(output_arrays),
     }
 
 

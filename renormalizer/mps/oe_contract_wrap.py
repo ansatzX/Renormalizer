@@ -54,6 +54,12 @@ def oe_contract(*args, **kwargs):
         log_error(e, args, kwargs)
         raise e
     if profile_enabled:
+        contract_path = getattr(backend, "contract_path", None)
+        path_summary = (
+            profiling.contract_path_summary(contract_path, args, kwargs)
+            if callable(contract_path)
+            else {}
+        )
         profiling.record(
             "oe_contract",
             backend=backend.name,
@@ -63,6 +69,8 @@ def oe_contract(*args, **kwargs):
             operand_array_backends=profiling.array_backend_names(args),
             output_shape=profiling.array_shape(result),
             optimize=kwargs.get("optimize"),
+            **path_summary,
+            **profiling.oe_compute_payload("oe_contract", args[1:], result, path_summary),
             wall_s=time.perf_counter() - started,
         )
     return result
@@ -100,6 +108,7 @@ def oe_contract_expression(*args, **kwargs):
                 output_shape=profiling.array_shape(result),
                 optimize=kwargs.get("optimize"),
                 **path_summary,
+                **profiling.oe_compute_payload("oe_expression_execute", profile_operands, result, path_summary),
                 wall_s=time.perf_counter() - started,
             )
         return result
