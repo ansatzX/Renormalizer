@@ -3532,6 +3532,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     write_bytes=sum(desc.estimated_write_bytes for desc in plan.descs),
                     copy_bytes=plan.copy_bytes,
                     workspace_bytes=plan.workspace_bytes,
+                    peak_bytes=sum(desc.estimated_write_bytes for desc in plan.descs) + plan.workspace_bytes,
                     num_gemm=1 if plan.kind == "gemm" else 0,
                     num_batched_gemm=1 if plan.kind in ("batched_gemm", "strided_batched_gemm") else 0,
                     num_grouped_tasks=0,

@@ -2375,6 +2375,7 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
 
     assert plan_event["equation"] == "ik,kj->ij"
     assert plan_event["plan_hash"] == plan.plan_hash
+    assert plan_event["peak_bytes"] == plan.estimated_peak_bytes
     assert execute["plan_hash"] == plan.plan_hash
     assert execute["equation"] == "ik,kj->ij"
     assert execute["input_modes"] == [["i", "k"], ["k", "j"]]
