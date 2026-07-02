@@ -2,6 +2,7 @@
 
 """CuPy backend — delegates to cupy if installed, raises clear error if not."""
 
+import contextlib
 import logging
 
 import numpy as np
@@ -136,6 +137,11 @@ class CupyBackend(AbstractBackend):
         token = event.token if isinstance(event, StreamEvent) else event
         stream.wait_event(token)
         return None
+
+    def _stream_context(self, stream):
+        if stream is None:
+            return contextlib.nullcontext()
+        return stream
 
     def _device_spec_for_array(self, x):
         if isinstance(x, _cupy.ndarray):

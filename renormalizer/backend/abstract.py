@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import contextlib
 import os
 from typing import Any
 
@@ -1347,6 +1348,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def wait_event(self, event, stream=None):
         return None
+
+    def _stream_context(self, stream):
+        return contextlib.nullcontext()
 
     def allocate_workspace(self, nbytes, *, device=None):
         nbytes = int(nbytes)
@@ -2696,6 +2700,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             conj_b=desc.conj_b,
             alpha=desc.alpha,
             beta=desc.beta,
+            stream=stream,
+            workspace=workspace,
         )
         return self._finalize_matmul_result(result, groups)
 
@@ -2717,20 +2723,21 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if B is None and self._is_matmul_desc(A):
             return self._execute_matmul_desc(A, stream=stream, workspace=workspace)
         xp = self.array_namespace or _np
-        return run_gemm_task(
-            GemmTask(
-                A,
-                B,
-                C=C,
-                trans_a=trans_a,
-                trans_b=trans_b,
-                conj_a=conj_a,
-                conj_b=conj_b,
-                alpha=alpha,
-                beta=beta,
-            ),
-            xp=xp,
-        )
+        with self._stream_context(stream):
+            return run_gemm_task(
+                GemmTask(
+                    A,
+                    B,
+                    C=C,
+                    trans_a=trans_a,
+                    trans_b=trans_b,
+                    conj_a=conj_a,
+                    conj_b=conj_b,
+                    alpha=alpha,
+                    beta=beta,
+                ),
+                xp=xp,
+            )
 
     def _execute_batched_matmul_desc(self, desc, *, stream=None, workspace=None):
         a, b, groups = self._prepare_matmul_desc(desc)
@@ -2744,6 +2751,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             conj_b=desc.conj_b,
             alpha=desc.alpha,
             beta=desc.beta,
+            stream=stream,
+            workspace=workspace,
         )
         return self._finalize_matmul_result(result, groups)
 
@@ -2765,38 +2774,40 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if B is None and self._is_matmul_desc(A):
             return self._execute_batched_matmul_desc(A, stream=stream, workspace=workspace)
         xp = self.array_namespace or _np
-        if conj_a:
-            A = xp.conj(A)
-        if conj_b:
-            B = xp.conj(B)
-        if trans_a:
-            A = xp.swapaxes(A, -1, -2)
-        if trans_b:
-            B = xp.swapaxes(B, -1, -2)
-        result = xp.matmul(A, B)
-        if alpha != 1.0:
-            result = alpha * result
-        if C is not None:
-            if beta != 0.0:
-                result = result + beta * C
-            C[...] = result
-            return C
-        return result
+        with self._stream_context(stream):
+            if conj_a:
+                A = xp.conj(A)
+            if conj_b:
+                B = xp.conj(B)
+            if trans_a:
+                A = xp.swapaxes(A, -1, -2)
+            if trans_b:
+                B = xp.swapaxes(B, -1, -2)
+            result = xp.matmul(A, B)
+            if alpha != 1.0:
+                result = alpha * result
+            if C is not None:
+                if beta != 0.0:
+                    result = result + beta * C
+                C[...] = result
+                return C
+            return result
 
     def _loop_matmul(self, desc, *, stream=None, workspace=None):
         xp = self.array_namespace or _np
         a, b, groups = self._prepare_matmul_desc(desc)
-        if desc.conj_a:
-            a = xp.conj(a)
-        if desc.conj_b:
-            b = xp.conj(b)
-        if desc.trans_a:
-            a = xp.swapaxes(a, -1, -2)
-        if desc.trans_b:
-            b = xp.swapaxes(b, -1, -2)
-        result = xp.matmul(a, b)
-        if desc.alpha != 1.0:
-            result = desc.alpha * result
+        with self._stream_context(stream):
+            if desc.conj_a:
+                a = xp.conj(a)
+            if desc.conj_b:
+                b = xp.conj(b)
+            if desc.trans_a:
+                a = xp.swapaxes(a, -1, -2)
+            if desc.trans_b:
+                b = xp.swapaxes(b, -1, -2)
+            result = xp.matmul(a, b)
+            if desc.alpha != 1.0:
+                result = desc.alpha * result
         return self._finalize_matmul_result(result, groups)
 
     def grouped_gemm(self, tasks, *, pack_threshold=4, stream=None, workspace=None):
@@ -2817,7 +2828,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             import time
 
             started = time.perf_counter()
-            result = grouped_gemm_bucketed(converted, xp=xp, pack_threshold=pack_threshold)
+            with self._stream_context(stream):
+                result = grouped_gemm_bucketed(converted, xp=xp, pack_threshold=pack_threshold)
             wall_s = time.perf_counter() - started
             try:
                 from renormalizer.utils import profiling
@@ -2857,7 +2869,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             except Exception:
                 pass
             return result
-        return grouped_gemm_bucketed(converted, xp=xp, pack_threshold=pack_threshold)
+        with self._stream_context(stream):
+            return grouped_gemm_bucketed(converted, xp=xp, pack_threshold=pack_threshold)
 
     def _handle_grouped_gemm_fallback(self):
         if self.supports_grouped_gemm:

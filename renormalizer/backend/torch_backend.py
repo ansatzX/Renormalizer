@@ -2,6 +2,8 @@
 
 """Optional PyTorch backend extension point."""
 
+import contextlib
+
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
@@ -147,6 +149,11 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
         token = event.token if isinstance(event, StreamEvent) else event
         stream.wait_event(token)
         return None
+
+    def _stream_context(self, stream):
+        if stream is None or self.device != "gpu" or not torch.cuda.is_available():
+            return contextlib.nullcontext()
+        return torch.cuda.stream(stream)
 
     def synchronize(self, device=None, stream=None):
         if self.device != "gpu" or not torch.cuda.is_available():

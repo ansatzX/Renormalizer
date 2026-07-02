@@ -1155,6 +1155,60 @@ def test_execute_batched_matmul_plan_preserves_generic_output_mode_order():
     assert np.allclose(result, expected)
 
 
+def test_gemm_primitives_execute_inside_backend_stream_context():
+    from contextlib import contextmanager
+
+    from renormalizer.backend import GemmTask
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class StreamCheckingNamespace:
+        def __init__(self, base, backend):
+            self._base = base
+            self._backend = backend
+
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+        def matmul(self, left, right):
+            assert self._backend._inside_stream_context
+            return self._base.matmul(left, right)
+
+    class StreamAwareNumpyBackend(NumpyBackend):
+        def __init__(self):
+            super().__init__()
+            self._inside_stream_context = False
+            self.stream_contexts = []
+            self.array_namespace = StreamCheckingNamespace(np, self)
+
+        @contextmanager
+        def _stream_context(self, stream):
+            self.stream_contexts.append(stream)
+            old = self._inside_stream_context
+            self._inside_stream_context = True
+            try:
+                yield
+            finally:
+                self._inside_stream_context = old
+
+    backend = StreamAwareNumpyBackend()
+    stream = object()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    batch_left = np.stack((left, left + 1.0), axis=0)
+    batch_right = np.stack((right, right - 1.0), axis=0)
+
+    assert np.allclose(backend.matmul(left, right, stream=stream), left @ right)
+    assert np.allclose(backend.batched_matmul(batch_left, batch_right, stream=stream), np.matmul(batch_left, batch_right))
+    grouped = backend.grouped_gemm(
+        [GemmTask(left, right), GemmTask(left + 2.0, right + 3.0)],
+        pack_threshold=1,
+        stream=stream,
+    )
+    assert np.allclose(grouped[0], left @ right)
+    assert np.allclose(grouped[1], (left + 2.0) @ (right + 3.0))
+    assert backend.stream_contexts == [stream, stream, stream]
+
+
 def test_backend_contraction_plan_event_records_generic_operands(tmp_path):
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend
