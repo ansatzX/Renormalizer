@@ -4298,6 +4298,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     tuple(getattr(desc.A, "shape", ())),
                     tuple(getattr(desc.B, "shape", ())),
                 ] if desc is not None else [],
+                input_dtypes=[
+                    str(getattr(desc.A, "dtype", None)),
+                    str(getattr(desc.B, "dtype", None)),
+                ] if desc is not None else [],
                 output_shape=tuple(getattr(result, "shape", plan.output_shape)),
                 dtype=str(getattr(result, "dtype", None)),
                 device=str(self.current_device()),
