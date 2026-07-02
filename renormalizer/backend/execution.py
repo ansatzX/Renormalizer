@@ -692,9 +692,28 @@ class EinsumSpec:
     optimize: str | Any | None = None
 
     def __post_init__(self):
-        object.__setattr__(self, "operands", tuple(self.operands))
-        object.__setattr__(self, "output_modes", tuple(self.output_modes))
-        object.__setattr__(self, "constants", tuple(int(index) for index in self.constants))
+        operands = tuple(self.operands)
+        output_modes = tuple(self.output_modes)
+        constants = tuple(int(index) for index in self.constants)
+        if not operands:
+            raise ValueError("EinsumSpec operands must be non-empty")
+        if len(set(output_modes)) != len(output_modes):
+            raise ValueError("EinsumSpec output_modes must be unique")
+        input_modes = set()
+        for operand in operands:
+            input_modes.update(operand.modes)
+        missing_modes = [mode for mode in output_modes if mode not in input_modes]
+        if missing_modes:
+            raise ValueError(
+                "EinsumSpec output_modes are not present in operands: {0}"
+                .format(missing_modes)
+            )
+        for index in constants:
+            if index < 0 or index >= len(operands):
+                raise ValueError("EinsumSpec constant operand index {0} is out of range".format(index))
+        object.__setattr__(self, "operands", operands)
+        object.__setattr__(self, "output_modes", output_modes)
+        object.__setattr__(self, "constants", constants)
 
 
 def _parse_einsum_modes(modes, *, context):

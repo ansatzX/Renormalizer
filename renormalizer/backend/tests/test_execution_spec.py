@@ -1146,6 +1146,28 @@ def test_tensor_operand_rejects_inconsistent_layout_metadata():
         TensorOperand(array, ("i", "k"), layout=wrong_shape)
 
 
+def test_einsum_spec_rejects_invalid_metadata():
+    from renormalizer.backend import EinsumSpec, TensorOperand
+
+    left = TensorOperand(np.ones((2, 3)), ("i", "k"))
+    right = TensorOperand(np.ones((3, 4)), ("k", "j"))
+
+    with pytest.raises(ValueError, match="EinsumSpec operands must be non-empty"):
+        EinsumSpec(operands=(), output_modes=("i", "j"))
+
+    with pytest.raises(ValueError, match="EinsumSpec output_modes must be unique"):
+        EinsumSpec(operands=(left, right), output_modes=("i", "i"))
+
+    with pytest.raises(ValueError, match="EinsumSpec output_modes are not present in operands"):
+        EinsumSpec(operands=(left, right), output_modes=("i", "missing"))
+
+    with pytest.raises(ValueError, match="EinsumSpec constant operand index -1 is out of range"):
+        EinsumSpec(operands=(left, right), output_modes=("i", "j"), constants=(-1,))
+
+    with pytest.raises(ValueError, match="EinsumSpec constant operand index 2 is out of range"):
+        EinsumSpec(operands=(left, right), output_modes=("i", "j"), constants=(2,))
+
+
 def test_pair_contraction_lowering_reports_gemm_shape_and_costs():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend
