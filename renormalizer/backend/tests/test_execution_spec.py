@@ -334,6 +334,115 @@ def test_numpy_backend_capabilities_and_array_info_are_explicit():
     assert info.backend_name == "numpy"
 
 
+def _valid_array_info_kwargs():
+    from renormalizer.backend import DeviceSpec
+
+    return {
+        "shape": (2, 3),
+        "dtype": np.dtype("float64"),
+        "itemsize": 8,
+        "ndim": 2,
+        "size": 6,
+        "nbytes": 48,
+        "device": DeviceSpec(kind="cpu"),
+        "is_host": True,
+        "is_device": False,
+        "is_distributed": False,
+        "strides": (24, 8),
+        "order": "C",
+        "contiguous": True,
+        "writeable": True,
+        "owns_data": False,
+        "backend_name": "numpy",
+    }
+
+
+def test_array_info_rejects_inconsistent_shape_metadata():
+    from renormalizer.backend import ArrayInfo
+
+    kwargs = _valid_array_info_kwargs()
+    kwargs["shape"] = (2, -1)
+    with pytest.raises(ValueError, match="ArrayInfo shape dimensions must be non-negative"):
+        ArrayInfo(**kwargs)
+
+    kwargs = _valid_array_info_kwargs()
+    kwargs["ndim"] = 1
+    with pytest.raises(ValueError, match="ArrayInfo ndim must match shape rank"):
+        ArrayInfo(**kwargs)
+
+    kwargs = _valid_array_info_kwargs()
+    kwargs["size"] = 7
+    with pytest.raises(ValueError, match="ArrayInfo size must match shape product"):
+        ArrayInfo(**kwargs)
+
+    kwargs = _valid_array_info_kwargs()
+    kwargs["nbytes"] = 40
+    with pytest.raises(ValueError, match="ArrayInfo nbytes must match size and itemsize"):
+        ArrayInfo(**kwargs)
+
+
+def test_array_info_rejects_invalid_stride_rank():
+    from renormalizer.backend import ArrayInfo
+
+    kwargs = _valid_array_info_kwargs()
+    kwargs["strides"] = (8,)
+
+    with pytest.raises(ValueError, match="ArrayInfo strides must match shape rank"):
+        ArrayInfo(**kwargs)
+
+
+def _valid_layout_spec_kwargs():
+    return {
+        "logical_shape": (2, 3),
+        "physical_shape": (2, 3),
+        "logical_modes": ("i", "j"),
+        "strides": (24, 8),
+        "order": "C",
+        "contiguous_groups": ((0, 1),),
+        "requires_transpose": False,
+        "transpose_perm": None,
+        "estimated_copy_bytes": 0,
+    }
+
+
+def test_layout_spec_rejects_inconsistent_rank_metadata():
+    from renormalizer.backend import LayoutSpec
+
+    kwargs = _valid_layout_spec_kwargs()
+    kwargs["logical_shape"] = (2, -1)
+    with pytest.raises(ValueError, match="LayoutSpec logical_shape dimensions must be non-negative"):
+        LayoutSpec(**kwargs)
+
+    kwargs = _valid_layout_spec_kwargs()
+    kwargs["logical_modes"] = ("i",)
+    with pytest.raises(ValueError, match="LayoutSpec logical_modes must match logical_shape rank"):
+        LayoutSpec(**kwargs)
+
+    kwargs = _valid_layout_spec_kwargs()
+    kwargs["strides"] = (8,)
+    with pytest.raises(ValueError, match="LayoutSpec strides must match physical shape rank"):
+        LayoutSpec(**kwargs)
+
+
+def test_layout_spec_rejects_invalid_transform_metadata():
+    from renormalizer.backend import LayoutSpec
+
+    kwargs = _valid_layout_spec_kwargs()
+    kwargs["contiguous_groups"] = ((0, 2),)
+    with pytest.raises(ValueError, match="LayoutSpec contiguous_groups indices out of range"):
+        LayoutSpec(**kwargs)
+
+    kwargs = _valid_layout_spec_kwargs()
+    kwargs["transpose_perm"] = (0, 0)
+    with pytest.raises(ValueError, match="LayoutSpec transpose_perm must be a permutation"):
+        LayoutSpec(**kwargs)
+
+    kwargs = _valid_layout_spec_kwargs()
+    kwargs["estimated_copy_bytes"] = -1
+    with pytest.raises(ValueError, match="LayoutSpec estimated_copy_bytes must be non-negative"):
+        LayoutSpec(**kwargs)
+
+
 def test_numpy_copy_policy_rejects_required_copy_and_allows_explicit_copy():
     from renormalizer.backend.execution import BackendCopyError, CopyPolicy
     from renormalizer.backend.numpy_backend import NumpyBackend
@@ -1067,8 +1176,8 @@ def _valid_contraction_plan_kwargs():
     return {
         "steps": (step,),
         "input_specs": (
-            TensorOperand(None, ("i", "k")),
-            TensorOperand(None, ("k", "j")),
+            TensorOperand(np.ones((2, 3)), ("i", "k")),
+            TensorOperand(np.ones((3, 4)), ("k", "j")),
         ),
         "output_modes": ("i", "j"),
     }

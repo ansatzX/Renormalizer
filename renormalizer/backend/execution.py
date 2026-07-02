@@ -174,6 +174,47 @@ class ArrayInfo:
     owns_data: bool | None
     backend_name: str
 
+    def __post_init__(self):
+        shape = tuple(int(dim) for dim in self.shape)
+        itemsize = int(self.itemsize)
+        ndim = int(self.ndim)
+        size = int(self.size)
+        nbytes = int(self.nbytes)
+        if any(dim < 0 for dim in shape):
+            raise ValueError("ArrayInfo shape dimensions must be non-negative")
+        if itemsize < 0:
+            raise ValueError("ArrayInfo itemsize must be non-negative")
+        if ndim < 0:
+            raise ValueError("ArrayInfo ndim must be non-negative")
+        if size < 0:
+            raise ValueError("ArrayInfo size must be non-negative")
+        if nbytes < 0:
+            raise ValueError("ArrayInfo nbytes must be non-negative")
+        if ndim != len(shape):
+            raise ValueError("ArrayInfo ndim must match shape rank")
+        if size != _prod(shape):
+            raise ValueError("ArrayInfo size must match shape product")
+        if not self.is_distributed and nbytes != size * itemsize:
+            raise ValueError("ArrayInfo nbytes must match size and itemsize")
+        strides = None if self.strides is None else tuple(int(stride) for stride in self.strides)
+        if strides is not None and len(strides) != len(shape):
+            raise ValueError("ArrayInfo strides must match shape rank")
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "itemsize", itemsize)
+        object.__setattr__(self, "ndim", ndim)
+        object.__setattr__(self, "size", size)
+        object.__setattr__(self, "nbytes", nbytes)
+        object.__setattr__(self, "strides", strides)
+        object.__setattr__(self, "order", str(self.order))
+        object.__setattr__(self, "contiguous", bool(self.contiguous))
+        object.__setattr__(self, "writeable", bool(self.writeable))
+        object.__setattr__(self, "is_host", bool(self.is_host))
+        object.__setattr__(self, "is_device", bool(self.is_device))
+        object.__setattr__(self, "is_distributed", bool(self.is_distributed))
+        if self.owns_data is not None:
+            object.__setattr__(self, "owns_data", bool(self.owns_data))
+        object.__setattr__(self, "backend_name", str(self.backend_name))
+
 
 @dataclass(frozen=True)
 class LayoutSpec:
@@ -186,6 +227,39 @@ class LayoutSpec:
     requires_transpose: bool = False
     transpose_perm: tuple[int, ...] | None = None
     estimated_copy_bytes: int = 0
+
+    def __post_init__(self):
+        logical_shape = tuple(int(dim) for dim in self.logical_shape)
+        physical_shape = None if self.physical_shape is None else tuple(int(dim) for dim in self.physical_shape)
+        physical_rank = len(logical_shape) if physical_shape is None else len(physical_shape)
+        logical_modes = tuple(self.logical_modes)
+        estimated_copy_bytes = int(self.estimated_copy_bytes)
+        if any(dim < 0 for dim in logical_shape):
+            raise ValueError("LayoutSpec logical_shape dimensions must be non-negative")
+        if physical_shape is not None and any(dim < 0 for dim in physical_shape):
+            raise ValueError("LayoutSpec physical_shape dimensions must be non-negative")
+        if len(logical_modes) != len(logical_shape):
+            raise ValueError("LayoutSpec logical_modes must match logical_shape rank")
+        strides = None if self.strides is None else tuple(int(stride) for stride in self.strides)
+        if strides is not None and len(strides) != physical_rank:
+            raise ValueError("LayoutSpec strides must match physical shape rank")
+        contiguous_groups = tuple(tuple(int(index) for index in group) for group in self.contiguous_groups)
+        if any(index < 0 or index >= len(logical_shape) for group in contiguous_groups for index in group):
+            raise ValueError("LayoutSpec contiguous_groups indices out of range")
+        transpose_perm = None if self.transpose_perm is None else tuple(int(index) for index in self.transpose_perm)
+        if transpose_perm is not None and sorted(transpose_perm) != list(range(len(logical_shape))):
+            raise ValueError("LayoutSpec transpose_perm must be a permutation")
+        if estimated_copy_bytes < 0:
+            raise ValueError("LayoutSpec estimated_copy_bytes must be non-negative")
+        object.__setattr__(self, "logical_shape", logical_shape)
+        object.__setattr__(self, "physical_shape", physical_shape)
+        object.__setattr__(self, "logical_modes", logical_modes)
+        object.__setattr__(self, "strides", strides)
+        object.__setattr__(self, "order", str(self.order))
+        object.__setattr__(self, "contiguous_groups", contiguous_groups)
+        object.__setattr__(self, "requires_transpose", bool(self.requires_transpose))
+        object.__setattr__(self, "transpose_perm", transpose_perm)
+        object.__setattr__(self, "estimated_copy_bytes", estimated_copy_bytes)
 
 
 def _prod(values) -> int:
