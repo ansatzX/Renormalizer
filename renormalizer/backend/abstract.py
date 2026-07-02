@@ -785,6 +785,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
         array = _ShapeOnlyArray(shape, dtype, itemsize)
         return TensorOperand(array, tuple(modes), name=name)
 
+    @staticmethod
+    def _estimate_multi_step_peak_bytes(steps, *, input_count):
+        live_temporary_bytes = [0] * int(input_count)
+        peak = 0
+        for step_index, step in enumerate(steps):
+            current_live = sum(live_temporary_bytes)
+            peak = max(peak, current_live + int(step.estimated_peak_bytes or 0))
+            for index in sorted((int(index) for index in step.inputs), reverse=True):
+                del live_temporary_bytes[index]
+            output_bytes = int(step.estimated_write_bytes or step.estimated_peak_bytes or 0)
+            live_temporary_bytes.append(output_bytes if step_index < len(steps) - 1 else 0)
+        return int(peak)
+
     def _multi_operand_contraction_plan(
         self,
         spec,
@@ -852,7 +865,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
             input_specs=spec.operands,
             output_modes=spec.output_modes,
             estimated_flops=sum(step.estimated_flops for step in steps),
-            estimated_peak_bytes=max((step.estimated_peak_bytes for step in steps), default=0),
+            estimated_peak_bytes=self._estimate_multi_step_peak_bytes(
+                steps,
+                input_count=len(spec.operands),
+            ),
             estimated_read_bytes=sum(step.estimated_read_bytes for step in steps),
             estimated_write_bytes=sum(step.estimated_write_bytes for step in steps),
             estimated_copy_bytes=sum(step.estimated_copy_bytes for step in steps),

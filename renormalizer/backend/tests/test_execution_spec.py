@@ -1807,6 +1807,31 @@ def test_plan_contraction_returns_multi_step_gemm_path_for_three_operand_einsum(
     assert np.allclose(result, np.einsum("ab,bc,cd->ad", left, middle, right))
 
 
+def test_multi_step_contraction_peak_tracks_live_intermediate_and_step_output():
+    from renormalizer.backend import BackendFeatureError
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    middle = np.arange(12, dtype=np.float64).reshape(3, 4)
+    right = np.arange(20, dtype=np.float64).reshape(4, 5)
+    spec = backend.parse_einsum("ab,bc,cd->ad", left, middle, right, optimize="greedy")
+
+    plan = backend.plan_contraction(spec, allow_distribution=False)
+
+    first_intermediate_bytes = plan.steps[0].estimated_write_bytes
+    final_output_bytes = plan.steps[1].estimated_write_bytes
+    expected_peak = first_intermediate_bytes + final_output_bytes
+    assert plan.estimated_peak_bytes == expected_peak
+
+    with pytest.raises(BackendFeatureError, match="memory_limit.*199.*peak.*200"):
+        backend.plan_contraction(
+            spec,
+            memory_limit=expected_peak - 1,
+            allow_slicing=False,
+        )
+
+
 def test_explicit_multi_operand_contract_uses_planner_and_executor():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
