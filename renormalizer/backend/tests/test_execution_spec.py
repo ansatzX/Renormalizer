@@ -1268,6 +1268,58 @@ def test_execute_grouped_gemm_plan_accumulates_sparse_output_blocks():
     assert result.blocks[out_key].shape == (2, 4)
 
 
+def test_grouped_gemm_plan_cost_model_reports_work_and_peak_memory():
+    from renormalizer.backend import (
+        BackendFeatureError,
+        BlockContractionSpec,
+        BlockKey,
+        BlockTensor,
+        DenseBlock,
+        HardwareModel,
+    )
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left_key = BlockKey((0,), (0,))
+    right_key = BlockKey((0,), (1,))
+    left = BlockTensor(
+        {left_key: DenseBlock(left_key, np.ones((2, 3), dtype=np.float64), ("i", "k"), (2, 3))},
+        global_shape=(2, 3),
+        modes=("i", "k"),
+        block_axis_meta=None,
+        backend="numpy",
+    )
+    right = BlockTensor(
+        {right_key: DenseBlock(right_key, np.ones((3, 4), dtype=np.float64), ("k", "j"), (3, 4))},
+        global_shape=(3, 4),
+        modes=("k", "j"),
+        block_axis_meta=None,
+        backend="numpy",
+    )
+    plan = backend.lower_block_contraction(
+        BlockContractionSpec(
+            left,
+            right,
+            output_modes=("i", "j"),
+            qn_rule=lambda left_key, right_key: BlockKey(left_key.qn_left, right_key.qn_right),
+        )
+    )
+    hw = HardwareModel(flop_per_s=24.0, memory_bandwidth_Bps=208.0, max_memory_bytes=64)
+
+    estimate = backend.estimate_contraction(plan, hw)
+
+    assert estimate.flops == 48
+    assert estimate.read_bytes == 144
+    assert estimate.write_bytes == 64
+    assert estimate.workspace_bytes == 0
+    assert estimate.peak_bytes == 64
+    assert estimate.compute_s == pytest.approx(2.0)
+    assert estimate.memory_s == pytest.approx(1.0)
+    assert estimate.total_s == pytest.approx(3.0)
+    with pytest.raises(BackendFeatureError, match="max_memory.*63.*peak.*64"):
+        backend.estimate_contraction(plan, HardwareModel(max_memory_bytes=63))
+
+
 def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
     from renormalizer.backend import (
         BlockContractionSpec,

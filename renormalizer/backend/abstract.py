@@ -1872,6 +1872,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def estimate_contraction(self, plan, hw=None):
         if isinstance(plan, MatmulPlan):
             return self.estimate_matmul(plan, hw)
+        if isinstance(plan, GroupedGemmPlan):
+            workspace_bytes = int(plan.estimated_workspace_bytes or 0)
+            return self._make_cost_estimate(
+                hw,
+                flops=plan.estimated_flops,
+                read_bytes=plan.estimated_read_bytes,
+                write_bytes=plan.estimated_write_bytes,
+                workspace_bytes=workspace_bytes,
+                peak_bytes=int(plan.estimated_write_bytes or 0) + workspace_bytes,
+            )
         if isinstance(plan, DistributedContractionPlan):
             return self._estimate_distributed_contraction(plan, hw)
         distributed_plan = self._distributed_plan_from_contraction_plan(plan)
