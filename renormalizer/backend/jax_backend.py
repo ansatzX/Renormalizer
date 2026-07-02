@@ -181,6 +181,22 @@ class JaxBackend(AbstractBackend):
             return len(self._jax_devices_by_kind.get("gpu", ()))
         return len(self._jax_devices_by_kind.get("cpu", ())) or 1
 
+    def _device_spec_for_array(self, x):
+        if isinstance(x, jnp.ndarray):
+            devices = tuple(x.devices())
+            if len(devices) == 1:
+                device = devices[0]
+                if self._device_kind(device) == "gpu":
+                    index = getattr(device, "id", None)
+                    return DeviceSpec(
+                        kind="cuda",
+                        index=index,
+                        visible_id=str(index) if index is not None else None,
+                    )
+                if self._device_kind(device) == "cpu":
+                    return DeviceSpec(kind="cpu")
+        return super()._device_spec_for_array(x)
+
     def _place_on_configured_device(self, x):
         if self._jax_device is None:
             return x

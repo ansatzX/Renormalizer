@@ -229,3 +229,73 @@ def test_jax_backend_honors_indexed_cuda_device_when_available():
     assert backend.current_device() == DeviceSpec(kind="cuda", index=1, visible_id="1")
     assert device.platform == "gpu"
     assert device.id == 1
+
+
+def test_torch_array_info_reports_actual_indexed_cuda_device_when_available():
+    try:
+        import torch
+    except (ImportError, OSError) as exc:
+        pytest.skip("torch unavailable: {0}".format(exc))
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("torch needs at least two CUDA devices for array_info device compliance")
+
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.execution import DeviceSpec
+    from renormalizer.backend.factory import create_backend
+
+    backend = create_backend("torch", config=BackendConfig(device="cuda:1", precision=64))
+    x = backend.to_backend(np.ones((2,), dtype=np.float64))
+    backend.set_device("cuda:0")
+    info = backend.array_info(x)
+
+    assert backend.current_device() == DeviceSpec(kind="cuda", index=0, visible_id="0")
+    assert info.device == DeviceSpec(kind="cuda", index=1, visible_id="1")
+    assert info.is_device is True
+
+
+def test_cupy_array_info_reports_actual_indexed_cuda_device_when_available():
+    try:
+        import cupy
+    except (ImportError, OSError) as exc:
+        pytest.skip("cupy unavailable: {0}".format(exc))
+    if cupy.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("cupy needs at least two CUDA devices for array_info device compliance")
+
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.execution import DeviceSpec
+    from renormalizer.backend.factory import create_backend
+
+    backend = create_backend("cupy", config=BackendConfig(device="cuda:1", precision=64))
+    x = backend.to_backend(np.ones((2,), dtype=np.float64))
+    backend.set_device("cuda:0")
+    info = backend.array_info(x)
+
+    assert backend.current_device() == DeviceSpec(kind="cuda", index=0, visible_id="0")
+    assert info.device == DeviceSpec(kind="cuda", index=1, visible_id="1")
+    assert info.is_device is True
+
+
+def test_jax_array_info_reports_actual_indexed_cuda_device_when_available():
+    try:
+        import jax
+    except (ImportError, OSError) as exc:
+        pytest.skip("jax unavailable: {0}".format(exc))
+    try:
+        devices = jax.devices("gpu")
+    except RuntimeError as exc:
+        pytest.skip("jax gpu unavailable: {0}".format(exc))
+    if len(devices) < 2:
+        pytest.skip("jax needs at least two CUDA devices for array_info device compliance")
+
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.execution import DeviceSpec
+    from renormalizer.backend.factory import create_backend
+
+    backend = create_backend("jax", config=BackendConfig(device="cuda:1", precision=64))
+    x = backend.to_backend(np.ones((2,), dtype=np.float64))
+    backend.set_device("cuda:0")
+    info = backend.array_info(x)
+
+    assert backend.current_device() == DeviceSpec(kind="cuda", index=0, visible_id="0")
+    assert info.device == DeviceSpec(kind="cuda", index=1, visible_id="1")
+    assert info.is_device is True

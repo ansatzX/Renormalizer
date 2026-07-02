@@ -5,6 +5,7 @@
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
+from renormalizer.backend.execution import DeviceSpec
 from renormalizer.backend.mpi import TorchDistributedMixin
 
 try:
@@ -84,6 +85,20 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
         if self.device == "gpu" and torch.cuda.is_available():
             return int(torch.cuda.device_count())
         return 1
+
+    def _device_spec_for_array(self, x):
+        if isinstance(x, torch.Tensor):
+            device = x.device
+            if device.type == "cuda":
+                index = device.index
+                return DeviceSpec(
+                    kind="cuda",
+                    index=index,
+                    visible_id=str(index) if index is not None else None,
+                )
+            if device.type == "cpu":
+                return DeviceSpec(kind="cpu")
+        return super()._device_spec_for_array(x)
 
     def __getattr__(self, name):
         return getattr(torch, name)

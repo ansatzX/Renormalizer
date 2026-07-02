@@ -296,9 +296,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def is_distributed_array(self, x: Any) -> bool:
         return isinstance(x, DistributedTensor)
 
+    def _device_spec_for_array(self, x: Any):
+        return self.current_device()
+
     def array_info(self, x: Any):
         if self.is_distributed_array(x):
-            local_info = array_info_for_backend(self, x.local_array, self.current_device())
+            local_info = array_info_for_backend(self, x.local_array, self._device_spec_for_array(x.local_array))
             return ArrayInfo(
                 shape=tuple(x.global_shape),
                 dtype=x.dtype,
@@ -321,7 +324,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 owns_data=local_info.owns_data,
                 backend_name=self.name,
             )
-        return array_info_for_backend(self, x, self.current_device())
+        return array_info_for_backend(self, x, self._device_spec_for_array(x))
 
     def layout(self, x: Any):
         return layout_from_array(x)

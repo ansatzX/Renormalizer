@@ -7,6 +7,7 @@ import logging
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
+from renormalizer.backend.execution import DeviceSpec
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,12 @@ class CupyBackend(AbstractBackend):
 
     def device_count(self):
         return int(_cupy.cuda.runtime.getDeviceCount())
+
+    def _device_spec_for_array(self, x):
+        if isinstance(x, _cupy.ndarray):
+            index = int(x.device.id)
+            return DeviceSpec(kind="cuda", index=index, visible_id=str(index))
+        return super()._device_spec_for_array(x)
 
     def array(self, *args, **kwargs):
         return self._on_configured_device(_cupy.array, *args, **kwargs)
