@@ -1505,6 +1505,9 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     execute = next(event for event in events if event["event"] == "contraction_execute")
 
     assert execute["plan_hash"] == plan.plan_hash
+    assert execute["equation"] == "ik,kj->ij"
+    assert execute["input_modes"] == [["i", "k"], ["k", "j"]]
+    assert execute["output_modes"] == ["i", "j"]
 
 
 def test_distributed_contract_matches_dense_for_row_sharded_matmul():
