@@ -2077,6 +2077,72 @@ def test_grouped_gemm_plan_cost_model_reports_work_and_peak_memory():
         backend.estimate_contraction(plan, HardwareModel(max_memory_bytes=63))
 
 
+def _valid_grouped_gemm_plan_kwargs():
+    from renormalizer.backend import BlockKey, MatmulDesc
+
+    desc = MatmulDesc(
+        np.ones((2, 3), dtype=np.float64),
+        np.ones((3, 4), dtype=np.float64),
+        None,
+        m=2,
+        n=4,
+        k=3,
+    )
+    return {
+        "tasks": (desc,),
+        "output_blocks": (BlockKey((0,), (1,)),),
+        "bucketed_by_shape": {(2, 4, 3): (0,)},
+        "scatter_add_required": False,
+        "estimated_flops": 48,
+        "estimated_read_bytes": 80,
+        "estimated_write_bytes": 64,
+        "estimated_workspace_bytes": 0,
+        "output_modes": ("i", "j"),
+        "global_shape": (2, 4),
+        "backend": "numpy",
+    }
+
+
+def test_grouped_gemm_plan_rejects_inconsistent_task_metadata():
+    from renormalizer.backend import GroupedGemmPlan
+
+    kwargs = _valid_grouped_gemm_plan_kwargs()
+
+    with pytest.raises(ValueError, match="GroupedGemmPlan tasks and output_blocks must have the same length"):
+        GroupedGemmPlan(**{**kwargs, "output_blocks": ()})
+
+    with pytest.raises(ValueError, match="GroupedGemmPlan bucket shapes must be rank-3"):
+        GroupedGemmPlan(**{**kwargs, "bucketed_by_shape": {(2, 4): (0,)}})
+
+    with pytest.raises(ValueError, match="GroupedGemmPlan bucket shapes must be non-negative"):
+        GroupedGemmPlan(**{**kwargs, "bucketed_by_shape": {(-2, 4, 3): (0,)}})
+
+    with pytest.raises(ValueError, match="GroupedGemmPlan bucket task indices out of range"):
+        GroupedGemmPlan(**{**kwargs, "bucketed_by_shape": {(2, 4, 3): (1,)}})
+
+    with pytest.raises(ValueError, match="GroupedGemmPlan output_modes must match global_shape rank"):
+        GroupedGemmPlan(**{**kwargs, "output_modes": ("i",), "global_shape": (2, 4)})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "estimated_flops",
+        "estimated_read_bytes",
+        "estimated_write_bytes",
+        "estimated_workspace_bytes",
+    ],
+)
+def test_grouped_gemm_plan_rejects_negative_estimates(field):
+    from renormalizer.backend import GroupedGemmPlan
+
+    kwargs = _valid_grouped_gemm_plan_kwargs()
+    kwargs[field] = -1
+
+    with pytest.raises(ValueError, match="GroupedGemmPlan {0} must be non-negative".format(field)):
+        GroupedGemmPlan(**kwargs)
+
+
 def test_lower_block_contraction_records_grouped_plan_profile(tmp_path):
     from renormalizer.backend import (
         BlockContractionSpec,

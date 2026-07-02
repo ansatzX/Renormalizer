@@ -1477,15 +1477,45 @@ class GroupedGemmPlan:
     plan_hash: str = ""
 
     def __post_init__(self):
-        object.__setattr__(self, "tasks", tuple(self.tasks))
-        object.__setattr__(self, "output_blocks", tuple(self.output_blocks))
-        object.__setattr__(self, "output_modes", tuple(self.output_modes))
-        object.__setattr__(self, "global_shape", tuple(int(dim) for dim in self.global_shape))
+        tasks = tuple(self.tasks)
+        output_blocks = tuple(self.output_blocks)
+        output_modes = tuple(self.output_modes)
+        global_shape = tuple(int(dim) for dim in self.global_shape)
+        if len(tasks) != len(output_blocks):
+            raise ValueError("GroupedGemmPlan tasks and output_blocks must have the same length")
+        if any(dim < 0 for dim in global_shape):
+            raise ValueError("GroupedGemmPlan global_shape dimensions must be non-negative")
+        if global_shape and len(output_modes) != len(global_shape):
+            raise ValueError("GroupedGemmPlan output_modes must match global_shape rank")
         bucketed = {
             tuple(int(dim) for dim in shape): tuple(int(index) for index in indices)
             for shape, indices in self.bucketed_by_shape.items()
         }
+        for shape, indices in bucketed.items():
+            if len(shape) != 3:
+                raise ValueError("GroupedGemmPlan bucket shapes must be rank-3")
+            if any(dim < 0 for dim in shape):
+                raise ValueError("GroupedGemmPlan bucket shapes must be non-negative")
+            if any(index < 0 or index >= len(tasks) for index in indices):
+                raise ValueError("GroupedGemmPlan bucket task indices out of range")
+        object.__setattr__(self, "tasks", tasks)
+        object.__setattr__(self, "output_blocks", output_blocks)
+        object.__setattr__(self, "output_modes", output_modes)
+        object.__setattr__(self, "global_shape", global_shape)
         object.__setattr__(self, "bucketed_by_shape", bucketed)
+        object.__setattr__(self, "scatter_add_required", bool(self.scatter_add_required))
+        if self.backend is not None:
+            object.__setattr__(self, "backend", str(self.backend))
+        for field in (
+            "estimated_flops",
+            "estimated_read_bytes",
+            "estimated_write_bytes",
+            "estimated_workspace_bytes",
+        ):
+            value = int(getattr(self, field))
+            if value < 0:
+                raise ValueError("GroupedGemmPlan {0} must be non-negative".format(field))
+            object.__setattr__(self, field, value)
         if not self.plan_hash:
             object.__setattr__(self, "plan_hash", _grouped_gemm_plan_hash(self))
 
