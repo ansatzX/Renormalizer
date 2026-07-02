@@ -4552,8 +4552,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     output_shape = tuple(getattr(result, "shape", plan.output_shape))
                     dtype = str(getattr(result, "dtype", None))
                     largest_intermediate = getattr(result, "nbytes", None)
+                shape_buckets = self._bucketed_by_desc_shape(descs)
                 num_blocks = len(descs)
-                num_shape_buckets = len(self._bucketed_by_desc_shape(descs))
+                num_shape_buckets = len(shape_buckets)
+                bucket_task_counts = [len(indices) for _, indices in sorted(shape_buckets.items())]
+                shape_bucket_payload = self._profile_shape_buckets(shape_buckets)
             else:
                 input_shapes = [
                     tuple(getattr(desc.A, "shape", ())),
@@ -4581,6 +4584,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 largest_intermediate = getattr(result, "nbytes", None)
                 num_blocks = 0
                 num_shape_buckets = 0
+                bucket_task_counts = None
+                shape_bucket_payload = None
 
             profiling.record(
                 "contraction_execute",
@@ -4610,6 +4615,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 num_grouped_tasks=len(plan.descs) if plan.kind == "grouped_gemm" else 0,
                 num_blocks=num_blocks,
                 num_shape_buckets=num_shape_buckets,
+                bucket_task_counts=bucket_task_counts,
+                shape_buckets=shape_bucket_payload,
                 fallback_reason=plan.fallback_reason,
                 wall_s=wall_s,
             )
