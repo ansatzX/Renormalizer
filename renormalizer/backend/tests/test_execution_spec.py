@@ -2962,6 +2962,51 @@ def test_contraction_cost_model_reports_peak_and_timing_estimates():
     assert estimate.estimated_time_s == pytest.approx(3.0)
 
 
+def test_contraction_cost_model_rejects_workspace_limit_violation():
+    from dataclasses import replace
+
+    from renormalizer.backend import BackendFeatureError, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    matmul_plan = replace(plan.steps[0].plan, workspace_bytes=64)
+    step = replace(plan.steps[0], plan=matmul_plan, required_workspace_bytes=64)
+    plan = replace(plan, steps=(step,), required_workspace_bytes=64)
+
+    with pytest.raises(BackendFeatureError, match="workspace_limit.*32.*requires.*64"):
+        backend.estimate_contraction(plan, HardwareModel(workspace_limit_bytes=32))
+
+
+def test_distributed_cost_model_rejects_workspace_limit_violation():
+    from dataclasses import replace
+
+    from renormalizer.backend import BackendFeatureError, DeviceMesh, DeviceSpec, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.ones((4, 3), dtype=np.float64)
+    right = np.ones((3, 2), dtype=np.float64)
+    dense_path = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    distributed_path = backend.plan_distributed_contraction_path(dense_path, mesh)
+    local_step = replace(distributed_path.steps[0].local_step, required_workspace_bytes=64)
+    distributed_step = replace(distributed_path.steps[0], local_step=local_step)
+    distributed_path = replace(distributed_path, steps=(distributed_step,))
+
+    with pytest.raises(BackendFeatureError, match="workspace_limit.*32.*requires.*64"):
+        backend.estimate_contraction(distributed_path, HardwareModel(workspace_limit_bytes=32))
+
+
 def test_estimate_distributed_contraction_reports_local_work_and_communication_cost():
     from renormalizer.backend import DeviceMesh, DeviceSpec, HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

@@ -1447,6 +1447,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def _hardware_comm_bandwidth(hw):
         return hw.network_bandwidth_Bps or hw.interconnect_bandwidth_bytes_s or hw.p2p_bandwidth_Bps
 
+    @staticmethod
+    def _validate_cost_model_workspace_limit(hw, workspace_bytes):
+        if hw is None or getattr(hw, "workspace_limit_bytes", None) is None:
+            return
+        limit = int(hw.workspace_limit_bytes)
+        workspace_bytes = int(workspace_bytes or 0)
+        if workspace_bytes > limit:
+            raise BackendFeatureError(
+                "workspace_limit {0} bytes is below plan workspace; requires {1} bytes"
+                .format(limit, workspace_bytes)
+            )
+
     def _make_cost_estimate(
         self,
         hw,
@@ -1460,6 +1472,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         peak_bytes=0,
     ):
         hw = HardwareModel() if hw is None else hw
+        self._validate_cost_model_workspace_limit(hw, workspace_bytes)
         compute_s = self._rate_seconds(flops, self._hardware_flop_rate(hw))
         memory_s = self._rate_seconds(read_bytes + write_bytes, self._hardware_memory_bandwidth(hw))
         copy_s = self._rate_seconds(copy_bytes, self._hardware_copy_bandwidth(hw))
@@ -1515,6 +1528,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         write_bytes = sum(int(step.estimated_write_bytes) for step in local_steps)
         copy_bytes = sum(int(step.estimated_copy_bytes) for step in local_steps)
         workspace_bytes = max((int(step.required_workspace_bytes) for step in local_steps), default=0)
+        self._validate_cost_model_workspace_limit(hw, workspace_bytes)
         local_flops = sum(int(step.estimated_flops) for step in local_steps)
         communication = tuple(item for step in plan.steps for item in step.communication)
 
