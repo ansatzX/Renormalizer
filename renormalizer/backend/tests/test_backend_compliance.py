@@ -135,31 +135,36 @@ def test_backend_compliance_explicit_contract_uses_planner_and_executor(monkeypa
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
-def test_backend_compliance_tensordot_routes_through_contract(monkeypatch, backend_name, device):
+def test_backend_compliance_tensordot_uses_planner_and_executor(monkeypatch, backend_name, device):
     backend = _backend_or_skip(backend_name, device)
     left_np = np.arange(2 * 3 * 4, dtype=np.float64).reshape(2, 3, 4)
     right_np = np.arange(4 * 3 * 5, dtype=np.float64).reshape(4, 3, 5)
     left = backend.to_backend(left_np)
     right = backend.to_backend(right_np)
-    original_contract = backend.contract
-    calls = []
+    plan_calls = []
+    execute_calls = []
+    original_plan_contraction = backend.plan_contraction
+    original_execute = backend.execute
 
-    def counting_contract(*args, **kwargs):
-        calls.append((args, dict(kwargs)))
-        return original_contract(*args, **kwargs)
+    def counting_plan_contraction(spec, **kwargs):
+        plan_calls.append(spec)
+        return original_plan_contraction(spec, **kwargs)
 
-    monkeypatch.setattr(backend, "contract", counting_contract)
+    def counting_execute(plan, **kwargs):
+        execute_calls.append(plan)
+        return original_execute(plan, **kwargs)
+
+    monkeypatch.setattr(backend, "plan_contraction", counting_plan_contraction)
+    monkeypatch.setattr(backend, "execute", counting_execute)
 
     result = backend.tensordot(left, right, axes=([2, 1], [0, 1]))
 
-    assert len(calls) == 1
-    args, kwargs = calls[0]
-    assert args[0] is left
-    assert args[2] is right
-    assert list(args[1]) == [0, 1, 2]
-    assert list(args[3]) == [2, 1, 3]
-    assert list(args[4]) == [0, 3]
-    assert kwargs == {}
+    assert len(plan_calls) == 1
+    assert len(execute_calls) == 1
+    assert tuple(plan_calls[0].operands[0].modes) == (0, 1, 2)
+    assert tuple(plan_calls[0].operands[1].modes) == (2, 1, 3)
+    assert tuple(plan_calls[0].output_modes) == (0, 3)
+    assert execute_calls[0].steps[0].kind == "gemm"
     _assert_allclose(backend, result, np.tensordot(left_np, right_np, axes=([2, 1], [0, 1])))
 
 

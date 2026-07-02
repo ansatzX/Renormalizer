@@ -374,7 +374,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def tensordot(self, a, b, axes=2):
         a, b = self._promote_tensordot_operands(a, b)
         left_modes, right_modes, output_modes = self._tensordot_contract_modes(a.ndim, b.ndim, axes)
-        return self.contract(a, left_modes, b, right_modes, output_modes)
+        spec = EinsumSpec(
+            operands=(
+                TensorOperand(a, left_modes, name="left"),
+                TensorOperand(b, right_modes, name="right"),
+            ),
+            output_modes=tuple(output_modes),
+        )
+        plan = self.plan_contraction(spec)
+        return self.execute(plan)
 
     def einsum(self, subscripts, *operands, **kwargs):
         return self.contract(subscripts, *operands, **kwargs)
