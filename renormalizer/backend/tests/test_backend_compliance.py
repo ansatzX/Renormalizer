@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 
+import functools
 import json
+import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -16,19 +20,92 @@ COMPLIANCE_CASES = (
 )
 
 
+_GPU_BACKEND_TEST_DEVICE_INDEX = {
+    "cupy": 0,
+    "torch": 1,
+    "jax": 2,
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _visible_cuda_device_count():
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        return len([
+            item
+            for item in visible.split(",")
+            if item.strip() and item.strip() != "-1"
+        ])
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "-L"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return 0
+    return sum(1 for line in output.splitlines() if line.strip().startswith("GPU "))
+
+
+def _compliance_device_for_backend(name, device):
+    if device not in ("gpu", "cuda"):
+        return device
+    env_name = "RENO_TEST_{0}_GPU_DEVICE".format(name.upper())
+    if os.environ.get(env_name):
+        return os.environ[env_name]
+    isolate = os.environ.get("RENO_TEST_ISOLATE_GPU_BACKENDS", "1").lower()
+    if isolate in ("0", "false", "no", "off"):
+        return device
+    index = _GPU_BACKEND_TEST_DEVICE_INDEX.get(name)
+    if index is None or _visible_cuda_device_count() <= index:
+        return device
+    return "cuda:{0}".format(index)
+
+
+def test_compliance_gpu_device_selection_spreads_backends_on_multi_gpu(monkeypatch):
+    monkeypatch.setenv("RENO_TEST_ISOLATE_GPU_BACKENDS", "1")
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_visible_cuda_device_count",
+        lambda: 8,
+        raising=False,
+    )
+
+    assert _compliance_device_for_backend("cupy", "gpu") == "cuda:0"
+    assert _compliance_device_for_backend("torch", "gpu") == "cuda:1"
+    assert _compliance_device_for_backend("jax", "gpu") == "cuda:2"
+    assert _compliance_device_for_backend("numpy", "cpu") == "cpu"
+
+
+def test_compliance_gpu_device_selection_respects_low_gpu_count_and_overrides(monkeypatch):
+    monkeypatch.setenv("RENO_TEST_ISOLATE_GPU_BACKENDS", "1")
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_visible_cuda_device_count",
+        lambda: 1,
+        raising=False,
+    )
+
+    assert _compliance_device_for_backend("torch", "gpu") == "gpu"
+
+    monkeypatch.setenv("RENO_TEST_TORCH_GPU_DEVICE", "cuda:7")
+    assert _compliance_device_for_backend("torch", "gpu") == "cuda:7"
+
+
 def _backend_or_skip(name, device="cpu", *, fallback_policy=None):
     from renormalizer.backend import BackendConfig
     from renormalizer.backend.factory import create_backend, is_backend_available
 
     if not is_backend_available(name):
         pytest.skip("{0} backend unavailable".format(name))
+    resolved_device = _compliance_device_for_backend(name, device)
     try:
         return create_backend(
             name,
-            config=BackendConfig(device=device, precision=64, fallback_policy=fallback_policy),
+            config=BackendConfig(device=resolved_device, precision=64, fallback_policy=fallback_policy),
         )
     except Exception as exc:
-        pytest.skip("{0}/{1} backend unavailable: {2}".format(name, device, exc))
+        pytest.skip("{0}/{1} backend unavailable: {2}".format(name, resolved_device, exc))
 
 
 def _assert_allclose(backend, actual, expected, **kwargs):
@@ -304,10 +381,11 @@ def test_gpu_backend_stream_events_and_synchronize_when_available(backend_name):
 
     if not is_backend_available(backend_name):
         pytest.skip("{0} unavailable".format(backend_name))
+    device = _compliance_device_for_backend(backend_name, "gpu")
     try:
-        backend = create_backend(backend_name, config=BackendConfig(device="gpu", precision=64))
+        backend = create_backend(backend_name, config=BackendConfig(device=device, precision=64))
     except Exception as exc:
-        pytest.skip("{0}/gpu unavailable: {1}".format(backend_name, exc))
+        pytest.skip("{0}/{1} unavailable: {2}".format(backend_name, device, exc))
 
     assert backend.capabilities.streams is True
     assert backend.capabilities.events is True
@@ -380,13 +458,14 @@ def test_backend_compliance_grouped_gemm_fallback_policy(backend_name, device):
 
     if not is_backend_available(backend_name):
         pytest.skip("{0} backend unavailable".format(backend_name))
+    resolved_device = _compliance_device_for_backend(backend_name, device)
     try:
         backend = create_backend(
             backend_name,
-            config=BackendConfig(device=device, precision=64, fallback_policy="forbid"),
+            config=BackendConfig(device=resolved_device, precision=64, fallback_policy="forbid"),
         )
     except Exception as exc:
-        pytest.skip("{0}/{1} backend unavailable: {2}".format(backend_name, device, exc))
+        pytest.skip("{0}/{1} backend unavailable: {2}".format(backend_name, resolved_device, exc))
 
     left_np = np.arange(4, dtype=np.float64).reshape(2, 2)
     right_np = np.arange(4, dtype=np.float64).reshape(2, 2)
@@ -566,10 +645,11 @@ def test_gpu_to_backend_copy_policy_rejects_host_and_dtype_copy(backend_name):
 
     if not is_backend_available(backend_name):
         pytest.skip("{0} unavailable".format(backend_name))
+    device = _compliance_device_for_backend(backend_name, "gpu")
     try:
-        backend = create_backend(backend_name, config=BackendConfig(device="gpu", precision=64))
+        backend = create_backend(backend_name, config=BackendConfig(device=device, precision=64))
     except Exception as exc:
-        pytest.skip("{0}/gpu unavailable: {1}".format(backend_name, exc))
+        pytest.skip("{0}/{1} unavailable: {2}".format(backend_name, device, exc))
 
     host = np.ones((2,), dtype=np.float64)
     with pytest.raises(BackendCopyError, match="to_backend would require"):
@@ -590,10 +670,11 @@ def test_gpu_to_host_copy_policy_rejects_device_to_host_copy(backend_name):
 
     if not is_backend_available(backend_name):
         pytest.skip("{0} unavailable".format(backend_name))
+    device = _compliance_device_for_backend(backend_name, "gpu")
     try:
-        backend = create_backend(backend_name, config=BackendConfig(device="gpu", precision=64))
+        backend = create_backend(backend_name, config=BackendConfig(device=device, precision=64))
     except Exception as exc:
-        pytest.skip("{0}/gpu unavailable: {1}".format(backend_name, exc))
+        pytest.skip("{0}/{1} unavailable: {2}".format(backend_name, device, exc))
 
     device = backend.to_backend(np.ones((2,), dtype=np.float64))
     with pytest.raises(BackendCopyError, match="to_host would require"):
