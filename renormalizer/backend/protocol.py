@@ -404,7 +404,15 @@ class BackendProtocol(Protocol):
         """Estimate cost for a contraction plan."""
         ...
 
-    def estimate_redistribute(self, src: Any, dst: Any, tensor_shape: Any, hw: Any = None, **kwargs: Any) -> Any:
+    def estimate_redistribute(
+        self,
+        src: Any,
+        dst: Any,
+        tensor_shape: Any,
+        hw: Any = None,
+        *,
+        itemsize: int = 8,
+    ) -> Any:
         """Estimate communication/copy cost for a redistribution."""
         ...
 
@@ -460,7 +468,7 @@ class BackendProtocol(Protocol):
         """Replicate a dense tensor across a device mesh."""
         ...
 
-    def distributed_contract(self, spec: Any, **kwargs: Any) -> Any:
+    def distributed_contract(self, spec: Any, *, plan: Any = None, stream: Any = None, workspace: Any = None) -> Any:
         """Execute a distributed contraction spec and return dense or distributed output."""
         ...
 
@@ -484,23 +492,76 @@ class BackendProtocol(Protocol):
         """Lower a block-sparse contraction to a grouped GEMM plan."""
         ...
 
-    def execute_matmul_plan(self, plan: Any, **kwargs: Any) -> Any:
+    def execute_matmul_plan(
+        self,
+        plan: Any,
+        *,
+        stream: Any = None,
+        workspace: Any = None,
+        plan_hash: Any = None,
+        record_profile: bool = True,
+        equation: Any = None,
+        input_modes: Any = None,
+        output_modes: Any = None,
+    ) -> Any:
         """Execute a matmul plan using this backend's primitives or recorded fallback."""
         ...
 
-    def execute_grouped_gemm_plan(self, plan: Any, **kwargs: Any) -> Any:
+    def execute_grouped_gemm_plan(
+        self,
+        plan: Any,
+        *,
+        pack_threshold: int = 4,
+        stream: Any = None,
+        workspace: Any = None,
+    ) -> Any:
         """Execute a grouped GEMM plan and return a sparse block tensor."""
         ...
 
-    def matmul(self, A: Any, B: Any = None, **kwargs: Any) -> Any:
+    def matmul(
+        self,
+        A: Any,
+        B: Any = None,
+        *,
+        C: Any = None,
+        trans_a: bool = False,
+        trans_b: bool = False,
+        conj_a: bool = False,
+        conj_b: bool = False,
+        alpha: Any = 1.0,
+        beta: Any = 0.0,
+        stream: Any = None,
+        workspace: Any = None,
+    ) -> Any:
         """Execute one dense GEMM, or a descriptor for compatibility."""
         ...
 
-    def batched_matmul(self, A: Any, B: Any = None, **kwargs: Any) -> Any:
+    def batched_matmul(
+        self,
+        A: Any,
+        B: Any = None,
+        *,
+        C: Any = None,
+        trans_a: bool = False,
+        trans_b: bool = False,
+        conj_a: bool = False,
+        conj_b: bool = False,
+        alpha: Any = 1.0,
+        beta: Any = 0.0,
+        stream: Any = None,
+        workspace: Any = None,
+    ) -> Any:
         """Execute same-shape stacked batched GEMM, or a descriptor for compatibility."""
         ...
 
-    def grouped_gemm(self, descs: Any, **kwargs: Any) -> Any:
+    def grouped_gemm(
+        self,
+        descs: Any,
+        *,
+        pack_threshold: int = 4,
+        stream: Any = None,
+        workspace: Any = None,
+    ) -> Any:
         """Execute grouped GEMM tasks through native support or bucketed fallback."""
         ...
 

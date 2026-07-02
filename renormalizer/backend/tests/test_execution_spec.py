@@ -45,6 +45,70 @@ def test_backend_protocol_planning_and_execution_signatures_are_explicit():
     )
 
 
+def test_backend_protocol_execution_primitive_signatures_are_explicit():
+    import inspect
+
+    from renormalizer.backend.protocol import BackendProtocol
+
+    def assert_keyword_only(signature, name):
+        assert name in signature.parameters
+        assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+    def assert_no_var_keyword(signature):
+        assert not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
+    redistribute_signature = inspect.signature(BackendProtocol.estimate_redistribute)
+    assert_keyword_only(redistribute_signature, "itemsize")
+    assert_no_var_keyword(redistribute_signature)
+
+    distributed_signature = inspect.signature(BackendProtocol.distributed_contract)
+    for name in ("plan", "stream", "workspace"):
+        assert_keyword_only(distributed_signature, name)
+    assert_no_var_keyword(distributed_signature)
+
+    execute_matmul_signature = inspect.signature(BackendProtocol.execute_matmul_plan)
+    for name in (
+        "stream",
+        "workspace",
+        "plan_hash",
+        "record_profile",
+        "equation",
+        "input_modes",
+        "output_modes",
+    ):
+        assert_keyword_only(execute_matmul_signature, name)
+    assert_no_var_keyword(execute_matmul_signature)
+
+    execute_grouped_signature = inspect.signature(BackendProtocol.execute_grouped_gemm_plan)
+    for name in ("pack_threshold", "stream", "workspace"):
+        assert_keyword_only(execute_grouped_signature, name)
+    assert_no_var_keyword(execute_grouped_signature)
+
+    for method_name in ("matmul", "batched_matmul"):
+        signature = inspect.signature(getattr(BackendProtocol, method_name))
+        for name in (
+            "C",
+            "trans_a",
+            "trans_b",
+            "conj_a",
+            "conj_b",
+            "alpha",
+            "beta",
+            "stream",
+            "workspace",
+        ):
+            assert_keyword_only(signature, name)
+        assert_no_var_keyword(signature)
+
+    grouped_signature = inspect.signature(BackendProtocol.grouped_gemm)
+    for name in ("pack_threshold", "stream", "workspace"):
+        assert_keyword_only(grouped_signature, name)
+    assert_no_var_keyword(grouped_signature)
+
+
 def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
     from renormalizer.backend.execution import DeviceSpec, parse_device_spec
 
