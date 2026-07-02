@@ -376,6 +376,29 @@ def test_backend_compliance_astype_copy_policy(backend_name, device):
     _assert_allclose(backend, converted, x_np.astype(np.complex128))
 
 
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_ascontiguousarray_copy_policy(backend_name, device):
+    from renormalizer.backend import BackendCopyError, CopyPolicy
+
+    backend = _backend_or_skip(backend_name, device)
+    x_np = np.arange(12, dtype=np.float64).reshape(3, 4)
+    x = backend.to_backend(x_np)
+    transposed = backend.permute(x, (1, 0))
+
+    with pytest.raises(BackendCopyError, match="make_contiguous would require"):
+        backend.ascontiguousarray(transposed, copy=CopyPolicy.NEVER)
+
+    contiguous = backend.ascontiguousarray(transposed)
+    info = backend.array_info(contiguous)
+
+    _assert_allclose(backend, contiguous, x_np.T)
+    assert info.order in ("C", "unknown")
+
+    copied = backend.ascontiguousarray(contiguous, copy=CopyPolicy.ALWAYS)
+    assert copied is not contiguous
+    _assert_allclose(backend, copied, x_np.T)
+
+
 @pytest.mark.parametrize("backend_name", ("cupy", "torch"))
 def test_gpu_backend_stream_events_and_synchronize_when_available(backend_name):
     from renormalizer.backend import BackendConfig, StreamEvent
