@@ -1294,7 +1294,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 reason="slice output mode {0!r} to satisfy memory_limit {1}".format(sliced_mode, memory_limit),
                 fallback_reason=base_step.fallback_reason,
             )
-            return ContractionPlan(
+            sliced_contraction_plan = ContractionPlan(
                 steps=(step,),
                 input_specs=plan.input_specs,
                 output_modes=plan.output_modes,
@@ -1308,10 +1308,65 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 sliced_modes=(sliced_mode,),
                 distributed_modes=plan.distributed_modes,
             )
+            self._record_sliced_contraction_plan(sliced_contraction_plan)
+            return sliced_contraction_plan
         raise BackendFeatureError(
             "slicing planner could not satisfy memory_limit {0}; plan peak is {1} bytes"
             .format(memory_limit, peak)
         )
+
+    def _record_sliced_contraction_plan(self, plan):
+        try:
+            from renormalizer.utils import profiling
+
+            if not profiling.should_record_op():
+                return
+            step = plan.steps[0] if plan.steps else None
+            sliced_plan = step.plan if step is not None else None
+            if not isinstance(sliced_plan, SlicedContractionPlan):
+                return
+            base_plan = sliced_plan.base_plan
+            base_step = base_plan.steps[0] if base_plan.steps else None
+            base_lowering = getattr(getattr(base_step, "plan", None), "kind", getattr(base_step, "kind", None))
+            equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)
+            output_shape = self._output_shape_for_contraction_plan(plan)
+            profiling.record(
+                "contraction_plan",
+                backend=self.name,
+                equation=equation,
+                lowering="slice",
+                plan_hash=plan.plan_hash,
+                input_modes=input_modes,
+                output_modes=output_modes,
+                input_shapes=[
+                    tuple(getattr(operand.array, "shape", ()))
+                    for operand in plan.input_specs
+                ],
+                output_shape=output_shape,
+                device=str(self.current_device()),
+                flops=plan.estimated_flops,
+                read_bytes=plan.estimated_read_bytes,
+                write_bytes=plan.estimated_write_bytes,
+                copy_bytes=plan.estimated_copy_bytes,
+                workspace_bytes=plan.required_workspace_bytes,
+                peak_bytes=plan.estimated_peak_bytes,
+                num_gemm=len(sliced_plan.output_slices) if base_lowering == "gemm" else 0,
+                num_batched_gemm=len(sliced_plan.output_slices) if base_lowering in ("batched_gemm", "strided_batched_gemm") else 0,
+                num_grouped_tasks=0,
+                num_blocks=0,
+                num_shape_buckets=0,
+                fallback_reason=getattr(step, "fallback_reason", None),
+                sliced_modes=[str(mode) for mode in plan.sliced_modes],
+                num_slices=len(sliced_plan.output_slices),
+                base_lowering=base_lowering,
+                slice_output_axis=sliced_plan.output_axis,
+                slice_output_shapes=[
+                    self._local_shape_for_slices(tuple(output_shape), output_slice)
+                    for output_slice in sliced_plan.output_slices
+                ],
+            )
+        except Exception:
+            pass
 
     def _enforce_plan_memory_limit(self, plan, *, memory_limit=None, allow_slicing=True):
         if memory_limit is None:

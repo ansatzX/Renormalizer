@@ -2752,6 +2752,51 @@ def test_execute_sliced_contraction_plan_records_profile_event(tmp_path):
     assert event["peak_bytes"] == plan.estimated_peak_bytes
 
 
+def test_plan_contraction_records_sliced_plan_profile_event(tmp_path):
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        plan = backend.plan_contraction(
+            backend.parse_einsum("ik,kj->ij", left, right),
+            memory_limit=63,
+            allow_slicing=True,
+        )
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(
+        payload
+        for payload in payloads
+        if payload["event"] == "contraction_plan"
+        and payload.get("plan_hash") == plan.plan_hash
+    )
+
+    assert event["lowering"] == "slice"
+    assert event["equation"] == "ik,kj->ij"
+    assert event["sliced_modes"] == [str(mode) for mode in plan.sliced_modes]
+    assert event["num_slices"] == len(plan.steps[0].plan.output_slices)
+    assert event["base_lowering"] == "gemm"
+    assert event["peak_bytes"] == plan.estimated_peak_bytes
+    assert event["read_bytes"] == plan.estimated_read_bytes
+
+
 def test_plan_contraction_rejects_target_devices_without_distribution():
     from renormalizer.backend import BackendFeatureError, DeviceSpec
     from renormalizer.backend.numpy_backend import NumpyBackend
