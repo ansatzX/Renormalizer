@@ -405,6 +405,76 @@ def _itemsize_of(array) -> int:
     return int(nbytes // size) if size else 0
 
 
+def _array_strides(array):
+    strides = getattr(array, "strides", None)
+    if callable(strides):
+        strides = strides()
+    if strides is not None:
+        return tuple(int(stride) for stride in strides)
+
+    stride = getattr(array, "stride", None)
+    if callable(stride):
+        try:
+            strides = stride()
+        except TypeError:
+            strides = None
+        if strides is not None:
+            itemsize = _itemsize_of(array)
+            return tuple(int(stride) * itemsize for stride in strides)
+    return None
+
+
+def _c_contiguous_from_strides(shape, strides, itemsize):
+    if strides is None:
+        return False
+    expected = int(itemsize)
+    for dim, stride in reversed(tuple(zip(shape, strides))):
+        if int(dim) <= 1:
+            continue
+        if int(stride) != expected:
+            return False
+        expected *= int(dim)
+    return True
+
+
+def _f_contiguous_from_strides(shape, strides, itemsize):
+    if strides is None:
+        return False
+    expected = int(itemsize)
+    for dim, stride in tuple(zip(shape, strides)):
+        if int(dim) <= 1:
+            continue
+        if int(stride) != expected:
+            return False
+        expected *= int(dim)
+    return True
+
+
+def _contiguous_order(array, shape, strides, flags):
+    c_contiguous = bool(flags.get("C_CONTIGUOUS", False))
+    f_contiguous = bool(flags.get("F_CONTIGUOUS", False))
+    itemsize = _itemsize_of(array)
+    if not c_contiguous:
+        c_contiguous = _c_contiguous_from_strides(shape, strides, itemsize)
+    if not f_contiguous:
+        f_contiguous = _f_contiguous_from_strides(shape, strides, itemsize)
+
+    is_contiguous = getattr(array, "is_contiguous", None)
+    if callable(is_contiguous):
+        try:
+            c_contiguous = bool(is_contiguous()) or c_contiguous
+        except TypeError:
+            pass
+
+    if c_contiguous:
+        order = "C"
+    elif f_contiguous:
+        order = "F"
+    else:
+        order = "unknown"
+    return order, bool(c_contiguous or f_contiguous)
+
+
 def _array_flags(array):
     flags = getattr(array, "flags", None)
     if flags is None:
@@ -421,17 +491,8 @@ def _array_flags(array):
 def array_info_for_backend(backend, array, device: DeviceSpec) -> ArrayInfo:
     shape = _shape_of(array)
     flags = _array_flags(array)
-    strides = getattr(array, "strides", None)
-    if strides is not None:
-        strides = tuple(int(stride) for stride in strides)
-    c_contiguous = bool(flags.get("C_CONTIGUOUS", False))
-    f_contiguous = bool(flags.get("F_CONTIGUOUS", False))
-    if c_contiguous:
-        order = "C"
-    elif f_contiguous:
-        order = "F"
-    else:
-        order = "unknown"
+    strides = _array_strides(array)
+    order, contiguous = _contiguous_order(array, shape, strides, flags)
     return ArrayInfo(
         shape=shape,
         dtype=getattr(array, "dtype", None),
@@ -445,7 +506,7 @@ def array_info_for_backend(backend, array, device: DeviceSpec) -> ArrayInfo:
         is_distributed=getattr(backend, "is_distributed_array", lambda _: False)(array),
         strides=strides,
         order=order,
-        contiguous=c_contiguous or f_contiguous,
+        contiguous=contiguous,
         writeable=bool(flags.get("WRITEABLE", True)),
         owns_data=flags.get("OWNDATA"),
         backend_name=backend.name,
@@ -454,16 +515,9 @@ def array_info_for_backend(backend, array, device: DeviceSpec) -> ArrayInfo:
 
 def layout_from_array(array, modes=None) -> LayoutSpec:
     shape = _shape_of(array)
-    strides = getattr(array, "strides", None)
-    if strides is not None:
-        strides = tuple(int(stride) for stride in strides)
+    strides = _array_strides(array)
     flags = _array_flags(array)
-    if flags.get("C_CONTIGUOUS", False):
-        order = "C"
-    elif flags.get("F_CONTIGUOUS", False):
-        order = "F"
-    else:
-        order = "unknown"
+    order, _ = _contiguous_order(array, shape, strides, flags)
     return LayoutSpec(
         logical_shape=shape,
         physical_shape=shape,

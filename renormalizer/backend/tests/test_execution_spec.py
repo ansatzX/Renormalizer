@@ -700,6 +700,29 @@ def test_torch_contraction_execute_supports_full_axis_permutation_when_available
     assert np.allclose(backend.to_numpy(result), np.einsum("abfh,hc->ahbfc", left_np, right_np))
 
 
+def test_torch_array_info_and_layout_report_contiguous_strides_when_available():
+    from renormalizer.backend import BackendConfig
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available("torch"):
+        pytest.skip("torch unavailable")
+
+    backend = create_backend("torch", config=BackendConfig(device="cpu", precision=64))
+    tensor = backend.to_backend(np.arange(6, dtype=np.float64).reshape(2, 3))
+
+    info = backend.array_info(tensor)
+    layout = backend.layout(tensor)
+
+    assert info.shape == (2, 3)
+    assert info.strides == (24, 8)
+    assert info.order == "C"
+    assert info.contiguous is True
+    assert layout.logical_modes == (0, 1)
+    assert layout.strides == (24, 8)
+    assert layout.order == "C"
+    assert layout.contiguous_groups == ((0, 1),)
+
+
 def test_cupy_grouped_gemm_is_backend_primitive_when_available():
     from renormalizer.backend import BackendConfig
     from renormalizer.backend.factory import create_backend, is_backend_available
