@@ -6,6 +6,8 @@ import logging
 
 import numpy as np
 
+from renormalizer.backend.execution import DeviceSpec
+
 try:
     import jax
     import jax.numpy as jnp
@@ -82,6 +84,7 @@ class JaxBackend(AbstractBackend):
                 .format(self.device)
             )
         self._jax_device = self._select_jax_device(self.device)
+        self.device_spec = self._device_spec_for_selected_device(self.device, self._jax_device)
 
         self.array_namespace = jnp
         self.ndarray = (jnp.ndarray, np.ndarray)
@@ -107,7 +110,7 @@ class JaxBackend(AbstractBackend):
             except Exception:
                 devices = []
             if devices:
-                devices_by_kind[kind] = devices[0]
+                devices_by_kind[kind] = tuple(devices)
         try:
             devices = jax.devices()
         except Exception:
@@ -115,7 +118,7 @@ class JaxBackend(AbstractBackend):
         for device in devices:
             kind = self._device_kind(device)
             if kind in self.supported_device_kinds and kind not in devices_by_kind:
-                devices_by_kind[kind] = device
+                devices_by_kind[kind] = (device,)
         self._jax_devices_by_kind = devices_by_kind
         available = tuple(kind for kind in self.supported_device_kinds if kind in devices_by_kind)
         return available or ("cpu",)
@@ -144,7 +147,39 @@ class JaxBackend(AbstractBackend):
                 "JAX device '{0}' was requested but is not available. Available devices: {1}."
                 .format(kind, ", ".join(self.available_device_kinds) or "none")
             )
-        return self._jax_devices_by_kind[kind]
+        devices = tuple(self._jax_devices_by_kind[kind])
+        if kind == "gpu" and self.config.device_spec is not None and self.config.device_spec.index is not None:
+            index = int(self.config.device_spec.index)
+            if index < 0 or index >= len(devices):
+                raise ValueError(
+                    "jax backend CUDA device index {0} is out of range for {1} visible device(s)"
+                    .format(index, len(devices))
+                )
+            return devices[index]
+        return devices[0]
+
+    def _device_spec_for_selected_device(self, kind, device):
+        if self.config.device_spec is not None:
+            return self.config.device_spec
+        if kind == "gpu":
+            index = getattr(device, "id", None)
+            return DeviceSpec(
+                kind="cuda",
+                index=index,
+                visible_id=str(index) if index is not None else None,
+            )
+        return DeviceSpec(kind="cpu")
+
+    def set_device(self, device):
+        super().set_device(device)
+        self.config = self.config.replace(device=device)
+        self._jax_device = self._select_jax_device(self.device)
+        self.device_spec = self._device_spec_for_selected_device(self.device, self._jax_device)
+
+    def device_count(self):
+        if self.device == "gpu":
+            return len(self._jax_devices_by_kind.get("gpu", ()))
+        return len(self._jax_devices_by_kind.get("cpu", ())) or 1
 
     def _place_on_configured_device(self, x):
         if self._jax_device is None:

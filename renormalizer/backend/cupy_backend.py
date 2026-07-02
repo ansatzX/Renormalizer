@@ -50,6 +50,7 @@ class CupyBackend(AbstractBackend):
         self.ndarray = (np.ndarray, _cupy.ndarray)
         self.device_array_types = (_cupy.ndarray,)
         self.memory_errors = (MemoryError, _cupy.cuda.memory.OutOfMemoryError)
+        self._activate_configured_device()
 
         self.linalg = _cupy.linalg
         self.random = _cupy.random
@@ -57,14 +58,46 @@ class CupyBackend(AbstractBackend):
     def __getattr__(self, name):
         return getattr(_cupy, name)
 
+    def _configured_cuda_index(self):
+        spec = self.current_device()
+        if spec.kind == "cuda" and spec.index is not None:
+            index = int(spec.index)
+            count = int(_cupy.cuda.runtime.getDeviceCount())
+            if index < 0 or index >= count:
+                raise ValueError(
+                    "cupy backend CUDA device index {0} is out of range for {1} visible device(s)"
+                    .format(index, count)
+                )
+            return index
+        return None
+
+    def _activate_configured_device(self):
+        index = self._configured_cuda_index()
+        if index is not None:
+            _cupy.cuda.Device(index).use()
+
+    def _on_configured_device(self, fn, *args, **kwargs):
+        index = self._configured_cuda_index()
+        if index is None:
+            return fn(*args, **kwargs)
+        with _cupy.cuda.Device(index):
+            return fn(*args, **kwargs)
+
+    def set_device(self, device):
+        super().set_device(device)
+        self._activate_configured_device()
+
+    def device_count(self):
+        return int(_cupy.cuda.runtime.getDeviceCount())
+
     def array(self, *args, **kwargs):
-        return _cupy.array(*args, **kwargs)
+        return self._on_configured_device(_cupy.array, *args, **kwargs)
 
     def asarray(self, *args, **kwargs):
-        return _cupy.asarray(*args, **kwargs)
+        return self._on_configured_device(_cupy.asarray, *args, **kwargs)
 
     def from_numpy(self, x):
-        return _cupy.asarray(x)
+        return self._on_configured_device(_cupy.asarray, x)
 
     def numpy(self, x):
         return self.to_numpy(x)
@@ -83,7 +116,7 @@ class CupyBackend(AbstractBackend):
 
     def to_backend(self, x):
         """Convert ``x`` to a CuPy array on the active device."""
-        return _cupy.asarray(x)
+        return self.asarray(x)
 
     def free_all_blocks(self):
         mempool = _cupy.get_default_memory_pool()
@@ -98,4 +131,8 @@ class CupyBackend(AbstractBackend):
         )
 
     def sync(self):
-        _cupy.cuda.Device(0).synchronize()
+        index = self._configured_cuda_index()
+        if index is None:
+            _cupy.cuda.Device().synchronize()
+        else:
+            _cupy.cuda.Device(index).synchronize()

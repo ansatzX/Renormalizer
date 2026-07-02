@@ -40,9 +40,7 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
             available.append("gpu")
         self.supports_gpu = True
         self._set_configured_device(("cpu", "gpu"), default="cpu", available=tuple(available))
-        torch_device = getattr(torch, "device", None)
-        if torch_device is not None:
-            self._torch_device = torch_device("cuda" if self.device == "gpu" else "cpu")
+        self._torch_device = self._configured_torch_device()
 
         self.array_namespace = torch
         self.linalg = torch.linalg
@@ -53,6 +51,39 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
         if torch_oom_error is not None:
             self.memory_errors = (MemoryError, torch_oom_error)
         self._init_distributed_runtime()
+
+    def _configured_cuda_index(self):
+        spec = self.current_device()
+        if spec.kind == "cuda" and spec.index is not None:
+            index = int(spec.index)
+            if index < 0 or index >= torch.cuda.device_count():
+                raise ValueError(
+                    "torch backend CUDA device index {0} is out of range for {1} visible device(s)"
+                    .format(index, torch.cuda.device_count())
+                )
+            return index
+        return None
+
+    def _configured_torch_device(self):
+        torch_device = getattr(torch, "device", None)
+        if torch_device is None:
+            return None
+        if self.device == "gpu":
+            index = self._configured_cuda_index()
+            if index is not None:
+                torch.cuda.set_device(index)
+                return torch_device("cuda:{0}".format(index))
+            return torch_device("cuda")
+        return torch_device("cpu")
+
+    def set_device(self, device):
+        super().set_device(device)
+        self._torch_device = self._configured_torch_device()
+
+    def device_count(self):
+        if self.device == "gpu" and torch.cuda.is_available():
+            return int(torch.cuda.device_count())
+        return 1
 
     def __getattr__(self, name):
         return getattr(torch, name)
