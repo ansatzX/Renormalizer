@@ -932,6 +932,26 @@ class HardwareModel:
     device_bandwidth_bytes_s: float | None = None
     interconnect_bandwidth_bytes_s: float | None = None
 
+    def __post_init__(self):
+        for field in (
+            "flop_per_s",
+            "memory_bandwidth_Bps",
+            "h2d_bandwidth_Bps",
+            "d2h_bandwidth_Bps",
+            "p2p_bandwidth_Bps",
+            "network_bandwidth_Bps",
+            "latency_s",
+            "max_memory_bytes",
+            "workspace_limit_bytes",
+            "device_flop_s",
+            "host_bandwidth_bytes_s",
+            "device_bandwidth_bytes_s",
+            "interconnect_bandwidth_bytes_s",
+        ):
+            value = getattr(self, field)
+            if value is not None and value < 0:
+                raise ValueError("{0} must be non-negative".format(field))
+
 
 @dataclass(frozen=True)
 class CostEstimate:

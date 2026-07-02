@@ -3967,6 +3967,31 @@ def test_plan_contraction_memory_preference_uses_slicing_to_reduce_peak():
     assert np.allclose(backend.execute(memory_plan), left @ right)
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "flop_per_s",
+        "memory_bandwidth_Bps",
+        "h2d_bandwidth_Bps",
+        "d2h_bandwidth_Bps",
+        "p2p_bandwidth_Bps",
+        "network_bandwidth_Bps",
+        "latency_s",
+        "max_memory_bytes",
+        "workspace_limit_bytes",
+        "device_flop_s",
+        "host_bandwidth_bytes_s",
+        "device_bandwidth_bytes_s",
+        "interconnect_bandwidth_bytes_s",
+    ],
+)
+def test_hardware_model_rejects_negative_physical_parameters(field):
+    from renormalizer.backend import HardwareModel
+
+    with pytest.raises(ValueError, match="{0} must be non-negative".format(field)):
+        HardwareModel(**{field: -1})
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend
