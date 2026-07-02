@@ -1340,6 +1340,7 @@ def test_grouped_gemm_records_bucketed_fallback_profile(tmp_path):
     assert event["read_bytes"] == 524544
     assert event["write_bytes"] == 262264
     assert event["copy_bytes"] == 524288
+    assert event["peak_bytes"] == event["write_bytes"] + event["workspace_bytes"]
     assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
     assert event["bucket_task_counts"] == [1, 2]
     assert event["shape_buckets"] == [
@@ -1772,6 +1773,7 @@ def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
         ["float64", "float64"],
         ["float64", "float64"],
     ]
+    assert event["peak_bytes"] == event["write_bytes"] + event["workspace_bytes"]
     assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
     assert event["wall_s"] >= 0.0
 
