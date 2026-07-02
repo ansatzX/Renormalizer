@@ -1096,6 +1096,12 @@ class ContractionStep:
             raise ValueError("ContractionStep inputs must be non-negative")
         if output < 0:
             raise ValueError("ContractionStep output must be non-negative")
+        input_modes = tuple(tuple(modes) for modes in self.input_modes)
+        output_modes = tuple(self.output_modes)
+        if len(input_modes) != len(inputs):
+            raise ValueError("ContractionStep input_modes must match inputs length")
+        if len(set(output_modes)) != len(output_modes):
+            raise ValueError("ContractionStep output_modes must be unique")
         for field in (
             "estimated_flops",
             "estimated_read_bytes",
@@ -1112,8 +1118,8 @@ class ContractionStep:
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "output", output)
-        object.__setattr__(self, "input_modes", tuple(tuple(modes) for modes in self.input_modes))
-        object.__setattr__(self, "output_modes", tuple(self.output_modes))
+        object.__setattr__(self, "input_modes", input_modes)
+        object.__setattr__(self, "output_modes", output_modes)
 
 
 @dataclass(frozen=True)
@@ -1136,6 +1142,12 @@ class ContractionPlan:
         steps = tuple(self.steps)
         if not steps:
             raise ValueError("ContractionPlan steps must be non-empty")
+        input_specs = tuple(self.input_specs)
+        output_modes = tuple(self.output_modes)
+        if not input_specs:
+            raise ValueError("ContractionPlan input_specs must be non-empty")
+        if steps[-1].output_modes != output_modes:
+            raise ValueError("ContractionPlan output_modes must match final step output_modes")
         for field in (
             "estimated_flops",
             "estimated_peak_bytes",
@@ -1150,8 +1162,8 @@ class ContractionPlan:
                 raise ValueError("ContractionPlan {0} must be non-negative".format(field))
             object.__setattr__(self, field, value)
         object.__setattr__(self, "steps", steps)
-        object.__setattr__(self, "input_specs", tuple(self.input_specs))
-        object.__setattr__(self, "output_modes", tuple(self.output_modes))
+        object.__setattr__(self, "input_specs", input_specs)
+        object.__setattr__(self, "output_modes", output_modes)
         object.__setattr__(self, "sliced_modes", tuple(self.sliced_modes))
         object.__setattr__(self, "distributed_modes", tuple(self.distributed_modes))
         if not self.plan_hash:

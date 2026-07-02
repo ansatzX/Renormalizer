@@ -1387,6 +1387,20 @@ def test_contraction_step_rejects_negative_tensor_ids():
         ContractionStep(**kwargs)
 
 
+def test_contraction_step_rejects_inconsistent_mode_metadata():
+    from renormalizer.backend import ContractionStep
+
+    kwargs = _valid_contraction_step_kwargs()
+    kwargs["input_modes"] = (("i", "k"),)
+    with pytest.raises(ValueError, match="ContractionStep input_modes must match inputs length"):
+        ContractionStep(**kwargs)
+
+    kwargs = _valid_contraction_step_kwargs()
+    kwargs["output_modes"] = ("i", "i")
+    with pytest.raises(ValueError, match="ContractionStep output_modes must be unique"):
+        ContractionStep(**kwargs)
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -1430,6 +1444,20 @@ def test_contraction_plan_rejects_empty_steps():
     kwargs["steps"] = ()
 
     with pytest.raises(ValueError, match="ContractionPlan steps must be non-empty"):
+        ContractionPlan(**kwargs)
+
+
+def test_contraction_plan_rejects_inconsistent_step_metadata():
+    from renormalizer.backend import ContractionPlan
+
+    kwargs = _valid_contraction_plan_kwargs()
+    kwargs["input_specs"] = ()
+    with pytest.raises(ValueError, match="ContractionPlan input_specs must be non-empty"):
+        ContractionPlan(**kwargs)
+
+    kwargs = _valid_contraction_plan_kwargs()
+    kwargs["output_modes"] = ("j", "i")
+    with pytest.raises(ValueError, match="ContractionPlan output_modes must match final step output_modes"):
         ContractionPlan(**kwargs)
 
 
