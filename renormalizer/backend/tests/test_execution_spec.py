@@ -2857,6 +2857,59 @@ def test_execute_grouped_matmul_plan_records_all_descriptor_shapes(tmp_path):
     ]
 
 
+def test_estimate_grouped_matmul_plan_peak_counts_all_outputs():
+    from renormalizer.backend import MatmulDesc, MatmulPlan
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left0 = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right0 = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left1 = left0 + 10.0
+    right1 = right0 - 2.0
+    descs = (
+        MatmulDesc(
+            left0,
+            right0,
+            None,
+            2,
+            4,
+            3,
+            estimated_flops=48,
+            estimated_read_bytes=left0.nbytes + right0.nbytes,
+            estimated_write_bytes=2 * 4 * left0.itemsize,
+        ),
+        MatmulDesc(
+            left1,
+            right1,
+            None,
+            2,
+            4,
+            3,
+            estimated_flops=48,
+            estimated_read_bytes=left1.nbytes + right1.nbytes,
+            estimated_write_bytes=2 * 4 * left1.itemsize,
+        ),
+    )
+    plan = MatmulPlan(
+        kind="grouped_gemm",
+        descs=descs,
+        pre_ops=(),
+        post_ops=(),
+        output_shape=(2, 4),
+        copy_bytes=0,
+        workspace_bytes=32,
+        estimated_flops=96,
+        estimated_time_s=None,
+        reason="test grouped matmul plan",
+    )
+
+    estimate = backend.estimate_matmul(plan)
+
+    assert estimate.write_bytes == 2 * 2 * 4 * left0.itemsize
+    assert estimate.workspace_bytes == 32
+    assert estimate.peak_bytes == estimate.write_bytes + estimate.workspace_bytes
+
+
 def test_execute_batched_matmul_plan_preserves_generic_output_mode_order():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend

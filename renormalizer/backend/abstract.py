@@ -1847,14 +1847,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def estimate_matmul(self, desc, hw=None):
         if isinstance(desc, MatmulPlan):
+            write_bytes = sum(item.estimated_write_bytes for item in desc.descs)
             return self._make_cost_estimate(
                 hw,
                 flops=desc.estimated_flops,
                 read_bytes=sum(item.estimated_read_bytes for item in desc.descs),
-                write_bytes=sum(item.estimated_write_bytes for item in desc.descs),
+                write_bytes=write_bytes,
                 copy_bytes=desc.copy_bytes,
                 workspace_bytes=desc.workspace_bytes,
-                peak_bytes=max((item.estimated_write_bytes for item in desc.descs), default=0) + desc.workspace_bytes,
+                peak_bytes=write_bytes + desc.workspace_bytes,
             )
         batch = self._prod_shape(desc.batch_shape)
         flops = desc.estimated_flops or int(2 * batch * desc.m * desc.n * desc.k)
