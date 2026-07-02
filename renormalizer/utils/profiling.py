@@ -27,6 +27,7 @@ _OP_EVENTS = frozenset({
     "contraction_plan",
     "contraction_execute",
     "svd_qn",
+    "eigh_qn",
     "hop_expr",
 })
 _TRACE_EVENTS = frozenset({
@@ -452,8 +453,11 @@ def decomposition_flops_estimate(shape, mode):
     r = min(m, n)
     if r <= 0:
         return 0
-    if str(mode).upper() == "QR":
+    upper_mode = str(mode).upper()
+    if upper_mode == "QR":
         return int(max(0, 2 * m * n * r - (2 * r * r * r) // 3))
+    if upper_mode == "EIGH":
+        return int((10 * r * r * r) // 3)
     return int(4 * m * n * r + (8 * r * r * r) // 3)
 
 
@@ -465,13 +469,22 @@ def svd_qn_compute_payload(mode, coef_array, coef_matrix, blocks, outputs):
     output_arrays = tuple(array for array in outputs if hasattr(array, "shape"))
     return {
         "compute_class": "svd",
-        "compute_subclass": "qr_qn" if str(mode).upper() == "QR" else "svd_qn",
+        "compute_subclass": _decomposition_subclass(mode),
         "input_dtype": str(getattr(coef_array, "dtype", None)),
         "output_dtype": str(getattr(output_arrays[0], "dtype", None)) if output_arrays else None,
         "flops_estimate": int(block_flops or decomposition_flops_estimate(getattr(coef_matrix, "shape", ()), mode)),
         "read_bytes": int(getattr(coef_array, "nbytes", 0)),
         "write_bytes": array_total_bytes(output_arrays),
     }
+
+
+def _decomposition_subclass(mode):
+    upper_mode = str(mode).upper()
+    if upper_mode == "QR":
+        return "qr_qn"
+    if upper_mode == "EIGH":
+        return "eigh_qn"
+    return "svd_qn"
 
 
 def array_total_bytes(values) -> int:

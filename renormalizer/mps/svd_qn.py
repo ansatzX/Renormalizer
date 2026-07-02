@@ -307,6 +307,8 @@ def eigh_qn(dm, qnbigl, qnbigr, qntot, system):
         New quantum number for U.
     """
     assert system in ["L", "R"]
+    profile_enabled = profiling.should_record_op()
+    started = time.perf_counter() if profile_enabled else None
     if system == "L":
         # qnbig and complementary qnbig
         qnbig, comp_qnbig = qnbigl, qnbigr
@@ -319,6 +321,8 @@ def eigh_qn(dm, qnbigl, qnbigr, qntot, system):
     block_u_list = []
     block_s_list = []
     new_qn = []
+    block_count = 0 if profile_enabled else None
+    blocks = [] if profile_enabled else None
 
     for nl in set([tuple(t) for t in localqn]):
         nr = qntot - nl
@@ -328,6 +332,9 @@ def eigh_qn(dm, qnbigl, qnbigr, qntot, system):
         block = dm.ravel().take(
             (lset * len(localqn)).reshape(-1, 1) + rset
         )
+        if profile_enabled:
+            block_count += 1
+            blocks.append(profiling.svd_qn_block_payload(nl, nr, lset, rset, block, len(lset)))
         block_s2, block_u = scipy.linalg.eigh(block)
         # numerical error for eigenvalue < 0
         block_s2[block_s2 < 0] = 0
@@ -340,6 +347,20 @@ def eigh_qn(dm, qnbigl, qnbigr, qntot, system):
 
     u = np.concatenate(block_u_list, axis=1)
     s = np.concatenate(block_s_list)
+    if profile_enabled:
+        profiling.record(
+            "eigh_qn",
+            system=system,
+            dm_shape=tuple(dm.shape),
+            matrix_shape=tuple(dm.shape),
+            qn_size=qn_size,
+            block_count=block_count,
+            blocks=blocks,
+            output_rank=int(u.shape[1]),
+            singular_value_count=int(len(s)),
+            **profiling.svd_qn_compute_payload("EIGH", dm, dm, blocks, (u, s)),
+            wall_s=time.perf_counter() - started,
+        )
     return u, s, new_qn
 
 

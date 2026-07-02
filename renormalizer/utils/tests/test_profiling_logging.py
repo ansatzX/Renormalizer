@@ -804,6 +804,56 @@ def test_svd_qn_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tm
     assert event["wall_s"] >= 0
 
 
+def test_eigh_qn_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
+    import numpy as np
+
+    from renormalizer.mps.svd_qn import eigh_qn
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    qn = np.zeros((2, 1), dtype=int)
+    try:
+        u, s, new_qn = eigh_qn(np.eye(2), qn, qn, np.array([0]), system="L")
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert u.shape == (2, 2)
+    assert s.shape == (2,)
+    assert len(new_qn) == 2
+    log_payloads = _profiling_payloads(caplog, profiling)
+    assert not [payload for payload in log_payloads if payload["event"] == "eigh_qn"]
+    event = next(payload for payload in _jsonl_payloads(event_path) if payload["event"] == "eigh_qn")
+    assert event["compute_class"] == "svd"
+    assert event["compute_subclass"] == "eigh_qn"
+    assert event["system"] == "L"
+    assert event["dm_shape"] == [2, 2]
+    assert event["matrix_shape"] == [2, 2]
+    assert event["input_dtype"] == "float64"
+    assert event["output_dtype"] == "float64"
+    assert event["read_bytes"] == 2 * 2 * 8
+    assert event["write_bytes"] >= 2 * 2 * 8
+    assert event["flops_estimate"] > 0
+    assert event["block_count"] == 1
+    assert event["blocks"] == [
+        {
+            "left_qn": [0],
+            "right_qn": [0],
+            "left_size": 2,
+            "right_size": 2,
+            "block_shape": [2, 2],
+            "rank": 2,
+        }
+    ]
+    assert event["output_rank"] == 2
+    assert event["singular_value_count"] == 2
+    assert event["wall_s"] >= 0
+
+
 def test_mps_copy_to_complex_and_environ_events_write_jsonl(caplog, tmp_path):
     from renormalizer import BasisHalfSpin, Model, Mpo, Mps, Op
     from renormalizer.mps.lib import Environ
