@@ -1529,7 +1529,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         bandwidth = self._hardware_comm_bandwidth(hw)
         total = 0.0
         for item in communication:
-            nbytes = int(item.bytes)
+            nbytes = int(getattr(item, "local_bytes", item.bytes))
             total += self._rate_seconds(nbytes, bandwidth)
             if nbytes and hw.latency_s:
                 total += int(item.num_messages) * float(hw.latency_s)

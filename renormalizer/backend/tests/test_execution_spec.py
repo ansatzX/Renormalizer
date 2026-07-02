@@ -2911,6 +2911,28 @@ def test_communication_plan_message_count_contributes_latency():
     ) == pytest.approx(5.5)
 
 
+def test_communication_plan_local_bytes_drive_per_rank_timing():
+    from renormalizer.backend import CommunicationPlan, HardwareModel
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    communication = CommunicationPlan(
+        kind="alltoall",
+        bytes=96,
+        local_bytes=48,
+        modes=("row", "col"),
+        num_messages=2,
+    )
+
+    assert communication.bytes == 96
+    assert communication.local_bytes == 48
+    assert communication.block_size == 48
+    assert backend._estimate_communication_sequence_s(
+        (communication,),
+        HardwareModel(network_bandwidth_Bps=24.0, latency_s=0.5),
+    ) == pytest.approx(3.0)
+
+
 def test_sharding_spec_can_replicate_over_unused_mesh_axes():
     from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
 

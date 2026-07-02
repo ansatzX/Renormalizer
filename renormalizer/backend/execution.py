@@ -820,6 +820,7 @@ class DistributionState:
 class CommunicationPlan:
     kind: str
     bytes: int
+    local_bytes: int | None = None
     modes: tuple[Hashable, ...] = ()
     reason: str | None = None
     num_messages: int = 1
@@ -827,11 +828,17 @@ class CommunicationPlan:
 
     def __post_init__(self):
         bytes_ = int(self.bytes)
+        local_bytes = bytes_ if self.local_bytes is None else int(self.local_bytes)
         num_messages = int(self.num_messages)
+        if bytes_ < 0:
+            raise ValueError("CommunicationPlan bytes must be non-negative")
+        if local_bytes < 0:
+            raise ValueError("CommunicationPlan local_bytes must be non-negative")
         if num_messages < 0:
             raise ValueError("CommunicationPlan num_messages must be non-negative")
-        block_size = bytes_ if self.block_size is None else int(self.block_size)
+        block_size = local_bytes if self.block_size is None else int(self.block_size)
         object.__setattr__(self, "bytes", bytes_)
+        object.__setattr__(self, "local_bytes", local_bytes)
         object.__setattr__(self, "modes", tuple(self.modes))
         object.__setattr__(self, "num_messages", num_messages)
         object.__setattr__(self, "block_size", block_size)
