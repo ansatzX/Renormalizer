@@ -366,6 +366,23 @@ def test_numpy_layout_transform_api_tracks_view_and_contiguous_copy():
     assert not np.shares_memory(contiguous, transposed)
 
 
+def test_permute_never_copy_policy_rejects_copying_backend_transpose():
+    from renormalizer.backend.execution import BackendCopyError, CopyPolicy
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class CopyingTransposeNamespace:
+        @staticmethod
+        def transpose(x, perm):
+            return np.array(np.transpose(x, perm), copy=True)
+
+    backend = NumpyBackend()
+    backend.array_namespace = CopyingTransposeNamespace
+    x = np.arange(12, dtype=np.float64).reshape(3, 4)
+
+    with pytest.raises(BackendCopyError, match="permute would require a copy"):
+        backend.permute(x, (1, 0), copy_policy=CopyPolicy.NEVER)
+
+
 def test_make_contiguous_accepts_mode_groups_for_gemm_layout_boundary():
     from renormalizer.backend.numpy_backend import NumpyBackend
 

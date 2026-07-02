@@ -584,6 +584,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             result = xp.permute(x, perm)
         else:
             result = xp.transpose(x, perm)
+        if copy_policy is CopyPolicy.NEVER and result is not x and not self._shares_memory(result, x):
+            raise BackendCopyError("permute would require a copy")
         if copy_policy is CopyPolicy.ALWAYS:
             return self.make_contiguous(result, copy_policy=CopyPolicy.ALWAYS)
         return result
@@ -3823,6 +3825,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def _shares_memory(self, left, right):
         if left is right:
             return True
+        for storage_attr in ("untyped_storage", "storage"):
+            left_storage = getattr(left, storage_attr, None)
+            right_storage = getattr(right, storage_attr, None)
+            if callable(left_storage) and callable(right_storage):
+                try:
+                    return left_storage().data_ptr() == right_storage().data_ptr()
+                except Exception:
+                    pass
         xp = self.array_namespace or _np
         shares_memory = getattr(xp, "shares_memory", None)
         if shares_memory is not None:
