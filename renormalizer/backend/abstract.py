@@ -485,6 +485,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
             self.opt_einsum_name,
         )
 
+    def contract_path(self, *args, **kwargs):
+        import opt_einsum as oe
+
+        return oe.contract_path(*args, **kwargs)
+
     @staticmethod
     def _contraction_step_from_matmul_plan(plan, input_modes, output_modes):
         return ContractionStep(

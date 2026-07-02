@@ -63,6 +63,7 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "make_contiguous",
     "parse_einsum",
     "contract_expression",
+    "contract_path",
     "plan_contraction",
     "plan_distributed_contraction_path",
     "estimate_matmul",
@@ -361,6 +362,10 @@ class BackendProtocol(Protocol):
 
     def contract_expression(self, *args: Any, **kwargs: Any) -> Any:
         """Create an opt_einsum expression that defaults to this backend."""
+        ...
+
+    def contract_path(self, *args: Any, **kwargs: Any) -> Any:
+        """Plan an opt_einsum contraction path through the backend surface."""
         ...
 
     def plan_contraction(self, spec: Any, **kwargs: Any) -> Any:

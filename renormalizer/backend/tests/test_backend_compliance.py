@@ -120,6 +120,18 @@ def test_backend_compliance_contract_expression_uses_backend_execution(backend_n
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_contract_path_uses_backend_surface(backend_name, device):
+    backend = _backend_or_skip(backend_name, device)
+
+    path, info = backend.contract_path("ik,kj->ij", (2, 3), (3, 4), shapes=True, optimize="greedy")
+
+    assert backend.capabilities.contraction_path is True
+    assert path == [(0, 1)]
+    assert int(info.largest_intermediate) == 8
+    assert int(info.opt_cost) == 48
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
 def test_backend_compliance_astype_copy_policy(backend_name, device):
     from renormalizer.backend import BackendCopyError, CopyPolicy
 
