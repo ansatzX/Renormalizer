@@ -668,11 +668,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
             distributed_modes=tuple(distributed_modes),
         )
 
-    def _plan_einsum_contraction(self, spec, *, sliced_modes=(), distributed_modes=(), comm_bytes=0):
+    def _plan_einsum_contraction(
+        self,
+        spec,
+        *,
+        sliced_modes=(),
+        distributed_modes=(),
+        comm_bytes=0,
+        record_profile=True,
+    ):
         if len(spec.operands) != 2:
             raise BackendFeatureError("plan_contraction currently supports two-operand explicit einsum specs")
         pair_spec = PairContractionSpec.from_operands(spec.operands[0], spec.operands[1], spec.output_modes)
-        matmul_plan = self.lower_pair_contraction_to_matmul(pair_spec)
+        matmul_plan = self.lower_pair_contraction_to_matmul(pair_spec, record_profile=record_profile)
         step = self._contraction_step_from_matmul_plan(
             matmul_plan,
             input_modes=(spec.operands[0].modes, spec.operands[1].modes),
@@ -2156,6 +2164,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 operands,
                 stream=stream,
                 workspace=workspace,
+                record_plan_profile=False,
             )
             if result is None:
                 result = self._zeros_backend(output_shape, getattr(local_result, "dtype", None))
@@ -2484,10 +2493,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return _np.einsum(equation, *operands)
         return einsum(equation, *operands)
 
-    def _execute_local_contraction_plan(self, equation, operands, *, stream=None, workspace=None):
+    def _execute_local_contraction_plan(
+        self,
+        equation,
+        operands,
+        *,
+        stream=None,
+        workspace=None,
+        record_plan_profile=True,
+    ):
         try:
             spec = self.parse_einsum(equation, *operands)
-            plan = self.plan_contraction(spec, allow_distribution=False)
+            plan = self._plan_einsum_contraction(spec, record_profile=record_plan_profile)
         except BackendFeatureError:
             return self._execute_einsum(equation, operands)
         if (
@@ -2955,12 +2972,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
         )
         return result
 
-    def lower_pair_contraction_to_matmul(self, spec):
+    def lower_pair_contraction_to_matmul(self, spec, *, record_profile=True):
         plan = lower_pair_contraction_to_matmul(spec, self.capabilities)
         try:
             from renormalizer.utils import profiling
 
-            if profiling.should_record_op():
+            if record_profile and profiling.should_record_op():
                 input_modes = (spec.left.modes, spec.right.modes)
                 equation = self._equation_from_modes(input_modes, spec.output_modes)
                 step = self._contraction_step_from_matmul_plan(

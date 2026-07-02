@@ -2752,6 +2752,39 @@ def test_execute_sliced_contraction_plan_records_profile_event(tmp_path):
     assert event["peak_bytes"] == plan.estimated_peak_bytes
 
 
+def test_execute_sliced_contraction_plan_does_not_profile_internal_slice_plans(tmp_path):
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    plan = backend.plan_contraction(
+        backend.parse_einsum("ik,kj->ij", left, right),
+        memory_limit=63,
+        allow_slicing=True,
+    )
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        backend.execute(plan)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert [payload["event"] for payload in payloads] == ["contraction_execute"]
+
+
 def test_plan_contraction_records_sliced_plan_profile_event(tmp_path):
     from renormalizer.backend.numpy_backend import NumpyBackend
     from renormalizer.utils import profiling
