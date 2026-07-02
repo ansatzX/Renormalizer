@@ -786,14 +786,36 @@ class PackedVectorSpec:
         center_shape = tuple(int(dim) for dim in self.center_shape)
         packed_dim = int(self.packed_dim)
         nrhs = int(self.nrhs)
+        batch_axis = int(self.batch_axis)
         if any(dim < 0 for dim in center_shape):
             raise ValueError("center_shape dimensions must be non-negative")
         if packed_dim < 0:
             raise ValueError("packed_dim must be non-negative")
         if nrhs < 1:
             raise ValueError("nrhs must be positive")
+        batch_ndim = len(center_shape) + 1
+        normalized_batch_axis = batch_axis + batch_ndim if batch_axis < 0 else batch_axis
+        if normalized_batch_axis < 0 or normalized_batch_axis >= batch_ndim:
+            raise ValueError(
+                "PackedVectorSpec batch_axis {0} is out of bounds for ndim {1}"
+                .format(batch_axis, batch_ndim)
+            )
+        mask_shape = getattr(self.qn_mask, "shape", None)
+        if mask_shape is not None and tuple(int(dim) for dim in mask_shape) != center_shape:
+            raise ValueError(
+                "PackedVectorSpec qn_mask shape must match center_shape {0}; got {1}"
+                .format(center_shape, tuple(int(dim) for dim in mask_shape))
+            )
+        mask_sum = getattr(self.qn_mask, "sum", None)
+        if callable(mask_sum):
+            true_count = int(mask_sum())
+            if true_count != packed_dim:
+                raise ValueError(
+                    "PackedVectorSpec packed_dim must match qn_mask true count {0}; got {1}"
+                    .format(true_count, packed_dim)
+                )
         object.__setattr__(self, "center_shape", center_shape)
-        object.__setattr__(self, "batch_axis", int(self.batch_axis))
+        object.__setattr__(self, "batch_axis", batch_axis)
         object.__setattr__(self, "packed_dim", packed_dim)
         object.__setattr__(self, "nrhs", nrhs)
 

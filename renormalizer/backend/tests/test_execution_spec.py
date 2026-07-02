@@ -1115,6 +1115,21 @@ def test_packed_vector_spec_rejects_wrong_packed_shapes():
         backend.pack_masked_vectors(np.ones(mask.shape + (3,)), spec)
 
 
+def test_packed_vector_spec_rejects_inconsistent_mask_metadata():
+    from renormalizer.backend.execution import PackedVectorSpec
+
+    mask = np.array([[True, False, True], [False, True, False]])
+
+    with pytest.raises(ValueError, match="PackedVectorSpec qn_mask shape must match center_shape"):
+        PackedVectorSpec(qn_mask=mask, center_shape=(3, 2), packed_dim=3)
+
+    with pytest.raises(ValueError, match="PackedVectorSpec packed_dim must match qn_mask true count"):
+        PackedVectorSpec(qn_mask=mask, center_shape=mask.shape, packed_dim=2)
+
+    with pytest.raises(ValueError, match="PackedVectorSpec batch_axis 3 is out of bounds for ndim 3"):
+        PackedVectorSpec(qn_mask=mask, center_shape=mask.shape, batch_axis=3, packed_dim=3)
+
+
 def test_tensor_operand_rejects_inconsistent_layout_metadata():
     from renormalizer.backend import LayoutSpec, TensorOperand
 
