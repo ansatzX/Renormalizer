@@ -3893,6 +3893,8 @@ def test_execute_contraction_plan_profile_records_plan_hash(tmp_path):
     assert execute["operands"][0]["is_host"] is True
     assert execute["operands"][0]["is_distributed"] is False
     assert execute["peak_bytes"] == execute["write_bytes"] + execute["workspace_bytes"]
+    assert execute["device_kind"] == "cpu"
+    assert execute["device_index"] is None
     assert execute["device_info"] == {
         "kind": "cpu",
         "index": None,

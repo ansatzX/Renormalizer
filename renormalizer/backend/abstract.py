@@ -946,8 +946,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     str(getattr(operand.array, "dtype", None))
                     for operand in plan.input_specs
                 ],
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=plan.estimated_flops,
                 read_bytes=plan.estimated_read_bytes,
                 write_bytes=plan.estimated_write_bytes,
@@ -1692,8 +1691,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     for operand in plan.input_specs
                 ],
                 output_shape=output_shape,
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=plan.estimated_flops,
                 read_bytes=plan.estimated_read_bytes,
                 write_bytes=plan.estimated_write_bytes,
@@ -2582,8 +2580,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ],
                 output_shape=tuple(getattr(result, "shape", ())),
                 dtype=str(getattr(result, "dtype", None)),
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=plan.estimated_flops,
                 read_bytes=plan.estimated_read_bytes,
                 write_bytes=plan.estimated_write_bytes,
@@ -2648,8 +2645,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ],
                 output_shape=tuple(getattr(result, "shape", ())),
                 dtype=str(getattr(result, "dtype", None)),
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=plan.estimated_flops,
                 read_bytes=plan.estimated_read_bytes,
                 write_bytes=plan.estimated_write_bytes,
@@ -3136,6 +3132,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
         return profiling.device_payload(device)
 
+    @staticmethod
+    def _profile_device_execution(device):
+        from renormalizer.utils import profiling
+
+        return profiling.device_execution_payload(device)
+
     def _profile_tensor_operand(self, operand):
         from renormalizer.utils import profiling
 
@@ -3341,8 +3343,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ],
                 input_dtypes=[str(self._operand_dtype(operand)) for operand in spec.operands],
                 output_shape=output_shape,
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=int(getattr(plan, "estimated_flops", 0)),
                 read_bytes=int(getattr(plan, "estimated_read_bytes", 0)),
                 write_bytes=int(getattr(plan, "estimated_write_bytes", 0)),
@@ -3475,8 +3476,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 input_dtypes=[str(self._operand_dtype(operand)) for operand in spec.operands],
                 output_shape=tuple(result.global_shape),
                 dtype=str(getattr(result, "dtype", None)),
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=flops,
                 read_bytes=int(getattr(metric_plan, "estimated_read_bytes", 0)),
                 write_bytes=int(getattr(metric_plan, "estimated_write_bytes", 0)),
@@ -3760,8 +3760,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         str(getattr(spec.left.array, "dtype", None)),
                         str(getattr(spec.right.array, "dtype", None)),
                     ],
-                    device=str(self.current_device()),
-                    device_info=self._profile_device(self.current_device()),
+                    **self._profile_device_execution(self.current_device()),
                     flops=plan.estimated_flops,
                     read_bytes=sum(desc.estimated_read_bytes for desc in plan.descs),
                     write_bytes=sum(desc.estimated_write_bytes for desc in plan.descs),
@@ -3956,8 +3955,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ],
                 output_shape=tuple(plan.global_shape),
                 dtype=str(getattr(plan.tasks[0].A, "dtype", None)) if plan.tasks else None,
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=int(plan.estimated_flops),
                 read_bytes=int(plan.estimated_read_bytes),
                 write_bytes=int(plan.estimated_write_bytes),
@@ -4080,8 +4078,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ],
                 output_shape=tuple(result.global_shape),
                 dtype=str(getattr(next(iter(result.blocks.values())).array, "dtype", None)) if result.blocks else None,
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=int(stats.flops),
                 read_bytes=int(stats.read_bytes),
                 write_bytes=int(stats.write_bytes),
@@ -4516,8 +4513,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     ],
                     output_shape=[tuple(getattr(item, "shape", ())) for item in result],
                     dtype=str(getattr(result[0], "dtype", None)) if result else None,
-                    device=str(self.current_device()),
-                    device_info=self._profile_device(self.current_device()),
+                    **self._profile_device_execution(self.current_device()),
                     flops=stats.flops,
                     read_bytes=stats.read_bytes,
                     write_bytes=stats.write_bytes,
@@ -4690,8 +4686,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 task_specs=task_specs,
                 output_shape=output_shape,
                 dtype=dtype,
-                device=str(self.current_device()),
-                device_info=self._profile_device(self.current_device()),
+                **self._profile_device_execution(self.current_device()),
                 flops=plan.estimated_flops,
                 read_bytes=sum(desc.estimated_read_bytes for desc in plan.descs),
                 write_bytes=sum(desc.estimated_write_bytes for desc in plan.descs),

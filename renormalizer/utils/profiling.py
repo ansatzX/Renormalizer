@@ -231,6 +231,16 @@ def device_payload(device):
     }
 
 
+def device_execution_payload(device):
+    payload = device_payload(device)
+    return {
+        "device": str(device),
+        "device_info": payload,
+        "device_kind": payload["kind"],
+        "device_index": payload["index"],
+    }
+
+
 def array_operand_payload(backend, name, array, modes):
     info = backend.array_info(array)
     return {

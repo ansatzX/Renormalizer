@@ -576,7 +576,7 @@ def _broadcast_case(backend, backend_name, device, rank, world_size):
             output_shape=list(expected.shape),
             input_dtypes=[str(expected.dtype)],
             dtype=str(expected.dtype),
-            device=str(backend.current_device()),
+            **profiling.device_execution_payload(backend.current_device()),
             global_shape=list(expected.shape),
             local_shape=list(expected.shape),
             distributed_modes=[],
