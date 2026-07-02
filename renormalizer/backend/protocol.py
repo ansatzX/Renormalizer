@@ -20,6 +20,11 @@ _BACKEND_PROTOCOL_RUNTIME_ATTRS = (
     "supports_jit",
     "supports_sparse",
     "supports_functional_update",
+    "supports_complex64",
+    "supports_complex128",
+    "supports_fp32",
+    "supports_fp64",
+    "supports_mixed_precision",
     "supports_batched_matmul",
     "supports_grouped_gemm",
     "supports_strided_batched_gemm",
@@ -200,6 +205,21 @@ class BackendProtocol(Protocol):
 
     supports_functional_update: bool
     """Whether update helpers return updated arrays without in-place mutation."""
+
+    supports_complex64: bool
+    """Whether complex64 arrays are supported."""
+
+    supports_complex128: bool
+    """Whether complex128 arrays are supported."""
+
+    supports_fp32: bool
+    """Whether float32 arrays are supported."""
+
+    supports_fp64: bool
+    """Whether float64 arrays are supported."""
+
+    supports_mixed_precision: bool
+    """Whether mixed-precision execution is natively supported."""
 
     supports_batched_matmul: bool
     """Whether same-shape stacked batched matmul is available."""

@@ -158,6 +158,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_jit = False
     supports_sparse = False
     supports_functional_update = True
+    supports_complex64 = True
+    supports_complex128 = True
+    supports_fp32 = True
+    supports_fp64 = True
+    supports_mixed_precision = False
     supports_batched_matmul = True
     supports_grouped_gemm = False
     supports_strided_batched_gemm = False
@@ -231,6 +236,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
             jit=self.supports_jit,
             sparse=self.supports_sparse,
             functional_update=self.supports_functional_update,
+            complex64=self.supports_complex64,
+            complex128=self.supports_complex128,
+            fp32=self.supports_fp32,
+            fp64=self.supports_fp64,
+            mixed_precision=self.supports_mixed_precision,
             device_index=self.supports_gpu,
             streams=bool(self.supports_streams and self.device == "gpu"),
             events=bool(self.supports_events and self.device == "gpu"),

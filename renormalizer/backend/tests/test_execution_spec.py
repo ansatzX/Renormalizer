@@ -166,6 +166,11 @@ def test_backend_protocol_capability_flags_are_explicit():
         "supports_jit",
         "supports_sparse",
         "supports_functional_update",
+        "supports_complex64",
+        "supports_complex128",
+        "supports_fp32",
+        "supports_fp64",
+        "supports_mixed_precision",
         "supports_batched_matmul",
         "supports_grouped_gemm",
         "supports_strided_batched_gemm",
@@ -187,6 +192,11 @@ def test_backend_capability_flags_mirror_capability_fields():
 
     backend = NumpyBackend()
 
+    assert backend.supports_complex64 is backend.capabilities.complex64
+    assert backend.supports_complex128 is backend.capabilities.complex128
+    assert backend.supports_fp32 is backend.capabilities.fp32
+    assert backend.supports_fp64 is backend.capabilities.fp64
+    assert backend.supports_mixed_precision is backend.capabilities.mixed_precision
     assert backend.supports_strided_batched_gemm is backend.capabilities.strided_batched_gemm
     assert backend.supports_point_to_point is backend.capabilities.point_to_point
 
