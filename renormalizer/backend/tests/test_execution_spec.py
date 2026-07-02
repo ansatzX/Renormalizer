@@ -1158,6 +1158,10 @@ def test_grouped_gemm_profile_records_one_input_shape_pair_per_task(tmp_path):
         [[2, 3], [3, 4]],
         [[5, 6], [6, 7]],
     ]
+    assert event["input_dtypes"] == [
+        ["float64", "float64"],
+        ["float64", "float64"],
+    ]
 
 
 def test_torch_grouped_gemm_uses_recorded_bucketed_fallback_when_available():
@@ -1617,6 +1621,10 @@ def test_lower_block_contraction_records_grouped_plan_profile(tmp_path):
     assert event["shape_buckets"] == [
         {"m": 2, "n": 4, "k": 3, "task_indices": [0, 1], "task_count": 2},
     ]
+    assert event["input_dtypes"] == [
+        ["float64", "float64"],
+        ["float64", "float64"],
+    ]
 
 
 def test_block_grouped_gemm_profile_correlates_plan_and_execute_events(tmp_path):
@@ -1760,6 +1768,10 @@ def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
         {"extra": [], "qn_left": [0], "qn_right": [1]},
     ]
     assert event["result_block_shapes"] == [{"extra": [], "qn_left": [0], "qn_right": [1], "shape": [2, 4]}]
+    assert event["input_dtypes"] == [
+        ["float64", "float64"],
+        ["float64", "float64"],
+    ]
     assert event["fallback_reason"] == "native grouped_gemm unavailable; used bucketed fallback"
     assert event["wall_s"] >= 0.0
 

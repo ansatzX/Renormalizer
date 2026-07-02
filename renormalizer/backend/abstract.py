@@ -3685,6 +3685,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     [tuple(getattr(desc.A, "shape", ())), tuple(getattr(desc.B, "shape", ()))]
                     for desc in plan.tasks
                 ],
+                input_dtypes=[
+                    [str(getattr(desc.A, "dtype", None)), str(getattr(desc.B, "dtype", None))]
+                    for desc in plan.tasks
+                ],
                 output_shape=tuple(plan.global_shape),
                 dtype=str(getattr(plan.tasks[0].A, "dtype", None)) if plan.tasks else None,
                 device=str(self.current_device()),
@@ -3785,6 +3789,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 plan_hash=plan.plan_hash,
                 input_shapes=[
                     [tuple(getattr(desc.A, "shape", ())), tuple(getattr(desc.B, "shape", ()))]
+                    for desc in plan.tasks
+                ],
+                input_dtypes=[
+                    [str(getattr(desc.A, "dtype", None)), str(getattr(desc.B, "dtype", None))]
                     for desc in plan.tasks
                 ],
                 output_shape=tuple(result.global_shape),
@@ -4203,6 +4211,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     lowering="grouped_gemm",
                     input_shapes=[
                         [tuple(getattr(task.A, "shape", ())), tuple(getattr(task.B, "shape", ()))]
+                        for task in converted
+                    ],
+                    input_dtypes=[
+                        [str(getattr(task.A, "dtype", None)), str(getattr(task.B, "dtype", None))]
                         for task in converted
                     ],
                     output_shape=[tuple(getattr(item, "shape", ())) for item in result],
