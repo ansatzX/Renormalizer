@@ -3951,6 +3951,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
             backend=self.name,
         )
         if should_profile:
+            xp = self.array_namespace or _np
+            flop_copy_ratio = 0 if self.supports_grouped_gemm else 10
+            stats = grouped_gemm_stats(
+                tasks,
+                xp=xp,
+                pack_threshold=pack_threshold,
+                flop_copy_ratio=flop_copy_ratio,
+            )
+            workspace_bytes = max(int(plan.estimated_workspace_bytes), int(stats.workspace_bytes))
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
@@ -3973,18 +3982,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 dtype=str(getattr(next(iter(result.blocks.values())).array, "dtype", None)) if result.blocks else None,
                 device=str(self.current_device()),
                 device_info=self._profile_device(self.current_device()),
-                flops=int(plan.estimated_flops),
-                read_bytes=int(plan.estimated_read_bytes),
-                write_bytes=int(plan.estimated_write_bytes),
-                copy_bytes=0,
-                workspace_bytes=int(plan.estimated_workspace_bytes),
-                peak_bytes=int(plan.estimated_write_bytes or 0) + int(plan.estimated_workspace_bytes or 0),
+                flops=int(stats.flops),
+                read_bytes=int(stats.read_bytes),
+                write_bytes=int(stats.write_bytes),
+                copy_bytes=int(stats.copy_bytes),
+                workspace_bytes=workspace_bytes,
+                peak_bytes=int(stats.write_bytes) + workspace_bytes,
                 largest_intermediate=max((self._array_nbytes(block.array) for block in result.blocks.values()), default=0),
-                num_gemm=0,
-                num_batched_gemm=0,
-                num_grouped_tasks=len(plan.tasks),
+                num_gemm=int(stats.loop_task_count),
+                num_batched_gemm=int(stats.batched_bucket_count),
+                num_grouped_tasks=int(stats.task_count),
                 num_blocks=len(result.blocks),
-                num_shape_buckets=len(plan.bucketed_by_shape),
+                num_shape_buckets=int(stats.shape_bucket_count),
                 fallback_reason=self._grouped_gemm_fallback_reason(),
                 output_modes=[str(mode) for mode in plan.output_modes],
                 global_shape=tuple(result.global_shape),
@@ -4001,8 +4010,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     }
                     for key, block in sorted(result.blocks.items(), key=self._block_sort_key)
                 ],
-                bucket_task_counts=[len(indices) for indices in plan.bucketed_by_shape.values()],
+                bucket_task_counts=stats.bucket_task_counts,
                 shape_buckets=self._profile_shape_buckets(plan.bucketed_by_shape),
+                batched_bucket_count=int(stats.batched_bucket_count),
+                loop_bucket_count=int(stats.loop_bucket_count),
+                batched_task_count=int(stats.batched_task_count),
+                loop_task_count=int(stats.loop_task_count),
                 pack_threshold=pack_threshold,
                 wall_s=time.perf_counter() - started,
             )

@@ -1777,13 +1777,25 @@ def test_execute_grouped_gemm_plan_records_block_profile(tmp_path):
         for line in event_path.read_text().splitlines()
         if line.strip()
     ]
-    event = next(payload for payload in payloads if payload.get("lowering") == "block_grouped_gemm")
+    event = next(
+        payload
+        for payload in payloads
+        if payload.get("event") == "contraction_execute"
+        and payload.get("lowering") == "block_grouped_gemm"
+    )
     assert event["backend"] == "numpy"
     assert event["output_modes"] == ["i", "j"]
     assert event["global_shape"] == [2, 4]
     assert event["num_grouped_tasks"] == 2
     assert event["num_blocks"] == 1
     assert event["num_shape_buckets"] == 1
+    assert event["num_batched_gemm"] == 0
+    assert event["num_gemm"] == 2
+    assert event["batched_bucket_count"] == 0
+    assert event["loop_bucket_count"] == 1
+    assert event["batched_task_count"] == 0
+    assert event["loop_task_count"] == 2
+    assert event["copy_bytes"] == 0
     assert event["scatter_add_required"] is True
     assert event["shape_buckets"] == [
         {"m": 2, "n": 4, "k": 3, "task_indices": [0, 1], "task_count": 2},
