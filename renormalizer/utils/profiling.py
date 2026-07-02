@@ -77,13 +77,16 @@ COMPUTE_CLASS_OE = "oe"
 COMPUTE_CLASS_SVD = "svd"
 COMPUTE_ROLE_COMPOSITE = "composite"
 COMPUTE_ROLE_KERNEL = "kernel"
+COMPUTE_ACCOUNTING_PRIMARY = "primary"
+COMPUTE_ACCOUNTING_INCLUSIVE = "inclusive"
 
 
-def compute_payload(compute_class, compute_subclass, compute_role):
+def compute_payload(compute_class, compute_subclass, compute_role, *, accounting=COMPUTE_ACCOUNTING_PRIMARY):
     return {
         "compute_class": str(compute_class),
         "compute_subclass": str(compute_subclass),
         "compute_role": str(compute_role),
+        "compute_accounting": str(accounting),
     }
 
 
@@ -136,6 +139,20 @@ def array_dtype_names(values):
     return [str(getattr(value, "dtype", None)) for value in values if hasattr(value, "shape")]
 
 
+def array_itemsize(value):
+    itemsize = getattr(value, "itemsize", None)
+    if itemsize is not None:
+        return int(itemsize)
+    dtype = getattr(value, "dtype", None)
+    itemsize = getattr(dtype, "itemsize", None)
+    if itemsize is not None:
+        return int(itemsize)
+    element_size = getattr(value, "element_size", None)
+    if callable(element_size):
+        return int(element_size())
+    return 0
+
+
 def _prod(values):
     result = 1
     for value in values:
@@ -183,7 +200,12 @@ def tensordot_compute_payload(left, right, axes, result):
     k = _prod(left_contract_shape) if left_contract_shape == right_contract_shape else 0
     flops = 2 * m * n * k if k else 0
     return {
-        **compute_payload(COMPUTE_CLASS_TENSORDOT, "api_tensordot", COMPUTE_ROLE_COMPOSITE),
+        **compute_payload(
+            COMPUTE_CLASS_TENSORDOT,
+            "api_tensordot",
+            COMPUTE_ROLE_COMPOSITE,
+            accounting=COMPUTE_ACCOUNTING_INCLUSIVE,
+        ),
         "input_dtypes": array_dtype_names((left, right)),
         "output_dtype": str(getattr(result, "dtype", None)),
         "left_free_shape": left_free_shape,
@@ -429,6 +451,10 @@ def contract_path_summary(contract_path, args, kwargs):
 
 def oe_compute_payload(subclass, operands, result, path_summary=None):
     path_summary = path_summary or {}
+    largest_intermediate_elements = json_int(path_summary.get("largest_intermediate"))
+    largest_intermediate_bytes = None
+    if largest_intermediate_elements is not None:
+        largest_intermediate_bytes = int(largest_intermediate_elements * array_itemsize(result))
     return {
         **compute_payload(COMPUTE_CLASS_OE, subclass, COMPUTE_ROLE_COMPOSITE),
         "input_dtypes": array_dtype_names(operands),
@@ -436,6 +462,10 @@ def oe_compute_payload(subclass, operands, result, path_summary=None):
         "flops_estimate": json_int(path_summary.get("flop_count")) or 0,
         "read_bytes": array_total_bytes(operands),
         "write_bytes": int(getattr(result, "nbytes", 0)),
+        "largest_intermediate_elements": largest_intermediate_elements,
+        "largest_intermediate_bytes": largest_intermediate_bytes,
+        "peak_bytes": largest_intermediate_bytes,
+        "workspace_bytes": largest_intermediate_bytes,
     }
 
 
@@ -568,6 +598,7 @@ class _ProfilingRuntime:
         self._summary_lock = threading.Lock()
         self._summaries = {}
         self._compute_summaries = {}
+        self._compute_class_summaries = {}
         self._overhead_lock = threading.Lock()
         self._overhead = dict(_OVERHEAD_TEMPLATE)
         self._event_output = None
@@ -724,6 +755,9 @@ class _ProfilingRuntime:
                     item["max_wall_s"] = max(item["max_wall_s"], wall_s)
                 if compute_signature is not None:
                     self._record_compute_summary_unlocked(payload, compute_signature, wall_s)
+                    class_signature = self._compute_class_signature_payload(payload)
+                    if class_signature is not None:
+                        self._record_compute_class_summary_unlocked(payload, class_signature, wall_s)
         finally:
             self._bump_overhead("summary_overhead_s", self.perf_counter() - started)
 
@@ -746,6 +780,7 @@ class _ProfilingRuntime:
             "compute_class",
             "compute_subclass",
             "compute_role",
+            "compute_accounting",
             "backend",
             "stage",
             "method",
@@ -759,47 +794,105 @@ class _ProfilingRuntime:
             if key in payload and payload[key] is not None
         }
 
-    def _record_compute_summary_unlocked(self, payload, signature, wall_s):
-        key = self._json.dumps(self._to_jsonable(signature), sort_keys=True, separators=(",", ":"))
+    def _compute_class_signature_payload(self, payload):
+        if payload.get("compute_accounting", COMPUTE_ACCOUNTING_PRIMARY) != COMPUTE_ACCOUNTING_PRIMARY:
+            return None
+        keys = (
+            "compute_class",
+            "backend",
+            "stage",
+            "method",
+            "device",
+            "device_kind",
+        )
+        return {
+            key: payload[key]
+            for key in keys
+            if key in payload and payload[key] is not None
+        }
+
+    def _compute_metrics(self, payload):
+        return {
+            "total_flops_estimate": self._number(payload, "flops_estimate", "flops"),
+            "total_read_bytes": self._number(payload, "read_bytes"),
+            "total_write_bytes": self._number(payload, "write_bytes"),
+            "total_copy_bytes": self._number(payload, "copy_bytes"),
+            "total_comm_bytes": self._number(payload, "comm_bytes", "estimated_comm_bytes"),
+            "max_workspace_bytes": self._number(payload, "workspace_bytes", "required_workspace_bytes"),
+            "max_peak_bytes": self._number(payload, "peak_bytes", "largest_intermediate_bytes"),
+            "max_largest_intermediate_elements": self._number(
+                payload, "largest_intermediate_elements", "largest_intermediate"
+            ),
+            "max_largest_intermediate_bytes": self._number(payload, "largest_intermediate_bytes"),
+            "total_contraction_steps": self._number(payload, "contraction_count"),
+            "total_svd_blocks": self._number(payload, "block_count"),
+            "total_gemm": self._number(payload, "num_gemm"),
+            "total_batched_gemm": self._number(payload, "num_batched_gemm"),
+            "total_grouped_tasks": self._number(payload, "num_grouped_tasks"),
+            "total_blocks": self._number(payload, "num_blocks"),
+            "total_shape_buckets": self._number(payload, "num_shape_buckets"),
+            "fallback_calls": 1 if payload.get("fallback_reason") else 0,
+        }
+
+    def _new_compute_item(self, signature, payload, wall_s, metrics, extra_sets=()):
         source_event = payload.get("event")
-        flops = self._number(payload, "flops_estimate", "flops")
-        read_bytes = self._number(payload, "read_bytes")
-        write_bytes = self._number(payload, "write_bytes")
-        copy_bytes = self._number(payload, "copy_bytes")
-        comm_bytes = self._number(payload, "comm_bytes", "estimated_comm_bytes")
-        workspace_bytes = self._number(payload, "workspace_bytes", "required_workspace_bytes")
-        peak_bytes = self._number(payload, "peak_bytes", "largest_intermediate")
-        item = self._compute_summaries.get(key)
-        if item is None:
-            self._compute_summaries[key] = {
-                "signature": signature,
-                "source_events": {str(source_event)} if source_event is not None else set(),
-                "call_count": 1,
-                "total_wall_s": wall_s,
-                "min_wall_s": wall_s,
-                "max_wall_s": wall_s,
-                "total_flops_estimate": flops,
-                "total_read_bytes": read_bytes,
-                "total_write_bytes": write_bytes,
-                "total_copy_bytes": copy_bytes,
-                "total_comm_bytes": comm_bytes,
-                "max_workspace_bytes": workspace_bytes,
-                "max_peak_bytes": peak_bytes,
-            }
-            return
+        item = {
+            "signature": signature,
+            "source_events": {str(source_event)} if source_event is not None else set(),
+            "call_count": 1,
+            "total_wall_s": wall_s,
+            "min_wall_s": wall_s,
+            "max_wall_s": wall_s,
+            **metrics,
+        }
+        for field, payload_name in extra_sets:
+            value = payload.get(payload_name)
+            item[field] = {str(value)} if value is not None else set()
+        return item
+
+    @staticmethod
+    def _accumulate_compute_item(item, payload, wall_s, metrics, extra_sets=()):
+        source_event = payload.get("event")
         if source_event is not None:
             item["source_events"].add(str(source_event))
+        for field, payload_name in extra_sets:
+            value = payload.get(payload_name)
+            if value is not None:
+                item[field].add(str(value))
         item["call_count"] += 1
         item["total_wall_s"] += wall_s
         item["min_wall_s"] = min(item["min_wall_s"], wall_s)
         item["max_wall_s"] = max(item["max_wall_s"], wall_s)
-        item["total_flops_estimate"] += flops
-        item["total_read_bytes"] += read_bytes
-        item["total_write_bytes"] += write_bytes
-        item["total_copy_bytes"] += copy_bytes
-        item["total_comm_bytes"] += comm_bytes
-        item["max_workspace_bytes"] = max(item["max_workspace_bytes"], workspace_bytes)
-        item["max_peak_bytes"] = max(item["max_peak_bytes"], peak_bytes)
+        for key, value in metrics.items():
+            if key.startswith("max_"):
+                item[key] = max(item[key], value)
+            else:
+                item[key] += value
+
+    def _record_compute_summary_unlocked(self, payload, signature, wall_s):
+        key = self._json.dumps(self._to_jsonable(signature), sort_keys=True, separators=(",", ":"))
+        metrics = self._compute_metrics(payload)
+        item = self._compute_summaries.get(key)
+        if item is None:
+            self._compute_summaries[key] = self._new_compute_item(signature, payload, wall_s, metrics)
+            return
+        self._accumulate_compute_item(item, payload, wall_s, metrics)
+
+    def _record_compute_class_summary_unlocked(self, payload, signature, wall_s):
+        key = self._json.dumps(self._to_jsonable(signature), sort_keys=True, separators=(",", ":"))
+        metrics = self._compute_metrics(payload)
+        extra_sets = (
+            ("source_subclasses", "compute_subclass"),
+            ("source_roles", "compute_role"),
+            ("lowerings", "lowering"),
+        )
+        item = self._compute_class_summaries.get(key)
+        if item is None:
+            self._compute_class_summaries[key] = self._new_compute_item(
+                signature, payload, wall_s, metrics, extra_sets=extra_sets
+            )
+            return
+        self._accumulate_compute_item(item, payload, wall_s, metrics, extra_sets=extra_sets)
 
     def register_event_output(self, file_path, mode="w") -> None:
         self.close_event_output()
@@ -831,6 +924,7 @@ class _ProfilingRuntime:
             with self._summary_lock:
                 self._summaries.clear()
                 self._compute_summaries.clear()
+                self._compute_class_summaries.clear()
             self._reset_overhead()
             self.flush_event_output()
             return
@@ -839,7 +933,9 @@ class _ProfilingRuntime:
             self._summaries.clear()
             compute_items = list(self._compute_summaries.values())
             self._compute_summaries.clear()
-        if not items and not compute_items and not self._has_overhead_activity():
+            compute_class_items = list(self._compute_class_summaries.values())
+            self._compute_class_summaries.clear()
+        if not items and not compute_items and not compute_class_items and not self._has_overhead_activity():
             self.flush_event_output()
             return
         for item in items:
@@ -892,6 +988,76 @@ class _ProfilingRuntime:
                 "total_comm_bytes": int(total_comm_bytes),
                 "max_workspace_bytes": int(item["max_workspace_bytes"]),
                 "max_peak_bytes": int(item["max_peak_bytes"]),
+                "max_largest_intermediate_elements": int(item["max_largest_intermediate_elements"]),
+                "max_largest_intermediate_bytes": int(item["max_largest_intermediate_bytes"]),
+                "total_contraction_steps": int(item["total_contraction_steps"]),
+                "total_svd_blocks": int(item["total_svd_blocks"]),
+                "total_gemm": int(item["total_gemm"]),
+                "total_batched_gemm": int(item["total_batched_gemm"]),
+                "total_grouped_tasks": int(item["total_grouped_tasks"]),
+                "total_blocks": int(item["total_blocks"]),
+                "total_shape_buckets": int(item["total_shape_buckets"]),
+                "fallback_calls": int(item["fallback_calls"]),
+                "flops_per_s_estimate": rate(total_flops),
+                "read_bandwidth_Bps": rate(total_read_bytes),
+                "write_bandwidth_Bps": rate(total_write_bytes),
+                "memory_bandwidth_Bps": rate(total_memory_bytes),
+                "copy_bandwidth_Bps": rate(total_copy_bytes),
+                "comm_bandwidth_Bps": rate(total_comm_bytes),
+                "arithmetic_intensity_flops_per_byte": (
+                    total_flops / total_memory_bytes if total_memory_bytes > 0 else None
+                ),
+            }
+            text = self._json.dumps(self._to_jsonable(payload), sort_keys=True, separators=(",", ":"))
+            logger.profiling("%s%s", LOG_PREFIX, text)
+            self._bump_overhead("summary_rows_logged", 1)
+        for item in sorted(
+            compute_class_items,
+            key=lambda row: self._json.dumps(self._to_jsonable(row["signature"]), sort_keys=True),
+        ):
+            signature = item["signature"]
+            call_count = item["call_count"]
+            total_wall_s = item["total_wall_s"]
+            total_flops = item["total_flops_estimate"]
+            total_read_bytes = item["total_read_bytes"]
+            total_write_bytes = item["total_write_bytes"]
+            total_memory_bytes = total_read_bytes + total_write_bytes
+            total_copy_bytes = item["total_copy_bytes"]
+            total_comm_bytes = item["total_comm_bytes"]
+
+            def rate(value):
+                return value / total_wall_s if total_wall_s > 0 else None
+
+            payload = {
+                "event": "profile_compute_class_summary",
+                **signature,
+                "source_events": sorted(item["source_events"]),
+                "source_subclasses": sorted(item["source_subclasses"]),
+                "source_roles": sorted(item["source_roles"]),
+                "lowerings": sorted(item["lowerings"]),
+                "call_count": call_count,
+                "total_wall_s": total_wall_s,
+                "mean_wall_s": total_wall_s / call_count if call_count else None,
+                "min_wall_s": item["min_wall_s"],
+                "max_wall_s": item["max_wall_s"],
+                "total_flops_estimate": int(total_flops),
+                "total_read_bytes": int(total_read_bytes),
+                "total_write_bytes": int(total_write_bytes),
+                "total_memory_bytes": int(total_memory_bytes),
+                "total_copy_bytes": int(total_copy_bytes),
+                "total_comm_bytes": int(total_comm_bytes),
+                "max_workspace_bytes": int(item["max_workspace_bytes"]),
+                "max_peak_bytes": int(item["max_peak_bytes"]),
+                "max_largest_intermediate_elements": int(item["max_largest_intermediate_elements"]),
+                "max_largest_intermediate_bytes": int(item["max_largest_intermediate_bytes"]),
+                "total_contraction_steps": int(item["total_contraction_steps"]),
+                "total_svd_blocks": int(item["total_svd_blocks"]),
+                "total_gemm": int(item["total_gemm"]),
+                "total_batched_gemm": int(item["total_batched_gemm"]),
+                "total_grouped_tasks": int(item["total_grouped_tasks"]),
+                "total_blocks": int(item["total_blocks"]),
+                "total_shape_buckets": int(item["total_shape_buckets"]),
+                "fallback_calls": int(item["fallback_calls"]),
                 "flops_per_s_estimate": rate(total_flops),
                 "read_bandwidth_Bps": rate(total_read_bytes),
                 "write_bandwidth_Bps": rate(total_write_bytes),

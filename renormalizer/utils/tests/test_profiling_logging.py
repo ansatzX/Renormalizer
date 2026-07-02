@@ -400,6 +400,7 @@ def test_tensordot_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch,
     assert event["compute_class"] == "tensordot"
     assert event["compute_subclass"] == "api_tensordot"
     assert event["compute_role"] == "composite"
+    assert event["compute_accounting"] == "inclusive"
     assert event["m"] == 2
     assert event["n"] == 4
     assert event["k"] == 3
@@ -714,6 +715,70 @@ def test_compute_summary_separates_roles_and_reports_derived_rates(caplog):
     assert kernel["copy_bandwidth_Bps"] == pytest.approx(25.0)
 
 
+def test_compute_class_summary_counts_only_primary_compute(caplog):
+    from renormalizer.utils.log import PROFILING
+    from renormalizer.utils import profiling
+
+    profiling.flush_summaries()
+    caplog.set_level(PROFILING, logger="renormalizer")
+
+    profiling.record(
+        "tensordot",
+        compute_class="tensordot",
+        compute_subclass="api_tensordot",
+        compute_role="composite",
+        compute_accounting="inclusive",
+        backend="numpy",
+        flops_estimate=100,
+        read_bytes=30,
+        write_bytes=20,
+        wall_s=0.1,
+    )
+    profiling.record(
+        "contraction_execute",
+        compute_class="tensordot",
+        compute_subclass="backend_execute",
+        compute_role="kernel",
+        compute_accounting="primary",
+        backend="numpy",
+        lowering="gemm",
+        flops=200,
+        read_bytes=40,
+        write_bytes=10,
+        wall_s=0.2,
+    )
+    profiling.record(
+        "oe_contract",
+        compute_class="oe",
+        compute_subclass="oe_contract",
+        compute_role="composite",
+        compute_accounting="primary",
+        backend="numpy",
+        flops_estimate=300,
+        read_bytes=50,
+        write_bytes=20,
+        wall_s=0.3,
+    )
+
+    profiling.flush_summaries()
+
+    payloads = _profiling_payloads(caplog, profiling)
+    class_summaries = [
+        payload for payload in payloads
+        if payload["event"] == "profile_compute_class_summary"
+    ]
+    tensordot = next(payload for payload in class_summaries if payload["compute_class"] == "tensordot")
+    oe = next(payload for payload in class_summaries if payload["compute_class"] == "oe")
+    assert tensordot["call_count"] == 1
+    assert tensordot["source_events"] == ["contraction_execute"]
+    assert tensordot["source_subclasses"] == ["backend_execute"]
+    assert tensordot["total_wall_s"] == pytest.approx(0.2)
+    assert tensordot["total_flops_estimate"] == 200
+    assert oe["call_count"] == 1
+    assert oe["source_events"] == ["oe_contract"]
+    assert oe["total_wall_s"] == pytest.approx(0.3)
+
+
 def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatch, tmp_path):
     import numpy as np
 
@@ -741,11 +806,15 @@ def test_oe_contract_writes_full_event_to_jsonl_in_trace_mode(caplog, monkeypatc
     assert event["compute_class"] == "oe"
     assert event["compute_subclass"] == "oe_contract"
     assert event["compute_role"] == "composite"
+    assert event["compute_accounting"] == "primary"
     assert event["input_dtypes"] == ["float64", "float64"]
     assert event["output_dtype"] == "float64"
     assert event["flops_estimate"] >= 1
     assert event["read_bytes"] == 2 * 3 * 8 + 3 * 4 * 8
     assert event["write_bytes"] == 2 * 4 * 8
+    assert event["largest_intermediate_elements"] >= 1
+    assert event["largest_intermediate_bytes"] == event["largest_intermediate_elements"] * 8
+    assert event["peak_bytes"] == event["largest_intermediate_bytes"]
     assert event["optimize"] == "greedy"
     assert event["wall_s"] >= 0
 
@@ -775,6 +844,7 @@ def test_oe_contract_expression_records_path_summary_in_jsonl(caplog, tmp_path):
     assert event["compute_class"] == "oe"
     assert event["compute_subclass"] == "oe_expression_execute"
     assert event["compute_role"] == "composite"
+    assert event["compute_accounting"] == "primary"
     assert event["input_dtypes"] == ["float64", "float64", "float64"]
     assert event["output_dtype"] == "float64"
     assert event["flops_estimate"] >= 1
