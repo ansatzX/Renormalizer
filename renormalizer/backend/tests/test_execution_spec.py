@@ -3556,6 +3556,7 @@ def test_execute_sliced_contraction_plan_records_profile_event(tmp_path):
     assert event["equation"] == "ik,kj->ij"
     assert event["input_modes"] == [["i", "k"], ["k", "j"]]
     assert event["output_modes"] == ["i", "j"]
+    assert event["input_dtypes"] == ["float64", "float64"]
     assert event["sliced_modes"] == [str(mode) for mode in plan.sliced_modes]
     assert event["num_slices"] == len(plan.steps[0].plan.output_slices)
     assert event["base_lowering"] == "gemm"
