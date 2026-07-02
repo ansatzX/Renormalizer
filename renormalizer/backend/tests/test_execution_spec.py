@@ -2544,6 +2544,18 @@ def test_plan_contraction_does_not_silently_ignore_target_devices():
         )
 
 
+def test_plan_contraction_rejects_unknown_preference_strategy():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    with pytest.raises(ValueError, match="prefer.*time.*memory.*balanced"):
+        backend.plan_contraction(spec, prefer="fastest")
+
+
 def test_contraction_cost_model_reports_peak_and_timing_estimates():
     from renormalizer.backend import HardwareModel
     from renormalizer.backend.numpy_backend import NumpyBackend

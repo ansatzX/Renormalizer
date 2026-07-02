@@ -767,7 +767,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         allow_distribution=False,
         target_devices=None,
     ):
-        del prefer
+        self._validate_plan_prefer(prefer)
         self._validate_plan_target_devices(target_devices, allow_distribution=allow_distribution)
         if isinstance(spec, DistributedContractionSpec):
             input_modes, output_modes = parse_einsum_equation(spec.equation)
@@ -916,6 +916,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
             memory_limit=memory_limit,
             allow_slicing=allow_slicing,
         )
+
+    @staticmethod
+    def _validate_plan_prefer(prefer):
+        if prefer not in ("time", "memory", "balanced"):
+            raise ValueError("prefer must be one of 'time', 'memory', or 'balanced'")
 
     def _validate_plan_target_devices(self, target_devices, *, allow_distribution):
         if target_devices is None:
