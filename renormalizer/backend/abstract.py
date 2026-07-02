@@ -1268,9 +1268,41 @@ class AbstractBackend(SingleProcessDistributedMixin):
             peak_bytes=write_bytes + workspace_bytes,
         )
 
+    def _estimate_distributed_contraction(self, plan, hw=None):
+        hw = HardwareModel() if hw is None else hw
+        local_steps = tuple(step.local_step for step in plan.steps)
+        read_bytes = sum(int(step.estimated_read_bytes) for step in local_steps)
+        write_bytes = sum(int(step.estimated_write_bytes) for step in local_steps)
+        copy_bytes = sum(int(step.estimated_copy_bytes) for step in local_steps)
+        workspace_bytes = max((int(step.required_workspace_bytes) for step in local_steps), default=0)
+        local_flops = sum(int(step.estimated_flops) for step in local_steps)
+        communication = tuple(item for step in plan.steps for item in step.communication)
+
+        compute_s = self._rate_seconds(local_flops, self._hardware_flop_rate(hw))
+        memory_s = self._rate_seconds(read_bytes + write_bytes, self._hardware_memory_bandwidth(hw))
+        copy_s = self._rate_seconds(copy_bytes, self._hardware_copy_bandwidth(hw))
+        comm_s = self._estimate_communication_sequence_s(communication, hw)
+        total_s = compute_s + memory_s + copy_s + comm_s
+        return CostEstimate(
+            flops=int(plan.total_flops or plan.path.estimated_flops),
+            read_bytes=int(read_bytes),
+            write_bytes=int(write_bytes),
+            copy_bytes=int(copy_bytes),
+            comm_bytes=int(plan.total_comm_bytes or plan.estimated_comm_bytes),
+            workspace_bytes=int(workspace_bytes),
+            peak_bytes=int(plan.peak_local_bytes),
+            compute_s=compute_s,
+            memory_s=memory_s,
+            copy_s=copy_s,
+            comm_s=comm_s,
+            total_s=total_s,
+        )
+
     def estimate_contraction(self, plan, hw=None):
         if isinstance(plan, MatmulPlan):
             return self.estimate_matmul(plan, hw)
+        if isinstance(plan, DistributedContractionPlan):
+            return self._estimate_distributed_contraction(plan, hw)
         peak_bytes = int(plan.estimated_peak_bytes or max((step.estimated_peak_bytes for step in plan.steps), default=0))
         return self._make_cost_estimate(
             hw,
