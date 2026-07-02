@@ -3577,7 +3577,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     global_shape = tuple(plan.output_shape)
 
         repeated_outputs = len(set(output_blocks)) != len(output_blocks)
-        return GroupedGemmPlan(
+        plan = GroupedGemmPlan(
             tasks=tuple(descs),
             output_blocks=tuple(output_blocks),
             bucketed_by_shape=self._bucketed_by_desc_shape(descs),
@@ -3594,6 +3594,53 @@ class AbstractBackend(SingleProcessDistributedMixin):
             },
             backend=self.name,
         )
+        self._record_block_contraction_plan(plan)
+        return plan
+
+    def _record_block_contraction_plan(self, plan):
+        try:
+            from renormalizer.utils import profiling
+
+            if not profiling.should_record_op():
+                return
+            unique_output_keys = [
+                key
+                for key in sorted(set(plan.output_blocks), key=lambda key: self._block_sort_key((key, None)))
+            ]
+            profiling.record(
+                "contraction_plan",
+                backend=self.name,
+                equation=None,
+                lowering="block_grouped_gemm",
+                input_shapes=[
+                    [tuple(getattr(desc.A, "shape", ())), tuple(getattr(desc.B, "shape", ()))]
+                    for desc in plan.tasks
+                ],
+                output_shape=tuple(plan.global_shape),
+                dtype=str(getattr(plan.tasks[0].A, "dtype", None)) if plan.tasks else None,
+                device=str(self.current_device()),
+                flops=int(plan.estimated_flops),
+                read_bytes=int(plan.estimated_read_bytes),
+                write_bytes=int(plan.estimated_write_bytes),
+                copy_bytes=0,
+                workspace_bytes=int(plan.estimated_workspace_bytes),
+                peak_bytes=int(plan.estimated_write_bytes or 0) + int(plan.estimated_workspace_bytes or 0),
+                num_gemm=0,
+                num_batched_gemm=0,
+                num_grouped_tasks=len(plan.tasks),
+                num_blocks=len(unique_output_keys),
+                num_shape_buckets=len(plan.bucketed_by_shape),
+                fallback_reason=None,
+                output_modes=[str(mode) for mode in plan.output_modes],
+                global_shape=tuple(plan.global_shape),
+                scatter_add_required=bool(plan.scatter_add_required),
+                output_block_keys=[self._profile_block_key(key) for key in plan.output_blocks],
+                unique_output_block_keys=[self._profile_block_key(key) for key in unique_output_keys],
+                bucket_task_counts=[len(indices) for indices in plan.bucketed_by_shape.values()],
+                shape_buckets=self._profile_shape_buckets(plan.bucketed_by_shape),
+            )
+        except Exception:
+            pass
 
     def execute_grouped_gemm_plan(self, plan, *, pack_threshold=4, stream=None, workspace=None):
         self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
