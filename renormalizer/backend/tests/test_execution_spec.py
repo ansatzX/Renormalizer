@@ -685,6 +685,83 @@ def test_grouped_gemm_warn_policy_emits_warning_and_returns_result():
     assert np.allclose(results[0], task.A @ task.B)
 
 
+def test_native_grouped_gemm_batches_same_shape_bucket_despite_copy_heuristic(tmp_path):
+    from renormalizer.backend.gemm import GemmTask, should_batch
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    class NativeGroupedNumpyBackend(NumpyBackend):
+        supports_grouped_gemm = True
+
+    backend = NativeGroupedNumpyBackend()
+    tasks = [
+        GemmTask(np.ones((64, 64), dtype=np.float64), np.ones((64, 64), dtype=np.float64))
+        for _ in range(8)
+    ]
+    assert should_batch(tasks, xp=np, pack_threshold=4) is False
+
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        backend.grouped_gemm(tasks, pack_threshold=4)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(payload for payload in payloads if payload["event"] == "contraction_execute")
+    assert event["fallback_reason"] is None
+    assert event["num_batched_gemm"] == 1
+    assert event["num_gemm"] == 0
+
+
+def test_grouped_gemm_profile_records_one_input_shape_pair_per_task(tmp_path):
+    from renormalizer.backend.gemm import GemmTask
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    tasks = [
+        GemmTask(np.ones((2, 3), dtype=np.float64), np.ones((3, 4), dtype=np.float64)),
+        GemmTask(np.ones((5, 6), dtype=np.float64), np.ones((6, 7), dtype=np.float64)),
+    ]
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        backend.grouped_gemm(tasks, pack_threshold=4)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(payload for payload in payloads if payload["event"] == "contraction_execute")
+
+    assert event["input_shapes"] == [
+        [[2, 3], [3, 4]],
+        [[5, 6], [6, 7]],
+    ]
+
+
 def test_torch_grouped_gemm_is_backend_primitive_when_available():
     from renormalizer.backend import BackendConfig
     from renormalizer.backend.factory import create_backend, is_backend_available

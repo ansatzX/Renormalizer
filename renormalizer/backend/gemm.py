@@ -120,7 +120,7 @@ def should_batch(tasks, *, xp=None, pack_threshold=4, flop_copy_ratio=10):
     return True
 
 
-def grouped_gemm_stats(tasks, *, xp=None, pack_threshold=4) -> GroupedGemmStats:
+def grouped_gemm_stats(tasks, *, xp=None, pack_threshold=4, flop_copy_ratio=10) -> GroupedGemmStats:
     tasks = list(tasks)
     buckets = group_tasks_by_shape(tasks, xp=xp)
     bucket_task_counts = tuple(sorted(len(group) for group in buckets.values()))
@@ -133,7 +133,7 @@ def grouped_gemm_stats(tasks, *, xp=None, pack_threshold=4) -> GroupedGemmStats:
     write_bytes = 0
     copy_bytes = 0
     for group in buckets.values():
-        group_batched = should_batch(group, xp=xp, pack_threshold=pack_threshold)
+        group_batched = should_batch(group, xp=xp, pack_threshold=pack_threshold, flop_copy_ratio=flop_copy_ratio)
         if group_batched:
             batched_bucket_count += 1
             batched_task_count += len(group)
@@ -181,7 +181,7 @@ def run_gemm_task(task: GemmTask, *, xp=None):
     return result
 
 
-def grouped_gemm_bucketed(tasks, *, xp=None, pack_threshold=4):
+def grouped_gemm_bucketed(tasks, *, xp=None, pack_threshold=4, flop_copy_ratio=10):
     if xp is None:
         import numpy as xp
 
@@ -189,7 +189,7 @@ def grouped_gemm_bucketed(tasks, *, xp=None, pack_threshold=4):
     buckets = group_tasks_by_shape(tasks, xp=xp)
     results_by_task = {}
     for group in buckets.values():
-        if not should_batch(group, xp=xp, pack_threshold=pack_threshold):
+        if not should_batch(group, xp=xp, pack_threshold=pack_threshold, flop_copy_ratio=flop_copy_ratio):
             for task in group:
                 results_by_task[id(task)] = run_gemm_task(task, xp=xp)
             continue

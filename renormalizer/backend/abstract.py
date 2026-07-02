@@ -3107,7 +3107,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
             for task in tasks
         ]
         fallback_reason = self._handle_grouped_gemm_fallback()
-        stats = grouped_gemm_stats(converted, xp=xp, pack_threshold=pack_threshold)
+        flop_copy_ratio = 0 if self.supports_grouped_gemm else 10
+        stats = grouped_gemm_stats(
+            converted,
+            xp=xp,
+            pack_threshold=pack_threshold,
+            flop_copy_ratio=flop_copy_ratio,
+        )
         try:
             from renormalizer.utils import profiling
 
@@ -3119,7 +3125,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
             started = time.perf_counter()
             with self._stream_context(stream):
-                result = grouped_gemm_bucketed(converted, xp=xp, pack_threshold=pack_threshold)
+                result = grouped_gemm_bucketed(
+                    converted,
+                    xp=xp,
+                    pack_threshold=pack_threshold,
+                    flop_copy_ratio=flop_copy_ratio,
+                )
             wall_s = time.perf_counter() - started
             try:
                 from renormalizer.utils import profiling
@@ -3161,7 +3172,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 pass
             return result
         with self._stream_context(stream):
-            return grouped_gemm_bucketed(converted, xp=xp, pack_threshold=pack_threshold)
+            return grouped_gemm_bucketed(
+                converted,
+                xp=xp,
+                pack_threshold=pack_threshold,
+                flop_copy_ratio=flop_copy_ratio,
+            )
 
     def _handle_grouped_gemm_fallback(self):
         if self.supports_grouped_gemm:
