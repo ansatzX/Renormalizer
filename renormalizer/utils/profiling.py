@@ -155,7 +155,8 @@ def _einsum_shape_map(equation, shapes):
     if "->" not in equation or "..." in equation:
         return None, None
     input_text, output_modes = equation.split("->", 1)
-    input_modes = input_text.split(",")
+    input_modes = [modes.strip() for modes in input_text.split(",")]
+    output_modes = output_modes.strip()
     if len(input_modes) != len(shapes):
         return None, None
     mode_sizes = {}
@@ -193,7 +194,8 @@ def _build_contraction_steps(equation, shapes, contraction_list, path, path_info
         if "->" not in step_equation:
             continue
         step_input_text, step_output_modes = step_equation.split("->", 1)
-        step_input_modes = step_input_text.split(",")
+        step_input_modes = [modes.strip() for modes in step_input_text.split(",")]
+        step_output_modes = step_output_modes.strip()
         input_shapes = [_shape_for_modes(modes, mode_sizes) for modes in step_input_modes]
         output_shape = _shape_for_modes(step_output_modes, mode_sizes)
         remaining_shapes = [_shape_for_modes(modes, mode_sizes) for modes in remaining_modes]

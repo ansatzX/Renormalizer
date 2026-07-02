@@ -486,6 +486,59 @@ def func_sum(funcs):
     return new_func
 
 
+def _rhs_batch_mode_from_equation(equation):
+    if not equation or "->" not in equation:
+        return None
+    output_modes = equation.split("->", 1)[1].replace(" ", "")
+    return output_modes[-1] if output_modes else None
+
+
+def _batched_rhs_path_profile(expr):
+    summary = getattr(expr, "path_summary", None) or {}
+    if not summary:
+        return {
+            "flops": 0,
+            "num_gemm": 0,
+            "num_batched_gemm": 1,
+            "fallback_reason": None,
+            "path_fields": {},
+        }
+
+    path_fields = {}
+    for key in ("path", "contraction_count", "contraction_types", "contraction_steps"):
+        if key in summary:
+            path_fields[key] = summary[key]
+    if summary.get("largest_intermediate") is not None:
+        path_fields["expr_largest_intermediate"] = summary["largest_intermediate"]
+
+    rhs_mode = _rhs_batch_mode_from_equation(getattr(expr, "equation", None))
+    if rhs_mode is not None:
+        path_fields["rhs_batch_mode"] = rhs_mode
+
+    steps = summary.get("contraction_steps") or []
+    total_gemm = sum(1 for item in summary.get("contraction_types") or [] if str(item).upper() == "GEMM")
+    batched_gemm = 0
+    if rhs_mode is not None:
+        for step in steps:
+            if str(step.get("contraction_type", "")).upper() != "GEMM":
+                continue
+            input_modes = step.get("input_modes") or []
+            if rhs_mode in str(step.get("output_modes", "")) and any(rhs_mode in str(modes) for modes in input_modes):
+                batched_gemm += 1
+
+    fallback_reason = None
+    if total_gemm and batched_gemm == 0:
+        fallback_reason = "batched RHS expression path has no GEMM carrying RHS mode"
+
+    return {
+        "flops": summary.get("flop_count") or 0,
+        "num_gemm": max(total_gemm - batched_gemm, 0),
+        "num_batched_gemm": batched_gemm,
+        "fallback_reason": fallback_reason,
+        "path_fields": path_fields,
+    }
+
+
 def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
     nrhs = 1 if x.ndim == 1 else x.shape[1]
     profile_enabled = profiling.should_record_op() and x.ndim == 2
@@ -512,6 +565,7 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
         output_nbytes = int(getattr(result, "nbytes", 0))
         cstruct_nbytes = int(getattr(cstruct, "nbytes", 0))
         cout_nbytes = int(getattr(cout, "nbytes", 0))
+        path_profile = _batched_rhs_path_profile(active_expr)
         profiling.record(
             "contraction_execute",
             backend=backend.name,
@@ -521,19 +575,20 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
             output_shape=tuple(result.shape),
             dtype=str(getattr(result, "dtype", None)),
             device=str(backend.current_device()),
-            flops=0,
+            flops=int(path_profile["flops"]),
             read_bytes=input_nbytes,
             write_bytes=output_nbytes,
             copy_bytes=0,
             workspace_bytes=max(cstruct_nbytes, cout_nbytes),
             largest_intermediate=max(input_nbytes, output_nbytes, cstruct_nbytes, cout_nbytes),
-            num_gemm=0,
-            num_batched_gemm=1,
+            num_gemm=int(path_profile["num_gemm"]),
+            num_batched_gemm=int(path_profile["num_batched_gemm"]),
             num_grouped_tasks=0,
             num_blocks=0,
             num_shape_buckets=0,
             num_rhs=int(nrhs),
-            fallback_reason=None,
+            fallback_reason=path_profile["fallback_reason"],
+            **path_profile["path_fields"],
             wall_s=time.perf_counter() - started,
         )
     return result

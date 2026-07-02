@@ -88,6 +88,7 @@ def oe_contract_expression(*args, **kwargs):
         if profile_enabled:
             if path_summary is None:
                 path_summary = profiling.contract_expression_path_summary(backend.contract_path, args, kwargs, expr)
+                expr_wrapped.path_summary = path_summary
             profile_operands = (matrix, *args2, *args[1:])
             profiling.record(
                 "oe_contract_expression",
@@ -103,4 +104,5 @@ def oe_contract_expression(*args, **kwargs):
             )
         return result
     expr_wrapped.equation = equation
+    expr_wrapped.path_summary = None
     return expr_wrapped

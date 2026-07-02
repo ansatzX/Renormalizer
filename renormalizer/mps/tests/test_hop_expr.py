@@ -139,6 +139,64 @@ def test_apply_hop_to_packed_vectors_profiles_batched_rhs_execution(tmp_path):
     assert event["wall_s"] >= 0.0
 
 
+def test_apply_hop_to_packed_vectors_profiles_batched_rhs_path_metadata(tmp_path):
+    from renormalizer.mps.gs import _apply_hop_to_packed_vectors
+    from renormalizer.mps.hop_expr import batched_hop_expr, hop_expr
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    rng = _rng()
+    ltensor = rng.normal(size=(2, 3, 2))
+    rtensor = rng.normal(size=(5, 3, 5))
+    cshape = (2, 5)
+    mask = np.ones(cshape, dtype=bool)
+    packed = rng.normal(size=(int(mask.sum()), 2))
+    expr = hop_expr(ltensor, rtensor, [], cshape)
+    batched_expr = batched_hop_expr(ltensor, rtensor, [], cshape, nrhs=2)
+
+    old_level = package_logger.level
+    event_path = tmp_path / "events.jsonl"
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = _apply_hop_to_packed_vectors(
+            packed,
+            mask,
+            expr,
+            batched_expr,
+            inverse=1.0,
+        )
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert result.shape == packed.shape
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(
+        payload
+        for payload in payloads
+        if payload["event"] == "contraction_execute" and payload["lowering"] == "batched_rhs_hop"
+    )
+    assert event["equation"].replace(" ", "") == "abc,lbk,ckr->alr"
+    assert event["rhs_batch_mode"] == "r"
+    assert event["path"]
+    assert event["contraction_count"] == len(event["contraction_steps"])
+    assert event["contraction_types"]
+    assert event["flops"] > 0
+    assert event["expr_largest_intermediate"] > 0
+    assert event["num_batched_gemm"] >= 1
+    assert any("r" in step["output_modes"] for step in event["contraction_steps"])
+    assert event["fallback_reason"] is None
+
+
 def test_apply_hop_to_packed_vectors_keeps_scalar_expression_for_vector_rhs():
     from renormalizer.mps.gs import _apply_hop_to_packed_vectors
 
