@@ -2818,6 +2818,34 @@ def test_execute_grouped_matmul_plan_records_all_descriptor_shapes(tmp_path):
     assert event["input_dtypes"] == [["float64", "float64"], ["float64", "float64"]]
     assert event["output_shape"] == [[2, 4], [2, 4]]
     assert event["num_grouped_tasks"] == 2
+    assert event["task_specs"] == [
+        {
+            "index": 0,
+            "m": 2,
+            "n": 4,
+            "k": 3,
+            "batch_shape": [],
+            "trans_a": False,
+            "trans_b": False,
+            "conj_a": False,
+            "conj_b": False,
+            "alpha": 1.0,
+            "beta": 0.0,
+        },
+        {
+            "index": 1,
+            "m": 2,
+            "n": 4,
+            "k": 3,
+            "batch_shape": [],
+            "trans_a": False,
+            "trans_b": False,
+            "conj_a": False,
+            "conj_b": False,
+            "alpha": 1.0,
+            "beta": 0.0,
+        },
+    ]
 
 
 def test_execute_batched_matmul_plan_preserves_generic_output_mode_order():

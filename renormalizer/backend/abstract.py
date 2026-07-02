@@ -3185,6 +3185,21 @@ class AbstractBackend(SingleProcessDistributedMixin):
             self._profile_array_operand("task{0}.B".format(index), desc.B, right_modes),
         ]
 
+    def _profile_matmul_desc_spec(self, desc, index):
+        return {
+            "index": int(index),
+            "m": int(desc.m),
+            "n": int(desc.n),
+            "k": int(desc.k),
+            "batch_shape": [int(dim) for dim in desc.batch_shape],
+            "trans_a": bool(desc.trans_a),
+            "trans_b": bool(desc.trans_b),
+            "conj_a": bool(desc.conj_a),
+            "conj_b": bool(desc.conj_b),
+            "alpha": self._profile_scalar(desc.alpha),
+            "beta": self._profile_scalar(desc.beta),
+        }
+
     @classmethod
     def _profile_sharding(cls, sharding):
         if sharding is None:
@@ -4525,6 +4540,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     self._profile_matmul_desc_operands(item, index)
                     for index, item in enumerate(descs)
                 ]
+                task_specs = [
+                    self._profile_matmul_desc_spec(item, index)
+                    for index, item in enumerate(descs)
+                ]
                 if isinstance(result, (tuple, list)):
                     output_shape = [tuple(getattr(item, "shape", ())) for item in result]
                     dtype = str(getattr(result[0], "dtype", None)) if result else None
@@ -4556,6 +4575,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         input_modes[1] if input_modes else (),
                     ),
                 ] if desc is not None else []
+                task_specs = None
                 output_shape = tuple(getattr(result, "shape", plan.output_shape))
                 dtype = str(getattr(result, "dtype", None))
                 largest_intermediate = getattr(result, "nbytes", None)
@@ -4573,6 +4593,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 input_shapes=input_shapes,
                 input_dtypes=input_dtypes,
                 operands=operands,
+                task_specs=task_specs,
                 output_shape=output_shape,
                 dtype=dtype,
                 device=str(self.current_device()),
