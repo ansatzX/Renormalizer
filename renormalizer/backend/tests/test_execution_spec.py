@@ -2435,6 +2435,46 @@ def test_lower_block_contraction_builds_deterministic_grouped_gemm_plan():
     assert plan.output_modes == ("i", "j")
 
 
+def test_lower_block_contraction_uses_operand_global_shape_for_output_metadata():
+    from renormalizer.backend import (
+        BlockContractionSpec,
+        BlockKey,
+        BlockTensor,
+        DenseBlock,
+    )
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left_key = BlockKey((0,), (0,))
+    right_key = BlockKey((0,), (1,))
+    out_key = BlockKey((0,), (1,))
+    spec = BlockContractionSpec(
+        BlockTensor(
+            {left_key: DenseBlock(left_key, np.ones((2, 3)), ("i", "k"), (2, 3), offset=(1, 0))},
+            global_shape=(5, 3),
+            modes=("i", "k"),
+            block_axis_meta=None,
+            backend="numpy",
+        ),
+        BlockTensor(
+            {right_key: DenseBlock(right_key, np.ones((3, 4)), ("k", "j"), (3, 4), offset=(0, 2))},
+            global_shape=(3, 7),
+            modes=("k", "j"),
+            block_axis_meta=None,
+            backend="numpy",
+        ),
+        output_modes=("i", "j"),
+        qn_rule=lambda left_key, right_key: out_key,
+    )
+
+    plan = backend.lower_block_contraction(spec)
+    result = backend.execute_grouped_gemm_plan(plan)
+
+    assert plan.global_shape == (5, 7)
+    assert result.global_shape == (5, 7)
+    assert result.blocks[out_key].shape == (2, 4)
+
+
 def test_lower_block_contraction_rejects_duplicate_outputs_without_accumulation():
     from renormalizer.backend import (
         BackendFeatureError,

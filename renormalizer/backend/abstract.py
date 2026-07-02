@@ -3849,10 +3849,27 @@ class AbstractBackend(SingleProcessDistributedMixin):
             buckets.setdefault(shape, []).append(index)
         return {shape: tuple(indices) for shape, indices in buckets.items()}
 
+    @staticmethod
+    def _block_contraction_global_shape(spec):
+        left_sizes = dict(zip(spec.left.modes, spec.left.global_shape))
+        right_sizes = dict(zip(spec.right.modes, spec.right.global_shape))
+        shape = []
+        for mode in spec.output_modes:
+            left_size = left_sizes.get(mode)
+            right_size = right_sizes.get(mode)
+            if left_size is not None and right_size is not None and int(left_size) != int(right_size):
+                raise ValueError(
+                    "BlockContractionSpec output mode {0!r} has inconsistent global sizes {1} and {2}"
+                    .format(mode, left_size, right_size)
+                )
+            size = left_size if left_size is not None else right_size
+            shape.append(int(size))
+        return tuple(shape)
+
     def lower_block_contraction(self, spec):
         descs = []
         output_blocks = []
-        global_shape = None
+        global_shape = self._block_contraction_global_shape(spec)
         for left_key, left_block in sorted(spec.left.blocks.items(), key=self._block_sort_key):
             if self._is_zero_sized_block(left_block):
                 continue
@@ -3875,8 +3892,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 desc = plan.descs[0]
                 descs.append(desc)
                 output_blocks.append(output_key)
-                if global_shape is None:
-                    global_shape = tuple(plan.output_shape)
 
         repeated_outputs = len(set(output_blocks)) != len(output_blocks)
         if repeated_outputs and not spec.accumulate:
@@ -3893,7 +3908,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             estimated_write_bytes=sum(int(desc.estimated_write_bytes) for desc in descs),
             estimated_workspace_bytes=sum(int(desc.estimated_workspace_bytes) for desc in descs),
             output_modes=tuple(spec.output_modes),
-            global_shape=global_shape or (),
+            global_shape=global_shape,
             block_axis_meta={
                 "left": spec.left.block_axis_meta,
                 "right": spec.right.block_axis_meta,
