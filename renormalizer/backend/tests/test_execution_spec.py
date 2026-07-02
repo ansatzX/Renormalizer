@@ -261,6 +261,16 @@ def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
         parse_device_spec("quantum:0")
 
 
+def test_device_spec_rejects_unknown_kind_and_canonicalizes_gpu_alias():
+    from renormalizer.backend.execution import DeviceSpec
+
+    assert DeviceSpec(kind="GPU", index=1) == DeviceSpec(kind="cuda", index=1)
+    assert DeviceSpec(kind="distributed", local_rank=0, global_rank=1).kind == "distributed"
+
+    with pytest.raises(ValueError, match="Unknown DeviceSpec kind"):
+        DeviceSpec(kind="quantum")
+
+
 def test_device_spec_rejects_negative_device_metadata():
     from renormalizer.backend.execution import DeviceSpec, parse_device_spec
 

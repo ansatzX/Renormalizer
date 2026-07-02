@@ -57,6 +57,8 @@ class FallbackPolicy(Enum):
 
 @dataclass(frozen=True)
 class DeviceSpec:
+    VALID_KINDS = frozenset(("cpu", "cuda", "rocm", "mps", "tpu", "distributed"))
+
     kind: str
     index: int | None = None
     local_rank: int | None = None
@@ -65,6 +67,10 @@ class DeviceSpec:
 
     def __post_init__(self):
         kind = str(self.kind).lower()
+        if kind == "gpu":
+            kind = "cuda"
+        if kind not in self.VALID_KINDS:
+            raise ValueError("Unknown DeviceSpec kind {0!r}".format(self.kind))
         index = None if self.index is None else int(self.index)
         local_rank = None if self.local_rank is None else int(self.local_rank)
         global_rank = None if self.global_rank is None else int(self.global_rank)
