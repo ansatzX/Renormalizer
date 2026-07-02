@@ -49,6 +49,23 @@ from renormalizer.backend.mpi import SingleProcessDistributedMixin
 from renormalizer.backend.transforms import UnavailableTransforms
 
 
+class _BackendContractExpression:
+    def __init__(self, expression, backend_name):
+        self.expression = expression
+        self.backend_name = backend_name
+
+    def __call__(self, *arrays, out=None, backend=None, evaluate_constants=False):
+        return self.expression(
+            *arrays,
+            out=out,
+            backend=self.backend_name if backend is None else backend,
+            evaluate_constants=evaluate_constants,
+        )
+
+    def __getattr__(self, name):
+        return getattr(self.expression, name)
+
+
 class AbstractBackend(SingleProcessDistributedMixin):
     name = "abstract"
     supported_device_kinds = ("cpu",)
@@ -459,6 +476,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def parse_einsum(self, equation, *operands, constants=(), optimize=None):
         return parse_einsum(equation, *operands, constants=constants, optimize=optimize)
+
+    def contract_expression(self, *args, **kwargs):
+        import opt_einsum as oe
+
+        return _BackendContractExpression(
+            oe.contract_expression(*args, **kwargs),
+            self.opt_einsum_name,
+        )
 
     @staticmethod
     def _contraction_step_from_matmul_plan(plan, input_modes, output_modes):

@@ -104,6 +104,22 @@ def test_backend_compliance_tensor_ops_and_linalg(backend_name, device):
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_contract_expression_uses_backend_execution(backend_name, device):
+    backend = _backend_or_skip(backend_name, device)
+    left_np = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right_np = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left = backend.to_backend(left_np)
+    right = backend.to_backend(right_np)
+
+    expr = backend.contract_expression("ik,kj->ij", left_np.shape, right_np.shape, optimize="greedy")
+    result = expr(left, right)
+
+    assert backend.capabilities.contract_expression is True
+    assert backend.is_array(result)
+    _assert_allclose(backend, result, left_np @ right_np)
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
 def test_backend_compliance_astype_copy_policy(backend_name, device):
     from renormalizer.backend import BackendCopyError, CopyPolicy
 
