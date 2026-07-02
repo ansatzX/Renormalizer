@@ -1443,6 +1443,51 @@ def test_distributed_contract_matches_dense_for_row_sharded_matmul():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_distributed_contract_executes_local_matmul_plan_instead_of_direct_einsum():
+    from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    class PlanOnlyNumpyBackend(NumpyBackend):
+        def __init__(self):
+            super().__init__()
+            self.local_matmul_plan_calls = 0
+
+        def execute_matmul_plan(self, plan, **kwargs):
+            self.local_matmul_plan_calls += 1
+            return super().execute_matmul_plan(plan, **kwargs)
+
+        def _execute_einsum(self, equation, operands):
+            raise AssertionError("distributed local contraction bypassed backend execution plan")
+
+    backend = PlanOnlyNumpyBackend()
+    mesh = DeviceMesh(
+        devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+        shape=(2,),
+        axis_names=("rank",),
+        backend="numpy",
+        local_rank=0,
+        global_rank=0,
+    )
+    left = np.arange(15, dtype=np.float64).reshape(5, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left_spec = ShardingSpec(
+        global_shape=left.shape,
+        modes=("i", "k"),
+        mesh=mesh,
+        ranks_per_mode={"i": 2},
+        mode_to_mesh_axis={"i": "rank"},
+    )
+    contract_spec = DistributedContractionSpec(
+        equation="ik,kj->ij",
+        operands=(backend.shard_tensor(left, left_spec), right),
+    )
+
+    result = backend.distributed_contract(contract_spec)
+
+    assert backend.local_matmul_plan_calls == 2
+    assert np.allclose(backend.gather_tensor(result), left @ right)
+
+
 def test_distributed_contract_allreduces_when_contracted_mode_is_sharded():
     from renormalizer.backend import DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

@@ -1738,6 +1738,26 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return _np.einsum(equation, *operands)
         return einsum(equation, *operands)
 
+    def _execute_local_contraction_plan(self, equation, operands, *, stream=None, workspace=None):
+        try:
+            spec = self.parse_einsum(equation, *operands)
+            plan = self.plan_contraction(spec, allow_distribution=False)
+        except BackendFeatureError:
+            return self._execute_einsum(equation, operands)
+        if (
+            isinstance(plan, ContractionPlan)
+            and len(plan.steps) == 1
+            and isinstance(plan.steps[0].plan, MatmulPlan)
+        ):
+            return self.execute_matmul_plan(
+                plan.steps[0].plan,
+                stream=stream,
+                workspace=workspace,
+                plan_hash=plan.plan_hash,
+                record_profile=False,
+            )
+        return self.execute(plan, stream=stream, workspace=workspace)
+
     def _sum_rank_local_arrays(self, rank_local_arrays):
         total = None
         for rank in sorted(rank_local_arrays):
@@ -2016,7 +2036,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
             )
 
     def _distributed_contract_impl(self, spec, *, plan=None, stream=None, workspace=None, communication_timings=None):
-        del stream, workspace
         if not isinstance(spec, DistributedContractionSpec):
             raise TypeError("distributed_contract expects a DistributedContractionSpec")
         if plan is None:
@@ -2061,7 +2080,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 operand.local_array if self.is_distributed_array(operand) else operand
                 for operand in operands
             )
-            local_array = self._execute_einsum(spec.equation, local_operands)
+            local_array = self._execute_local_contraction_plan(
+                spec.equation,
+                local_operands,
+                stream=stream,
+                workspace=workspace,
+            )
             result_sharding = execution_sharding
             if reduced_distributed_modes:
                 if reduce_scatter_axis is not None:
@@ -2105,7 +2129,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
         rank_local_arrays = {}
         for rank in range(mesh.world_size):
             local_operands = tuple(self._local_operand_for_rank(operand, rank) for operand in operands)
-            rank_local_arrays[rank] = self._execute_einsum(spec.equation, local_operands)
+            rank_local_arrays[rank] = self._execute_local_contraction_plan(
+                spec.equation,
+                local_operands,
+                stream=stream,
+                workspace=workspace,
+            )
         result_sharding = execution_sharding
         if reduced_distributed_modes:
             reduced = self._time_distributed_communication(
@@ -2905,12 +2934,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
         except Exception:
             pass
 
-    def execute_matmul_plan(self, plan, *, stream=None, workspace=None, plan_hash=None):
+    def execute_matmul_plan(self, plan, *, stream=None, workspace=None, plan_hash=None, record_profile=True):
         self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         try:
             from renormalizer.utils import profiling
 
-            should_profile = profiling.should_record_op()
+            should_profile = bool(record_profile and profiling.should_record_op())
         except Exception:
             should_profile = False
         if should_profile:
