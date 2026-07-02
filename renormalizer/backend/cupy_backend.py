@@ -40,6 +40,7 @@ class CupyBackend(AbstractBackend):
     supports_gpu = True
     supports_streams = True
     supports_events = True
+    supports_memory_pool = True
     host_array_types = (np.ndarray,)
 
     def __init__(self, config=None):

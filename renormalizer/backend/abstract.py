@@ -162,6 +162,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_grouped_gemm = False
     supports_streams = False
     supports_events = False
+    supports_memory_pool = False
     supports_block_sparse = True
     supports_packed_blocks = False
     supports_scatter_add = True
@@ -231,7 +232,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             device_index=self.supports_gpu,
             streams=bool(self.supports_streams and self.device == "gpu"),
             events=bool(self.supports_events and self.device == "gpu"),
-            memory_pool=self.supports_gpu,
+            memory_pool=self.supports_memory_pool,
             matmul=True,
             batched_matmul=self.supports_batched_matmul,
             grouped_gemm=self.supports_grouped_gemm,

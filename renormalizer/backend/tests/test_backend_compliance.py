@@ -411,6 +411,20 @@ def test_backend_grouped_gemm_capability_requires_native_override(backend_name, 
         assert backend.supports_grouped_gemm is False
 
 
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_memory_pool_capability_requires_native_hooks(backend_name, device):
+    from renormalizer.backend.abstract import AbstractBackend
+
+    backend = _backend_or_skip(backend_name, device)
+
+    if (
+        type(backend).free_all_blocks is AbstractBackend.free_all_blocks
+        and type(backend).log_memory_usage is AbstractBackend.log_memory_usage
+    ):
+        assert backend.capabilities.memory_pool is False
+        assert backend.supports_memory_pool is False
+
+
 def test_torch_backend_honors_indexed_cuda_device_when_available():
     try:
         import torch
