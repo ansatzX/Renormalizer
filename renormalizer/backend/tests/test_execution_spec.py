@@ -4313,6 +4313,13 @@ def test_communication_plan_rejects_negative_block_size():
         CommunicationPlan(kind="alltoall", bytes=64, block_size=-1)
 
 
+def test_communication_plan_rejects_unknown_kind():
+    from renormalizer.backend import CommunicationPlan
+
+    with pytest.raises(ValueError, match="Unknown CommunicationPlan kind"):
+        CommunicationPlan(kind="mystery", bytes=64)
+
+
 def test_sharding_spec_can_replicate_over_unused_mesh_axes():
     from renormalizer.backend import DeviceMesh, DeviceSpec, ShardingSpec
 

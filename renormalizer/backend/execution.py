@@ -854,6 +854,17 @@ class DistributionState:
 
 @dataclass(frozen=True)
 class CommunicationPlan:
+    VALID_KINDS = frozenset((
+        "activate_distribution",
+        "redistribute",
+        "broadcast",
+        "allreduce",
+        "reduce_scatter",
+        "gather",
+        "allgather",
+        "alltoall",
+    ))
+
     kind: str
     bytes: int
     local_bytes: int | None = None
@@ -863,6 +874,9 @@ class CommunicationPlan:
     block_size: int | None = None
 
     def __post_init__(self):
+        kind = str(self.kind)
+        if kind not in self.VALID_KINDS:
+            raise ValueError("Unknown CommunicationPlan kind {0!r}".format(self.kind))
         bytes_ = int(self.bytes)
         local_bytes = bytes_ if self.local_bytes is None else int(self.local_bytes)
         num_messages = int(self.num_messages)
@@ -877,6 +891,7 @@ class CommunicationPlan:
             raise ValueError("CommunicationPlan block_size must be non-negative")
         object.__setattr__(self, "bytes", bytes_)
         object.__setattr__(self, "local_bytes", local_bytes)
+        object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "modes", tuple(self.modes))
         object.__setattr__(self, "num_messages", num_messages)
         object.__setattr__(self, "block_size", block_size)
