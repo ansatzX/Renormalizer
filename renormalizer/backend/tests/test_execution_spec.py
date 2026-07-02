@@ -2485,6 +2485,11 @@ def test_multi_step_contraction_plan_profile_records_aggregate_event(tmp_path):
     assert event["equation"] == "ab,bc,cd->ad"
     assert event["input_shapes"] == [[2, 3], [3, 4], [4, 5]]
     assert event["output_shape"] == [2, 5]
+    assert event["operands"][0]["itemsize"] == left.itemsize
+    assert event["operands"][0]["size"] == left.size
+    assert event["operands"][0]["writeable"] is True
+    assert event["operands"][0]["owns_data"] is False
+    assert event["operands"][0]["is_distributed"] is False
     assert event["flops"] == 180
     assert event["read_bytes"] == plan.estimated_read_bytes
     assert event["write_bytes"] == plan.estimated_write_bytes
