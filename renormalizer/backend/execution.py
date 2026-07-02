@@ -1035,6 +1035,9 @@ class MatmulPlan:
         kind = str(self.kind)
         if kind not in self.VALID_KINDS:
             raise ValueError("Unknown MatmulPlan kind {0!r}".format(self.kind))
+        descs = tuple(self.descs)
+        if not descs:
+            raise ValueError("MatmulPlan descs must be non-empty")
         output_shape = tuple(int(dim) for dim in self.output_shape)
         if any(dim < 0 for dim in output_shape):
             raise ValueError("MatmulPlan output_shape dimensions must be non-negative")
@@ -1044,7 +1047,7 @@ class MatmulPlan:
                 raise ValueError("MatmulPlan {0} must be non-negative".format(field))
             object.__setattr__(self, field, value)
         object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "descs", tuple(self.descs))
+        object.__setattr__(self, "descs", descs)
         object.__setattr__(self, "pre_ops", tuple(self.pre_ops))
         object.__setattr__(self, "post_ops", tuple(self.post_ops))
         object.__setattr__(self, "output_shape", output_shape)

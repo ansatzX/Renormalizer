@@ -1342,6 +1342,16 @@ def test_matmul_plan_rejects_negative_output_dimensions():
         MatmulPlan(**kwargs)
 
 
+def test_matmul_plan_rejects_empty_descriptors():
+    from renormalizer.backend import MatmulPlan
+
+    kwargs = _valid_matmul_plan_kwargs()
+    kwargs["descs"] = ()
+
+    with pytest.raises(ValueError, match="MatmulPlan descs must be non-empty"):
+        MatmulPlan(**kwargs)
+
+
 @pytest.mark.parametrize("field", ["copy_bytes", "workspace_bytes", "estimated_flops"])
 def test_matmul_plan_rejects_negative_estimates(field):
     from renormalizer.backend import MatmulPlan
