@@ -126,6 +126,45 @@ def test_backend_compliance_astype_copy_policy(backend_name, device):
     _assert_allclose(backend, converted, x_np.astype(np.complex128))
 
 
+@pytest.mark.parametrize("backend_name", ("cupy", "torch"))
+def test_gpu_backend_stream_events_and_synchronize_when_available(backend_name):
+    from renormalizer.backend import BackendConfig, StreamEvent
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available(backend_name):
+        pytest.skip("{0} unavailable".format(backend_name))
+    try:
+        backend = create_backend(backend_name, config=BackendConfig(device="gpu", precision=64))
+    except Exception as exc:
+        pytest.skip("{0}/gpu unavailable: {1}".format(backend_name, exc))
+
+    assert backend.capabilities.streams is True
+    assert backend.capabilities.events is True
+
+    stream = backend.new_stream()
+    default_stream = backend.default_stream()
+    event = backend.record_event(stream=stream)
+
+    assert stream is not None
+    assert default_stream is not None
+    assert isinstance(event, StreamEvent)
+    assert event.device == backend.current_device()
+    assert event.stream is stream
+    assert event.token is not None
+
+    backend.wait_event(event, stream=default_stream)
+
+    left_np = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right_np = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left = backend.to_backend(left_np)
+    right = backend.to_backend(right_np)
+    plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    result = backend.execute(plan, stream=stream)
+    backend.synchronize(stream=stream)
+
+    _assert_allclose(backend, result, left_np @ right_np)
+
+
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
 def test_backend_compliance_profiling_execute_event(tmp_path, backend_name, device):
     from renormalizer.utils import profiling

@@ -5,7 +5,7 @@
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
-from renormalizer.backend.execution import BackendCopyError, CopyPolicy, DeviceSpec, legacy_device_kind, parse_device_spec
+from renormalizer.backend.execution import BackendCopyError, CopyPolicy, DeviceSpec, StreamEvent, legacy_device_kind, parse_device_spec
 from renormalizer.backend.mpi import TorchDistributedMixin
 
 try:
@@ -27,6 +27,8 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
     opt_einsum_name = "torch"
     supports_gpu = True
     supports_grouped_gemm = True
+    supports_streams = True
+    supports_events = True
 
     def __init__(self, config=None):
         if torch is None:
@@ -119,6 +121,46 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
         if self.device == "gpu" and torch.cuda.is_available():
             return int(torch.cuda.device_count())
         return 1
+
+    def default_stream(self):
+        if self.device != "gpu" or not torch.cuda.is_available():
+            return None
+        return torch.cuda.current_stream(device=self._torch_device)
+
+    def new_stream(self):
+        if self.device != "gpu" or not torch.cuda.is_available():
+            return None
+        return torch.cuda.Stream(device=self._torch_device)
+
+    def record_event(self, stream=None):
+        if self.device != "gpu" or not torch.cuda.is_available():
+            return super().record_event(stream=stream)
+        stream = self.default_stream() if stream is None else stream
+        event = torch.cuda.Event()
+        event.record(stream)
+        return StreamEvent(device=self.current_device(), stream=stream, token=event)
+
+    def wait_event(self, event, stream=None):
+        if self.device != "gpu" or not torch.cuda.is_available():
+            return super().wait_event(event, stream=stream)
+        stream = self.default_stream() if stream is None else stream
+        token = event.token if isinstance(event, StreamEvent) else event
+        stream.wait_event(token)
+        return None
+
+    def synchronize(self, device=None, stream=None):
+        if self.device != "gpu" or not torch.cuda.is_available():
+            return None
+        if stream is not None:
+            stream.synchronize()
+            return None
+        spec = parse_device_spec(device) if device is not None else self.current_device()
+        torch_device = self._torch_device_for_spec(spec)
+        torch.cuda.synchronize(device=torch_device)
+        return None
+
+    def sync(self):
+        return self.synchronize()
 
     def _device_spec_for_array(self, x):
         if isinstance(x, torch.Tensor):

@@ -7,7 +7,7 @@ import logging
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
-from renormalizer.backend.execution import BackendCopyError, CopyPolicy, DeviceSpec, legacy_device_kind, parse_device_spec
+from renormalizer.backend.execution import BackendCopyError, CopyPolicy, DeviceSpec, StreamEvent, legacy_device_kind, parse_device_spec
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,8 @@ class CupyBackend(AbstractBackend):
     opt_einsum_name = "cupy"
     supports_gpu = True
     supports_grouped_gemm = True
+    supports_streams = True
+    supports_events = True
     host_array_types = (np.ndarray,)
 
     def __init__(self, config=None):
@@ -117,6 +119,24 @@ class CupyBackend(AbstractBackend):
     def device_count(self):
         return int(_cupy.cuda.runtime.getDeviceCount())
 
+    def default_stream(self):
+        return self._on_configured_device(_cupy.cuda.get_current_stream)
+
+    def new_stream(self):
+        return self._on_configured_device(_cupy.cuda.Stream, non_blocking=True)
+
+    def record_event(self, stream=None):
+        stream = self.default_stream() if stream is None else stream
+        event = self._on_configured_device(_cupy.cuda.Event)
+        event.record(stream)
+        return StreamEvent(device=self.current_device(), stream=stream, token=event)
+
+    def wait_event(self, event, stream=None):
+        stream = self.default_stream() if stream is None else stream
+        token = event.token if isinstance(event, StreamEvent) else event
+        stream.wait_event(token)
+        return None
+
     def _device_spec_for_array(self, x):
         if isinstance(x, _cupy.ndarray):
             index = int(x.device.id)
@@ -194,3 +214,16 @@ class CupyBackend(AbstractBackend):
             _cupy.cuda.Device().synchronize()
         else:
             _cupy.cuda.Device(index).synchronize()
+
+    def synchronize(self, device=None, stream=None):
+        if stream is not None:
+            stream.synchronize()
+            return None
+        if device is not None:
+            index = self._target_cuda_index(device)
+            if index is None:
+                _cupy.cuda.Device().synchronize()
+            else:
+                _cupy.cuda.Device(index).synchronize()
+            return None
+        return self.sync()
