@@ -962,12 +962,80 @@ class MatmulDesc:
     estimated_write_bytes: int = 0
     estimated_workspace_bytes: int = 0
 
+    @staticmethod
+    def _validate_array_shape(name, array, expected_shape):
+        shape = _shape_of(array)
+        if not shape:
+            return
+        expected_shape = tuple(int(dim) for dim in expected_shape)
+        if shape != expected_shape:
+            raise ValueError("MatmulDesc {0} shape must match descriptor".format(name))
+
+    @staticmethod
+    def _layout_size_map(layout):
+        return {
+            mode: int(dim)
+            for mode, dim in zip(layout.logical_modes, layout.logical_shape)
+        }
+
+    @staticmethod
+    def _layout_sizes_for_modes(modes, *maps):
+        sizes = []
+        for mode in modes:
+            found = False
+            for mapping in maps:
+                if mode in mapping:
+                    sizes.append(mapping[mode])
+                    found = True
+                    break
+            if not found:
+                raise ValueError("MatmulDesc layout metadata is missing mode {0!r}".format(mode))
+        return tuple(sizes)
+
+    def _validate_layout_semantics(self):
+        if self.layout_a is None or self.layout_b is None or self.layout_c is None:
+            return False
+        left_modes = tuple(self.layout_a.logical_modes)
+        right_modes = tuple(self.layout_b.logical_modes)
+        output_modes = tuple(self.layout_c.logical_modes)
+        left_sizes = self._layout_size_map(self.layout_a)
+        right_sizes = self._layout_size_map(self.layout_b)
+        left_set = set(left_modes)
+        right_set = set(right_modes)
+        output_set = set(output_modes)
+        batch_modes = tuple(mode for mode in output_modes if mode in left_set and mode in right_set)
+        contracted_modes = tuple(mode for mode in left_modes if mode in right_set and mode not in output_set)
+        left_only_modes = tuple(mode for mode in output_modes if mode in left_set and mode not in right_set)
+        right_only_modes = tuple(mode for mode in output_modes if mode in right_set and mode not in left_set)
+        expected_batch_shape = self._layout_sizes_for_modes(batch_modes, left_sizes, right_sizes)
+        expected_m = _prod(self._layout_sizes_for_modes(left_only_modes, left_sizes))
+        expected_n = _prod(self._layout_sizes_for_modes(right_only_modes, right_sizes))
+        k_left = _prod(self._layout_sizes_for_modes(contracted_modes, left_sizes))
+        k_right = _prod(self._layout_sizes_for_modes(contracted_modes, right_sizes))
+        if tuple(self.batch_shape) != expected_batch_shape:
+            raise ValueError("MatmulDesc batch_shape must match layout metadata")
+        if k_left != k_right or (self.m, self.n, self.k) != (expected_m, expected_n, k_left):
+            raise ValueError("MatmulDesc dimensions must match layout metadata")
+        return True
+
+    def _validate_matrix_shapes(self):
+        batch_shape = tuple(self.batch_shape)
+        left_shape = batch_shape + ((self.k, self.m) if self.trans_a else (self.m, self.k))
+        right_shape = batch_shape + ((self.n, self.k) if self.trans_b else (self.k, self.n))
+        output_shape = batch_shape + (self.m, self.n)
+        self._validate_array_shape("A", self.A, left_shape)
+        self._validate_array_shape("B", self.B, right_shape)
+        if self.C is not None:
+            self._validate_array_shape("C", self.C, output_shape)
+
     def __post_init__(self):
         for field in ("m", "n", "k"):
             value = int(getattr(self, field))
             if value < 0:
                 raise ValueError("MatmulDesc {0} must be non-negative".format(field))
             object.__setattr__(self, field, value)
+        if not self._validate_layout_semantics():
+            self._validate_matrix_shapes()
         batch_shape = tuple(int(dim) for dim in self.batch_shape)
         if any(dim < 0 for dim in batch_shape):
             raise ValueError("MatmulDesc batch_shape dimensions must be non-negative")

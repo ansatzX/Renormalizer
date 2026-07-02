@@ -1289,6 +1289,108 @@ def test_matmul_desc_rejects_negative_estimates(field):
         MatmulDesc(None, None, None, 2, 3, 4, **kwargs)
 
 
+def test_matmul_desc_rejects_matrix_shapes_inconsistent_with_descriptor():
+    from renormalizer.backend import MatmulDesc
+
+    left = np.ones((2, 3), dtype=np.float64)
+    right = np.ones((3, 4), dtype=np.float64)
+    out = np.zeros((2, 4), dtype=np.float64)
+
+    MatmulDesc(left, right, out, 2, 4, 3)
+    MatmulDesc(left.T, right, out, 2, 4, 3, trans_a=True)
+    MatmulDesc(
+        np.ones((5, 2, 3), dtype=np.float64),
+        np.ones((5, 3, 4), dtype=np.float64),
+        np.zeros((5, 2, 4), dtype=np.float64),
+        2,
+        4,
+        3,
+        batch_shape=(5,),
+    )
+
+    with pytest.raises(ValueError, match="MatmulDesc A shape must match descriptor"):
+        MatmulDesc(np.ones((2, 5), dtype=np.float64), right, None, 2, 4, 3)
+
+    with pytest.raises(ValueError, match="MatmulDesc B shape must match descriptor"):
+        MatmulDesc(left, np.ones((5, 4), dtype=np.float64), None, 2, 4, 3)
+
+    with pytest.raises(ValueError, match="MatmulDesc C shape must match descriptor"):
+        MatmulDesc(left, right, np.zeros((3, 4), dtype=np.float64), 2, 4, 3)
+
+    with pytest.raises(ValueError, match="MatmulDesc C shape must match descriptor"):
+        MatmulDesc(
+            np.ones((5, 2, 3), dtype=np.float64),
+            np.ones((5, 3, 4), dtype=np.float64),
+            np.zeros((2, 4), dtype=np.float64),
+            2,
+            4,
+            3,
+            batch_shape=(5,),
+        )
+
+
+def test_matmul_desc_rejects_layout_semantics_inconsistent_with_descriptor():
+    from renormalizer.backend import LayoutSpec, MatmulDesc
+
+    def layout(shape, modes):
+        return LayoutSpec(
+            logical_shape=shape,
+            physical_shape=shape,
+            logical_modes=modes,
+            strides=None,
+            order="C",
+            contiguous_groups=(tuple(range(len(shape))),),
+        )
+
+    left = np.ones((2, 3, 4), dtype=np.float64)
+    right = np.ones((2, 4, 5), dtype=np.float64)
+    out = np.zeros((2, 3, 5), dtype=np.float64)
+    layout_a = layout((2, 3, 4), ("batch", "i", "k"))
+    layout_b = layout((2, 4, 5), ("batch", "k", "j"))
+    layout_c = layout((2, 3, 5), ("batch", "i", "j"))
+
+    MatmulDesc(
+        left,
+        right,
+        out,
+        3,
+        5,
+        4,
+        batch_shape=(2,),
+        layout_a=layout_a,
+        layout_b=layout_b,
+        layout_c=layout_c,
+    )
+
+    with pytest.raises(ValueError, match="MatmulDesc dimensions must match layout metadata"):
+        MatmulDesc(
+            left,
+            right,
+            out,
+            4,
+            5,
+            4,
+            batch_shape=(2,),
+            layout_a=layout_a,
+            layout_b=layout_b,
+            layout_c=layout_c,
+        )
+
+    with pytest.raises(ValueError, match="MatmulDesc batch_shape must match layout metadata"):
+        MatmulDesc(
+            left,
+            right,
+            out,
+            3,
+            5,
+            4,
+            batch_shape=(3,),
+            layout_a=layout_a,
+            layout_b=layout_b,
+            layout_c=layout_c,
+        )
+
+
 def test_layout_transform_rejects_negative_shape_dimensions():
     from renormalizer.backend import LayoutTransform
 

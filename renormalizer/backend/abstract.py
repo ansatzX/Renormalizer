@@ -42,6 +42,7 @@ from renormalizer.backend.execution import (
     Workspace,
     array_info_for_backend,
     layout_from_array,
+    layout_from_modes_shape,
     legacy_device_kind,
     lower_pair_contraction_to_matmul,
     parse_einsum,
@@ -812,7 +813,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
         )
         dtype = getattr(left_operand.array, "dtype", None) or getattr(right_operand.array, "dtype", None)
         array = _ShapeOnlyArray(shape, dtype, itemsize)
-        return TensorOperand(array, tuple(modes), name=name)
+        return TensorOperand(
+            array,
+            tuple(modes),
+            layout=layout_from_modes_shape(modes, shape),
+            name=name,
+        )
 
     @staticmethod
     def _estimate_multi_step_peak_bytes(steps, *, input_count):
@@ -2048,10 +2054,24 @@ class AbstractBackend(SingleProcessDistributedMixin):
         local_plan = step.plan
         if isinstance(local_plan, MatmulPlan) and len(local_plan.descs) == 1:
             desc = local_plan.descs[0]
+            local_left = self._shape_only_operand(
+                local_input_shapes[0],
+                path.input_specs[0].modes,
+                path.input_specs[0],
+                path.input_specs[1],
+                name="local_operand0",
+            )
+            local_right = self._shape_only_operand(
+                local_input_shapes[1],
+                path.input_specs[1].modes,
+                path.input_specs[0],
+                path.input_specs[1],
+                name="local_operand1",
+            )
             local_desc = MatmulDesc(
-                A=desc.A,
-                B=desc.B,
-                C=desc.C,
+                A=local_left.array,
+                B=local_right.array,
+                C=None,
                 m=m,
                 n=n,
                 k=k,
@@ -2064,9 +2084,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 beta=desc.beta,
                 dtype_compute=desc.dtype_compute,
                 dtype_output=desc.dtype_output,
-                layout_a=desc.layout_a,
-                layout_b=desc.layout_b,
-                layout_c=desc.layout_c,
+                layout_a=local_left.layout,
+                layout_b=local_right.layout,
+                layout_c=layout_from_modes_shape(path.output_modes, output_shape),
                 estimated_flops=flops,
                 estimated_read_bytes=read_bytes,
                 estimated_write_bytes=write_bytes,
