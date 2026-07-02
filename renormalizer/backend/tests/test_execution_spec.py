@@ -2763,6 +2763,63 @@ def test_execute_matmul_plan_runs_gemm_and_records_execute_event(tmp_path):
     assert event["wall_s"] >= 0.0
 
 
+def test_execute_grouped_matmul_plan_records_all_descriptor_shapes(tmp_path):
+    from renormalizer.backend import MatmulDesc, MatmulPlan
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = NumpyBackend()
+    left0 = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right0 = np.arange(12, dtype=np.float64).reshape(3, 4)
+    left1 = left0 + 10.0
+    right1 = right0 - 2.0
+    descs = (
+        MatmulDesc(left0, right0, None, 2, 4, 3, estimated_flops=48),
+        MatmulDesc(left1, right1, None, 2, 4, 3, estimated_flops=48),
+    )
+    plan = MatmulPlan(
+        kind="grouped_gemm",
+        descs=descs,
+        pre_ops=(),
+        post_ops=(),
+        output_shape=(2, 4),
+        copy_bytes=0,
+        workspace_bytes=0,
+        estimated_flops=96,
+        estimated_time_s=None,
+        reason="test grouped matmul plan",
+    )
+    event_path = tmp_path / "events.jsonl"
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+
+        result = backend.execute_matmul_plan(plan, plan_hash="grouped-plan")
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert len(result) == 2
+    assert np.allclose(result[0], left0 @ right0)
+    assert np.allclose(result[1], left1 @ right1)
+
+    payloads = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(payload for payload in payloads if payload.get("plan_hash") == "grouped-plan")
+
+    assert event["lowering"] == "grouped_gemm"
+    assert event["input_shapes"] == [[[2, 3], [3, 4]], [[2, 3], [3, 4]]]
+    assert event["input_dtypes"] == [["float64", "float64"], ["float64", "float64"]]
+    assert event["output_shape"] == [[2, 4], [2, 4]]
+    assert event["num_grouped_tasks"] == 2
+
+
 def test_execute_batched_matmul_plan_preserves_generic_output_mode_order():
     from renormalizer.backend.execution import PairContractionSpec, TensorOperand
     from renormalizer.backend.numpy_backend import NumpyBackend

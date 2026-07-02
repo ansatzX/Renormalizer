@@ -4509,25 +4509,42 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
             if not profiling.should_record_op():
                 return
-            desc = plan.descs[0] if plan.descs else None
-
-            profiling.record(
-                "contraction_execute",
-                backend=self.name,
-                equation=equation,
-                lowering=plan.kind,
-                plan_hash=plan_hash or getattr(plan, "plan_hash", ""),
-                input_modes=input_modes,
-                output_modes=output_modes,
-                input_shapes=[
+            descs = tuple(plan.descs)
+            desc = descs[0] if descs else None
+            grouped = plan.kind == "grouped_gemm"
+            if grouped:
+                input_shapes = [
+                    [tuple(getattr(item.A, "shape", ())), tuple(getattr(item.B, "shape", ()))]
+                    for item in descs
+                ]
+                input_dtypes = [
+                    [str(getattr(item.A, "dtype", None)), str(getattr(item.B, "dtype", None))]
+                    for item in descs
+                ]
+                operands = [
+                    self._profile_matmul_desc_operands(item, index)
+                    for index, item in enumerate(descs)
+                ]
+                if isinstance(result, (tuple, list)):
+                    output_shape = [tuple(getattr(item, "shape", ())) for item in result]
+                    dtype = str(getattr(result[0], "dtype", None)) if result else None
+                    largest_intermediate = max((array_nbytes(item) for item in result), default=0)
+                else:
+                    output_shape = tuple(getattr(result, "shape", plan.output_shape))
+                    dtype = str(getattr(result, "dtype", None))
+                    largest_intermediate = getattr(result, "nbytes", None)
+                num_blocks = len(descs)
+                num_shape_buckets = len(self._bucketed_by_desc_shape(descs))
+            else:
+                input_shapes = [
                     tuple(getattr(desc.A, "shape", ())),
                     tuple(getattr(desc.B, "shape", ())),
-                ] if desc is not None else [],
-                input_dtypes=[
+                ] if desc is not None else []
+                input_dtypes = [
                     str(getattr(desc.A, "dtype", None)),
                     str(getattr(desc.B, "dtype", None)),
-                ] if desc is not None else [],
-                operands=[
+                ] if desc is not None else []
+                operands = [
                     self._profile_array_operand(
                         "operand0",
                         desc.A,
@@ -4538,9 +4555,26 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         desc.B,
                         input_modes[1] if input_modes else (),
                     ),
-                ] if desc is not None else [],
-                output_shape=tuple(getattr(result, "shape", plan.output_shape)),
-                dtype=str(getattr(result, "dtype", None)),
+                ] if desc is not None else []
+                output_shape = tuple(getattr(result, "shape", plan.output_shape))
+                dtype = str(getattr(result, "dtype", None))
+                largest_intermediate = getattr(result, "nbytes", None)
+                num_blocks = 0
+                num_shape_buckets = 0
+
+            profiling.record(
+                "contraction_execute",
+                backend=self.name,
+                equation=equation,
+                lowering=plan.kind,
+                plan_hash=plan_hash or getattr(plan, "plan_hash", ""),
+                input_modes=input_modes,
+                output_modes=output_modes,
+                input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
+                operands=operands,
+                output_shape=output_shape,
+                dtype=dtype,
                 device=str(self.current_device()),
                 device_info=self._profile_device(self.current_device()),
                 flops=plan.estimated_flops,
@@ -4549,12 +4583,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 copy_bytes=plan.copy_bytes,
                 workspace_bytes=plan.workspace_bytes,
                 peak_bytes=sum(desc.estimated_write_bytes for desc in plan.descs) + plan.workspace_bytes,
-                largest_intermediate=getattr(result, "nbytes", None),
+                largest_intermediate=largest_intermediate,
                 num_gemm=1 if plan.kind == "gemm" else 0,
                 num_batched_gemm=1 if plan.kind in ("batched_gemm", "strided_batched_gemm") else 0,
                 num_grouped_tasks=len(plan.descs) if plan.kind == "grouped_gemm" else 0,
-                num_blocks=0,
-                num_shape_buckets=0,
+                num_blocks=num_blocks,
+                num_shape_buckets=num_shape_buckets,
                 fallback_reason=plan.fallback_reason,
                 wall_s=wall_s,
             )
