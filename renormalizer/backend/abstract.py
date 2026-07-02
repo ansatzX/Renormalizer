@@ -160,12 +160,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_functional_update = True
     supports_batched_matmul = True
     supports_grouped_gemm = False
+    supports_strided_batched_gemm = False
     supports_streams = False
     supports_events = False
     supports_memory_pool = False
     supports_block_sparse = True
     supports_packed_blocks = False
     supports_scatter_add = True
+    supports_point_to_point = False
     host_array_types = (_np.ndarray,)
     device_array_types = ()
 
@@ -236,7 +238,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             matmul=True,
             batched_matmul=self.supports_batched_matmul,
             grouped_gemm=self.supports_grouped_gemm,
-            strided_batched_gemm=False,
+            strided_batched_gemm=self.supports_strided_batched_gemm,
             einsum=True,
             contract_expression=True,
             contraction_path=True,
@@ -251,6 +253,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             allgather=self.size > 1,
             reduce_scatter=self.size > 1,
             alltoall=self.size > 1,
+            point_to_point=bool(self.supports_point_to_point and self.size > 1),
         )
 
     @property

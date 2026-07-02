@@ -168,16 +168,27 @@ def test_backend_protocol_capability_flags_are_explicit():
         "supports_functional_update",
         "supports_batched_matmul",
         "supports_grouped_gemm",
+        "supports_strided_batched_gemm",
         "supports_streams",
         "supports_events",
         "supports_memory_pool",
         "supports_block_sparse",
         "supports_packed_blocks",
         "supports_scatter_add",
+        "supports_point_to_point",
     )
 
     for name in required:
         assert name in BackendProtocol.__annotations__
+
+
+def test_backend_capability_flags_mirror_capability_fields():
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+
+    assert backend.supports_strided_batched_gemm is backend.capabilities.strided_batched_gemm
+    assert backend.supports_point_to_point is backend.capabilities.point_to_point
 
 
 def test_device_spec_parses_cpu_and_indexed_cuda_aliases():
