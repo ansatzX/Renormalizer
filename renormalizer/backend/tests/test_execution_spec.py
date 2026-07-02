@@ -2841,6 +2841,28 @@ def test_plan_contraction_target_devices_builds_distributed_plan():
     assert np.allclose(backend.gather_tensor(result), left @ right)
 
 
+def test_plan_contraction_target_devices_memory_preference_keeps_distributed_metadata():
+    from renormalizer.backend import DeviceSpec, DistributedContractionPlan
+    from renormalizer.backend.numpy_backend import NumpyBackend
+
+    backend = NumpyBackend()
+    left = np.arange(6, dtype=np.float64).reshape(2, 3)
+    right = np.arange(12, dtype=np.float64).reshape(3, 4)
+    spec = backend.parse_einsum("ik,kj->ij", left, right)
+
+    plan = backend.plan_contraction(
+        spec,
+        prefer="memory",
+        allow_distribution=True,
+        target_devices=(DeviceSpec("cpu", global_rank=0), DeviceSpec("cpu", global_rank=1)),
+    )
+
+    assert isinstance(plan.steps[0].plan, DistributedContractionPlan)
+    assert plan.steps[0].kind == "gemm"
+    assert plan.distributed_modes
+    assert plan.sliced_modes == ()
+
+
 def test_plan_contraction_rejects_target_devices_with_explicit_distributed_spec():
     from renormalizer.backend import BackendFeatureError, DeviceMesh, DeviceSpec, DistributedContractionSpec, ShardingSpec
     from renormalizer.backend.numpy_backend import NumpyBackend

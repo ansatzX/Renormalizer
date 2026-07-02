@@ -1122,12 +1122,6 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ), memory_limit=memory_limit, allow_slicing=allow_slicing)
             return self._enforce_plan_memory_limit(plan, memory_limit=memory_limit, allow_slicing=allow_slicing)
         plan = self._plan_einsum_contraction(spec)
-        plan = self._apply_contraction_plan_preference(
-            plan,
-            prefer=prefer,
-            memory_limit=memory_limit,
-            allow_slicing=allow_slicing,
-        )
         if target_device_specs is not None:
             mesh = self._mesh_from_target_devices(target_device_specs)
             distributed_plan = self.plan_distributed_contraction_path(
@@ -1136,6 +1130,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 memory_limit_per_device=memory_limit,
             )
             return self._wrap_distributed_contraction_plan(plan, distributed_plan)
+        plan = self._apply_contraction_plan_preference(
+            plan,
+            prefer=prefer,
+            memory_limit=memory_limit,
+            allow_slicing=allow_slicing,
+        )
         return self._enforce_plan_memory_limit(plan, memory_limit=memory_limit, allow_slicing=allow_slicing)
 
     @staticmethod
