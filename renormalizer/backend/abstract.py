@@ -60,12 +60,36 @@ from renormalizer.backend.transforms import UnavailableTransforms
 
 
 class _BackendContractExpression:
-    def __init__(self, expression, backend_name, backend=None, equation=None, contract_kwargs=None):
+    def __init__(
+        self,
+        expression,
+        backend_name,
+        backend=None,
+        equation=None,
+        expression_operands=(),
+        constants=(),
+        contract_kwargs=None,
+    ):
         self.expression = expression
         self.backend_name = backend_name
         self._backend = backend
         self._planned_equation = equation
+        self._expression_operands = tuple(expression_operands)
+        self._constants = frozenset(int(index) for index in constants)
         self._contract_kwargs = {} if contract_kwargs is None else dict(contract_kwargs)
+
+    def _planned_operands(self, arrays):
+        variable_count = len(self._expression_operands) - len(self._constants)
+        if len(arrays) != variable_count:
+            return None
+        array_iter = iter(arrays)
+        operands = []
+        for index, operand in enumerate(self._expression_operands):
+            if index in self._constants:
+                operands.append(operand)
+            else:
+                operands.append(next(array_iter))
+        return tuple(operands)
 
     def __call__(
         self,
@@ -83,12 +107,20 @@ class _BackendContractExpression:
             and backend is None
             and not evaluate_constants
         ):
+            operands = self._planned_operands(arrays)
+            if operands is None:
+                return self.expression(
+                    *arrays,
+                    out=out,
+                    backend=self.backend_name,
+                    evaluate_constants=evaluate_constants,
+                )
             kwargs = dict(self._contract_kwargs)
             if stream is not None:
                 kwargs["stream"] = stream
             if workspace is not None:
                 kwargs["workspace"] = workspace
-            return self._backend.contract(self._planned_equation, *arrays, **kwargs)
+            return self._backend.contract(self._planned_equation, *operands, **kwargs)
         return self.expression(
             *arrays,
             out=out,
@@ -623,8 +655,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
         equation = "".join(args[0].split())
         if "->" not in equation or "..." in equation:
             return False
-        constants = kwargs.get("constants")
-        if constants:
+        try:
+            constants = tuple(int(index) for index in (kwargs.get("constants") or ()))
+        except TypeError:
+            return False
+        if len(constants) > 1:
+            return False
+        if any(index < 0 or index >= 2 for index in constants):
             return False
         supported_kwargs = {"optimize", "constants"}
         return all(key in supported_kwargs for key in kwargs)
@@ -666,11 +703,17 @@ class AbstractBackend(SingleProcessDistributedMixin):
         import opt_einsum as oe
 
         planned = self._contract_expression_is_plannable(args, kwargs)
+        if planned:
+            planned_constants = kwargs.get("constants") or ()
+        else:
+            planned_constants = ()
         return _BackendContractExpression(
             oe.contract_expression(*args, **kwargs),
             self.opt_einsum_name,
             backend=self if planned else None,
             equation="".join(args[0].split()) if planned else None,
+            expression_operands=args[1:] if planned else (),
+            constants=planned_constants,
             contract_kwargs={
                 key: kwargs[key]
                 for key in ("optimize",)
