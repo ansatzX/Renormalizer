@@ -1622,6 +1622,28 @@ class DenseBlock:
     shape: tuple[int, ...]
     offset: tuple[int, ...] | None = None
 
+    def __post_init__(self):
+        modes = tuple(self.modes)
+        shape = tuple(int(dim) for dim in self.shape)
+        if any(dim < 0 for dim in shape):
+            raise ValueError("DenseBlock shape dimensions must be non-negative")
+        if len(modes) != len(shape):
+            raise ValueError("DenseBlock modes must match shape rank")
+        array_shape = _shape_of(self.array)
+        if array_shape and array_shape != shape:
+            raise ValueError("DenseBlock shape must match array shape")
+        if self.offset is None:
+            offset = None
+        else:
+            offset = tuple(int(item) for item in self.offset)
+            if len(offset) != len(shape):
+                raise ValueError("DenseBlock offset must match shape rank")
+            if any(item < 0 for item in offset):
+                raise ValueError("DenseBlock offset entries must be non-negative")
+        self.modes = modes
+        self.shape = shape
+        self.offset = offset
+
 
 @dataclass
 class BlockTensor:
@@ -1630,6 +1652,24 @@ class BlockTensor:
     modes: tuple[Hashable, ...]
     block_axis_meta: Any
     backend: str
+
+    def __post_init__(self):
+        global_shape = tuple(int(dim) for dim in self.global_shape)
+        modes = tuple(self.modes)
+        if any(dim < 0 for dim in global_shape):
+            raise ValueError("BlockTensor global_shape dimensions must be non-negative")
+        if len(modes) != len(global_shape):
+            raise ValueError("BlockTensor modes must match global_shape rank")
+        blocks = dict(self.blocks)
+        for key, block in blocks.items():
+            if key != block.key:
+                raise ValueError("BlockTensor block dictionary key must match block.key")
+            if tuple(block.modes) != modes:
+                raise ValueError("BlockTensor block modes must match tensor modes")
+        self.blocks = blocks
+        self.global_shape = global_shape
+        self.modes = modes
+        self.backend = str(self.backend)
 
 
 @dataclass(frozen=True)

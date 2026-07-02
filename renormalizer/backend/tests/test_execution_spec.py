@@ -1828,6 +1828,53 @@ def test_grouped_gemm_records_bucketed_fallback_profile(tmp_path):
     assert event["wall_s"] >= 0.0
 
 
+def test_dense_block_rejects_invalid_shape_metadata():
+    from renormalizer.backend import BlockKey, DenseBlock
+
+    key = BlockKey((0,), (1,))
+
+    with pytest.raises(ValueError, match="DenseBlock shape dimensions must be non-negative"):
+        DenseBlock(key, np.ones((2, 3)), ("i", "k"), (-2, 3))
+
+    with pytest.raises(ValueError, match="DenseBlock modes must match shape rank"):
+        DenseBlock(key, np.ones((2, 3)), ("i",), (2, 3))
+
+    with pytest.raises(ValueError, match="DenseBlock shape must match array shape"):
+        DenseBlock(key, np.ones((2, 3)), ("i", "k"), (2, 4))
+
+    with pytest.raises(ValueError, match="DenseBlock offset must match shape rank"):
+        DenseBlock(key, np.ones((2, 3)), ("i", "k"), (2, 3), offset=(0,))
+
+    with pytest.raises(ValueError, match="DenseBlock offset entries must be non-negative"):
+        DenseBlock(key, np.ones((2, 3)), ("i", "k"), (2, 3), offset=(-1, 0))
+
+
+def test_block_tensor_rejects_inconsistent_block_metadata():
+    from renormalizer.backend import BlockKey, BlockTensor, DenseBlock
+
+    key = BlockKey((0,), (1,))
+    block = DenseBlock(key, np.ones((2, 3)), ("i", "k"), (2, 3))
+
+    with pytest.raises(ValueError, match="BlockTensor global_shape dimensions must be non-negative"):
+        BlockTensor({key: block}, global_shape=(-2, 3), modes=("i", "k"), block_axis_meta=None, backend="numpy")
+
+    with pytest.raises(ValueError, match="BlockTensor modes must match global_shape rank"):
+        BlockTensor({key: block}, global_shape=(2, 3), modes=("i",), block_axis_meta=None, backend="numpy")
+
+    with pytest.raises(ValueError, match="BlockTensor block dictionary key must match block.key"):
+        BlockTensor(
+            {BlockKey((2,), (3,)): block},
+            global_shape=(2, 3),
+            modes=("i", "k"),
+            block_axis_meta=None,
+            backend="numpy",
+        )
+
+    wrong_modes = DenseBlock(key, np.ones((2, 3)), ("row", "col"), (2, 3))
+    with pytest.raises(ValueError, match="BlockTensor block modes must match tensor modes"):
+        BlockTensor({key: wrong_modes}, global_shape=(2, 3), modes=("i", "k"), block_axis_meta=None, backend="numpy")
+
+
 def test_lower_block_contraction_builds_deterministic_grouped_gemm_plan():
     from renormalizer.backend import (
         BlockContractionSpec,
