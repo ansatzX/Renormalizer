@@ -7,7 +7,7 @@ import time
 
 from renormalizer.mps.backend import np, backend, xp
 from renormalizer.mps.matrix import (Matrix, multi_tensor_contract, asxp,
-    asnumpy, tensordot)
+    asnumpy, tensordot, tensordot_einsum_equation)
 from renormalizer.utils import profiling
 
 
@@ -171,34 +171,57 @@ def contract_one_site_multi_mpo(environ, ms, mos, domain, ms_conj=None):
     assert domain in ["L", "R"]
     profile_enabled = profiling.enabled()
     started = time.perf_counter() if profile_enabled else None
+    plan_summaries = [] if profile_enabled else None
+
+    def contract_pair(left, right, axes):
+        equation = tensordot_einsum_equation(left.ndim, right.ndim, axes[0], axes[1])
+        local_summaries = [] if plan_summaries is not None else None
+        result = multi_tensor_contract(
+            [([0, 1], equation)],
+            left,
+            right,
+            profile_collector=local_summaries,
+        )
+        if plan_summaries is not None:
+            plan_summaries.extend(local_summaries)
+        return result
+
     if ms_conj is None:
         ms_conj = ms.conj()
     if domain == "L":
         if ms.ndim == 3:
-            outtensor = tensordot(environ, ms_conj, ([0], [0]))
+            outtensor = contract_pair(environ, ms_conj, ([0], [0]))
             for mo in mos:
-                outtensor = tensordot(outtensor, mo, ([0,-2], [0,1]))
-            outtensor = tensordot(outtensor, ms, ([0,-2], [0,1]))
+                outtensor = contract_pair(outtensor, mo, ([0,-2], [0,1]))
+            outtensor = contract_pair(outtensor, ms, ([0,-2], [0,1]))
         elif ms.ndim == 4:
-            outtensor = tensordot(environ, ms_conj.transpose(0,2,1,3), ([0], [0]))
+            outtensor = contract_pair(
+                environ,
+                ms_conj.transpose(0,2,1,3),
+                ([0], [0]),
+            )
             for mo in mos:
-                outtensor = tensordot(outtensor, mo, ([0,-2], [0,1]))
-            outtensor = tensordot(outtensor, ms, ([0,1,-2], [0,2,1]))
+                outtensor = contract_pair(outtensor, mo, ([0,-2], [0,1]))
+            outtensor = contract_pair(outtensor, ms, ([0,1,-2], [0,2,1]))
         else:
             raise ValueError(
                 f"MPS ndim is not 3 or 4, got {ms.ndim}"
             )
     else:
         if ms.ndim == 3:
-            outtensor = tensordot(environ, ms_conj, ([0], [-1]))
+            outtensor = contract_pair(environ, ms_conj, ([0], [-1]))
             for mo in mos:
-                outtensor = tensordot(outtensor, mo, ([0,-1], [-1,1]))
-            outtensor = tensordot(outtensor, ms, ([0,-1], [-1,1]))
+                outtensor = contract_pair(outtensor, mo, ([0,-1], [-1,1]))
+            outtensor = contract_pair(outtensor, ms, ([0,-1], [-1,1]))
         elif ms.ndim == 4:
-            outtensor = tensordot(environ, ms_conj.transpose(0,2,1,3), ([0], [-1]))
+            outtensor = contract_pair(
+                environ,
+                ms_conj.transpose(0,2,1,3),
+                ([0], [-1]),
+            )
             for mo in mos:
-                outtensor = tensordot(outtensor, mo, ([0,-1], [-1,1]))
-            outtensor = tensordot(outtensor, ms, ([0,2,-1], [-1,2,1]))
+                outtensor = contract_pair(outtensor, mo, ([0,-1], [-1,1]))
+            outtensor = contract_pair(outtensor, ms, ([0,2,-1], [-1,2,1]))
         else:
             raise ValueError(
                 f"MPS ndim is not 3 or 4, got {ms.ndim}"
@@ -215,6 +238,7 @@ def contract_one_site_multi_mpo(environ, ms, mos, domain, ms_conj=None):
             mps_conj_shape=tuple(ms_conj.shape),
             mpo_shapes=[tuple(mo.shape) for mo in mos],
             output_shape=tuple(outtensor.shape),
+            **profiling.aggregate_contraction_plan_summaries(plan_summaries),
             wall_s=time.perf_counter() - started,
         )
     return outtensor
@@ -233,6 +257,7 @@ def contract_one_site(environ, ms, mo, domain, ms_conj=None):
     assert domain in ["L", "R"]
     profile_enabled = profiling.enabled()
     started = time.perf_counter() if profile_enabled else None
+    plan_summaries = [] if profile_enabled else None
     if isinstance(ms, Matrix):
         ms = ms.array
     if isinstance(mo, Matrix):
@@ -269,7 +294,14 @@ def contract_one_site(environ, ms, mo, domain, ms_conj=None):
             raise ValueError(
                 f"MPS ndim is not 3 or 4, got {ms.ndim}"
             )
-        outtensor = multi_tensor_contract(path, environ, ms_conj, mo, ms)
+        outtensor = multi_tensor_contract(
+            path,
+            environ,
+            ms_conj,
+            mo,
+            ms,
+            profile_collector=plan_summaries,
+        )
 
     else:
         assert environ.shape[0] == ms_conj.shape[-1]
@@ -301,7 +333,14 @@ def contract_one_site(environ, ms, mo, domain, ms_conj=None):
             raise ValueError(
                 f"MPS ndim is not 3 or 4, got {ms.ndim}"
             )
-        outtensor = multi_tensor_contract(path, ms_conj, environ, mo, ms)
+        outtensor = multi_tensor_contract(
+            path,
+            ms_conj,
+            environ,
+            mo,
+            ms,
+            profile_collector=plan_summaries,
+        )
 
     if profile_enabled:
         profiling.record(
@@ -314,6 +353,7 @@ def contract_one_site(environ, ms, mo, domain, ms_conj=None):
             mps_conj_shape=tuple(ms_conj.shape),
             mpo_shape=tuple(mo.shape),
             output_shape=tuple(outtensor.shape),
+            **profiling.aggregate_contraction_plan_summaries(plan_summaries),
             wall_s=time.perf_counter() - started,
         )
     return outtensor

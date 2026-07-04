@@ -40,6 +40,7 @@ _BACKEND_PROTOCOL_RUNTIME_ATTRS = (
     "supports_block_sparse",
     "supports_packed_blocks",
     "supports_scatter_add",
+    "supports_distributed",
     "supports_distributed_array",
     "supports_allreduce",
     "supports_broadcast",
@@ -103,6 +104,7 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "allocate_workspace",
     "release_workspace",
     "execute",
+    "last_execution_profile",
     "unpack_masked_vectors",
     "pack_masked_vectors",
     "shard_tensor",
@@ -122,6 +124,9 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "matmul",
     "batched_matmul",
     "grouped_gemm",
+    "gemv_batch",
+    "prepack_grouped_gemm",
+    "execute_prepacked_grouped_gemm",
     "synchronize",
     "sync",
     "free_all_blocks",
@@ -137,6 +142,8 @@ _BACKEND_PROTOCOL_RUNTIME_METHODS = (
     "allgather",
     "reduce_scatter",
     "alltoall",
+    "send",
+    "recv",
 )
 
 try:
@@ -243,7 +250,13 @@ class BackendProtocol(Protocol):
     """Whether same-shape stacked batched matmul is available."""
 
     supports_grouped_gemm: bool
-    """Whether native grouped GEMM is available, excluding bucketed fallback."""
+    """Whether a backend-owned grouped GEMM entrypoint is available.
+
+    This means the backend owns grouping/dispatch and does not rely on the
+    AbstractBackend bucketed fallback.  The implementation may still be a
+    bucketed batched-matmul path; vendor grouped BLAS is reported separately by
+    profiling policy/implementation fields.
+    """
 
     supports_strided_batched_gemm: bool
     """Whether native strided batched GEMM is available."""
@@ -277,6 +290,9 @@ class BackendProtocol(Protocol):
 
     supports_scatter_add: bool
     """Whether backend scatter-add/update primitives are available."""
+
+    supports_distributed: bool
+    """Whether this backend is currently participating in a distributed runtime."""
 
     supports_distributed_array: bool
     """Whether backend distributed tensor wrapper APIs are available."""
@@ -406,7 +422,15 @@ class BackendProtocol(Protocol):
         """Convert an array-like object to this backend's representation."""
         ...
 
-    def tensordot(self, a: Any, b: Any, axes: Any = 2) -> Any:
+    def tensordot(
+        self,
+        a: Any,
+        b: Any,
+        axes: Any = 2,
+        *,
+        stream: Any = None,
+        workspace: Any = None,
+    ) -> Any:
         """Contract two tensors through the backend boundary."""
         ...
 
@@ -492,7 +516,14 @@ class BackendProtocol(Protocol):
         """Plan an explicit contraction into backend execution steps."""
         ...
 
-    def plan_distributed_contraction_path(self, path: Any, mesh: Any, memory_limit_per_device: Any = None, cost_model: Any = None) -> Any:
+    def plan_distributed_contraction_path(
+        self,
+        path: Any,
+        mesh: Any,
+        *,
+        memory_limit_per_device: Any = None,
+        cost_model: Any = None,
+    ) -> Any:
         """Plan distributed placement/communication for a contraction path."""
         ...
 
@@ -544,6 +575,10 @@ class BackendProtocol(Protocol):
         """Execute a backend plan through the unified plan executor."""
         ...
 
+    def last_execution_profile(self) -> Any:
+        """Return the latest structured execution profile payload, if any."""
+        ...
+
     def unpack_masked_vectors(self, x: Any, spec: Any) -> Any:
         """Unpack one or more packed masked vectors into a structured center tensor."""
         ...
@@ -564,7 +599,7 @@ class BackendProtocol(Protocol):
         """Redistribute a distributed tensor according to a new sharding spec."""
         ...
 
-    def replicate_tensor(self, x: Any, mesh: Any, **kwargs: Any) -> Any:
+    def replicate_tensor(self, x: Any, mesh: Any, *, modes: Any = None) -> Any:
         """Replicate a dense tensor across a device mesh."""
         ...
 
@@ -584,7 +619,7 @@ class BackendProtocol(Protocol):
         """Return the number of available devices for this backend."""
         ...
 
-    def lower_pair_contraction_to_matmul(self, spec: Any) -> Any:
+    def lower_pair_contraction_to_matmul(self, spec: Any, *, record_profile: bool = True) -> Any:
         """Lower a mode-labeled pair contraction to a matmul execution plan."""
         ...
 
@@ -598,11 +633,13 @@ class BackendProtocol(Protocol):
         *,
         stream: Any = None,
         workspace: Any = None,
+        pack_threshold: int | None = None,
         plan_hash: Any = None,
         record_profile: bool = True,
         equation: Any = None,
         input_modes: Any = None,
         output_modes: Any = None,
+        fallback_policy: Any = None,
     ) -> Any:
         """Execute a matmul plan using this backend's primitives or recorded fallback."""
         ...
@@ -614,6 +651,8 @@ class BackendProtocol(Protocol):
         pack_threshold: int = 4,
         stream: Any = None,
         workspace: Any = None,
+        policy: Any = "auto",
+        fallback_policy: Any = None,
     ) -> Any:
         """Execute a grouped GEMM plan and return a sparse block tensor."""
         ...
@@ -632,6 +671,7 @@ class BackendProtocol(Protocol):
         beta: Any = 0.0,
         stream: Any = None,
         workspace: Any = None,
+        fallback_policy: Any = None,
     ) -> Any:
         """Execute one dense GEMM, or a descriptor for compatibility."""
         ...
@@ -650,6 +690,7 @@ class BackendProtocol(Protocol):
         beta: Any = 0.0,
         stream: Any = None,
         workspace: Any = None,
+        fallback_policy: Any = None,
     ) -> Any:
         """Execute same-shape stacked batched GEMM, or a descriptor for compatibility."""
         ...
@@ -658,11 +699,54 @@ class BackendProtocol(Protocol):
         self,
         descs: Any,
         *,
+        buffers: Any = None,
         pack_threshold: int = 4,
         stream: Any = None,
         workspace: Any = None,
+        policy: Any = "auto",
+        fallback_policy: Any = None,
+        profile_context: Any = None,
     ) -> Any:
         """Execute grouped GEMM tasks through native support or bucketed fallback."""
+        ...
+
+    def gemv_batch(
+        self,
+        descs: Any,
+        *,
+        buffers: Any = None,
+        role: Any = None,
+        stream: Any = None,
+        workspace: Any = None,
+        fallback_policy: Any = None,
+        profile_context: Any = None,
+    ) -> Any:
+        """Execute a FOCUS-style GEMV batch and record primitive metadata."""
+        ...
+
+    def prepack_grouped_gemm(
+        self,
+        descs: Any,
+        *,
+        buffers: Any = None,
+        pack_threshold: int = 4,
+        stream: Any = None,
+        workspace: Any = None,
+        policy: Any = "auto",
+        fallback_policy: Any = None,
+    ) -> Any:
+        """Pack reusable same-shape grouped GEMM buckets once for repeated execution."""
+        ...
+
+    def execute_prepacked_grouped_gemm(
+        self,
+        plan: Any,
+        *,
+        stream: Any = None,
+        workspace: Any = None,
+        fallback_policy: Any = None,
+    ) -> Any:
+        """Execute a prepacked grouped GEMM plan without repacking A/B buckets."""
         ...
 
     def synchronize(self, device: Any = None, stream: Any = None) -> Any:
@@ -732,4 +816,12 @@ class BackendProtocol(Protocol):
 
     def alltoall(self, x: Any, split_axis: Any = 0, concat_axis: Any = 0) -> Any:
         """Exchange tensor chunks across distributed workers."""
+        ...
+
+    def send(self, x: Any, *, dst: int, tag: int = 0) -> None:
+        """Send a value to a peer distributed worker."""
+        ...
+
+    def recv(self, *, src: int, tag: int = 0, like: Any = None) -> Any:
+        """Receive a value from a peer distributed worker."""
         ...

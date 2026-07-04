@@ -1,6 +1,8 @@
 import json
 import logging
 
+import numpy as np
+
 
 def _jsonl_payloads(path):
     return [
@@ -8,6 +10,48 @@ def _jsonl_payloads(path):
         for line in path.read_text().splitlines()
         if line.strip()
     ]
+
+
+def test_ttns_condition_initialization_uses_backend_tensordot_boundary(monkeypatch):
+    from renormalizer import BasisHalfSpin
+    from renormalizer.tn import BasisTree, TTNS
+    from renormalizer.tn import tree
+
+    original_tensordot = tree.tensordot
+    calls = []
+
+    def counting_tensordot(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_tensordot(*args, **kwargs)
+
+    monkeypatch.setattr(tree, "tensordot", counting_tensordot)
+    basis = BasisTree.binary([BasisHalfSpin(0), BasisHalfSpin(1)])
+
+    ttns = TTNS(basis, condition={})
+
+    assert ttns.node_list
+    assert len(calls) == len(basis.basis_list_postorder)
+
+
+def test_symbolic_ttno_numeric_mo_uses_backend_tensordot_boundary(monkeypatch):
+    from renormalizer import BasisHalfSpin, Op
+    from renormalizer.tn import symbolic_ttno
+
+    original_tensordot = symbolic_ttno.tensordot
+    calls = []
+
+    def counting_tensordot(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_tensordot(*args, **kwargs)
+
+    monkeypatch.setattr(symbolic_ttno, "tensordot", counting_tensordot)
+    mo = np.empty((1,), dtype=object)
+    mo[0] = [Op("X", 0)]
+
+    tensor = symbolic_ttno.symbolic_mo_to_numeric_mo_general([BasisHalfSpin(0)], mo, float)
+
+    assert tensor.shape == (2, 2, 1)
+    assert len(calls) == 1
 
 
 def test_tree_runtime_events_write_jsonl(caplog, tmp_path):

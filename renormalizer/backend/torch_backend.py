@@ -31,7 +31,8 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
     supports_device_index = True
     supports_streams = True
     supports_events = True
-    supports_grouped_gemm = True
+    supports_grouped_gemm = False
+    supports_point_to_point = True
 
     def __init__(self, config=None):
         if torch is None:
@@ -147,7 +148,11 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
         if self.device != "gpu" or not torch.cuda.is_available():
             return super().wait_event(event, stream=stream)
         stream = self.default_stream() if stream is None else stream
-        token = event.token if isinstance(event, StreamEvent) else event
+        if isinstance(event, StreamEvent):
+            self._validate_stream_event(event)
+            token = event.token
+        else:
+            token = event
         stream.wait_event(token)
         return None
 
@@ -335,15 +340,23 @@ class TorchBackend(TorchDistributedMixin, AbstractBackend):
             right_axes = tuple(right_axes)
         return (left_axes, right_axes)
 
-    def tensordot(self, a, b, axes=2):
-        return super().tensordot(a, b, axes=axes)
+    def tensordot(self, a, b, axes=2, *, stream=None, workspace=None):
+        return super().tensordot(a, b, axes=axes, stream=stream, workspace=workspace)
 
-    def grouped_gemm(self, tasks, *, pack_threshold=4, stream=None, workspace=None):
-        return super().grouped_gemm(
-            tasks,
-            pack_threshold=pack_threshold,
-            stream=stream,
-            workspace=workspace,
+    def grouped_gemm(
+        self,
+        tasks,
+        *,
+        buffers=None,
+        pack_threshold=4,
+        stream=None,
+        workspace=None,
+        policy="auto",
+        fallback_policy=None,
+        profile_context=None,
+    ):
+        raise NotImplementedError(
+            "Torch grouped_gemm is not implemented in the NumPy2/CuPy execution-IR phase"
         )
 
 

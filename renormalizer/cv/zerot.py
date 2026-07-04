@@ -202,8 +202,8 @@ class SpectraZtCV(SpectraCv):
             a_diag = multi_tensor_contract(path_pre, part_l, a_oper_isite1,
                                            a_oper_isite1)
             a_diag = xp.einsum("adfdg -> adfg", a_diag)
-            a_diag = xp.tensordot(a_diag, part_r,
-                                  axes=([2, 3], [1, 2]))[qn_mask]
+            a_diag = tensordot(a_diag, part_r,
+                               axes=([2, 3], [1, 2]))[qn_mask]
         else:
             #  S-a   d     k   h-S
             #  O-b  -O- j -O-  f-O
@@ -224,7 +224,7 @@ class SpectraZtCV(SpectraCv):
                                             a_oper_isite1)
             a_diagr = xp.einsum("hjkmk -> khjm", a_diagr)
 
-            a_diag = xp.tensordot(
+            a_diag = tensordot(
                 a_diagl, a_diagr, axes=([2, 3], [2, 3]))[qn_mask]
 
         a_diag = asnumpy(a_diag + xp.ones(nonzeros) * self.eta**2)

@@ -6,7 +6,15 @@ import logging
 
 import numpy as np
 
-from renormalizer.backend.execution import BackendCopyError, CopyPolicy, DeviceSpec, legacy_device_kind, parse_device_spec
+from renormalizer.backend.execution import (
+    ArrayInfo,
+    BackendCopyError,
+    CopyPolicy,
+    DeviceSpec,
+    LayoutSpec,
+    legacy_device_kind,
+    parse_device_spec,
+)
 
 try:
     import jax
@@ -64,6 +72,7 @@ class JaxBackend(AbstractBackend):
     supports_autodiff = True
     supports_jit = True
     supports_functional_update = True
+    supports_grouped_gemm = False
 
     def __init__(self, config=None):
         if jax is None:
@@ -220,6 +229,22 @@ class JaxBackend(AbstractBackend):
             return len(self._jax_devices_by_kind.get("gpu", ()))
         return len(self._jax_devices_by_kind.get("cpu", ())) or 1
 
+    @staticmethod
+    def _logical_c_strides(shape, itemsize):
+        stride = int(itemsize)
+        strides = []
+        for dim in reversed(tuple(shape)):
+            strides.append(stride)
+            stride *= int(dim)
+        return tuple(reversed(strides))
+
+    @staticmethod
+    def _shape_size(shape):
+        size = 1
+        for dim in tuple(shape):
+            size *= int(dim)
+        return int(size)
+
     def _device_spec_for_array(self, x):
         if isinstance(x, jnp.ndarray):
             devices = tuple(x.devices())
@@ -235,6 +260,49 @@ class JaxBackend(AbstractBackend):
                 if self._device_kind(device) == "cpu":
                     return DeviceSpec(kind="cpu")
         return super()._device_spec_for_array(x)
+
+    def array_info(self, x):
+        if isinstance(x, jnp.ndarray):
+            shape = tuple(int(dim) for dim in x.shape)
+            dtype = getattr(x, "dtype", None)
+            itemsize = int(np.dtype(dtype).itemsize) if dtype is not None else 0
+            size = self._shape_size(shape)
+            return ArrayInfo(
+                shape=shape,
+                dtype=dtype,
+                itemsize=itemsize,
+                ndim=len(shape),
+                size=size,
+                nbytes=int(getattr(x, "nbytes", size * itemsize)),
+                device=self._device_spec_for_array(x),
+                is_host=False,
+                is_device=True,
+                is_distributed=False,
+                strides=self._logical_c_strides(shape, itemsize),
+                order="C",
+                contiguous=True,
+                writeable=False,
+                owns_data=None,
+                backend_name=self.name,
+            )
+        return super().array_info(x)
+
+    def layout(self, x):
+        if isinstance(x, jnp.ndarray):
+            shape = tuple(int(dim) for dim in x.shape)
+            dtype = getattr(x, "dtype", None)
+            itemsize = int(np.dtype(dtype).itemsize) if dtype is not None else 0
+            rank = len(shape)
+            return LayoutSpec(
+                logical_shape=shape,
+                physical_shape=shape,
+                logical_modes=tuple(range(rank)),
+                strides=self._logical_c_strides(shape, itemsize),
+                order="C",
+                contiguous_groups=(tuple(range(rank)),) if rank else (),
+                estimated_copy_bytes=0,
+            )
+        return super().layout(x)
 
     def _place_on_configured_device(self, x):
         if self._jax_device is None:
@@ -331,6 +399,22 @@ class JaxBackend(AbstractBackend):
         if target_device is not None:
             result = jax.device_put(result, device=target_device)
         return result
+
+    def grouped_gemm(
+        self,
+        tasks,
+        *,
+        buffers=None,
+        pack_threshold=4,
+        stream=None,
+        workspace=None,
+        policy="auto",
+        fallback_policy=None,
+        profile_context=None,
+    ):
+        raise NotImplementedError(
+            "JAX grouped_gemm is not implemented in the NumPy2/CuPy execution-IR phase"
+        )
 
     def sync(self):
         return None

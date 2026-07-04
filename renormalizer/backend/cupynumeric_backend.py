@@ -73,9 +73,11 @@ class CupynumericBackend(AbstractBackend):
         return getattr(cnp, name)
 
     def array(self, *args, **kwargs):
+        kwargs = self._kwargs_with_default_dtype(args, kwargs)
         return cnp.array(*args, **kwargs)
 
     def asarray(self, *args, **kwargs):
+        kwargs = self._kwargs_with_default_dtype(args, kwargs)
         return cnp.asarray(*args, **kwargs)
 
     def from_numpy(self, x):
@@ -124,6 +126,8 @@ class CupynumericBackend(AbstractBackend):
             return x
         if copy is CopyPolicy.NEVER:
             raise BackendCopyError("to_backend would require creating a backend array")
+        if dtype is None:
+            dtype = self._default_dtype_for(x)
         try:
             return cnp.asarray(x, dtype=dtype)
         except NotImplementedError as exc:

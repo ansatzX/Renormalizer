@@ -259,7 +259,60 @@ def _normalized_tensordot_axes(axes, a_ndim, b_ndim):
     return left_axes, right_axes
 
 
-def tensordot(a: Union[Matrix, np.ndarray], b: Union[Matrix, np.ndarray, xp.ndarray], axes) -> xp.ndarray:
+def _positive_axes(axes, ndim):
+    normalized = []
+    for axis in axes:
+        axis = int(axis)
+        if axis < 0:
+            axis += ndim
+        if axis < 0 or axis >= ndim:
+            raise ValueError("tensordot axis {0} is out of bounds for rank {1}".format(axis, ndim))
+        normalized.append(axis)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("tensordot axes must be unique")
+    return normalized
+
+
+def tensordot_einsum_equation(a_ndim, b_ndim, left_axes, right_axes):
+    labels = tuple("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    if a_ndim + b_ndim - len(left_axes) > len(labels):
+        raise ValueError("tensordot rank is too large for profiling einsum labels")
+    left_axes = _positive_axes(left_axes, a_ndim)
+    right_axes = _positive_axes(right_axes, b_ndim)
+    if len(left_axes) != len(right_axes):
+        raise ValueError("tensordot axes must have the same length")
+
+    label_iter = iter(labels)
+    left_modes = [next(label_iter) for _ in range(a_ndim)]
+    right_modes = [None] * b_ndim
+    for left_axis, right_axis in zip(left_axes, right_axes):
+        right_modes[right_axis] = left_modes[left_axis]
+    for axis in range(b_ndim):
+        if right_modes[axis] is None:
+            right_modes[axis] = next(label_iter)
+    output_modes = [
+        mode for axis, mode in enumerate(left_modes)
+        if axis not in set(left_axes)
+    ] + [
+        mode for axis, mode in enumerate(right_modes)
+        if axis not in set(right_axes)
+    ]
+    return "{0},{1}->{2}".format(
+        "".join(left_modes),
+        "".join(right_modes),
+        "".join(output_modes),
+    )
+
+
+def tensordot(
+    a: Union[Matrix, np.ndarray],
+    b: Union[Matrix, np.ndarray, xp.ndarray],
+    axes,
+    *,
+    stream=None,
+    workspace=None,
+    profile_collector=None,
+) -> xp.ndarray:
     a_arr = asxp(a)
     b_arr = asxp(b)
     left_axes, right_axes = _normalized_tensordot_axes(axes, a_arr.ndim, b_arr.ndim)
@@ -270,18 +323,29 @@ def tensordot(a: Union[Matrix, np.ndarray], b: Union[Matrix, np.ndarray, xp.ndar
             "for the current FMO workload. Legate raises a lower-level runtime error here; "
             "Renormalizer now fails fast at the backend boundary."
         )
+    if backend.name not in ("numpy", "cupy"):
+        raise NotImplementedError(
+            "matrix.tensordot execution IR is only implemented for NumPy and CuPy backends "
+            "in the current NumPy2/CuPy phase"
+        )
+    equation = tensordot_einsum_equation(a_arr.ndim, b_arr.ndim, left_axes, right_axes)
+    spec = backend.parse_einsum(equation, a_arr, b_arr)
+    if profiling.should_record_op():
+        plan = backend.plan_contraction(spec)
+    else:
+        plan = _cached_pair_contraction_plan(equation, spec, a_arr, b_arr)
+    if profile_collector is not None:
+        profile_collector.append(profiling.contraction_plan_summary(plan, equation=equation))
     if not profiling.should_record_op():
-        return backend.tensordot(a_arr, b_arr, axes)
+        return backend.execute(plan, stream=stream, workspace=workspace)
     started = time.perf_counter()
-    result = backend.tensordot(a_arr, b_arr, axes)
+    result = backend.execute(plan, stream=stream, workspace=workspace)
     profiling.record(
         "tensordot",
         backend=backend.name,
-        input_shapes=[tuple(a_arr.shape), tuple(b_arr.shape)],
         operand_array_types=profiling.array_type_names((a_arr, b_arr)),
         operand_array_backends=profiling.array_backend_names((a_arr, b_arr)),
         axes=(left_axes, right_axes),
-        output_shape=tuple(result.shape),
         **profiling.tensordot_compute_payload(a_arr, b_arr, axes, result),
         wall_s=time.perf_counter() - started,
     )
@@ -317,7 +381,13 @@ def allclose(a, b, rtol=1.0e-5, atol=1.0e-8):
     return np.allclose(a, b, rtol=rtol, atol=atol)
 
 
-def multi_tensor_contract(path, *operands: [List[Union[Matrix, np.ndarray, xp.ndarray]]]):
+def multi_tensor_contract(
+    path,
+    *operands: [List[Union[Matrix, np.ndarray, xp.ndarray]]],
+    stream=None,
+    workspace=None,
+    profile_collector=None,
+):
     """
     ipath[0] is the index of the mat
     ipaht[1] is the contraction index
@@ -331,21 +401,33 @@ def multi_tensor_contract(path, *operands: [List[Union[Matrix, np.ndarray, xp.nd
             MPO[isite], MPS[isite])
     """
     if not profiling.should_record_op():
-        return _multi_tensor_contract_impl(path, operands)
+        return _multi_tensor_contract_impl(path, operands, stream=stream, workspace=workspace)
     started = time.perf_counter()
     initial_operands = tuple(operands)
+    plan_summaries = [] if profile_collector is None else profile_collector
     with profiling.span("multi_tensor_contract", backend=backend.name, contraction_count=len(path)):
-        result = _multi_tensor_contract_impl(path, operands)
+        result = _multi_tensor_contract_impl(
+            path,
+            operands,
+            stream=stream,
+            workspace=workspace,
+            plan_collector=plan_summaries,
+        )
         profiling.record(
             "multi_tensor_contract",
             backend=backend.name,
-            **profiling.multi_tensor_contract_payload(path, initial_operands, result),
+            **profiling.multi_tensor_contract_payload(
+                path,
+                initial_operands,
+                result,
+                plan_summaries=plan_summaries,
+            ),
             wall_s=time.perf_counter() - started,
         )
         return result
 
 
-def _multi_tensor_contract_impl(path, operands):
+def _multi_tensor_contract_impl(path, operands, *, stream=None, workspace=None, plan_collector=None):
     operands = list(operands)
     for ipath in path:
 
@@ -364,6 +446,9 @@ def _multi_tensor_contract_impl(path, operands):
             input_str[1],
             idx_removed,
             output_modes=results_str,
+            stream=stream,
+            workspace=workspace,
+            plan_collector=plan_collector,
         )
 
         for x in sorted(ipath[0], reverse=True):
@@ -381,6 +466,9 @@ def pair_tensor_contract(
     input_right,
     idx_removed,
     output_modes=None,
+    stream=None,
+    workspace=None,
+    plan_collector=None,
 ):
     left_array = asxp(view_left)
     right_array = asxp(view_right)
@@ -399,7 +487,9 @@ def pair_tensor_contract(
         plan = backend.plan_contraction(spec)
     else:
         plan = _cached_pair_contraction_plan(equation, spec, left_array, right_array)
-    return backend.execute(plan)
+    if plan_collector is not None:
+        plan_collector.append(profiling.contraction_plan_summary(plan, equation=equation))
+    return backend.execute(plan, stream=stream, workspace=workspace)
 
 
 def _expand_pair_contract_modes(input_left, input_right, removed, left_array, right_array, output_modes=None):
@@ -480,10 +570,19 @@ def _array_plan_cache_key(array):
 
 
 def _pair_contraction_plan_cache_key(equation, spec):
+    capabilities = backend.capabilities
+    capability_signature = (
+        bool(capabilities.matmul),
+        bool(capabilities.batched_matmul),
+        bool(capabilities.grouped_gemm),
+        bool(capabilities.strided_batched_gemm),
+        bool(capabilities.custom_contraction_plan),
+    )
     return (
         backend.name,
         str(backend.current_device()),
         str(backend.fallback_policy),
+        capability_signature,
         equation,
         tuple(operand.modes for operand in spec.operands),
         tuple(spec.output_modes),

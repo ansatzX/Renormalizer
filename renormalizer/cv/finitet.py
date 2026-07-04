@@ -269,7 +269,7 @@ class SpectraFtCV(SpectraCv):
             M4_path, M4_1, h_mpo_isite,
             h_mpo_isite, M4_4)
         pre_M4 = xp.einsum('abbd->abd', pre_M4)
-        pre_M4 = xp.tensordot(pre_M4, M4_5, axes=0)
+        pre_M4 = tensordot(pre_M4, M4_5, axes=0)
         pre_M4 = xp.moveaxis(pre_M4, [2, 3], [3, 2])[
             self.condition(dag_qnmat, [down_exciton, up_exciton])]
 

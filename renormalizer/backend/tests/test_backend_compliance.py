@@ -92,7 +92,7 @@ def test_compliance_gpu_device_selection_respects_low_gpu_count_and_overrides(mo
     assert _compliance_device_for_backend("torch", "gpu") == "cuda:7"
 
 
-def _backend_or_skip(name, device="cpu", *, fallback_policy=None):
+def _backend_or_skip(name, device="cpu", *, precision=64, fallback_policy=None):
     from renormalizer.backend import BackendConfig
     from renormalizer.backend.factory import create_backend, is_backend_available
 
@@ -102,7 +102,7 @@ def _backend_or_skip(name, device="cpu", *, fallback_policy=None):
     try:
         return create_backend(
             name,
-            config=BackendConfig(device=resolved_device, precision=64, fallback_policy=fallback_policy),
+            config=BackendConfig(device=resolved_device, precision=precision, fallback_policy=fallback_policy),
         )
     except Exception as exc:
         pytest.skip("{0}/{1} backend unavailable: {2}".format(name, resolved_device, exc))
@@ -110,6 +110,46 @@ def _backend_or_skip(name, device="cpu", *, fallback_policy=None):
 
 def _assert_allclose(backend, actual, expected, **kwargs):
     np.testing.assert_allclose(backend.to_numpy(actual), expected, **kwargs)
+
+
+def _grouped_gemm_out_of_scope_for_np2_cupy_phase(backend):
+    return getattr(backend, "name", None) in {"torch", "jax"}
+
+
+@pytest.mark.parametrize(
+    "precision,real_dtype,complex_dtype,is_32bits",
+    (
+        (32, np.dtype("float32"), np.dtype("complex64"), True),
+        (64, np.dtype("float64"), np.dtype("complex128"), False),
+    ),
+)
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_dtype_precision_controls_python_array_creation(
+    backend_name,
+    device,
+    precision,
+    real_dtype,
+    complex_dtype,
+    is_32bits,
+):
+    backend = _backend_or_skip(backend_name, device, precision=precision)
+
+    real_arrays = (
+        backend.array([1.0, 2.0]),
+        backend.asarray([1.0, 2.0]),
+        backend.to_backend([1.0, 2.0]),
+    )
+    complex_arrays = (
+        backend.array([1.0 + 2.0j, 3.0 + 4.0j]),
+        backend.asarray([1.0 + 2.0j, 3.0 + 4.0j]),
+        backend.to_backend([1.0 + 2.0j, 3.0 + 4.0j]),
+    )
+
+    assert backend.is_32bits is is_32bits
+    for real in real_arrays:
+        assert backend.to_numpy(real).dtype == real_dtype
+    for complex_array in complex_arrays:
+        assert backend.to_numpy(complex_array).dtype == complex_dtype
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
@@ -139,6 +179,78 @@ def test_backend_compliance_roundtrip_layout_and_functional_update(backend_name,
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_layout_view_and_contiguous_copy_policy(backend_name, device):
+    from renormalizer.backend import BackendCopyError, CopyPolicy
+
+    backend = _backend_or_skip(backend_name, device)
+    x_np = np.arange(24, dtype=np.float64).reshape(2, 3, 4)
+    x = backend.to_backend(x_np)
+
+    layout = backend.layout(x)
+    reshaped = backend.reshape_view(x, (6, 4))
+    transposed = backend.permute(x, (1, 0, 2))
+    transposed_layout = backend.layout(transposed)
+
+    assert layout.logical_shape == x_np.shape
+    assert layout.physical_shape == x_np.shape
+    assert layout.logical_modes == (0, 1, 2)
+    assert layout.order in ("C", "unknown")
+    assert layout.estimated_copy_bytes >= 0
+    assert backend.can_reshape_view(x, (6, 4)) is True
+    assert backend.is_array(reshaped)
+    assert transposed_layout.logical_shape == x_np.transpose(1, 0, 2).shape
+    assert transposed_layout.logical_modes == (0, 1, 2)
+
+    if transposed_layout.order == "C":
+        no_copy = backend.make_contiguous(transposed, copy_policy=CopyPolicy.NEVER)
+        assert backend.is_array(no_copy)
+        _assert_allclose(backend, no_copy, x_np.transpose(1, 0, 2))
+    else:
+        with pytest.raises(BackendCopyError, match="make_contiguous would require"):
+            backend.make_contiguous(transposed, copy_policy=CopyPolicy.NEVER)
+
+    contiguous = backend.make_contiguous(transposed)
+    contiguous_info = backend.array_info(contiguous)
+
+    assert backend.is_array(contiguous)
+    assert contiguous_info.contiguous is True
+    _assert_allclose(backend, reshaped, x_np.reshape(6, 4))
+    _assert_allclose(backend, contiguous, x_np.transpose(1, 0, 2))
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_scatter_style_updates_are_functional_and_backend_resident(backend_name, device):
+    backend = _backend_or_skip(backend_name, device)
+    x_np = np.arange(6, dtype=np.float64).reshape(2, 3)
+    x = backend.to_backend(x_np)
+
+    added = backend.at_add(x, (slice(None), 1), 10.0)
+    subbed = backend.at_sub(x, (1, slice(None)), 2.0)
+    multiplied = backend.at_mul(x, (0, slice(None)), 3.0)
+
+    expected_added = x_np.copy()
+    expected_added[:, 1] += 10.0
+    expected_subbed = x_np.copy()
+    expected_subbed[1, :] -= 2.0
+    expected_multiplied = x_np.copy()
+    expected_multiplied[0, :] *= 3.0
+
+    assert backend.capabilities.functional_update is True
+    assert backend.capabilities.scatter_add is True
+    assert backend.is_array(added)
+    assert backend.is_array(subbed)
+    assert backend.is_array(multiplied)
+    if device in ("gpu", "cuda"):
+        assert backend.is_device_array(added)
+        assert backend.is_device_array(subbed)
+        assert backend.is_device_array(multiplied)
+    _assert_allclose(backend, x, x_np)
+    _assert_allclose(backend, added, expected_added)
+    _assert_allclose(backend, subbed, expected_subbed)
+    _assert_allclose(backend, multiplied, expected_multiplied)
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
 def test_backend_compliance_matmul_batched_and_pair_execute(backend_name, device):
     backend = _backend_or_skip(backend_name, device)
     left_np = np.arange(6, dtype=np.float64).reshape(2, 3)
@@ -157,6 +269,23 @@ def test_backend_compliance_matmul_batched_and_pair_execute(backend_name, device
     _assert_allclose(backend, backend.execute(plan), left_np @ right_np)
     assert plan.steps[0].kind == "gemm"
     assert plan.plan_hash
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_strided_batched_gemm_capability_matches_lowering(backend_name, device):
+    backend = _backend_or_skip(backend_name, device)
+    left_np = np.arange(2 * 2 * 3, dtype=np.float64).reshape(2, 2, 3)
+    right_np = np.arange(2 * 3 * 4, dtype=np.float64).reshape(2, 3, 4)
+    left = backend.to_backend(left_np)
+    right = backend.to_backend(right_np)
+
+    plan = backend.plan_contraction(backend.parse_einsum("bik,bkj->bij", left, right))
+    result = backend.execute(plan)
+
+    assert backend.capabilities.strided_batched_gemm is True
+    assert plan.steps[0].kind == "strided_batched_gemm"
+    assert plan.steps[0].plan.kind == "strided_batched_gemm"
+    _assert_allclose(backend, result, np.matmul(left_np, right_np))
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
@@ -191,8 +320,11 @@ def test_backend_compliance_explicit_contract_uses_planner_and_executor(monkeypa
     right = backend.to_backend(right_np)
     plan_calls = []
     execute_calls = []
+    execute_kwargs = []
     original_plan_contraction = backend.plan_contraction
     original_execute = backend.execute
+    stream = backend.new_stream()
+    workspace = backend.allocate_workspace(4096)
 
     def counting_plan_contraction(spec, **kwargs):
         plan_calls.append(spec)
@@ -200,16 +332,19 @@ def test_backend_compliance_explicit_contract_uses_planner_and_executor(monkeypa
 
     def counting_execute(plan, **kwargs):
         execute_calls.append(plan)
+        execute_kwargs.append(kwargs)
         return original_execute(plan, **kwargs)
 
     monkeypatch.setattr(backend, "plan_contraction", counting_plan_contraction)
     monkeypatch.setattr(backend, "execute", counting_execute)
 
-    result = backend.contract("ik,kj->ij", left, right)
+    result = backend.contract("ik,kj->ij", left, right, stream=stream, workspace=workspace)
 
     assert len(plan_calls) == 1
     assert len(execute_calls) == 1
     assert execute_calls[0].steps[0].kind == "gemm"
+    assert execute_kwargs[0]["stream"] is stream
+    assert execute_kwargs[0]["workspace"] is workspace
     _assert_allclose(backend, result, left_np @ right_np)
 
 
@@ -222,6 +357,9 @@ def test_backend_compliance_tensordot_uses_planner_and_executor(monkeypatch, bac
     right = backend.to_backend(right_np)
     plan_calls = []
     execute_calls = []
+    execute_kwargs = []
+    stream = backend.new_stream()
+    workspace = backend.allocate_workspace(4096)
     original_plan_contraction = backend.plan_contraction
     original_execute = backend.execute
 
@@ -231,12 +369,13 @@ def test_backend_compliance_tensordot_uses_planner_and_executor(monkeypatch, bac
 
     def counting_execute(plan, **kwargs):
         execute_calls.append(plan)
+        execute_kwargs.append(kwargs)
         return original_execute(plan, **kwargs)
 
     monkeypatch.setattr(backend, "plan_contraction", counting_plan_contraction)
     monkeypatch.setattr(backend, "execute", counting_execute)
 
-    result = backend.tensordot(left, right, axes=([2, 1], [0, 1]))
+    result = backend.tensordot(left, right, axes=([2, 1], [0, 1]), stream=stream, workspace=workspace)
 
     assert len(plan_calls) == 1
     assert len(execute_calls) == 1
@@ -244,6 +383,8 @@ def test_backend_compliance_tensordot_uses_planner_and_executor(monkeypatch, bac
     assert tuple(plan_calls[0].operands[1].modes) == (2, 1, 3)
     assert tuple(plan_calls[0].output_modes) == (0, 3)
     assert execute_calls[0].steps[0].kind == "gemm"
+    assert execute_kwargs[0]["stream"] is stream
+    assert execute_kwargs[0]["workspace"] is workspace
     _assert_allclose(backend, result, np.tensordot(left_np, right_np, axes=([2, 1], [0, 1])))
 
 
@@ -377,6 +518,23 @@ def test_backend_compliance_astype_copy_policy(backend_name, device):
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_to_backend_copy_policy_rejects_materialization_and_dtype_copy(backend_name, device):
+    from renormalizer.backend import BackendCopyError, CopyPolicy
+
+    backend = _backend_or_skip(backend_name, device)
+    x_np = np.array([1.0, 2.0], dtype=np.float64)
+    x = backend.to_backend(x_np)
+
+    same = backend.to_backend(x, copy=CopyPolicy.NEVER)
+
+    assert same is x
+    with pytest.raises(BackendCopyError, match="to_backend would require"):
+        backend.to_backend([1.0, 2.0], copy=CopyPolicy.NEVER)
+    with pytest.raises(BackendCopyError, match="to_backend would require"):
+        backend.to_backend(x, dtype=np.float32, copy=CopyPolicy.NEVER)
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
 def test_backend_compliance_ascontiguousarray_copy_policy(backend_name, device):
     from renormalizer.backend import BackendCopyError, CopyPolicy
 
@@ -385,8 +543,13 @@ def test_backend_compliance_ascontiguousarray_copy_policy(backend_name, device):
     x = backend.to_backend(x_np)
     transposed = backend.permute(x, (1, 0))
 
-    with pytest.raises(BackendCopyError, match="make_contiguous would require"):
-        backend.ascontiguousarray(transposed, copy=CopyPolicy.NEVER)
+    if backend.layout(transposed).order == "C":
+        same = backend.ascontiguousarray(transposed, copy=CopyPolicy.NEVER)
+        assert backend.is_array(same)
+        _assert_allclose(backend, same, x_np.T)
+    else:
+        with pytest.raises(BackendCopyError, match="make_contiguous would require"):
+            backend.ascontiguousarray(transposed, copy=CopyPolicy.NEVER)
 
     contiguous = backend.ascontiguousarray(transposed)
     info = backend.array_info(contiguous)
@@ -397,6 +560,28 @@ def test_backend_compliance_ascontiguousarray_copy_policy(backend_name, device):
     copied = backend.ascontiguousarray(contiguous, copy=CopyPolicy.ALWAYS)
     assert copied is not contiguous
     _assert_allclose(backend, copied, x_np.T)
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_packed_vectors_preserve_backend_residency(backend_name, device):
+    from renormalizer.backend.execution import PackedVectorSpec
+
+    backend = _backend_or_skip(backend_name, device)
+    mask_np = np.array([[True, False, True], [False, True, False]])
+    mask = backend.to_backend(mask_np)
+    spec = PackedVectorSpec(qn_mask=mask, center_shape=mask_np.shape, packed_dim=3, nrhs=2)
+    packed_np = np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]])
+    packed = backend.to_backend(packed_np)
+
+    struct = backend.unpack_masked_vectors(packed, spec)
+    roundtrip = backend.pack_masked_vectors(struct, spec)
+
+    assert backend.is_array(struct)
+    assert backend.is_array(roundtrip)
+    if device in ("gpu", "cuda"):
+        assert backend.is_device_array(struct)
+        assert backend.is_device_array(roundtrip)
+    _assert_allclose(backend, roundtrip, packed_np)
 
 
 @pytest.mark.parametrize("backend_name", ("cupy", "torch"))
@@ -470,9 +655,60 @@ def test_backend_compliance_profiling_execute_event(tmp_path, backend_name, devi
     execute = next(event for event in events if event["event"] == "contraction_execute")
 
     assert execute["backend"] == backend.name
+    assert execute["compute_class"] == "contraction_plan"
+    assert execute["compute_profile"]["compute_class"] == "contraction_plan"
+    assert execute["compute_profile"]["workload_signature"]["compute_class"] == "contraction_plan"
     assert execute["lowering"] == "gemm"
     assert execute["plan_hash"] == plan.plan_hash
     assert execute["flops"] == 48
+    assert execute["fallback_reason"] is None
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_complex_contraction_profile_records_dtype_and_device(tmp_path, backend_name, device):
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log, package_logger
+
+    backend = _backend_or_skip(backend_name, device)
+    left_np = np.array(
+        [[1.0 + 2.0j, 3.0 - 1.0j, -2.0 + 0.5j], [0.25 - 0.75j, 2.0 + 4.0j, 1.5 + 0.0j]],
+        dtype=np.complex128,
+    )
+    right_np = np.array(
+        [[2.0 - 1.0j, 0.5 + 0.25j], [-1.0 + 0.0j, 3.0 - 2.0j], [4.0 + 1.0j, -0.5 + 1.5j]],
+        dtype=np.complex128,
+    )
+    left = backend.to_backend(left_np)
+    right = backend.to_backend(right_np)
+    plan = backend.plan_contraction(backend.parse_einsum("ik,kj->ij", left, right))
+    event_path = tmp_path / "{0}-{1}-complex.jsonl".format(backend_name, device)
+    old_level = package_logger.level
+    try:
+        init_log(PROFILING)
+        profiling.register_event_output(event_path)
+        result = backend.execute(plan)
+    finally:
+        profiling.close_event_output()
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    _assert_allclose(backend, result, left_np @ right_np)
+    events = [
+        json.loads(line)
+        for line in event_path.read_text().splitlines()
+        if line.strip()
+    ]
+    execute = next(event for event in events if event["event"] == "contraction_execute")
+
+    assert execute["backend"] == backend.name
+    assert execute["lowering"] == "gemm"
+    assert execute["dtype"] == "complex128"
+    assert execute["output_dtype"] == "complex128"
+    assert execute["dtype_profile"]["input_dtypes"] == ["complex128", "complex128"]
+    assert execute["dtype_profile"]["numeric_kind"] == "complex"
+    assert execute["dtype_profile"]["precision_bits"] == 128
+    assert execute["device_profile"]["backend"] == backend.name
+    assert execute["device_profile"]["array_location"] in ("host", "device")
     assert execute["fallback_reason"] is None
 
 
@@ -496,12 +732,57 @@ def test_backend_compliance_grouped_gemm_fallback_policy(backend_name, device):
     right_np = np.arange(4, dtype=np.float64).reshape(2, 2)
     task = GemmTask(backend.to_backend(left_np), backend.to_backend(right_np))
 
+    if _grouped_gemm_out_of_scope_for_np2_cupy_phase(backend):
+        with pytest.raises(NotImplementedError, match="grouped_gemm is not implemented"):
+            backend.grouped_gemm([task])
+        return
     if backend.capabilities.grouped_gemm:
         result = backend.grouped_gemm([task])[0]
         _assert_allclose(backend, result, left_np @ right_np)
     else:
-        with pytest.raises(BackendFeatureError, match="native grouped_gemm unavailable"):
+        with pytest.raises(BackendFeatureError, match="backend-owned grouped_gemm unavailable"):
             backend.grouped_gemm([task])
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_grouped_gemm_warn_policy_records_non_silent_fallback(backend_name, device):
+    from renormalizer.backend import BackendConfig, GemmTask
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available(backend_name):
+        pytest.skip("{0} backend unavailable".format(backend_name))
+    resolved_device = _compliance_device_for_backend(backend_name, device)
+    try:
+        backend = create_backend(
+            backend_name,
+            config=BackendConfig(device=resolved_device, precision=64, fallback_policy="warn"),
+        )
+    except Exception as exc:
+        pytest.skip("{0}/{1} backend unavailable: {2}".format(backend_name, resolved_device, exc))
+
+    left_np = np.arange(4, dtype=np.float64).reshape(2, 2)
+    right_np = np.arange(4, dtype=np.float64).reshape(2, 2)
+    task = GemmTask(backend.to_backend(left_np), backend.to_backend(right_np))
+
+    if _grouped_gemm_out_of_scope_for_np2_cupy_phase(backend):
+        with pytest.raises(NotImplementedError, match="grouped_gemm is not implemented"):
+            backend.grouped_gemm([task])
+        return
+    if backend.capabilities.grouped_gemm:
+        result = backend.grouped_gemm([task])[0]
+        _assert_allclose(backend, result, left_np @ right_np)
+        profile = backend.last_execution_profile()
+        assert profile["fallback_reason"] is None
+        return
+
+    with pytest.warns(RuntimeWarning, match="backend-owned grouped_gemm unavailable"):
+        result = backend.grouped_gemm([task])[0]
+
+    _assert_allclose(backend, result, left_np @ right_np)
+    profile = backend.last_execution_profile()
+    assert profile["fallback_policy"] == "warn"
+    assert profile["fallback_reason"] == "backend-owned grouped_gemm unavailable; used bucketed fallback"
+    assert profile["lowering_profile"]["silent_fallback"] is False
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
@@ -510,9 +791,42 @@ def test_backend_grouped_gemm_capability_requires_native_override(backend_name, 
 
     backend = _backend_or_skip(backend_name, device)
 
-    if type(backend).grouped_gemm is AbstractBackend.grouped_gemm:
+    if _grouped_gemm_out_of_scope_for_np2_cupy_phase(backend):
         assert backend.capabilities.grouped_gemm is False
         assert backend.supports_grouped_gemm is False
+        return
+    if backend.capabilities.grouped_gemm:
+        assert type(backend).grouped_gemm is not AbstractBackend.grouped_gemm
+    else:
+        assert type(backend).grouped_gemm is AbstractBackend.grouped_gemm
+        assert backend.capabilities.grouped_gemm is False
+        assert backend.supports_grouped_gemm is False
+
+
+def test_jax_grouped_gemm_is_not_implemented_in_np2_cupy_phase():
+    from renormalizer.backend import BackendConfig, GemmTask
+    from renormalizer.backend.factory import create_backend, is_backend_available
+
+    if not is_backend_available("jax"):
+        pytest.skip("jax backend unavailable")
+    try:
+        backend = create_backend("jax", config=BackendConfig(device="cpu", precision=64))
+    except Exception as exc:
+        pytest.skip("jax backend unavailable: {0}".format(exc))
+
+    tasks = [
+        GemmTask(
+            backend.to_backend(np.full((16, 16), index + 1.0, dtype=np.float64)),
+            backend.to_backend(np.eye(16, dtype=np.float64)),
+            tag="jax-{0}".format(index),
+        )
+        for index in range(4)
+    ]
+
+    assert backend.capabilities.grouped_gemm is False
+    assert backend.supports_grouped_gemm is False
+    with pytest.raises(NotImplementedError, match="JAX grouped_gemm is not implemented"):
+        backend.grouped_gemm(tasks, pack_threshold=2)
 
 
 @pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
@@ -527,6 +841,25 @@ def test_backend_memory_pool_capability_requires_native_hooks(backend_name, devi
     ):
         assert backend.capabilities.memory_pool is False
         assert backend.supports_memory_pool is False
+
+
+@pytest.mark.parametrize("backend_name,device", COMPLIANCE_CASES)
+def test_backend_compliance_memory_hooks_are_callable_and_capability_is_truthful(backend_name, device):
+    from renormalizer.backend.abstract import AbstractBackend
+
+    backend = _backend_or_skip(backend_name, device)
+
+    assert backend.sync() is None
+    assert backend.synchronize() is None
+    assert backend.free_all_blocks() is None
+    assert backend.log_memory_usage("compliance") is None
+
+    has_native_memory_hooks = (
+        type(backend).free_all_blocks is not AbstractBackend.free_all_blocks
+        or type(backend).log_memory_usage is not AbstractBackend.log_memory_usage
+    )
+    assert backend.capabilities.memory_pool is has_native_memory_hooks
+    assert backend.supports_memory_pool is has_native_memory_hooks
 
 
 def test_torch_backend_honors_indexed_cuda_device_when_available():

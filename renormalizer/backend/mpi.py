@@ -8,28 +8,86 @@ class SingleProcessDistributedMixin:
     size = 1
     is_distributed = False
 
+    _single_process_reduce_ops = frozenset(("sum", "add", "prod", "product", "max", "min"))
+
+    @staticmethod
+    def _single_process_collective_axis(x, axis, label):
+        ndim = getattr(x, "ndim", None)
+        if ndim is None:
+            shape = getattr(x, "shape", None)
+            if shape is None:
+                raise ValueError("{0} requires array-like input when axis is provided".format(label))
+            ndim = len(shape)
+        ndim = int(ndim)
+        axis = int(axis)
+        normalized = axis + ndim if axis < 0 else axis
+        if normalized < 0 or normalized >= ndim:
+            raise ValueError("{0} {1} is out of range for rank {2}".format(label, axis, ndim))
+        return normalized
+
+    @staticmethod
+    def _single_process_collective_root(root, label):
+        root = int(root)
+        if root != 0:
+            raise ValueError("{0} root {1} is out of range for world size 1".format(label, root))
+        return root
+
+    @staticmethod
+    def _single_process_collective_peer(peer, label):
+        peer = int(peer)
+        if peer != 0:
+            raise ValueError("{0} {1} is out of range for world size 1".format(label, peer))
+        return peer
+
+    @classmethod
+    def _single_process_reduce_op(cls, op):
+        name = str(op or "sum").lower()
+        if name not in cls._single_process_reduce_ops:
+            raise ValueError("unsupported distributed reduction op {0!r}".format(op))
+        return name
+
     def barrier(self):
         return None
 
     def allreduce(self, x, op="sum"):
+        self._single_process_reduce_op(op)
         return x
 
     def broadcast(self, x, root=0):
+        self._single_process_collective_root(root, "broadcast")
         return x
 
     def gather(self, x, root=0):
+        self._single_process_collective_root(root, "gather")
         return [x]
 
     def allgather(self, x, axis=None):
         if axis is None:
             return [x]
+        self._single_process_collective_axis(x, axis, "allgather axis")
         return x
 
     def reduce_scatter(self, x, op="sum", axis=0):
+        self._single_process_reduce_op(op)
+        self._single_process_collective_axis(x, axis, "reduce_scatter axis")
         return x
 
     def alltoall(self, x, split_axis=0, concat_axis=0):
+        self._single_process_collective_axis(x, split_axis, "alltoall split_axis")
+        self._single_process_collective_axis(x, concat_axis, "alltoall concat_axis")
         return x
+
+    def send(self, x, *, dst, tag=0):
+        self._single_process_collective_peer(dst, "send dst")
+        int(tag)
+        return None
+
+    def recv(self, *, src, tag=0, like=None):
+        self._single_process_collective_peer(src, "recv src")
+        int(tag)
+        if like is None:
+            raise ValueError("recv requires a like buffer in single-process mode")
+        return like
 
 
 class TorchDistributedMixin:
@@ -37,6 +95,16 @@ class TorchDistributedMixin:
 
     _distributed = None
     _distributed_backend = None
+
+    def _distributed_peer(self, peer, label):
+        peer = int(peer)
+        size = int(self.size)
+        if peer < 0 or peer >= size:
+            raise ValueError("{0} {1} is out of range for world size {2}".format(label, peer, size))
+        return peer
+
+    def _distributed_root(self, root, label):
+        return self._distributed_peer(root, label)
 
     def _torch_module(self):
         module = getattr(self, "array_namespace", None)
@@ -99,10 +167,8 @@ class TorchDistributedMixin:
     def is_distributed(self):
         return self.size > 1
 
-    def _reduce_op(self, op):
-        reduce_op = getattr(self._distributed, "ReduceOp", None)
-        if reduce_op is None:
-            return None
+    @staticmethod
+    def _reduce_op_attr(op):
         name = str(op or "sum").lower()
         mapping = {
             "sum": "SUM",
@@ -113,17 +179,28 @@ class TorchDistributedMixin:
             "min": "MIN",
         }
         attr = mapping.get(name)
-        if attr is None or not hasattr(reduce_op, attr):
+        if attr is None:
+            raise ValueError("unsupported distributed reduction op {0!r}".format(op))
+        return attr
+
+    def _reduce_op(self, op):
+        attr = self._reduce_op_attr(op)
+        reduce_op = getattr(self._distributed, "ReduceOp", None)
+        if reduce_op is None:
+            return None
+        if not hasattr(reduce_op, attr):
             raise ValueError("unsupported distributed reduction op {0!r}".format(op))
         return getattr(reduce_op, attr)
 
     @staticmethod
-    def _normalize_axis(axis, ndim):
+    def _normalize_axis(axis, ndim, label=None):
+        raw_axis = int(axis)
         axis = int(axis)
         if axis < 0:
             axis += int(ndim)
         if axis < 0 or axis >= int(ndim):
-            raise ValueError("axis {0} is out of range for rank {1}".format(axis, ndim))
+            label = "axis" if label is None else str(label)
+            raise ValueError("{0} {1} is out of range for rank {2}".format(label, raw_axis, ndim))
         return axis
 
     @staticmethod
@@ -140,20 +217,22 @@ class TorchDistributedMixin:
         return None
 
     def allreduce(self, x, op="sum"):
+        self._reduce_op_attr(op)
         if not self._distributed_ready():
             return x
         self._distributed.all_reduce(x, op=self._reduce_op(op))
         return x
 
     def broadcast(self, x, root=0):
+        root = self._distributed_root(root, "broadcast root")
         if not self._distributed_ready():
             return x
         torch_module = self._torch_module()
         if torch_module is not None and isinstance(x, torch_module.Tensor):
-            self._distributed.broadcast(x, src=int(root))
+            self._distributed.broadcast(x, src=root)
             return x
-        values = [x if self.rank == int(root) else None]
-        self._distributed.broadcast_object_list(values, src=int(root))
+        values = [x if self.rank == root else None]
+        self._distributed.broadcast_object_list(values, src=root)
         return values[0]
 
     def _allgather_tensor(self, x):
@@ -173,7 +252,41 @@ class TorchDistributedMixin:
             for value, value_shape in zip(gathered, shapes)
         ]
 
+    def _gather_tensor(self, x, root):
+        torch_module = self._torch_module()
+        shape = torch_module.tensor(tuple(x.shape), dtype=torch_module.long, device=x.device)
+        shape_list = None
+        if self.rank == root:
+            shape_list = [torch_module.empty_like(shape) for _ in range(self.size)]
+        self._distributed.gather(shape, gather_list=shape_list, dst=root)
+
+        shapes = None
+        if self.rank == root:
+            shapes = [tuple(int(dim.item()) for dim in item) for item in shape_list]
+            max_shape = tuple(max(shape[axis] for shape in shapes) for axis in range(len(shapes[0])))
+            max_shape_tensor = torch_module.tensor(max_shape, dtype=torch_module.long, device=x.device)
+        else:
+            max_shape_tensor = torch_module.empty_like(shape)
+        self._distributed.broadcast(max_shape_tensor, src=root)
+        max_shape = tuple(int(dim.item()) for dim in max_shape_tensor)
+
+        slices = tuple(slice(0, dim) for dim in x.shape)
+        padded = torch_module.zeros(max_shape, dtype=x.dtype, device=x.device)
+        padded[slices] = x
+        gather_list = None
+        if self.rank == root:
+            gather_list = [torch_module.empty_like(padded) for _ in range(self.size)]
+        self._distributed.gather(padded, gather_list=gather_list, dst=root)
+        if self.rank != root:
+            return None
+        return [
+            value[tuple(slice(0, dim) for dim in value_shape)].clone()
+            for value, value_shape in zip(gather_list, shapes)
+        ]
+
     def allgather(self, x, axis=None):
+        if axis is not None:
+            axis = self._normalize_axis(axis, x.ndim, "allgather axis")
         if not self._distributed_ready():
             return [x] if axis is None else x
         torch_module = self._torch_module()
@@ -181,26 +294,63 @@ class TorchDistributedMixin:
             values = self._allgather_tensor(x)
             if axis is None:
                 return values
-            axis = self._normalize_axis(axis, x.ndim)
             return torch_module.cat(values, dim=axis)
         values = [None for _ in range(self.size)]
         self._distributed.all_gather_object(values, x)
         return values
 
     def gather(self, x, root=0):
+        root = self._distributed_root(root, "gather root")
         if not self._distributed_ready():
             return [x]
+        torch_module = self._torch_module()
+        if (
+            torch_module is not None
+            and isinstance(x, torch_module.Tensor)
+            and hasattr(self._distributed, "gather")
+        ):
+            return self._gather_tensor(x, root)
         values = self.allgather(x)
-        return values if self.rank == int(root) else None
+        return values if self.rank == root else None
+
+    def send(self, x, *, dst, tag=0):
+        dst = self._distributed_peer(dst, "send dst")
+        tag = int(tag)
+        if not self._distributed_ready():
+            if int(self.size) == 1:
+                return None
+            raise RuntimeError("torch point-to-point send requires initialized torch.distributed")
+        torch_module = self._torch_module()
+        if torch_module is None or not isinstance(x, torch_module.Tensor):
+            raise TypeError("torch point-to-point send requires a torch.Tensor")
+        self._distributed.send(x, dst=dst, tag=tag)
+        return None
+
+    def recv(self, *, src, tag=0, like=None):
+        src = self._distributed_peer(src, "recv src")
+        tag = int(tag)
+        if like is None:
+            raise ValueError("recv requires a like buffer")
+        if not self._distributed_ready():
+            if int(self.size) == 1:
+                return like
+            raise RuntimeError("torch point-to-point recv requires initialized torch.distributed")
+        torch_module = self._torch_module()
+        if torch_module is None or not isinstance(like, torch_module.Tensor):
+            raise TypeError("torch point-to-point recv requires a torch.Tensor like buffer")
+        output = torch_module.empty_like(like)
+        self._distributed.recv(output, src=src, tag=tag)
+        return output
 
     def reduce_scatter(self, x, op="sum", axis=0):
+        self._reduce_op_attr(op)
+        axis = self._normalize_axis(axis, x.ndim, "reduce_scatter axis")
         if not self._distributed_ready():
             return x
         torch_module = self._torch_module()
         if torch_module is None or not isinstance(x, torch_module.Tensor):
             reduced = self.allreduce(x, op=op)
             return reduced
-        axis = self._normalize_axis(axis, x.ndim)
         if x.shape[axis] % self.size == 0 and hasattr(self._distributed, "reduce_scatter_tensor"):
             moved = torch_module.movedim(x, axis, 0).contiguous()
             local_dim = moved.shape[0] // self.size
@@ -214,14 +364,14 @@ class TorchDistributedMixin:
         return reduced[tuple(slices)]
 
     def alltoall(self, x, split_axis=0, concat_axis=0):
+        split_axis = self._normalize_axis(split_axis, x.ndim, "alltoall split_axis")
+        concat_axis = self._normalize_axis(concat_axis, x.ndim, "alltoall concat_axis")
         if not self._distributed_ready():
             return x
         torch_module = self._torch_module()
         if torch_module is None or not isinstance(x, torch_module.Tensor):
             values = self.allgather(x)
             return values[self.rank]
-        split_axis = self._normalize_axis(split_axis, x.ndim)
-        concat_axis = self._normalize_axis(concat_axis, x.ndim)
         if x.shape[split_axis] % self.size != 0 or not hasattr(self._distributed, "all_to_all_single"):
             gathered = self.allgather(x)
             chunks = []

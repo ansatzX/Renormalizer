@@ -1044,9 +1044,9 @@ class Mps(MatrixProduct):
                     u = asxp(u)
                     us = u.dot(xp.diag(s))
 
-                    rtensor = xp.tensordot(rtensor, us, axes=(-1, -1))
+                    rtensor = tensordot(rtensor, us, axes=(-1, -1))
 
-                    environ_mps[imps] = xp.tensordot(asxp(environ_mps[imps]), us, axes=(-1, 0))
+                    environ_mps[imps] = tensordot(asxp(environ_mps[imps]), us, axes=(-1, 0))
                     environ_mps.qn[imps + 1] = qnrset
                     environ_mps.qnidx = imps
 
@@ -1592,9 +1592,10 @@ class Mps(MatrixProduct):
             return None
         prod = np.eye(1).reshape(1, 1, 1)
         for ms in self:
-            prod = np.tensordot(prod, ms, axes=1)
+            prod = tensordot(prod, ms, axes=1)
             prod = prod.reshape((prod.shape[0], -1, prod.shape[-1]))
-        return {"var": prod.var(), "mean": prod.mean(), "ptp": prod.ptp()}
+        prod = asnumpy(prod)
+        return {"var": prod.var(), "mean": prod.mean(), "ptp": np.ptp(prod)}
 
     def todense(self) -> np.array:
         dim = np.prod(self.pbond_list)
@@ -1604,8 +1605,8 @@ class Mps(MatrixProduct):
         for mt in self:
             dim1 = res.shape[1] * mt.shape[1]
             dim2 = mt.shape[-1]
-            res = np.tensordot(res, mt.array, axes=1).reshape(1, dim1, dim2)
-        return res[0, :, 0]
+            res = tensordot(res, mt.array, axes=1).reshape(1, dim1, dim2)
+        return asnumpy(res)[0, :, 0]
     
     def calc_1site_rdm(self, idx=None) -> Dict[int, np.ndarray]:
         r""" Calculate 1-site reduced density matrix
@@ -1888,17 +1889,17 @@ def projector(
         axes = (0, 0)
 
     if Ovlp_inv1 is None:
-        proj = xp.tensordot(ms, ms.conj(), axes=axes)
+        proj = tensordot(ms, ms.conj(), axes=axes)
     else:
         # consider the case that the canonical condition is not fulfilled
         if left:
-            proj = xp.tensordot(Ovlp0, ms, axes=(-1, 0))
-            proj = xp.tensordot(proj, Ovlp_inv1, axes=(-1, 0))
-            proj = xp.tensordot(proj, ms.conj(), axes=(-1, -1))
+            proj = tensordot(Ovlp0, ms, axes=(-1, 0))
+            proj = tensordot(proj, Ovlp_inv1, axes=(-1, 0))
+            proj = tensordot(proj, ms.conj(), axes=(-1, -1))
         else:
-            proj = xp.tensordot(ms, Ovlp0, axes=(-1, 0))
-            proj = xp.tensordot(Ovlp_inv1, proj, axes=(-1, 0))
-            proj = xp.tensordot(proj, ms.conj(), axes=(0, 0))
+            proj = tensordot(ms, Ovlp0, axes=(-1, 0))
+            proj = tensordot(Ovlp_inv1, proj, axes=(-1, 0))
+            proj = tensordot(proj, ms.conj(), axes=(0, 0))
 
     if left:
         sz = int(np.prod(ms.shape[:-1]))

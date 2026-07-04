@@ -136,7 +136,11 @@ class CupyBackend(AbstractBackend):
 
     def wait_event(self, event, stream=None):
         stream = self.default_stream() if stream is None else stream
-        token = event.token if isinstance(event, StreamEvent) else event
+        if isinstance(event, StreamEvent):
+            self._validate_stream_event(event)
+            token = event.token
+        else:
+            token = event
         stream.wait_event(token)
         return None
 
@@ -152,9 +156,11 @@ class CupyBackend(AbstractBackend):
         return super()._device_spec_for_array(x)
 
     def array(self, *args, **kwargs):
+        kwargs = self._kwargs_with_default_dtype(args, kwargs)
         return self._on_configured_device(_cupy.array, *args, **kwargs)
 
     def asarray(self, *args, **kwargs):
+        kwargs = self._kwargs_with_default_dtype(args, kwargs)
         return self._on_configured_device(_cupy.asarray, *args, **kwargs)
 
     def from_numpy(self, x):
@@ -202,7 +208,33 @@ class CupyBackend(AbstractBackend):
             return self._on_cuda_index(target_index, _cupy.asarray, x, dtype=dtype)
         if copy is CopyPolicy.NEVER:
             raise BackendCopyError("to_backend would require a host-to-device copy")
+        if dtype is None:
+            dtype = self._default_dtype_for(x)
         return self._on_cuda_index(target_index, _cupy.asarray, x, dtype=dtype)
+
+    def grouped_gemm(
+        self,
+        tasks,
+        *,
+        buffers=None,
+        pack_threshold=4,
+        stream=None,
+        workspace=None,
+        policy="auto",
+        fallback_policy=None,
+        profile_context=None,
+    ):
+        """Execute grouped GEMM through CuPy-owned bucketed matmul batches."""
+        return super().grouped_gemm(
+            tasks,
+            buffers=buffers,
+            pack_threshold=pack_threshold,
+            stream=stream,
+            workspace=workspace,
+            policy=policy,
+            fallback_policy=fallback_policy,
+            profile_context=profile_context,
+        )
 
     def free_all_blocks(self):
         mempool = _cupy.get_default_memory_pool()
@@ -235,11 +267,3 @@ class CupyBackend(AbstractBackend):
                 _cupy.cuda.Device(index).synchronize()
             return None
         return self.sync()
-
-    def grouped_gemm(self, tasks, *, pack_threshold=4, stream=None, workspace=None):
-        return super().grouped_gemm(
-            tasks,
-            pack_threshold=pack_threshold,
-            stream=stream,
-            workspace=workspace,
-        )

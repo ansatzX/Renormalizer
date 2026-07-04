@@ -7,6 +7,7 @@ from collections import defaultdict
 import numpy as np
 import scipy
 
+from renormalizer.backend import BackendFeatureError, FallbackPolicy
 from renormalizer.mps.matrix import tensordot, multi_tensor_contract, asnumpy, asxp
 from renormalizer.mps.backend import backend, xp, primme, IMPORT_PRIMME_EXCEPTION
 from renormalizer.mps import Mps
@@ -18,7 +19,108 @@ from renormalizer.utils import profiling
 logger = logging.getLogger(__name__)
 
 
-def _tda_multi_hop(x, hop):
+_TDA_RHS_LOOP_FALLBACK_REASON = "tda matmat rebuilds ket-dependent environments per RHS"
+
+
+def _validate_tda_multi_hop_result_shape(x, result, source):
+    result_shape = tuple(int(dim) for dim in getattr(result, "shape", ()))
+    input_shape = tuple(int(dim) for dim in getattr(x, "shape", ()))
+    if result_shape != input_shape:
+        raise ValueError(
+            "TDA {0} output shape must match input shape; got {1}, expected {2}"
+            .format(source, result_shape, input_shape)
+        )
+
+
+def _record_tda_multi_hop_event(
+    x,
+    result,
+    wall_s,
+    *,
+    lowering,
+    num_rhs_loop_calls,
+    num_batched_gemm,
+    fallback_from,
+    fallback_to,
+    fallback_reason,
+):
+    if fallback_reason is None:
+        fallback_reasons = []
+        fallback_policy = None
+    else:
+        fallback_reasons = [str(fallback_reason)]
+        fallback_policy = backend.fallback_policy.value
+    if lowering == "fallback_rhs_loop":
+        execution_primitives = ["rhs_loop"]
+        execution_policies = ["fallback_rhs_loop"]
+    elif lowering == "batched_rhs_hop":
+        execution_primitives = ["matmat_hop"]
+        execution_policies = ["external_vectorized_matmat"]
+    else:
+        execution_primitives = [str(lowering)]
+        execution_policies = ["backend_{0}".format(lowering)]
+    profiling.record(
+        "contraction_execute",
+        backend=backend.name,
+        **profiling.contraction_execute_compute_payload(lowering),
+        equation=None,
+        lowering=lowering,
+        input_shapes=[tuple(x.shape)],
+        input_dtypes=[str(getattr(x, "dtype", None))],
+        operands=[
+            profiling.array_operand_payload(backend, "packed_rhs", x, ("packed", "rhs")),
+        ],
+        output_shape=tuple(result.shape),
+        output_strides=profiling.array_strides(result),
+        output_order=profiling.array_order(result),
+        output_contiguous=profiling.array_contiguous(result),
+        output_backend=profiling.array_backend_name(result),
+        output_device_kind=profiling.array_device_kind(result),
+        output_location=profiling.array_location(result),
+        output_is_host=profiling.array_is_host(result),
+        output_is_device=profiling.array_is_device(result),
+        output_is_distributed=profiling.array_is_distributed(result),
+        dtype=str(getattr(result, "dtype", None)),
+        **profiling.device_execution_payload(backend.current_device()),
+        flops=0,
+        read_bytes=int(getattr(x, "nbytes", 0)),
+        write_bytes=int(getattr(result, "nbytes", 0)),
+        copy_bytes=0,
+        workspace_bytes=0,
+        largest_intermediate=max(
+            int(getattr(x, "nbytes", 0)),
+            int(getattr(result, "nbytes", 0)),
+        ),
+        num_gemm=0,
+        num_batched_gemm=int(num_batched_gemm),
+        num_grouped_tasks=0,
+        num_blocks=0,
+        num_shape_buckets=0,
+        num_rhs=int(x.shape[1]),
+        num_rhs_loop_calls=int(num_rhs_loop_calls),
+        execution_primitives=execution_primitives,
+        execution_policies=execution_policies,
+        fallback_reasons=fallback_reasons,
+        fallback_from=fallback_from,
+        fallback_to=fallback_to,
+        fallback_policy=fallback_policy,
+        fallback_reason=fallback_reason,
+        wall_s=wall_s,
+    )
+
+
+def _handle_tda_rhs_loop_fallback_policy():
+    reason = _TDA_RHS_LOOP_FALLBACK_REASON
+    if backend.fallback_policy is FallbackPolicy.FORBID:
+        raise BackendFeatureError(reason)
+    if backend.fallback_policy is FallbackPolicy.WARN:
+        import warnings
+
+        warnings.warn(reason, RuntimeWarning, stacklevel=3)
+    return reason
+
+
+def _tda_multi_hop(x, hop, *, matmat_hop=None):
     if x.ndim == 1:
         return hop(x)
     if x.ndim != 2:
@@ -26,40 +128,37 @@ def _tda_multi_hop(x, hop):
 
     should_profile = profiling.should_record_op()
     started = time.perf_counter() if should_profile else None
+    if matmat_hop is not None:
+        result = matmat_hop(x)
+        _validate_tda_multi_hop_result_shape(x, result, "matmat_hop")
+        if should_profile:
+            _record_tda_multi_hop_event(
+                x,
+                result,
+                time.perf_counter() - started,
+                lowering="batched_rhs_hop",
+                num_rhs_loop_calls=0,
+                num_batched_gemm=1,
+                fallback_from=None,
+                fallback_to=None,
+                fallback_reason=None,
+            )
+        return result
+
+    fallback_reason = _handle_tda_rhs_loop_fallback_policy()
     result = np.stack([hop(x[:, i]) for i in range(x.shape[1])], axis=1)
+    _validate_tda_multi_hop_result_shape(x, result, "rhs_loop")
     if should_profile:
-        profiling.record(
-            "contraction_execute",
-            backend=backend.name,
-            **profiling.contraction_execute_compute_payload(),
-            equation=None,
+        _record_tda_multi_hop_event(
+            x,
+            result,
+            time.perf_counter() - started,
             lowering="fallback_rhs_loop",
-            input_shapes=[tuple(x.shape)],
-            input_dtypes=[str(getattr(x, "dtype", None))],
-            operands=[
-                profiling.array_operand_payload(backend, "packed_rhs", x, ("packed", "rhs")),
-            ],
-            output_shape=tuple(result.shape),
-            dtype=str(getattr(result, "dtype", None)),
-            **profiling.device_execution_payload(backend.current_device()),
-            flops=0,
-            read_bytes=int(getattr(x, "nbytes", 0)),
-            write_bytes=int(getattr(result, "nbytes", 0)),
-            copy_bytes=0,
-            workspace_bytes=0,
-            largest_intermediate=max(
-                int(getattr(x, "nbytes", 0)),
-                int(getattr(result, "nbytes", 0)),
-            ),
-            num_gemm=0,
-            num_batched_gemm=0,
-            num_grouped_tasks=0,
-            num_blocks=0,
-            num_shape_buckets=0,
-            num_rhs=int(x.shape[1]),
             num_rhs_loop_calls=int(x.shape[1]),
-            fallback_reason="tda matmat rebuilds ket-dependent environments per RHS",
-            wall_s=time.perf_counter() - started,
+            num_batched_gemm=0,
+            fallback_from="batched_rhs_hop",
+            fallback_to="rhs_loop",
+            fallback_reason=fallback_reason,
         )
     return result
 

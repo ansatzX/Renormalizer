@@ -50,11 +50,18 @@ from renormalizer.backend.execution import (
     parse_einsum_equation,
 )
 from renormalizer.backend.gemm import (
+    BufferRef,
+    GemmBatch,
     GemmTask,
+    GemvBatch,
+    GemvDesc,
+    MatmulDesc as BufferMatmulDesc,
     array_nbytes,
+    execute_prepacked_grouped_gemm as execute_prepacked_grouped_gemm_plan,
     gemm_task_key,
-    grouped_gemm_bucketed,
+    grouped_gemm_bucketed_profiled,
     grouped_gemm_stats,
+    prepack_grouped_gemm as prepack_grouped_gemm_plan,
     run_gemm_task,
 )
 from renormalizer.backend.mpi import SingleProcessDistributedMixin
@@ -168,7 +175,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_matmul = True
     supports_batched_matmul = True
     supports_grouped_gemm = False
-    supports_strided_batched_gemm = False
+    supports_strided_batched_gemm = True
     supports_einsum = True
     supports_contract_expression = True
     supports_contraction_path = True
@@ -197,6 +204,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         self._real_dtype = None
         self._complex_dtype = None
         self.transforms = UnavailableTransforms(self.name)
+        self._last_execution_profile = None
         self.use_64bits()
         self._set_configured_device(self.supported_device_kinds, default="cpu")
         self._apply_precision_config()
@@ -261,16 +269,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
             matmul=self.supports_matmul,
             batched_matmul=self.supports_batched_matmul,
             grouped_gemm=self.supports_grouped_gemm,
-            strided_batched_gemm=self.supports_strided_batched_gemm,
+            strided_batched_gemm=bool(self.supports_strided_batched_gemm and self.supports_batched_matmul),
             einsum=self.supports_einsum,
             contract_expression=self.supports_contract_expression,
             contraction_path=self.supports_contraction_path,
             custom_contraction_plan=self.supports_custom_contraction_plan,
             block_sparse=self.supports_block_sparse,
-            packed_blocks=self.supports_packed_blocks,
+            packed_blocks=bool(self.supports_packed_blocks and self.supports_block_sparse),
             scatter_add=self.supports_scatter_add,
             distributed=self.is_distributed,
-            distributed_array=self.supports_distributed_array,
+            distributed_array=bool(self.supports_distributed_array and self.is_distributed),
             allreduce=bool(self.supports_allreduce and self.size > 1),
             broadcast=bool(self.supports_broadcast and self.size > 1),
             allgather=bool(self.supports_allgather and self.size > 1),
@@ -282,6 +290,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
     @property
     def fallback_policy(self):
         return self.config.fallback_policy
+
+    @property
+    def supports_distributed(self):
+        return bool(self.is_distributed)
+
+    def last_execution_profile(self):
+        if self._last_execution_profile is None:
+            return None
+        return dict(self._last_execution_profile)
 
     def current_device(self):
         return self.device_spec or self._device_spec_from_kind(self.device)
@@ -370,6 +387,27 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def from_numpy(self, x: _np.ndarray):
         raise NotImplementedError
+
+    def _default_dtype_for(self, x):
+        if hasattr(x, "dtype"):
+            return None
+        try:
+            dtype = _np.asarray(x).dtype
+        except (TypeError, ValueError):
+            return None
+        if _np.issubdtype(dtype, _np.floating):
+            return self.real_dtype
+        if _np.issubdtype(dtype, _np.complexfloating):
+            return self.complex_dtype
+        return None
+
+    def _kwargs_with_default_dtype(self, args, kwargs):
+        kwargs = dict(kwargs)
+        if "dtype" not in kwargs and args:
+            dtype = self._default_dtype_for(args[0])
+            if dtype is not None:
+                kwargs["dtype"] = dtype
+        return kwargs
 
     def to_numpy(self, x: Any):
         return self.numpy(x)
@@ -476,7 +514,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         output_modes.extend(right_modes[axis] for axis in range(b_ndim) if axis not in right_axes)
         return left_modes, right_modes, output_modes
 
-    def tensordot(self, a, b, axes=2):
+    def tensordot(self, a, b, axes=2, *, stream=None, workspace=None):
         a, b = self._promote_tensordot_operands(a, b)
         left_modes, right_modes, output_modes = self._tensordot_contract_modes(a.ndim, b.ndim, axes)
         spec = EinsumSpec(
@@ -487,7 +525,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             output_modes=tuple(output_modes),
         )
         plan = self.plan_contraction(spec)
-        return self.execute(plan)
+        return self.execute(plan, stream=stream, workspace=workspace)
 
     def einsum(self, subscripts, *operands, **kwargs):
         return self.contract(subscripts, *operands, **kwargs)
@@ -690,6 +728,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return True
 
     @staticmethod
+    def _plan_policy_kwargs(kwargs):
+        return {
+            key: kwargs[key]
+            for key in (
+                "memory_limit",
+                "prefer",
+                "allow_slicing",
+                "allow_distribution",
+                "target_devices",
+            )
+            if key in kwargs
+        }
+
+    @staticmethod
     def _contract_expression_is_plannable(args, kwargs):
         if len(args) < 3 or not isinstance(args[0], str):
             return False
@@ -703,7 +755,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
         operand_count = len(args) - 1
         if any(index < 0 or index >= operand_count for index in constants):
             return False
-        supported_kwargs = {"optimize", "constants"}
+        supported_kwargs = {
+            "optimize",
+            "constants",
+            "memory_limit",
+            "prefer",
+            "allow_slicing",
+            "allow_distribution",
+            "target_devices",
+        }
         return all(key in supported_kwargs for key in kwargs)
 
     def _execute_explicit_planned_contract(self, args, kwargs):
@@ -711,17 +771,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         operands = args[1:]
         optimize = kwargs.get("optimize")
         spec = self.parse_einsum(equation, *operands, optimize=optimize)
-        plan_kwargs = {
-            key: kwargs[key]
-            for key in (
-                "memory_limit",
-                "prefer",
-                "allow_slicing",
-                "allow_distribution",
-                "target_devices",
-            )
-            if key in kwargs
-        }
+        plan_kwargs = self._plan_policy_kwargs(kwargs)
         plan = self.plan_contraction(spec, **plan_kwargs)
         execute_kwargs = {
             key: kwargs[key]
@@ -746,20 +796,29 @@ class AbstractBackend(SingleProcessDistributedMixin):
         planned = self._contract_expression_is_plannable(args, kwargs)
         if planned:
             planned_constants = kwargs.get("constants") or ()
+            oe_kwargs = {
+                key: kwargs[key]
+                for key in ("optimize", "constants")
+                if key in kwargs
+            }
+            contract_kwargs = {
+                key: kwargs[key]
+                for key in ("optimize",)
+                if key in kwargs
+            }
+            contract_kwargs.update(self._plan_policy_kwargs(kwargs))
         else:
             planned_constants = ()
+            oe_kwargs = kwargs
+            contract_kwargs = None
         return _BackendContractExpression(
-            oe.contract_expression(*args, **kwargs),
+            oe.contract_expression(*args, **oe_kwargs),
             self.opt_einsum_name,
             backend=self if planned else None,
             equation="".join(args[0].split()) if planned else None,
             expression_operands=args[1:] if planned else (),
             constants=planned_constants,
-            contract_kwargs={
-                key: kwargs[key]
-                for key in ("optimize",)
-                if key in kwargs
-            } if planned else None,
+            contract_kwargs=contract_kwargs,
         )
 
     def contract_path(self, *args, **kwargs):
@@ -770,6 +829,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
     @staticmethod
     def _contraction_step_from_matmul_plan(plan, input_modes, output_modes, *, inputs=(0, 1), output=2):
         write_bytes = sum(desc.estimated_write_bytes for desc in plan.descs)
+        peak_bytes = write_bytes + int(plan.copy_bytes) + int(plan.workspace_bytes)
         return ContractionStep(
             kind=plan.kind,
             inputs=tuple(inputs),
@@ -781,7 +841,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             estimated_read_bytes=sum(desc.estimated_read_bytes for desc in plan.descs),
             estimated_write_bytes=write_bytes,
             estimated_copy_bytes=plan.copy_bytes,
-            estimated_peak_bytes=write_bytes + plan.workspace_bytes,
+            estimated_peak_bytes=peak_bytes,
             estimated_comm_bytes=0,
             required_workspace_bytes=plan.workspace_bytes,
             reason=plan.reason,
@@ -832,6 +892,103 @@ class AbstractBackend(SingleProcessDistributedMixin):
             output_bytes = int(step.estimated_write_bytes or step.estimated_peak_bytes or 0)
             live_temporary_bytes.append(output_bytes if step_index < len(steps) - 1 else 0)
         return int(peak)
+
+    @classmethod
+    def _contraction_step_largest_intermediate_memory(cls, step):
+        plan = getattr(step, "plan", None)
+        if isinstance(plan, MatmulPlan):
+            return cls._matmul_plan_largest_intermediate_memory(plan)
+        return int(getattr(step, "estimated_write_bytes", 0) or 0), 0
+
+    @classmethod
+    def _contraction_plan_largest_intermediate_memory(cls, plan):
+        candidates = [
+            cls._contraction_step_largest_intermediate_memory(step)
+            for step in tuple(getattr(plan, "steps", ()))
+        ]
+        return max(candidates, default=(0, 0), key=lambda item: item[0])
+
+    @staticmethod
+    def _dtype_label(dtype):
+        if dtype is None:
+            return None
+        name = getattr(dtype, "name", None)
+        if name is not None:
+            return str(name)
+        try:
+            return str(_np.dtype(dtype))
+        except (TypeError, ValueError):
+            return str(dtype)
+
+    @classmethod
+    def _matmul_plan_output_dtype(cls, plan):
+        for desc in reversed(tuple(getattr(plan, "descs", ())) or ()):
+            dtype = getattr(desc, "dtype_output", None)
+            if dtype is None and getattr(desc, "C", None) is not None:
+                dtype = getattr(desc.C, "dtype", None)
+            if dtype is None:
+                input_dtypes = [
+                    getattr(getattr(desc, "A", None), "dtype", None),
+                    getattr(getattr(desc, "B", None), "dtype", None),
+                ]
+                try:
+                    dtype = _np.result_type(*[item for item in input_dtypes if item is not None])
+                except (TypeError, ValueError):
+                    labels = [cls._dtype_label(item) for item in input_dtypes]
+                    labels = [item for item in labels if item is not None]
+                    if labels and len(set(labels)) == 1:
+                        return labels[0]
+            label = cls._dtype_label(dtype)
+            if label is not None:
+                return label
+        return None
+
+    @classmethod
+    def _contraction_plan_output_dtype(cls, plan):
+        for step in reversed(tuple(getattr(plan, "steps", ())) or ()):
+            step_plan = getattr(step, "plan", None)
+            if isinstance(step_plan, MatmulPlan):
+                label = cls._matmul_plan_output_dtype(step_plan)
+                if label is not None:
+                    return label
+        return None
+
+    @staticmethod
+    def _profile_contraction_steps(steps):
+        items = []
+        for index, step in enumerate(steps):
+            plan = getattr(step, "plan", None)
+            lowering = getattr(plan, "kind", None) or step.kind
+            execution_items = {}
+            if isinstance(plan, MatmulPlan):
+                execution_items = AbstractBackend._matmul_plan_execution_items(
+                    plan,
+                    fallback_reason=getattr(step, "fallback_reason", None),
+                )
+            items.append({
+                "index": int(index),
+                "kind": str(step.kind),
+                "lowering": str(lowering),
+                **execution_items,
+                "inputs": [int(item) for item in step.inputs],
+                "output": int(step.output),
+                "input_modes": [
+                    [str(mode) for mode in modes]
+                    for modes in step.input_modes
+                ],
+                "output_modes": [str(mode) for mode in step.output_modes],
+                "plan_hash": getattr(plan, "plan_hash", None),
+                "flops": int(step.estimated_flops),
+                "read_bytes": int(step.estimated_read_bytes),
+                "write_bytes": int(step.estimated_write_bytes),
+                "copy_bytes": int(step.estimated_copy_bytes),
+                "peak_bytes": int(step.estimated_peak_bytes),
+                "comm_bytes": int(step.estimated_comm_bytes),
+                "workspace_bytes": int(step.required_workspace_bytes),
+                "fallback_reason": getattr(step, "fallback_reason", None),
+                "reason": getattr(step, "reason", None),
+            })
+        return items
 
     def _multi_operand_contraction_plan(
         self,
@@ -926,13 +1083,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 getattr(step.plan, "kind", step.kind)
                 for step in plan.steps
             ]
+            largest_intermediate_bytes, largest_intermediate_elements = (
+                self._contraction_plan_largest_intermediate_memory(plan)
+            )
 
             profiling.record(
                 "contraction_plan",
                 backend=self.name,
                 equation=equation,
                 lowering="multi_step",
+                dtype=self._contraction_plan_output_dtype(plan),
                 step_lowerings=step_lowerings,
+                step_count=len(plan.steps),
+                contraction_steps=self._profile_contraction_steps(plan.steps),
                 plan_hash=plan.plan_hash,
                 operands=[self._profile_tensor_operand(operand) for operand in plan.input_specs],
                 input_modes=[[str(mode) for mode in modes] for modes in input_modes],
@@ -953,6 +1116,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 copy_bytes=plan.estimated_copy_bytes,
                 workspace_bytes=plan.required_workspace_bytes,
                 peak_bytes=plan.estimated_peak_bytes,
+                largest_intermediate=largest_intermediate_bytes,
+                largest_intermediate_elements=largest_intermediate_elements,
+                largest_intermediate_bytes=largest_intermediate_bytes,
                 num_gemm=sum(1 for lowering in step_lowerings if lowering == "gemm"),
                 num_batched_gemm=sum(
                     1
@@ -1281,6 +1447,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         allow_slicing=True,
         allow_distribution=False,
         target_devices=None,
+        record_profile=True,
     ):
         self._validate_plan_prefer(prefer)
         target_device_specs = self._validate_plan_target_devices(
@@ -1307,6 +1474,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 einsum_spec,
                 distributed_modes=distributed_modes,
                 comm_bytes=comm_bytes if distributed_modes else 0,
+                record_profile=record_profile,
             )
             if distributed_modes:
                 output_sharding = self._derive_output_sharding(spec, input_modes, output_modes, output_shape)
@@ -1449,10 +1617,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     memory_limit=memory_limit,
                     allow_slicing=allow_slicing,
                 )
-                self._record_distributed_contraction_plan(spec, wrapped_plan)
+                if record_profile:
+                    self._record_distributed_contraction_plan(spec, wrapped_plan)
                 return wrapped_plan
             return self._enforce_plan_memory_limit(plan, memory_limit=memory_limit, allow_slicing=allow_slicing)
-        plan = self._plan_einsum_contraction(spec)
+        plan = self._plan_einsum_contraction(spec, record_profile=record_profile)
+        if target_device_specs is None and allow_distribution:
+            target_device_specs = self._auto_plan_target_devices()
         if target_device_specs is not None:
             mesh = self._mesh_from_target_devices(target_device_specs)
             distributed_plan = self.plan_distributed_contraction_path(
@@ -1461,10 +1632,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 memory_limit_per_device=memory_limit,
             )
             wrapped_plan = self._wrap_distributed_contraction_plan(plan, distributed_plan)
-            self._record_distributed_contraction_plan(
-                self._distributed_spec_from_plan(distributed_plan),
-                wrapped_plan,
-            )
+            if record_profile:
+                self._record_distributed_contraction_plan(
+                    self._distributed_spec_from_plan(distributed_plan),
+                    wrapped_plan,
+                )
             return wrapped_plan
         plan = self._apply_contraction_plan_preference(
             plan,
@@ -1488,6 +1660,27 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if not allow_distribution:
             raise BackendFeatureError("target_devices require allow_distribution=True")
         return devices
+
+    def _auto_plan_target_devices(self):
+        try:
+            count = int(self.device_count())
+        except Exception:
+            return None
+        if count <= 1:
+            return None
+        current = self.current_device()
+        kind = current.kind
+        devices = []
+        for index in range(count):
+            if kind in ("cuda", "gpu", "rocm", "mps", "tpu"):
+                devices.append(
+                    DeviceSpec(kind=kind, index=index, local_rank=index, global_rank=index)
+                )
+            else:
+                devices.append(
+                    DeviceSpec(kind=kind, local_rank=index, global_rank=index)
+                )
+        return tuple(devices)
 
     def _mesh_from_target_devices(self, devices):
         devices = tuple(devices)
@@ -1672,12 +1865,26 @@ class AbstractBackend(SingleProcessDistributedMixin):
             base_lowering = getattr(getattr(base_step, "plan", None), "kind", getattr(base_step, "kind", None))
             equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)
             output_shape = self._output_shape_for_contraction_plan(plan)
+            slice_output_shapes = [
+                self._local_shape_for_slices(tuple(output_shape), output_slice)
+                for output_slice in sliced_plan.output_slices
+            ]
+            largest_intermediate_elements = max(
+                (self._prod_shape(shape) for shape in slice_output_shapes),
+                default=0,
+            )
+            itemsize = max(
+                (self._operand_itemsize(operand.array) for operand in plan.input_specs),
+                default=0,
+            )
+            largest_intermediate_bytes = int(largest_intermediate_elements) * int(itemsize)
 
             profiling.record(
                 "contraction_plan",
                 backend=self.name,
                 equation=equation,
                 lowering="slice",
+                dtype=self._contraction_plan_output_dtype(base_plan),
                 plan_hash=plan.plan_hash,
                 input_modes=input_modes,
                 output_modes=output_modes,
@@ -1698,6 +1905,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 copy_bytes=plan.estimated_copy_bytes,
                 workspace_bytes=plan.required_workspace_bytes,
                 peak_bytes=plan.estimated_peak_bytes,
+                largest_intermediate=largest_intermediate_bytes,
+                largest_intermediate_elements=largest_intermediate_elements,
+                largest_intermediate_bytes=largest_intermediate_bytes,
                 num_gemm=len(sliced_plan.output_slices) if base_lowering == "gemm" else 0,
                 num_batched_gemm=len(sliced_plan.output_slices) if base_lowering in ("batched_gemm", "strided_batched_gemm") else 0,
                 num_grouped_tasks=0,
@@ -1708,10 +1918,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 num_slices=len(sliced_plan.output_slices),
                 base_lowering=base_lowering,
                 slice_output_axis=sliced_plan.output_axis,
-                slice_output_shapes=[
-                    self._local_shape_for_slices(tuple(output_shape), output_slice)
-                    for output_slice in sliced_plan.output_slices
-                ],
+                slice_output_shapes=slice_output_shapes,
             )
         except Exception:
             pass
@@ -1763,9 +1970,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @staticmethod
     def _rate_seconds(amount, rate):
-        if not amount or not rate:
+        if not amount:
             return 0.0
+        if not rate:
+            return float("inf")
         return float(amount) / float(rate)
+
+    @staticmethod
+    def _matmul_desc_layout_copy_bytes(desc):
+        total = 0
+        for layout in (getattr(desc, "layout_a", None), getattr(desc, "layout_b", None), getattr(desc, "layout_c", None)):
+            total += int(getattr(layout, "estimated_copy_bytes", 0) or 0)
+        return int(total)
 
     @staticmethod
     def _hardware_flop_rate(hw):
@@ -1788,6 +2004,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
     @staticmethod
     def _hardware_comm_bandwidth(hw):
         return hw.network_bandwidth_Bps or hw.interconnect_bandwidth_bytes_s or hw.p2p_bandwidth_Bps
+
+    @staticmethod
+    def _hardware_point_to_point_bandwidth(hw):
+        return hw.p2p_bandwidth_Bps or hw.interconnect_bandwidth_bytes_s or hw.network_bandwidth_Bps
+
+    @classmethod
+    def _hardware_bandwidth_for_communication(cls, item, hw):
+        if getattr(item, "kind", None) == "point_to_point":
+            return cls._hardware_point_to_point_bandwidth(hw)
+        return cls._hardware_comm_bandwidth(hw)
 
     @staticmethod
     def _validate_cost_model_workspace_limit(hw, workspace_bytes):
@@ -1853,28 +2079,32 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def estimate_matmul(self, desc, hw=None):
         if isinstance(desc, MatmulPlan):
             write_bytes = sum(item.estimated_write_bytes for item in desc.descs)
+            copy_bytes = int(desc.copy_bytes)
+            workspace_bytes = int(desc.workspace_bytes)
             return self._make_cost_estimate(
                 hw,
                 flops=desc.estimated_flops,
                 read_bytes=sum(item.estimated_read_bytes for item in desc.descs),
                 write_bytes=write_bytes,
-                copy_bytes=desc.copy_bytes,
-                workspace_bytes=desc.workspace_bytes,
-                peak_bytes=write_bytes + desc.workspace_bytes,
+                copy_bytes=copy_bytes,
+                workspace_bytes=workspace_bytes,
+                peak_bytes=write_bytes + copy_bytes + workspace_bytes,
             )
         batch = self._prod_shape(desc.batch_shape)
         flops = desc.estimated_flops or int(2 * batch * desc.m * desc.n * desc.k)
         read_bytes = desc.estimated_read_bytes or (self._array_nbytes(desc.A) + self._array_nbytes(desc.B))
         itemsize = max(self._operand_itemsize(desc.A), self._operand_itemsize(desc.B), 1)
         write_bytes = desc.estimated_write_bytes or int(batch * desc.m * desc.n * itemsize)
+        copy_bytes = self._matmul_desc_layout_copy_bytes(desc)
         workspace_bytes = int(desc.estimated_workspace_bytes)
         return self._make_cost_estimate(
             hw,
             flops=flops,
             read_bytes=read_bytes,
             write_bytes=write_bytes,
+            copy_bytes=copy_bytes,
             workspace_bytes=workspace_bytes,
-            peak_bytes=write_bytes + workspace_bytes,
+            peak_bytes=write_bytes + copy_bytes + workspace_bytes,
         )
 
     def _estimate_distributed_contraction(self, plan, hw=None):
@@ -1914,13 +2144,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return self.estimate_matmul(plan, hw)
         if isinstance(plan, GroupedGemmPlan):
             workspace_bytes = int(plan.estimated_workspace_bytes or 0)
+            copy_bytes = int(plan.estimated_copy_bytes or 0)
             return self._make_cost_estimate(
                 hw,
                 flops=plan.estimated_flops,
                 read_bytes=plan.estimated_read_bytes,
                 write_bytes=plan.estimated_write_bytes,
+                copy_bytes=copy_bytes,
                 workspace_bytes=workspace_bytes,
-                peak_bytes=int(plan.estimated_write_bytes or 0) + workspace_bytes,
+                peak_bytes=int(plan.estimated_write_bytes or 0) + copy_bytes + workspace_bytes,
             )
         if isinstance(plan, DistributedContractionPlan):
             return self._estimate_distributed_contraction(plan, hw)
@@ -1941,7 +2173,22 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def estimate_redistribute(self, src, dst, tensor_shape, hw=None, *, itemsize=8):
         hw = HardwareModel() if hw is None else hw
-        nbytes = self._prod_shape(tensor_shape) * int(itemsize)
+        tensor_shape = tuple(int(dim) for dim in tensor_shape)
+        if any(dim < 0 for dim in tensor_shape):
+            raise ValueError("estimate_redistribute tensor_shape dimensions must be non-negative")
+        itemsize = int(itemsize)
+        if itemsize <= 0:
+            raise ValueError("estimate_redistribute itemsize must be positive")
+        if isinstance(src, ShardingSpec):
+            if tuple(src.global_shape) != tensor_shape:
+                raise ValueError("estimate_redistribute tensor_shape must match source global_shape")
+        if isinstance(dst, ShardingSpec):
+            if tuple(dst.global_shape) != tensor_shape:
+                raise ValueError("estimate_redistribute tensor_shape must match destination global_shape")
+        if isinstance(src, ShardingSpec) and isinstance(dst, ShardingSpec):
+            if tuple(src.modes) != tuple(dst.modes):
+                raise ValueError("estimate_redistribute source and destination modes must match")
+        nbytes = self._prod_shape(tensor_shape) * itemsize
         movement_bytes = 0 if self._sharding_specs_equivalent(src, dst) else nbytes
         src_local_bytes = (
             self._local_nbytes_for_sharding(src, itemsize)
@@ -2088,16 +2335,24 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 estimated_flops=flops,
                 estimated_read_bytes=read_bytes,
                 estimated_write_bytes=write_bytes,
-                estimated_workspace_bytes=desc.estimated_workspace_bytes,
             )
+            local_copy_bytes = sum(
+                int(getattr(layout, "estimated_copy_bytes", 0) or 0)
+                for layout in (local_desc.layout_a, local_desc.layout_b, local_desc.layout_c)
+            )
+            local_desc = replace(local_desc, estimated_workspace_bytes=local_copy_bytes)
+            # The distributed activation step rewrites the contraction around
+            # already-materialized local shards.  The source plan's transforms
+            # describe the global/distributed operands and may have incompatible
+            # shapes, so the local plan must carry only local layout transforms.
             local_plan = MatmulPlan(
                 kind=local_plan.kind,
                 descs=(local_desc,),
-                pre_ops=local_plan.pre_ops,
-                post_ops=local_plan.post_ops,
+                pre_ops=(),
+                post_ops=(),
                 output_shape=output_shape,
-                copy_bytes=local_plan.copy_bytes,
-                workspace_bytes=local_plan.workspace_bytes,
+                copy_bytes=local_copy_bytes,
+                workspace_bytes=local_copy_bytes,
                 estimated_flops=flops,
                 estimated_time_s=local_plan.estimated_time_s,
                 reason=local_plan.reason,
@@ -2113,30 +2368,24 @@ class AbstractBackend(SingleProcessDistributedMixin):
             estimated_flops=flops,
             estimated_read_bytes=read_bytes,
             estimated_write_bytes=write_bytes,
-            estimated_copy_bytes=step.estimated_copy_bytes,
-            estimated_peak_bytes=max(write_bytes, step.required_workspace_bytes),
+            estimated_copy_bytes=getattr(local_plan, "copy_bytes", step.estimated_copy_bytes),
+            estimated_peak_bytes=max(write_bytes, getattr(local_plan, "workspace_bytes", step.required_workspace_bytes)),
             estimated_comm_bytes=step.estimated_comm_bytes,
-            required_workspace_bytes=step.required_workspace_bytes,
+            required_workspace_bytes=getattr(local_plan, "workspace_bytes", step.required_workspace_bytes),
             reason=step.reason,
             fallback_reason=step.fallback_reason,
         )
 
     def _peak_local_bytes_for_distributed_plan(self, plan):
-        itemsize = max(
-            (self._operand_itemsize(operand.array) for operand in plan.path.input_specs),
-            default=1,
-        )
-        operand_peak = max(
-            (
-                operand.array.local_nbytes
-                if isinstance(operand.array, DistributedTensor)
-                else self._array_nbytes(operand.array)
-                for operand in plan.path.input_specs
-            ),
-            default=0,
-        )
-        output_peak = self._local_nbytes_for_sharding(plan.output_sharding, itemsize)
-        return max(operand_peak, output_peak, int(plan.path.required_workspace_bytes))
+        peaks = []
+        for step in plan.steps:
+            peaks.extend(int(state.local_nbytes) for state in step.input_states)
+            if step.output_state is not None:
+                peaks.append(int(step.output_state.local_nbytes))
+            peaks.append(int(getattr(step.local_step, "estimated_peak_bytes", 0) or 0))
+            peaks.append(int(getattr(step.local_step, "required_workspace_bytes", 0) or 0))
+            peaks.extend(int(getattr(item, "local_bytes", 0) or 0) for item in step.communication)
+        return max(peaks, default=0)
 
     @staticmethod
     def _communication_totals(steps):
@@ -2144,20 +2393,55 @@ class AbstractBackend(SingleProcessDistributedMixin):
         total_redistribute_bytes = 0
         total_allreduce_bytes = 0
         total_gather_bytes = 0
+        total_point_to_point_bytes = 0
+        total_broadcast_bytes = 0
+        total_reduce_scatter_bytes = 0
+        total_alltoall_bytes = 0
+        total_allgather_bytes = 0
         for step in steps:
             for communication in step.communication:
                 nbytes = int(communication.bytes)
                 total_comm_bytes += nbytes
+                if communication.kind == "broadcast":
+                    total_broadcast_bytes += nbytes
+                elif communication.kind == "reduce_scatter":
+                    total_reduce_scatter_bytes += nbytes
+                elif communication.kind == "alltoall":
+                    total_alltoall_bytes += nbytes
+                elif communication.kind == "allgather":
+                    total_allgather_bytes += nbytes
                 if communication.kind in ("redistribute", "alltoall", "activate_distribution"):
                     total_redistribute_bytes += nbytes
                 elif communication.kind in ("allreduce", "reduce_scatter"):
                     total_allreduce_bytes += nbytes
                 elif communication.kind in ("gather", "allgather"):
                     total_gather_bytes += nbytes
-        return total_comm_bytes, total_redistribute_bytes, total_allreduce_bytes, total_gather_bytes
+                elif communication.kind == "point_to_point":
+                    total_point_to_point_bytes += nbytes
+        return (
+            total_comm_bytes,
+            total_redistribute_bytes,
+            total_allreduce_bytes,
+            total_gather_bytes,
+            total_point_to_point_bytes,
+            total_broadcast_bytes,
+            total_reduce_scatter_bytes,
+            total_alltoall_bytes,
+            total_allgather_bytes,
+        )
 
     def _with_distributed_plan_totals(self, plan):
-        total_comm_bytes, total_redistribute_bytes, total_allreduce_bytes, total_gather_bytes = (
+        (
+            total_comm_bytes,
+            total_redistribute_bytes,
+            total_allreduce_bytes,
+            total_gather_bytes,
+            total_point_to_point_bytes,
+            total_broadcast_bytes,
+            total_reduce_scatter_bytes,
+            total_alltoall_bytes,
+            total_allgather_bytes,
+        ) = (
             self._communication_totals(plan.steps)
         )
         return DistributedContractionPlan(
@@ -2172,13 +2456,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
             total_redistribute_bytes=total_redistribute_bytes,
             total_allreduce_bytes=total_allreduce_bytes,
             total_gather_bytes=total_gather_bytes,
+            total_point_to_point_bytes=total_point_to_point_bytes,
+            total_broadcast_bytes=total_broadcast_bytes,
+            total_reduce_scatter_bytes=total_reduce_scatter_bytes,
+            total_alltoall_bytes=total_alltoall_bytes,
+            total_allgather_bytes=total_allgather_bytes,
         )
 
     def _estimate_communication_sequence_s(self, communication, hw):
         hw = HardwareModel() if hw is None else hw
-        bandwidth = self._hardware_comm_bandwidth(hw)
         total = 0.0
         for item in communication:
+            bandwidth = self._hardware_bandwidth_for_communication(item, hw)
             nbytes = int(getattr(item, "local_bytes", item.bytes))
             total += self._rate_seconds(nbytes, bandwidth)
             if nbytes and hw.latency_s:
@@ -2219,20 +2508,35 @@ class AbstractBackend(SingleProcessDistributedMixin):
             key=lambda item: (int(item[1]) >= 2, int(item[1])),
             reverse=True,
         )
+        shardable_candidates = [
+            item for item in candidates
+            if int(item[1]) > 1
+        ]
         assignments = {}
         used_modes = set()
-        for axis_name, axis_size in zip(mesh.axis_names, mesh.shape):
+        mesh_axes = sorted(
+            zip(mesh.axis_names, mesh.shape),
+            key=lambda item: int(item[1]),
+            reverse=True,
+        )
+        for axis_name, axis_size in mesh_axes:
             if int(axis_size) <= 1:
                 continue
-            candidate = next((item for item in candidates if item[0] not in used_modes), None)
+            axis_size = int(axis_size)
+            candidate = next(
+                (
+                    item for item in shardable_candidates
+                    if item[0] not in used_modes and int(item[1]) >= axis_size
+                ),
+                None,
+            )
             if candidate is None:
-                break
+                continue
             mode, _ = candidate
             used_modes.add(mode)
-            assignments[mode] = (axis_name, int(axis_size))
+            assignments[mode] = (axis_name, axis_size)
         if not assignments:
-            selected_mode, _ = candidates[0]
-            assignments[selected_mode] = (mesh.axis_names[0], int(mesh.shape[0]))
+            raise BackendFeatureError("cannot distribute contraction automatically: no shardable output modes")
         sharded_modes = tuple(mode for mode in path.output_modes if mode in assignments)
         return ShardingSpec(
             global_shape=output_shape,
@@ -2304,6 +2608,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         self,
         path,
         mesh,
+        *,
         memory_limit_per_device=None,
         cost_model=None,
     ):
@@ -2331,6 +2636,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 total_redistribute_bytes=distributed_plan.total_redistribute_bytes,
                 total_allreduce_bytes=distributed_plan.total_allreduce_bytes,
                 total_gather_bytes=distributed_plan.total_gather_bytes,
+                total_point_to_point_bytes=distributed_plan.total_point_to_point_bytes,
+                total_broadcast_bytes=distributed_plan.total_broadcast_bytes,
+                total_reduce_scatter_bytes=distributed_plan.total_reduce_scatter_bytes,
+                total_alltoall_bytes=distributed_plan.total_alltoall_bytes,
+                total_allgather_bytes=distributed_plan.total_allgather_bytes,
             )
         result = self._with_distributed_plan_totals(distributed_plan)
         effective_memory_limit = self._effective_memory_limit_per_device(memory_limit_per_device, cost_model)
@@ -2351,6 +2661,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return StreamEvent(device=self.current_device(), stream=stream)
 
     def wait_event(self, event, stream=None):
+        self._validate_stream_event(event)
         return None
 
     def _stream_context(self, stream):
@@ -2363,11 +2674,34 @@ class AbstractBackend(SingleProcessDistributedMixin):
         spec = parse_device_spec(device) if device is not None else self.current_device()
         if spec is None:
             spec = self.current_device()
-        buffer = self.to_backend(_np.empty((nbytes,), dtype=_np.uint8))
+        buffer = self.to_backend(_np.empty((nbytes,), dtype=_np.uint8), device=spec)
         return Workspace(device=spec, nbytes=nbytes, buffer=buffer)
 
     def release_workspace(self, workspace):
+        if not isinstance(workspace, Workspace):
+            raise TypeError("workspace must be a Workspace instance")
+        if getattr(workspace, "released", False):
+            return None
+        current = self.current_device()
+        if not self._device_specs_compatible(workspace.device, current):
+            raise BackendFeatureError(
+                "workspace device {0!r} is incompatible with current device {1!r}"
+                .format(workspace.device, current)
+            )
+        workspace.buffer = None
+        workspace.released = True
         return None
+
+    def _validate_stream_event(self, event):
+        if not isinstance(event, StreamEvent):
+            raise TypeError("event must be a StreamEvent instance")
+        current = self.current_device()
+        if not self._device_specs_compatible(event.device, current):
+            raise BackendFeatureError(
+                "stream event device {0!r} is incompatible with current device {1!r}"
+                .format(event.device, current)
+            )
+        return event
 
     @staticmethod
     def _device_specs_compatible(actual, expected):
@@ -2382,6 +2716,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def _plan_required_workspace_bytes(self, plan):
         if isinstance(plan, ContractionPlan):
+            distributed_plan = self._distributed_plan_from_contraction_plan(plan)
+            if distributed_plan is not None:
+                return self._plan_required_workspace_bytes(distributed_plan)
             return int(plan.required_workspace_bytes)
         if isinstance(plan, MatmulPlan):
             return int(plan.workspace_bytes)
@@ -2402,6 +2739,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return
         if not isinstance(workspace, Workspace):
             raise TypeError("workspace must be a Workspace instance")
+        if getattr(workspace, "released", False):
+            raise BackendFeatureError("released workspace cannot be used")
         current = self.current_device()
         if not self._device_specs_compatible(workspace.device, current):
             raise BackendFeatureError(
@@ -2547,7 +2886,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
             raise BackendFeatureError("sliced contraction plan has no slices to execute")
         return result
 
-    def _record_sliced_contraction_execute(self, plan, result, wall_s):
+    def _record_sliced_contraction_execute(self, plan, result, wall_s, *, stream=None, workspace=None):
         try:
             from renormalizer.utils import profiling
 
@@ -2559,11 +2898,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
             base_step = base_plan.steps[0] if base_plan is not None and base_plan.steps else None
             base_lowering = getattr(getattr(base_step, "plan", None), "kind", getattr(base_step, "kind", None))
             equation, input_modes, output_modes = self._contraction_plan_profile_metadata(plan)
+            largest_intermediate_bytes = int(getattr(result, "nbytes", 0) or 0)
+            largest_intermediate_elements = self._array_size(result)
 
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
-                **profiling.contraction_execute_compute_payload(),
+                **profiling.contraction_execute_compute_payload("slice"),
                 equation=equation,
                 lowering="slice",
                 plan_hash=plan.plan_hash,
@@ -2581,13 +2922,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 output_shape=tuple(getattr(result, "shape", ())),
                 dtype=str(getattr(result, "dtype", None)),
                 **self._profile_device_execution(self.current_device()),
+                **self._profile_execution_resources(stream=stream, workspace=workspace),
                 flops=plan.estimated_flops,
                 read_bytes=plan.estimated_read_bytes,
                 write_bytes=plan.estimated_write_bytes,
                 copy_bytes=plan.estimated_copy_bytes,
                 workspace_bytes=plan.required_workspace_bytes,
                 peak_bytes=plan.estimated_peak_bytes,
-                largest_intermediate=getattr(result, "nbytes", None),
+                largest_intermediate=largest_intermediate_bytes,
+                largest_intermediate_elements=largest_intermediate_elements,
+                largest_intermediate_bytes=largest_intermediate_bytes,
                 num_gemm=len(sliced_plan.output_slices) if base_lowering == "gemm" else 0,
                 num_batched_gemm=len(sliced_plan.output_slices) if base_lowering in ("batched_gemm", "strided_batched_gemm") else 0,
                 num_grouped_tasks=0,
@@ -2612,7 +2956,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         descs = tuple(replace(desc, A=left, B=right) for desc in plan.descs)
         return replace(plan, descs=descs)
 
-    def _record_multi_step_contraction_execute(self, plan, result, wall_s):
+    def _record_multi_step_contraction_execute(self, plan, result, wall_s, *, stream=None, workspace=None):
         try:
             from renormalizer.utils import profiling
 
@@ -2623,14 +2967,21 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 getattr(step.plan, "kind", step.kind)
                 for step in plan.steps
             ]
+            largest_intermediate_bytes = max(
+                [int(getattr(result, "nbytes", 0) or 0)]
+                + [int(step.estimated_write_bytes or 0) for step in plan.steps]
+            )
+            largest_intermediate_elements = self._elements_for_nbytes(largest_intermediate_bytes, result)
 
             profiling.record(
                 "contraction_execute",
                 backend=self.name,
-                **profiling.contraction_execute_compute_payload(),
+                **profiling.contraction_execute_compute_payload("multi_step"),
                 equation=equation,
                 lowering="multi_step",
                 step_lowerings=step_lowerings,
+                step_count=len(plan.steps),
+                contraction_steps=self._profile_contraction_steps(plan.steps),
                 plan_hash=plan.plan_hash,
                 input_modes=input_modes,
                 output_modes=output_modes,
@@ -2646,16 +2997,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 output_shape=tuple(getattr(result, "shape", ())),
                 dtype=str(getattr(result, "dtype", None)),
                 **self._profile_device_execution(self.current_device()),
+                **self._profile_execution_resources(stream=stream, workspace=workspace),
                 flops=plan.estimated_flops,
                 read_bytes=plan.estimated_read_bytes,
                 write_bytes=plan.estimated_write_bytes,
                 copy_bytes=plan.estimated_copy_bytes,
                 workspace_bytes=plan.required_workspace_bytes,
                 peak_bytes=plan.estimated_peak_bytes,
-                largest_intermediate=max(
-                    [int(getattr(result, "nbytes", 0) or 0)]
-                    + [int(step.estimated_write_bytes or 0) for step in plan.steps]
-                ),
+                largest_intermediate=largest_intermediate_bytes,
+                largest_intermediate_elements=largest_intermediate_elements,
+                largest_intermediate_bytes=largest_intermediate_bytes,
                 num_gemm=sum(1 for lowering in step_lowerings if lowering == "gemm"),
                 num_batched_gemm=sum(
                     1
@@ -2717,7 +3068,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
             raise BackendFeatureError("multi-step contraction execution did not reduce to one output")
         result = operands[0]
         if started is not None:
-            self._record_multi_step_contraction_execute(plan, result, time.perf_counter() - started)
+            self._record_multi_step_contraction_execute(
+                plan,
+                result,
+                time.perf_counter() - started,
+                stream=stream,
+                workspace=workspace,
+            )
         return result
 
     @staticmethod
@@ -2770,7 +3127,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         workspace=workspace,
                     )
                     wall_s = time.perf_counter() - started
-                    self._record_sliced_contraction_execute(plan, result, wall_s)
+                    self._record_sliced_contraction_execute(
+                        plan,
+                        result,
+                        wall_s,
+                        stream=stream,
+                        workspace=workspace,
+                    )
                     return result
                 return self._execute_sliced_contraction_plan(
                     inner_plan,
@@ -2790,12 +3153,27 @@ class AbstractBackend(SingleProcessDistributedMixin):
         raise BackendFeatureError("Unknown backend execution plan {0!r}".format(type(plan).__name__))
 
     def synchronize(self, device=None, stream=None):
+        if device is not None:
+            spec = parse_device_spec(device)
+            if spec is None:
+                spec = self.current_device()
+            current = self.current_device()
+            if not self._device_specs_compatible(spec, current):
+                raise BackendFeatureError(
+                    "synchronize device {0!r} is incompatible with current device {1!r}"
+                    .format(spec, current)
+                )
         return self.sync()
 
     def unpack_masked_vectors(self, x: Any, spec):
         mask = self._validated_packed_mask(spec)
         shape = tuple(int(dim) for dim in getattr(x, "shape", ()))
         if shape == (spec.packed_dim,):
+            if spec.nrhs != 1:
+                raise ValueError(
+                    "batched packed vector shape must be ({0}, {1}); got {2}"
+                    .format(spec.packed_dim, spec.nrhs, shape)
+                )
             struct = self._zeros_backend(spec.center_shape, getattr(x, "dtype", None))
             return self._masked_set(struct, mask, x)
         if shape != (spec.packed_dim, spec.nrhs):
@@ -2814,6 +3192,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
         mask = self._validated_packed_mask(spec)
         shape = tuple(int(dim) for dim in getattr(x_struct, "shape", ()))
         if shape == spec.center_shape:
+            if spec.nrhs != 1:
+                raise ValueError(
+                    "batched center tensor shape must include RHS axis; expected ({0}, {1}) layout; got {2}"
+                    .format(spec.center_shape, spec.nrhs, shape)
+                )
             return x_struct[mask]
 
         ndim = len(spec.center_shape) + 1
@@ -2839,6 +3222,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def shard_tensor(self, x, spec: ShardingSpec):
         if self.is_distributed_array(x):
             x = self.gather_tensor(x)
+        input_shape = tuple(int(dim) for dim in getattr(x, "shape", ()))
+        if input_shape != tuple(spec.global_shape):
+            raise ValueError(
+                "shard_tensor input shape {0} must match ShardingSpec global_shape {1}"
+                .format(input_shape, tuple(spec.global_shape))
+            )
         if self.is_distributed and int(spec.mesh.world_size) == int(self.size):
             rank = int(self.rank)
             local_slice = spec.local_slices[rank]
@@ -2874,16 +3263,33 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def gather_tensor(self, x, root=None):
         if not self.is_distributed_array(x):
             return x
+        if root is not None:
+            root = int(root)
+            world_size = int(x.mesh.world_size)
+            if root < 0 or root >= world_size:
+                raise ValueError(
+                    "gather_tensor root {0} is out of range for world size {1}"
+                    .format(root, world_size)
+                )
         if x.rank_local_arrays is None:
             if self.is_distributed and int(x.mesh.world_size) == int(self.size):
-                gathered = self.allgather(x.local_array)
+                if root is None:
+                    gathered = self.allgather(x.local_array)
+                else:
+                    gathered = self.gather(x.local_array, root=root)
+                    if int(self.rank) != root:
+                        return None
                 result = self._zeros_backend(x.global_shape, x.dtype)
                 for rank, value in enumerate(gathered):
                     result = self._slice_set(result, x.sharding.local_slices[rank], value)
                 return result
             if x.sharding.local_slices.get(x.mesh.local_rank) == tuple(slice(None) for _ in x.global_shape):
+                if root is not None and int(x.mesh.local_rank) != root:
+                    return None
                 return x.local_array
             raise BackendFeatureError("cannot gather distributed tensor without rank-local arrays")
+        if root is not None and int(x.mesh.local_rank) != root:
+            return None
         result = self._zeros_backend(x.global_shape, x.dtype)
         for rank in sorted(x.rank_local_arrays):
             result = self._slice_set(result, x.sharding.local_slices[rank], x.rank_local_arrays[rank])
@@ -2936,6 +3342,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return self.shard_tensor(dense, new_spec)
 
     def replicate_tensor(self, x, mesh, *, modes=None):
+        if self.is_distributed_array(x):
+            x = self.gather_tensor(x)
         modes = tuple(range(len(getattr(x, "shape", ())))) if modes is None else tuple(modes)
         spec = ShardingSpec(
             global_shape=tuple(int(dim) for dim in getattr(x, "shape", ())),
@@ -2987,6 +3395,70 @@ class AbstractBackend(SingleProcessDistributedMixin):
             return _np.einsum(equation, *operands)
         return einsum(equation, *operands)
 
+    def _record_local_contraction_fallback_execute(
+        self,
+        equation,
+        operands,
+        result,
+        wall_s,
+        fallback_reason,
+        *,
+        stream=None,
+        workspace=None,
+    ):
+        try:
+            from renormalizer.utils import profiling
+
+            if not profiling.should_record_op():
+                return
+            input_modes, output_modes = parse_einsum_equation(equation)
+            result_nbytes = self._array_nbytes(result)
+            result_elements = self._array_size(result)
+            profiling.record(
+                "contraction_execute",
+                backend=self.name,
+                **profiling.contraction_execute_compute_payload("block_grouped_gemm"),
+                equation=equation,
+                lowering="fallback_einsum",
+                input_modes=[[str(mode) for mode in modes] for modes in input_modes],
+                output_modes=[str(mode) for mode in output_modes],
+                input_shapes=[tuple(getattr(operand, "shape", ())) for operand in operands],
+                operands=[
+                    self._profile_array_operand(
+                        "operand{0}".format(index),
+                        operand,
+                        input_modes[index],
+                    )
+                    for index, operand in enumerate(operands)
+                ],
+                input_dtypes=[str(getattr(operand, "dtype", None)) for operand in operands],
+                output_shape=tuple(getattr(result, "shape", ())),
+                dtype=str(getattr(result, "dtype", None)),
+                **self._profile_device_execution(self.current_device()),
+                **self._profile_execution_resources(stream=stream, workspace=workspace),
+                flops=0,
+                read_bytes=sum(self._array_nbytes(operand) for operand in operands),
+                write_bytes=result_nbytes,
+                copy_bytes=0,
+                workspace_bytes=0,
+                peak_bytes=result_nbytes,
+                largest_intermediate=result_nbytes,
+                largest_intermediate_elements=result_elements,
+                largest_intermediate_bytes=result_nbytes,
+                num_gemm=0,
+                num_batched_gemm=0,
+                num_grouped_tasks=0,
+                num_blocks=0,
+                num_shape_buckets=0,
+                fallback_reason=fallback_reason,
+                fallback_from="local_contraction_plan",
+                fallback_to="einsum",
+                fallback_policy=self.fallback_policy.value,
+                wall_s=wall_s,
+            )
+        except Exception:
+            pass
+
     def _execute_local_contraction_plan(
         self,
         equation,
@@ -2999,7 +3471,35 @@ class AbstractBackend(SingleProcessDistributedMixin):
         try:
             spec = self.parse_einsum(equation, *operands)
             plan = self._plan_einsum_contraction(spec, record_profile=record_plan_profile)
-        except BackendFeatureError:
+        except BackendFeatureError as exc:
+            reason = "local contraction planning failed; used einsum fallback: {0}".format(exc)
+            if self.fallback_policy is FallbackPolicy.FORBID:
+                raise BackendFeatureError(reason) from exc
+            if self.fallback_policy is FallbackPolicy.WARN:
+                import warnings
+
+                warnings.warn(reason, RuntimeWarning, stacklevel=3)
+            try:
+                from renormalizer.utils import profiling
+
+                should_profile = profiling.should_record_op()
+            except Exception:
+                should_profile = False
+            if should_profile:
+                import time
+
+                started = time.perf_counter()
+                result = self._execute_einsum(equation, operands)
+                self._record_local_contraction_fallback_execute(
+                    equation,
+                    operands,
+                    result,
+                    time.perf_counter() - started,
+                    reason,
+                    stream=stream,
+                    workspace=workspace,
+                )
+                return result
             return self._execute_einsum(equation, operands)
         if (
             isinstance(plan, ContractionPlan)
@@ -3045,8 +3545,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 return int(default or 0)
             return int(getattr(step, name, default) or 0)
 
-        if plan is None:
+        def with_execution_items(profile, execution_items):
             return {
+                **profile,
+                "local_execution_primitives": list(execution_items.get("execution_primitives", ())),
+                "local_execution_policies": list(execution_items.get("execution_policies", ())),
+                "local_fallback_reasons": list(execution_items.get("fallback_reasons", ())),
+            }
+
+        if plan is None:
+            return with_execution_items({
                 "local_lowering": None,
                 "num_gemm": 0,
                 "num_batched_gemm": 0,
@@ -3060,12 +3568,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 "local_workspace_bytes": step_metric("required_workspace_bytes"),
                 "local_peak_bytes": step_metric("estimated_peak_bytes"),
                 "fallback_reason": None,
-            }
+            }, {})
         if isinstance(plan, MatmulPlan):
             read_bytes = sum(int(desc.estimated_read_bytes) for desc in plan.descs)
             write_bytes = sum(int(desc.estimated_write_bytes) for desc in plan.descs)
             workspace_bytes = int(plan.workspace_bytes)
-            return {
+            execution_items = AbstractBackend._matmul_plan_execution_items(
+                plan,
+                fallback_reason=getattr(step, "fallback_reason", None),
+            )
+            return with_execution_items({
                 "local_lowering": plan.kind,
                 "num_gemm": 1 if plan.kind == "gemm" else 0,
                 "num_batched_gemm": 1 if plan.kind in ("batched_gemm", "strided_batched_gemm") else 0,
@@ -3079,9 +3591,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 "local_workspace_bytes": step_metric("required_workspace_bytes", workspace_bytes),
                 "local_peak_bytes": step_metric("estimated_peak_bytes", max(write_bytes, workspace_bytes)),
                 "fallback_reason": plan.fallback_reason,
-            }
+            }, execution_items)
         if isinstance(plan, GroupedGemmPlan):
-            return {
+            execution_items = {
+                "execution_primitives": ["grouped_gemm"],
+                "execution_policies": ["backend_grouped_gemm"],
+                "fallback_reasons": [],
+            }
+            return with_execution_items({
                 "local_lowering": "grouped_gemm",
                 "num_gemm": 0,
                 "num_batched_gemm": 0,
@@ -3091,15 +3608,15 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 "local_flops": step_metric("estimated_flops", plan.estimated_flops),
                 "local_read_bytes": step_metric("estimated_read_bytes", plan.estimated_read_bytes),
                 "local_write_bytes": step_metric("estimated_write_bytes", plan.estimated_write_bytes),
-                "local_copy_bytes": step_metric("estimated_copy_bytes"),
+                "local_copy_bytes": step_metric("estimated_copy_bytes", plan.estimated_copy_bytes),
                 "local_workspace_bytes": step_metric("required_workspace_bytes", plan.estimated_workspace_bytes),
                 "local_peak_bytes": step_metric(
                     "estimated_peak_bytes",
-                    plan.estimated_write_bytes + plan.estimated_workspace_bytes,
+                    plan.estimated_write_bytes + plan.estimated_copy_bytes + plan.estimated_workspace_bytes,
                 ),
                 "fallback_reason": None,
-            }
-        return {
+            }, execution_items)
+        return with_execution_items({
             "local_lowering": type(plan).__name__,
             "num_gemm": 0,
             "num_batched_gemm": 0,
@@ -3113,6 +3630,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "local_workspace_bytes": step_metric("required_workspace_bytes"),
             "local_peak_bytes": step_metric("estimated_peak_bytes"),
             "fallback_reason": None,
+        }, {})
+
+    @staticmethod
+    def _distributed_execution_items(local_profile):
+        return {
+            "execution_primitives": [
+                "distributed_contract",
+                *list(local_profile.get("local_execution_primitives", ())),
+            ],
+            "execution_policies": [
+                "backend_distributed_contract",
+                *list(local_profile.get("local_execution_policies", ())),
+            ],
+            "fallback_reasons": list(local_profile.get("local_fallback_reasons", ())),
         }
 
     @staticmethod
@@ -3137,6 +3668,21 @@ class AbstractBackend(SingleProcessDistributedMixin):
         from renormalizer.utils import profiling
 
         return profiling.device_execution_payload(device)
+
+    @staticmethod
+    def _profile_execution_resources(stream=None, workspace=None):
+        workspace_device = getattr(workspace, "device", None)
+        return {
+            "stream_provided": stream is not None,
+            "stream_type": type(stream).__name__ if stream is not None else None,
+            "workspace_provided": workspace is not None,
+            "workspace_nbytes": int(getattr(workspace, "nbytes", 0) or 0) if workspace is not None else None,
+            "workspace_released": bool(getattr(workspace, "released", False)) if workspace is not None else None,
+            "workspace_device_kind": getattr(workspace_device, "kind", None),
+            "workspace_device_index": getattr(workspace_device, "index", None),
+            "workspace_device_local_rank": getattr(workspace_device, "local_rank", None),
+            "workspace_device_global_rank": getattr(workspace_device, "global_rank", None),
+        }
 
     def _profile_tensor_operand(self, operand):
         from renormalizer.utils import profiling
@@ -3189,11 +3735,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     def _profile_gemm_task_spec(self, task, index, *, xp=None):
         key = gemm_task_key(task, xp=xp)
-        return {
+        spec = {
             "index": int(index),
-            "m": int(key[2]),
-            "n": int(key[3]),
-            "k": int(key[4]),
+            "m": int(key[3]),
+            "n": int(key[4]),
+            "k": int(key[5]),
             "trans_a": bool(task.trans_a),
             "trans_b": bool(task.trans_b),
             "conj_a": bool(task.conj_a),
@@ -3202,6 +3748,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "beta": self._profile_scalar(task.beta),
             "tag": self._profile_scalar(task.tag),
         }
+        batch_shape = tuple(int(dim) for dim in key[2])
+        if batch_shape:
+            spec["batch_shape"] = batch_shape
+        return spec
 
     @staticmethod
     def _profile_layout_spec(layout):
@@ -3229,6 +3779,23 @@ class AbstractBackend(SingleProcessDistributedMixin):
             ),
             "estimated_copy_bytes": int(layout.estimated_copy_bytes),
         }
+
+    @staticmethod
+    def _profile_layout_transform(transform):
+        return {
+            "kind": transform.kind,
+            "input_shape": [int(dim) for dim in transform.input_shape],
+            "output_shape": [int(dim) for dim in transform.output_shape],
+            "copy_bytes": int(transform.copy_bytes),
+            "reason": transform.reason,
+        }
+
+    @classmethod
+    def _profile_layout_transforms(cls, transforms):
+        return [
+            cls._profile_layout_transform(transform)
+            for transform in tuple(transforms)
+        ]
 
     def _profile_matmul_desc_operands(self, desc, index):
         left_modes = tuple(getattr(desc.layout_a, "logical_modes", ()) or ())
@@ -3261,6 +3828,84 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "layout_b": self._profile_layout_spec(desc.layout_b),
             "layout_c": self._profile_layout_spec(desc.layout_c),
         }
+
+    @staticmethod
+    def _profile_matmul_desc_group_key(desc):
+        dtype_a = str(getattr(desc.A, "dtype", None))
+        dtype_b = str(getattr(desc.B, "dtype", None))
+        dtype = dtype_a if dtype_a == dtype_b else "{0},{1}".format(dtype_a, dtype_b)
+        return {
+            "dtype": dtype,
+            "trans_a": "C" if desc.conj_a and desc.trans_a else ("T" if desc.trans_a else "N"),
+            "trans_b": "C" if desc.conj_b and desc.trans_b else ("T" if desc.trans_b else "N"),
+            "conj_a": bool(desc.conj_a),
+            "conj_b": bool(desc.conj_b),
+            "batch_shape": tuple(int(dim) for dim in desc.batch_shape),
+            "m": int(desc.m),
+            "n": int(desc.n),
+            "k": int(desc.k),
+            "lda": int(desc.k),
+            "ldb": int(desc.n),
+            "ldc": int(desc.n),
+        }
+
+    @classmethod
+    def _profile_matmul_desc_group_keys(cls, descs):
+        group_keys = []
+        seen = set()
+        for desc in descs:
+            payload = cls._profile_matmul_desc_group_key(desc)
+            key = (
+                payload["dtype"],
+                payload["trans_a"],
+                payload["trans_b"],
+                payload["conj_a"],
+                payload["conj_b"],
+                payload["batch_shape"],
+                payload["m"],
+                payload["n"],
+                payload["k"],
+                payload["lda"],
+                payload["ldb"],
+                payload["ldc"],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            group_keys.append(payload)
+        return group_keys
+
+    @classmethod
+    def _profile_matmul_desc_group_key_buckets(cls, descs):
+        buckets = {}
+        order = []
+        for index, desc in enumerate(descs):
+            payload = cls._profile_matmul_desc_group_key(desc)
+            key = (
+                payload["dtype"],
+                payload["trans_a"],
+                payload["trans_b"],
+                payload["conj_a"],
+                payload["conj_b"],
+                payload["batch_shape"],
+                payload["m"],
+                payload["n"],
+                payload["k"],
+                payload["lda"],
+                payload["ldb"],
+                payload["ldc"],
+            )
+            if key not in buckets:
+                buckets[key] = {**payload, "task_indices": []}
+                order.append(key)
+            buckets[key]["task_indices"].append(int(index))
+
+        group_key_buckets = []
+        for key in order:
+            item = dict(buckets[key])
+            item["task_count"] = len(item["task_indices"])
+            group_key_buckets.append(item)
+        return group_key_buckets
 
     @classmethod
     def _profile_sharding(cls, sharding):
@@ -3299,6 +3944,52 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "sharding": cls._profile_sharding(state.sharding),
         }
 
+    def _profile_communication_plan(self, item, *, wall_s=None):
+        primitive = str(item.kind)
+        is_collective = primitive in {
+            "broadcast",
+            "allreduce",
+            "reduce_scatter",
+            "gather",
+            "allgather",
+            "alltoall",
+        }
+        payload = {
+            "kind": primitive,
+            "primitive": primitive,
+            "collective": primitive,
+            "is_collective": is_collective,
+            "is_point_to_point": primitive == "point_to_point",
+            "bytes": int(item.bytes),
+            "local_bytes": int(getattr(item, "local_bytes", item.bytes)),
+            "modes": [str(mode) for mode in item.modes],
+            "num_messages": int(item.num_messages),
+            "block_size": int(item.block_size),
+            "wall_s": float(0.0 if wall_s is None else wall_s),
+        }
+        return payload
+
+    def _profile_distributed_step(self, step, index, *, communication_payloads=None):
+        if communication_payloads is None:
+            communication_payloads = [
+                self._profile_communication_plan(item)
+                for item in step.communication
+            ]
+        return {
+            "index": int(index),
+            "kind": str(step.kind),
+            "local_step": self._profile_contraction_steps((step.local_step,))[0],
+            "input_states": [
+                self._profile_distribution_state(state)
+                for state in step.input_states
+            ],
+            "output_state": self._profile_distribution_state(step.output_state),
+            "communication": list(communication_payloads),
+            "estimated_compute_s": float(step.estimated_compute_s),
+            "estimated_comm_s": float(step.estimated_comm_s),
+            "estimated_total_s": float(step.estimated_total_s),
+        }
+
     def _record_distributed_contraction_plan(self, spec, plan):
         try:
             from renormalizer.utils import profiling
@@ -3322,12 +4013,48 @@ class AbstractBackend(SingleProcessDistributedMixin):
             distributed_modes = tuple(getattr(plan, "distributed_modes", ()))
             if not distributed_modes and output_state is not None:
                 distributed_modes = tuple(getattr(output_state, "distributed_modes", ()))
+            communication_payload = [
+                self._profile_communication_plan(item)
+                for item in communication
+            ]
+            dtype = None
+            if distributed_step is not None:
+                dtype = self._matmul_plan_output_dtype(distributed_step.local_contraction_plan)
+            largest_intermediate_bytes = int(local_profile["local_write_bytes"] or 0)
+            largest_intermediate_elements = 0
+            if output_state is not None:
+                largest_intermediate_bytes = max(
+                    largest_intermediate_bytes,
+                    int(getattr(output_state, "local_nbytes", 0) or 0),
+                )
+                largest_intermediate_elements = self._prod_shape(getattr(output_state, "local_shape", ()))
+            elif largest_intermediate_bytes:
+                dtype_itemsize = max(
+                    (int(getattr(self._operand_dtype(operand), "itemsize", 0) or 0) for operand in spec.operands),
+                    default=0,
+                )
+                if dtype_itemsize:
+                    largest_intermediate_elements = largest_intermediate_bytes // dtype_itemsize
+            rank = None
+            world_size = None
+            local_shape = None
+            global_shape = tuple(output_shape)
+            if output_state is not None:
+                local_shape = tuple(getattr(output_state, "local_shape", ()) or ())
+                global_shape = tuple(getattr(output_state, "shape", ()) or output_shape)
+                sharding = getattr(output_state, "sharding", None)
+                mesh = getattr(sharding, "mesh", None)
+                if mesh is not None:
+                    rank = int(getattr(mesh, "global_rank", 0))
+                    world_size = int(getattr(mesh, "world_size", 1))
 
             profiling.record(
                 "contraction_plan",
                 backend=self.name,
                 equation=spec.equation,
                 lowering="distributed",
+                dtype=dtype,
+                is_distributed_runtime=bool(getattr(self, "is_distributed", False)),
                 plan_hash=plan.plan_hash,
                 local_plan_hash=distributed_plan.path.plan_hash,
                 input_modes=[[str(mode) for mode in modes] for modes in input_modes],
@@ -3350,7 +4077,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 copy_bytes=int(getattr(plan, "estimated_copy_bytes", 0)),
                 workspace_bytes=int(getattr(plan, "required_workspace_bytes", 0)),
                 peak_bytes=int(getattr(plan, "estimated_peak_bytes", 0)),
+                largest_intermediate=largest_intermediate_bytes,
+                largest_intermediate_elements=largest_intermediate_elements,
+                largest_intermediate_bytes=largest_intermediate_bytes,
                 local_lowering=local_profile["local_lowering"],
+                local_execution_primitives=local_profile["local_execution_primitives"],
+                local_execution_policies=local_profile["local_execution_policies"],
+                local_fallback_reasons=local_profile["local_fallback_reasons"],
+                **self._distributed_execution_items(local_profile),
                 num_gemm=local_profile["num_gemm"],
                 num_batched_gemm=local_profile["num_batched_gemm"],
                 num_grouped_tasks=local_profile["num_grouped_tasks"],
@@ -3368,21 +4102,24 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 estimated_compute_s=float(getattr(distributed_step, "estimated_compute_s", 0.0)),
                 estimated_comm_s=float(getattr(distributed_step, "estimated_comm_s", 0.0)),
                 estimated_total_s=float(getattr(distributed_step, "estimated_total_s", 0.0)),
+                rank=rank,
+                world_size=world_size,
+                local_shape=local_shape,
+                global_shape=global_shape,
                 input_states=[
                     self._profile_distribution_state(state)
                     for state in input_states
                 ],
                 output_state=self._profile_distribution_state(output_state),
-                communication=[
-                    {
-                        "collective": item.kind,
-                        "bytes": int(item.bytes),
-                        "local_bytes": int(getattr(item, "local_bytes", item.bytes)),
-                        "modes": [str(mode) for mode in item.modes],
-                        "num_messages": int(item.num_messages),
-                        "block_size": int(item.block_size),
-                    }
-                    for item in communication
+                communication=communication_payload,
+                distributed_step_count=len(distributed_plan.steps),
+                distributed_steps=[
+                    self._profile_distributed_step(
+                        step,
+                        index,
+                        communication_payloads=communication_payload if index == 0 else None,
+                    )
+                    for index, step in enumerate(distributed_plan.steps)
                 ],
                 comm_bytes=int(
                     distributed_plan.total_comm_bytes
@@ -3391,11 +4128,26 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 redistribute_bytes=int(distributed_plan.total_redistribute_bytes),
                 allreduce_bytes=int(distributed_plan.total_allreduce_bytes),
                 gather_bytes=int(distributed_plan.total_gather_bytes),
+                point_to_point_bytes=int(distributed_plan.total_point_to_point_bytes),
+                broadcast_bytes=int(distributed_plan.total_broadcast_bytes),
+                reduce_scatter_bytes=int(distributed_plan.total_reduce_scatter_bytes),
+                alltoall_bytes=int(distributed_plan.total_alltoall_bytes),
+                allgather_bytes=int(distributed_plan.total_allgather_bytes),
             )
         except Exception:
             pass
 
-    def _record_distributed_contraction_execute(self, spec, plan, result, wall_s, communication_timings=None):
+    def _record_distributed_contraction_execute(
+        self,
+        spec,
+        plan,
+        result,
+        wall_s,
+        communication_timings=None,
+        *,
+        stream=None,
+        workspace=None,
+    ):
         try:
             from renormalizer.utils import profiling
 
@@ -3453,13 +4205,31 @@ class AbstractBackend(SingleProcessDistributedMixin):
             if not distributed_modes and output_state is not None:
                 distributed_modes = tuple(getattr(output_state, "distributed_modes", ()))
             input_modes, output_modes = parse_einsum_equation(spec.equation)
+            communication_payload = [
+                self._profile_communication_plan(
+                    item,
+                    wall_s=pop_communication_wall_s(item.kind),
+                )
+                for item in communication
+            ]
+            output_local_array = result.local_array
+            output_local_shape = tuple(result.local_shape)
+            output_local_strides = profiling.array_strides(output_local_array)
+            output_local_order = profiling.array_order(output_local_array)
+            output_local_contiguous = profiling.array_contiguous(output_local_array)
+            output_local_backend = profiling.array_backend_name(output_local_array)
+            output_local_device_kind = profiling.array_device_kind(output_local_array)
+            output_local_location = profiling.array_location(output_local_array)
 
-            profiling.record(
-                "contraction_execute",
-                backend=self.name,
-                **profiling.contraction_execute_compute_payload(),
+            execute_payload = {
+                "event": "contraction_execute",
+                "backend": self.name,
+            }
+            execute_payload.update(
+                profiling.contraction_execute_compute_payload("distributed"),
                 equation=spec.equation,
                 lowering="distributed",
+                is_distributed_runtime=bool(getattr(self, "is_distributed", False)),
                 plan_hash=plan_hash,
                 local_plan_hash=local_plan_hash,
                 input_modes=[[str(mode) for mode in modes] for modes in input_modes],
@@ -3475,8 +4245,28 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ],
                 input_dtypes=[str(self._operand_dtype(operand)) for operand in spec.operands],
                 output_shape=tuple(result.global_shape),
+                output_strides=output_local_strides,
+                output_order=output_local_order,
+                output_contiguous=output_local_contiguous,
+                output_backend=self.name,
+                output_device_kind="distributed",
+                output_location="distributed",
+                output_is_host=False,
+                output_is_device=False,
+                output_is_distributed=True,
+                output_local_shape=output_local_shape,
+                output_local_strides=output_local_strides,
+                output_local_order=output_local_order,
+                output_local_contiguous=output_local_contiguous,
+                output_local_backend=output_local_backend,
+                output_local_device_kind=output_local_device_kind,
+                output_local_location=output_local_location,
+                output_local_is_host=profiling.array_is_host(output_local_array),
+                output_local_is_device=profiling.array_is_device(output_local_array),
+                output_local_is_distributed=profiling.array_is_distributed(output_local_array),
                 dtype=str(getattr(result, "dtype", None)),
                 **self._profile_device_execution(self.current_device()),
+                **self._profile_execution_resources(stream=stream, workspace=workspace),
                 flops=flops,
                 read_bytes=int(getattr(metric_plan, "estimated_read_bytes", 0)),
                 write_bytes=int(getattr(metric_plan, "estimated_write_bytes", 0)),
@@ -3484,7 +4274,13 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 workspace_bytes=int(getattr(metric_plan, "required_workspace_bytes", 0)),
                 peak_bytes=int(getattr(metric_plan, "estimated_peak_bytes", 0)),
                 largest_intermediate=int(result.local_nbytes),
+                largest_intermediate_elements=self._prod_shape(result.local_shape),
+                largest_intermediate_bytes=int(result.local_nbytes),
                 local_lowering=local_profile["local_lowering"],
+                local_execution_primitives=local_profile["local_execution_primitives"],
+                local_execution_policies=local_profile["local_execution_policies"],
+                local_fallback_reasons=local_profile["local_fallback_reasons"],
+                **self._distributed_execution_items(local_profile),
                 num_gemm=local_profile["num_gemm"],
                 num_batched_gemm=local_profile["num_batched_gemm"],
                 num_grouped_tasks=local_profile["num_grouped_tasks"],
@@ -3511,21 +4307,64 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     for state in input_states
                 ],
                 output_state=self._profile_distribution_state(output_state),
-                communication=[
-                    {
-                        "collective": item.kind,
-                        "bytes": int(item.bytes),
-                        "local_bytes": int(getattr(item, "local_bytes", item.bytes)),
-                        "modes": [str(mode) for mode in item.modes],
-                        "num_messages": int(item.num_messages),
-                        "block_size": int(item.block_size),
-                        "wall_s": pop_communication_wall_s(item.kind),
-                    }
-                    for item in communication
-                ],
+                communication=communication_payload,
+                distributed_step_count=len(distributed_plan.steps) if distributed_plan is not None else 0,
+                distributed_steps=[
+                    self._profile_distributed_step(
+                        step,
+                        index,
+                        communication_payloads=communication_payload if index == 0 else None,
+                    )
+                    for index, step in enumerate(distributed_plan.steps)
+                ] if distributed_plan is not None else [],
                 comm_bytes=comm_bytes,
+                redistribute_bytes=(
+                    int(distributed_plan.total_redistribute_bytes)
+                    if distributed_plan is not None
+                    else 0
+                ),
+                allreduce_bytes=(
+                    int(distributed_plan.total_allreduce_bytes)
+                    if distributed_plan is not None
+                    else 0
+                ),
+                gather_bytes=(
+                    int(distributed_plan.total_gather_bytes)
+                    if distributed_plan is not None
+                    else 0
+                ),
+                point_to_point_bytes=(
+                    int(distributed_plan.total_point_to_point_bytes)
+                    if distributed_plan is not None
+                    else 0
+                ),
+                broadcast_bytes=(
+                    int(distributed_plan.total_broadcast_bytes)
+                    if distributed_plan is not None
+                    else 0
+                ),
+                reduce_scatter_bytes=(
+                    int(distributed_plan.total_reduce_scatter_bytes)
+                    if distributed_plan is not None
+                    else 0
+                ),
+                alltoall_bytes=(
+                    int(distributed_plan.total_alltoall_bytes)
+                    if distributed_plan is not None
+                    else 0
+                ),
+                allgather_bytes=(
+                    int(distributed_plan.total_allgather_bytes)
+                    if distributed_plan is not None
+                    else 0
+                ),
                 wall_s=wall_s,
             )
+            standardized_payload = profiling.standardize_event_payload(execute_payload)
+            self._last_execution_profile = dict(standardized_payload)
+            record_payload = dict(standardized_payload)
+            record_payload.pop("event", None)
+            profiling.record("contraction_execute", **record_payload)
         except Exception:
             pass
 
@@ -3715,6 +4554,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             result,
             wall_s,
             communication_timings=communication_timings,
+            stream=stream,
+            workspace=workspace,
         )
         return result
 
@@ -3736,6 +4577,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     input_specs=(spec.left, spec.right),
                     output_modes=spec.output_modes,
                 )
+                largest_intermediate_bytes, largest_intermediate_elements = (
+                    self._matmul_plan_largest_intermediate_memory(plan)
+                )
 
                 profiling.record(
                     "contraction_plan",
@@ -3743,6 +4587,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     equation=equation,
                     plan_hash=contraction_plan.plan_hash,
                     lowering=plan.kind,
+                    dtype=self._matmul_plan_output_dtype(plan),
                     operands=[
                         self._profile_tensor_operand(spec.left),
                         self._profile_tensor_operand(spec.right),
@@ -3766,12 +4611,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     write_bytes=sum(desc.estimated_write_bytes for desc in plan.descs),
                     copy_bytes=plan.copy_bytes,
                     workspace_bytes=plan.workspace_bytes,
-                    peak_bytes=sum(desc.estimated_write_bytes for desc in plan.descs) + plan.workspace_bytes,
+                    peak_bytes=(
+                        sum(desc.estimated_write_bytes for desc in plan.descs)
+                        + plan.copy_bytes
+                        + plan.workspace_bytes
+                    ),
+                    largest_intermediate=largest_intermediate_bytes,
+                    largest_intermediate_elements=largest_intermediate_elements,
+                    largest_intermediate_bytes=largest_intermediate_bytes,
                     num_gemm=1 if plan.kind == "gemm" else 0,
                     num_batched_gemm=1 if plan.kind in ("batched_gemm", "strided_batched_gemm") else 0,
                     num_grouped_tasks=0,
                     num_blocks=0,
                     num_shape_buckets=0,
+                    **self._matmul_plan_execution_items(plan),
                     fallback_reason=plan.fallback_reason,
                 )
         except Exception:
@@ -3801,6 +4654,72 @@ class AbstractBackend(SingleProcessDistributedMixin):
             }
         return {"repr": repr(key)}
 
+    @classmethod
+    def _profile_zero_sized_block_skips(cls, plan):
+        left_keys = tuple(getattr(plan, "zero_sized_left_block_keys", ()) or ())
+        right_keys = tuple(getattr(plan, "zero_sized_right_block_keys", ()) or ())
+        return {
+            "num_zero_sized_left_blocks_skipped": len(left_keys),
+            "num_zero_sized_right_blocks_skipped": len(right_keys),
+            "num_zero_sized_blocks_skipped": len(left_keys) + len(right_keys),
+            "zero_sized_left_block_keys": [cls._profile_block_key(key) for key in left_keys],
+            "zero_sized_right_block_keys": [cls._profile_block_key(key) for key in right_keys],
+        }
+
+    @classmethod
+    def _profile_output_block_offsets(cls, output_blocks, output_block_offsets, *, unique=False):
+        if unique:
+            keys = sorted(set(output_blocks), key=lambda key: cls._block_sort_key((key, None)))
+        else:
+            keys = tuple(output_blocks)
+        items = []
+        for key in keys:
+            offset = output_block_offsets.get(key)
+            if offset is None:
+                continue
+            items.append({
+                **cls._profile_block_key(key),
+                "offset": [int(dim) for dim in offset],
+            })
+        return items
+
+    @classmethod
+    def _profile_result_block_shape(cls, key, block):
+        item = {
+            **cls._profile_block_key(key),
+            "shape": tuple(block.shape),
+        }
+        if block.offset is not None:
+            item["offset"] = tuple(int(dim) for dim in block.offset)
+        return item
+
+    def _profile_result_block_layout(self, key, block):
+        from renormalizer.utils import profiling
+
+        array = block.array
+        info = self.array_info(array)
+        item = {
+            **self._profile_block_key(key),
+            "shape": tuple(info.shape),
+            "strides": info.strides,
+            "order": info.order,
+            "contiguous": info.contiguous,
+            "dtype": str(info.dtype),
+            "itemsize": int(info.itemsize),
+            "nbytes": int(info.nbytes),
+            "backend": info.backend_name,
+            "device": str(info.device),
+            "device_kind": getattr(info.device, "kind", None),
+            "device_index": getattr(info.device, "index", None),
+            "location": profiling.array_location(array),
+            "is_host": bool(info.is_host),
+            "is_device": bool(info.is_device),
+            "is_distributed": bool(info.is_distributed),
+        }
+        if block.offset is not None:
+            item["offset"] = tuple(int(dim) for dim in block.offset)
+        return item
+
     @staticmethod
     def _is_zero_sized_block(block):
         shape = tuple(int(dim) for dim in getattr(block, "shape", getattr(block.array, "shape", ())))
@@ -3825,29 +4744,138 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def _bucketed_by_desc_shape(descs):
         buckets = {}
         for index, desc in enumerate(descs):
-            key = (int(desc.m), int(desc.n), int(desc.k))
+            batch_shape = tuple(int(dim) for dim in getattr(desc, "batch_shape", ()) or ())
+            key = (batch_shape, int(desc.m), int(desc.n), int(desc.k)) if batch_shape else (
+                int(desc.m),
+                int(desc.n),
+                int(desc.k),
+            )
             buckets.setdefault(key, []).append(index)
         return {key: tuple(indices) for key, indices in buckets.items()}
 
     @staticmethod
-    def _profile_shape_buckets(bucketed_by_shape):
-        return [
-            {
-                "m": int(shape[0]),
-                "n": int(shape[1]),
-                "k": int(shape[2]),
+    def _shape_bucket_sort_key(item):
+        shape = item[0]
+        if len(shape) == 4 and isinstance(shape[0], tuple):
+            return (1, shape[0], int(shape[1]), int(shape[2]), int(shape[3]))
+        return (0, (), int(shape[0]), int(shape[1]), int(shape[2]))
+
+    @classmethod
+    def _profile_shape_buckets(cls, bucketed_by_shape):
+        items = []
+        for shape, indices in sorted(bucketed_by_shape.items(), key=cls._shape_bucket_sort_key):
+            if len(shape) == 4 and isinstance(shape[0], tuple):
+                batch_shape = tuple(int(dim) for dim in shape[0])
+                m, n, k = shape[1:]
+            else:
+                batch_shape = ()
+                m, n, k = shape[:3]
+            item = {
+                "m": int(m),
+                "n": int(n),
+                "k": int(k),
                 "task_indices": [int(index) for index in indices],
                 "task_count": int(len(indices)),
             }
-            for shape, indices in sorted(bucketed_by_shape.items())
-        ]
+            if batch_shape:
+                item["batch_shape"] = batch_shape
+                batch_count = 1
+                for dim in batch_shape:
+                    batch_count *= int(dim)
+                item["batch_count"] = int(batch_count)
+            items.append(item)
+        return items
+
+    @classmethod
+    def _profile_group_boundaries(cls, bucketed_by_shape):
+        group_sizes = []
+        sorted_indices = []
+        for _shape, indices in sorted(bucketed_by_shape.items(), key=cls._shape_bucket_sort_key):
+            group_indices = [int(index) for index in indices]
+            group_sizes.append(len(group_indices))
+            sorted_indices.extend(group_indices)
+        gsta = [0]
+        for size in group_sizes:
+            gsta.append(gsta[-1] + int(size))
+        return {
+            "group_sizes": group_sizes,
+            "gsta": gsta,
+            "sorted_indices": sorted_indices,
+        }
+
+    @classmethod
+    def _profile_output_contributions(cls, output_blocks, output_block_offsets=None, tasks=None):
+        groups = {}
+        for index, key in enumerate(output_blocks):
+            groups.setdefault(key, []).append(int(index))
+        output_block_offsets = output_block_offsets or {}
+        tasks = tuple(tasks or ())
+
+        contribution_counts = []
+        output_contributions = []
+        reduction_group_count = 0
+        scatter_add_task_count = 0
+        max_contributions = 0
+        for key, indices in sorted(groups.items(), key=cls._block_sort_key):
+            contribution_count = len(indices)
+            max_contributions = max(max_contributions, contribution_count)
+            if contribution_count > 1:
+                reduction_group_count += 1
+                scatter_add_task_count += contribution_count
+            contribution = {
+                **cls._profile_block_key(key),
+                "contribution_count": contribution_count,
+                "task_indices": [int(index) for index in indices],
+            }
+            offset = output_block_offsets.get(key)
+            if offset is not None:
+                contribution["offset"] = [int(dim) for dim in offset]
+            contribution_counts.append(
+                contribution
+            )
+            contribution_detail = dict(contribution)
+            contributions = []
+            total_write_bytes = 0
+            for index in indices:
+                task = tasks[index] if index < len(tasks) else None
+                if task is None:
+                    shape = None
+                    nbytes = 0
+                else:
+                    batch_shape = tuple(int(dim) for dim in getattr(task, "batch_shape", ()) or ())
+                    shape = batch_shape + (int(task.m), int(task.n))
+                    nbytes = int(getattr(task, "estimated_write_bytes", 0) or 0)
+                total_write_bytes += int(nbytes)
+                contributions.append({
+                    "task_index": int(index),
+                    "shape": [int(dim) for dim in shape] if shape is not None else None,
+                    "nbytes": int(nbytes),
+                    "output_offset": [int(dim) for dim in offset] if offset is not None else None,
+                })
+            contribution_detail["total_write_bytes"] = int(total_write_bytes)
+            contribution_detail["contributions"] = contributions
+            output_contributions.append(contribution_detail)
+
+        return {
+            "reduction_mode": "scatter_add" if reduction_group_count else "overwrite",
+            "num_output_reduction_groups": int(reduction_group_count),
+            "num_scatter_add_tasks": int(scatter_add_task_count),
+            "max_output_contributions": int(max_contributions),
+            "output_contribution_counts": contribution_counts,
+            "output_contributions": output_contributions,
+        }
 
     @staticmethod
     def _bucketed_by_task_shape(tasks, *, xp=None):
         buckets = {}
         for index, task in enumerate(tasks):
             key = gemm_task_key(task, xp=xp)
-            shape = (int(key[2]), int(key[3]), int(key[4]))
+            batch_shape = tuple(int(dim) for dim in key[2])
+            shape = (batch_shape, int(key[3]), int(key[4]), int(key[5])) if batch_shape else (
+                int(key[3]),
+                int(key[4]),
+                int(key[5]),
+            )
             buckets.setdefault(shape, []).append(index)
         return {shape: tuple(indices) for shape, indices in buckets.items()}
 
@@ -3868,15 +4896,62 @@ class AbstractBackend(SingleProcessDistributedMixin):
             shape.append(int(size))
         return tuple(shape)
 
+    @staticmethod
+    def _block_offset_map(block):
+        if block.offset is None:
+            return None
+        return {
+            mode: int(offset)
+            for mode, offset in zip(block.modes, block.offset)
+        }
+
+    def _block_contraction_output_offset(self, output_modes, left_block, right_block):
+        left_offsets = self._block_offset_map(left_block)
+        right_offsets = self._block_offset_map(right_block)
+        if left_offsets is None and right_offsets is None:
+            return None
+        output_offset = []
+        for mode in output_modes:
+            candidates = []
+            if left_offsets is not None and mode in left_offsets:
+                candidates.append(left_offsets[mode])
+            if right_offsets is not None and mode in right_offsets:
+                candidates.append(right_offsets[mode])
+            if not candidates:
+                return None
+            if len(candidates) == 2 and candidates[0] != candidates[1]:
+                raise BackendFeatureError(
+                    "block contraction output mode {0!r} has incompatible block offsets {1} and {2}"
+                    .format(mode, candidates[0], candidates[1])
+                )
+            output_offset.append(int(candidates[0]))
+        return tuple(output_offset)
+
     def lower_block_contraction(self, spec):
         descs = []
         output_blocks = []
+        output_block_offsets = {}
+        estimated_copy_bytes = 0
         global_shape = self._block_contraction_global_shape(spec)
-        for left_key, left_block in sorted(spec.left.blocks.items(), key=self._block_sort_key):
-            if self._is_zero_sized_block(left_block):
+        sorted_left_blocks = sorted(spec.left.blocks.items(), key=self._block_sort_key)
+        sorted_right_blocks = sorted(spec.right.blocks.items(), key=self._block_sort_key)
+        zero_sized_left_block_keys = tuple(
+            key
+            for key, block in sorted_left_blocks
+            if self._is_zero_sized_block(block)
+        )
+        zero_sized_right_block_keys = tuple(
+            key
+            for key, block in sorted_right_blocks
+            if self._is_zero_sized_block(block)
+        )
+        zero_sized_left_block_key_set = set(zero_sized_left_block_keys)
+        zero_sized_right_block_key_set = set(zero_sized_right_block_keys)
+        for left_key, left_block in sorted_left_blocks:
+            if left_key in zero_sized_left_block_key_set:
                 continue
-            for right_key, right_block in sorted(spec.right.blocks.items(), key=self._block_sort_key):
-                if self._is_zero_sized_block(right_block):
+            for right_key, right_block in sorted_right_blocks:
+                if right_key in zero_sized_right_block_key_set:
                     continue
                 output_key = spec.qn_rule(left_key, right_key)
                 if output_key is None:
@@ -3886,7 +4961,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     TensorOperand(right_block.array, tuple(right_block.modes), name="right"),
                     output_modes=spec.output_modes,
                 )
-                plan = lower_pair_contraction_to_matmul(pair_spec, self.capabilities)
+                plan = self.lower_pair_contraction_to_matmul(
+                    pair_spec,
+                    record_profile=False,
+                )
                 if plan.kind == "fallback_tensordot":
                     self._handle_plan_fallback(plan)
                 if not plan.descs:
@@ -3894,6 +4972,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 desc = plan.descs[0]
                 descs.append(desc)
                 output_blocks.append(output_key)
+                output_offset = self._block_contraction_output_offset(
+                    spec.output_modes,
+                    left_block,
+                    right_block,
+                )
+                if output_offset is not None:
+                    previous_offset = output_block_offsets.setdefault(output_key, output_offset)
+                    if previous_offset != output_offset:
+                        raise BackendFeatureError(
+                            "duplicate output block keys require matching output offsets"
+                        )
+                estimated_copy_bytes += int(plan.copy_bytes)
 
         repeated_outputs = len(set(output_blocks)) != len(output_blocks)
         if repeated_outputs and not spec.accumulate:
@@ -3909,12 +4999,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
             estimated_read_bytes=sum(int(desc.estimated_read_bytes) for desc in descs),
             estimated_write_bytes=sum(int(desc.estimated_write_bytes) for desc in descs),
             estimated_workspace_bytes=sum(int(desc.estimated_workspace_bytes) for desc in descs),
+            estimated_copy_bytes=estimated_copy_bytes,
             output_modes=tuple(spec.output_modes),
             global_shape=global_shape,
+            output_block_offsets=output_block_offsets,
             block_axis_meta={
                 "left": spec.left.block_axis_meta,
                 "right": spec.right.block_axis_meta,
             },
+            zero_sized_left_block_keys=zero_sized_left_block_keys,
+            zero_sized_right_block_keys=zero_sized_right_block_keys,
             backend=self.name,
         )
         self._record_block_contraction_plan(plan)
@@ -3929,6 +5023,12 @@ class AbstractBackend(SingleProcessDistributedMixin):
             unique_output_keys = [
                 key
                 for key in sorted(set(plan.output_blocks), key=lambda key: self._block_sort_key((key, None)))
+            ]
+            fallback_reason = self._grouped_gemm_fallback_reason(len(plan.tasks))
+            grouped_gemm_policy = self._block_grouped_gemm_plan_policy(fallback_reason)
+            task_operands = [
+                self._profile_matmul_desc_operands(desc, index)
+                for index, desc in enumerate(plan.tasks)
             ]
 
             profiling.record(
@@ -3945,10 +5045,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     [str(getattr(desc.A, "dtype", None)), str(getattr(desc.B, "dtype", None))]
                     for desc in plan.tasks
                 ],
-                task_operands=[
-                    self._profile_matmul_desc_operands(desc, index)
-                    for index, desc in enumerate(plan.tasks)
-                ],
+                operands=task_operands,
+                task_operands=task_operands,
                 task_specs=[
                     self._profile_matmul_desc_spec(desc, index)
                     for index, desc in enumerate(plan.tasks)
@@ -3959,30 +5057,78 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 flops=int(plan.estimated_flops),
                 read_bytes=int(plan.estimated_read_bytes),
                 write_bytes=int(plan.estimated_write_bytes),
-                copy_bytes=0,
+                copy_bytes=int(plan.estimated_copy_bytes),
                 workspace_bytes=int(plan.estimated_workspace_bytes),
-                peak_bytes=int(plan.estimated_write_bytes or 0) + int(plan.estimated_workspace_bytes or 0),
+                peak_bytes=(
+                    int(plan.estimated_write_bytes or 0)
+                    + int(plan.estimated_copy_bytes or 0)
+                    + int(plan.estimated_workspace_bytes or 0)
+                ),
                 num_gemm=0,
                 num_batched_gemm=0,
                 num_grouped_tasks=len(plan.tasks),
                 num_blocks=len(unique_output_keys),
                 num_shape_buckets=len(plan.bucketed_by_shape),
-                fallback_reason=self._grouped_gemm_fallback_reason(),
+                supports_grouped_gemm=bool(self.supports_grouped_gemm),
+                grouped_gemm_policy=grouped_gemm_policy,
+                grouped_gemm_implementation=self._grouped_gemm_implementation_from_policy(
+                    grouped_gemm_policy,
+                    fallback_reason,
+                ),
+                **self._grouped_gemm_execution_items(grouped_gemm_policy, fallback_reason),
+                requires_grouped_gemm_fallback=fallback_reason is not None,
+                fallback_from="grouped_gemm" if fallback_reason is not None else None,
+                fallback_to="bucketed_grouped_gemm" if fallback_reason is not None else None,
+                fallback_reason=fallback_reason,
+                fallback_policy=self.fallback_policy.value if fallback_reason is not None else None,
                 output_modes=[str(mode) for mode in plan.output_modes],
                 global_shape=tuple(plan.global_shape),
                 scatter_add_required=bool(plan.scatter_add_required),
+                **self._profile_output_contributions(
+                    plan.output_blocks,
+                    plan.output_block_offsets,
+                    tasks=plan.tasks,
+                ),
+                **self._profile_zero_sized_block_skips(plan),
+                dense_materialized=False,
+                materialized_dense_bytes=0,
                 output_block_keys=[self._profile_block_key(key) for key in plan.output_blocks],
                 unique_output_block_keys=[self._profile_block_key(key) for key in unique_output_keys],
+                output_block_offsets=self._profile_output_block_offsets(
+                    plan.output_blocks,
+                    plan.output_block_offsets,
+                ),
+                unique_output_block_offsets=self._profile_output_block_offsets(
+                    plan.output_blocks,
+                    plan.output_block_offsets,
+                    unique=True,
+                ),
                 bucket_task_counts=[len(indices) for indices in plan.bucketed_by_shape.values()],
                 shape_buckets=self._profile_shape_buckets(plan.bucketed_by_shape),
+                **self._profile_group_boundaries(plan.bucketed_by_shape),
+                group_keys=self._profile_matmul_desc_group_keys(plan.tasks),
+                group_key_buckets=self._profile_matmul_desc_group_key_buckets(plan.tasks),
             )
         except Exception:
             pass
 
-    def execute_grouped_gemm_plan(self, plan, *, pack_threshold=4, stream=None, workspace=None):
+    def execute_grouped_gemm_plan(
+        self,
+        plan,
+        *,
+        pack_threshold=4,
+        stream=None,
+        workspace=None,
+        policy="auto",
+        fallback_policy=None,
+    ):
         self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
         if len(plan.tasks) != len(plan.output_blocks):
             raise ValueError("GroupedGemmPlan tasks and output_blocks must have the same length")
+        execution_policy, fallback_policy = self._resolve_grouped_gemm_call_policies(
+            policy,
+            fallback_policy,
+        )
         try:
             from renormalizer.utils import profiling
 
@@ -3998,13 +5144,21 @@ class AbstractBackend(SingleProcessDistributedMixin):
         task_groups = {}
         tasks = []
         task_output_keys = []
-        functional_accumulation = self.name == "jax"
+        functional_accumulation = self.name == "jax" or bool(plan.scatter_add_required)
         for desc, output_key in zip(plan.tasks, plan.output_blocks):
             a, b, groups = self._prepare_matmul_desc(desc)
+            output_shape = tuple(int(dim) for dim in getattr(desc, "batch_shape", ()) or ()) + (
+                int(desc.m),
+                int(desc.n),
+            )
             if output_key not in flat_outputs:
                 dtype = getattr(desc, "dtype_output", None) or getattr(a, "dtype", None)
-                flat_outputs[output_key] = self._zeros_backend((desc.m, desc.n), dtype)
+                flat_outputs[output_key] = self._zeros_backend(output_shape, dtype)
                 task_groups[output_key] = groups
+            elif tuple(getattr(flat_outputs[output_key], "shape", ())) != output_shape:
+                raise BackendFeatureError(
+                    "duplicate output block keys require matching contribution shapes"
+                )
             tasks.append(
                 GemmTask(
                     a,
@@ -4022,7 +5176,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
             task_output_keys.append(output_key)
 
         if tasks:
-            results = self.grouped_gemm(tasks, pack_threshold=pack_threshold, stream=stream, workspace=workspace)
+            grouped_gemm_kwargs = {
+                "pack_threshold": pack_threshold,
+                "stream": stream,
+                "workspace": workspace,
+            }
+            if execution_policy != "auto":
+                grouped_gemm_kwargs["policy"] = execution_policy
+            if fallback_policy is not self.fallback_policy:
+                grouped_gemm_kwargs["fallback_policy"] = fallback_policy
+            if should_profile:
+                with profiling.scope(compute_accounting_override=profiling.COMPUTE_ACCOUNTING_INCLUSIVE):
+                    results = self.grouped_gemm(tasks, **grouped_gemm_kwargs)
+            else:
+                results = self.grouped_gemm(tasks, **grouped_gemm_kwargs)
             if functional_accumulation:
                 for output_key, result in zip(task_output_keys, results):
                     flat_outputs[output_key] = flat_outputs[output_key] + result
@@ -4035,6 +5202,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 array=array,
                 modes=tuple(plan.output_modes),
                 shape=tuple(getattr(array, "shape", ())),
+                offset=plan.output_block_offsets.get(output_key),
             )
         result = BlockTensor(
             blocks=blocks,
@@ -4046,76 +5214,141 @@ class AbstractBackend(SingleProcessDistributedMixin):
         if should_profile:
             xp = self.array_namespace or _np
             flop_copy_ratio = 0 if self.supports_grouped_gemm else 10
+            allow_batched = bool(self.supports_grouped_gemm or self.supports_batched_matmul)
+            effective_pack_threshold, effective_flop_copy_ratio, effective_allow_batched = (
+                self._grouped_gemm_execution_policy_controls(
+                    execution_policy,
+                    pack_threshold=pack_threshold,
+                    flop_copy_ratio=flop_copy_ratio,
+                    allow_batched=allow_batched,
+                )
+            )
             stats = grouped_gemm_stats(
                 tasks,
                 xp=xp,
-                pack_threshold=pack_threshold,
-                flop_copy_ratio=flop_copy_ratio,
+                pack_threshold=effective_pack_threshold,
+                flop_copy_ratio=effective_flop_copy_ratio,
+                allow_batched=effective_allow_batched,
             )
             workspace_bytes = max(int(plan.estimated_workspace_bytes), int(stats.workspace_bytes))
-            profiling.record(
-                "contraction_execute",
-                backend=self.name,
-                **profiling.contraction_execute_compute_payload(),
-                equation=None,
-                lowering="block_grouped_gemm",
-                plan_hash=plan.plan_hash,
-                input_shapes=[
+            fallback_reason = self._grouped_gemm_fallback_reason(len(plan.tasks))
+            task_operands = [
+                self._profile_matmul_desc_operands(desc, index)
+                for index, desc in enumerate(plan.tasks)
+            ]
+            output_reduction_executor = (
+                "post_grouped_gemm"
+                if plan.scatter_add_required
+                else ("functional_accumulation" if functional_accumulation else "direct_output")
+            )
+            grouped_gemm_output_write_mode = (
+                "workspace_then_reduce"
+                if plan.scatter_add_required
+                else ("workspace_then_assign" if functional_accumulation else "direct_output")
+            )
+            grouped_gemm_policy = self._grouped_gemm_execution_policy(stats, fallback_reason)
+            execute_payload = {
+                "event": "contraction_execute",
+                "backend": self.name,
+                **profiling.contraction_execute_compute_payload("block_grouped_gemm"),
+                "equation": None,
+                "lowering": "block_grouped_gemm",
+                "plan_hash": plan.plan_hash,
+                "input_shapes": [
                     [tuple(getattr(desc.A, "shape", ())), tuple(getattr(desc.B, "shape", ()))]
                     for desc in plan.tasks
                 ],
-                input_dtypes=[
+                "input_dtypes": [
                     [str(getattr(desc.A, "dtype", None)), str(getattr(desc.B, "dtype", None))]
                     for desc in plan.tasks
                 ],
-                task_operands=[
-                    self._profile_matmul_desc_operands(desc, index)
-                    for index, desc in enumerate(plan.tasks)
-                ],
-                task_specs=[
+                "operands": task_operands,
+                "task_operands": task_operands,
+                "task_specs": [
                     self._profile_matmul_desc_spec(desc, index)
                     for index, desc in enumerate(plan.tasks)
                 ],
-                output_shape=tuple(result.global_shape),
-                dtype=str(getattr(next(iter(result.blocks.values())).array, "dtype", None)) if result.blocks else None,
+                "output_shape": tuple(result.global_shape),
+                "dtype": str(getattr(next(iter(result.blocks.values())).array, "dtype", None)) if result.blocks else None,
                 **self._profile_device_execution(self.current_device()),
-                flops=int(stats.flops),
-                read_bytes=int(stats.read_bytes),
-                write_bytes=int(stats.write_bytes),
-                copy_bytes=int(stats.copy_bytes),
-                workspace_bytes=workspace_bytes,
-                peak_bytes=int(stats.write_bytes) + workspace_bytes,
-                largest_intermediate=max((self._array_nbytes(block.array) for block in result.blocks.values()), default=0),
-                num_gemm=int(stats.loop_task_count),
-                num_batched_gemm=int(stats.batched_bucket_count),
-                num_grouped_tasks=int(stats.task_count),
-                num_blocks=len(result.blocks),
-                num_shape_buckets=int(stats.shape_bucket_count),
-                fallback_reason=self._grouped_gemm_fallback_reason(),
-                output_modes=[str(mode) for mode in plan.output_modes],
-                global_shape=tuple(result.global_shape),
-                scatter_add_required=bool(plan.scatter_add_required),
-                output_block_keys=[self._profile_block_key(key) for key in plan.output_blocks],
-                unique_output_block_keys=[
+                "flops": int(stats.flops),
+                "read_bytes": int(stats.read_bytes),
+                "write_bytes": int(stats.write_bytes),
+                "copy_bytes": int(stats.copy_bytes),
+                "workspace_bytes": workspace_bytes,
+                **self._profile_execution_resources(stream=stream, workspace=workspace),
+                "peak_bytes": int(stats.write_bytes) + int(stats.copy_bytes) + workspace_bytes,
+                "largest_intermediate": max((self._array_nbytes(block.array) for block in result.blocks.values()), default=0),
+                "largest_intermediate_elements": max((self._array_size(block.array) for block in result.blocks.values()), default=0),
+                "largest_intermediate_bytes": max((self._array_nbytes(block.array) for block in result.blocks.values()), default=0),
+                "num_gemm": int(stats.loop_task_count),
+                "num_batched_gemm": int(stats.batched_bucket_count),
+                "num_grouped_tasks": int(stats.task_count),
+                "num_blocks": len(result.blocks),
+                "num_shape_buckets": int(stats.shape_bucket_count),
+                "supports_grouped_gemm": bool(self.supports_grouped_gemm),
+                "requested_policy": execution_policy,
+                "grouped_gemm_policy": grouped_gemm_policy,
+                "grouped_gemm_implementation": self._grouped_gemm_implementation(stats, fallback_reason),
+                **self._grouped_gemm_execution_items(grouped_gemm_policy, fallback_reason),
+                "requires_grouped_gemm_fallback": fallback_reason is not None,
+                "fallback_from": "grouped_gemm" if fallback_reason is not None else None,
+                "fallback_to": self._grouped_gemm_fallback_target(stats, fallback_reason),
+                "fallback_reason": fallback_reason,
+                "fallback_policy": fallback_policy.value if fallback_reason is not None else None,
+                "output_modes": [str(mode) for mode in plan.output_modes],
+                "global_shape": tuple(result.global_shape),
+                "scatter_add_required": bool(plan.scatter_add_required),
+                "output_reduction_executor": output_reduction_executor,
+                "grouped_gemm_output_write_mode": grouped_gemm_output_write_mode,
+                **self._profile_output_contributions(
+                    plan.output_blocks,
+                    plan.output_block_offsets,
+                    tasks=plan.tasks,
+                ),
+                **self._profile_zero_sized_block_skips(plan),
+                "dense_materialized": False,
+                "materialized_dense_bytes": 0,
+                "output_block_keys": [self._profile_block_key(key) for key in plan.output_blocks],
+                "unique_output_block_keys": [
                     self._profile_block_key(key)
                     for key, _block in sorted(result.blocks.items(), key=self._block_sort_key)
                 ],
-                result_block_shapes=[
-                    {
-                        **self._profile_block_key(key),
-                        "shape": tuple(block.shape),
-                    }
+                "output_block_offsets": self._profile_output_block_offsets(
+                    plan.output_blocks,
+                    plan.output_block_offsets,
+                ),
+                "unique_output_block_offsets": self._profile_output_block_offsets(
+                    result.blocks.keys(),
+                    plan.output_block_offsets,
+                    unique=True,
+                ),
+                "result_block_shapes": [
+                    self._profile_result_block_shape(key, block)
                     for key, block in sorted(result.blocks.items(), key=self._block_sort_key)
                 ],
-                bucket_task_counts=stats.bucket_task_counts,
-                shape_buckets=self._profile_shape_buckets(plan.bucketed_by_shape),
-                batched_bucket_count=int(stats.batched_bucket_count),
-                loop_bucket_count=int(stats.loop_bucket_count),
-                batched_task_count=int(stats.batched_task_count),
-                loop_task_count=int(stats.loop_task_count),
-                pack_threshold=pack_threshold,
-                wall_s=time.perf_counter() - started,
-            )
+                "result_block_layouts": [
+                    self._profile_result_block_layout(key, block)
+                    for key, block in sorted(result.blocks.items(), key=self._block_sort_key)
+                ],
+                "bucket_task_counts": stats.bucket_task_counts,
+                "shape_buckets": self._profile_shape_buckets(plan.bucketed_by_shape),
+                **self._profile_group_boundaries(plan.bucketed_by_shape),
+                "group_keys": self._profile_matmul_desc_group_keys(plan.tasks),
+                "group_key_buckets": self._profile_matmul_desc_group_key_buckets(plan.tasks),
+                "batched_bucket_count": int(stats.batched_bucket_count),
+                "loop_bucket_count": int(stats.loop_bucket_count),
+                "batched_task_count": int(stats.batched_task_count),
+                "loop_task_count": int(stats.loop_task_count),
+                "pack_threshold": pack_threshold,
+                "effective_pack_threshold": int(effective_pack_threshold),
+                "effective_allow_batched": bool(effective_allow_batched),
+                "wall_s": time.perf_counter() - started,
+            }
+            self._last_execution_profile = dict(execute_payload)
+            record_payload = dict(execute_payload)
+            record_payload.pop("event", None)
+            profiling.record("contraction_execute", **record_payload)
         return result
 
     def _desc_mode_groups(self, desc):
@@ -4197,7 +5430,16 @@ class AbstractBackend(SingleProcessDistributedMixin):
         return self.asarray(x)
 
     def _validated_packed_mask(self, spec):
-        mask_host = _np.asarray(self.to_numpy(spec.qn_mask) if self.is_array(spec.qn_mask) else spec.qn_mask, dtype=bool)
+        if self.is_array(spec.qn_mask):
+            mask_shape = tuple(int(dim) for dim in getattr(spec.qn_mask, "shape", ()))
+            if mask_shape != tuple(spec.center_shape):
+                raise ValueError(
+                    "qn_mask shape must match center_shape {0}; got {1}"
+                    .format(spec.center_shape, mask_shape)
+                )
+            return self.to_backend(spec.qn_mask, dtype=bool)
+
+        mask_host = _np.asarray(spec.qn_mask, dtype=bool)
         if mask_host.shape != tuple(spec.center_shape):
             raise ValueError(
                 "qn_mask shape must match center_shape {0}; got {1}"
@@ -4246,6 +5488,39 @@ class AbstractBackend(SingleProcessDistributedMixin):
         dtype = getattr(array, "dtype", None)
         itemsize = int(getattr(dtype, "itemsize", 0) or 0)
         return AbstractBackend._prod_shape(getattr(array, "shape", ())) * itemsize
+
+    @staticmethod
+    def _array_size(array):
+        numel = getattr(array, "numel", None)
+        if callable(numel):
+            return int(numel())
+        size = getattr(array, "size", None)
+        if size is not None:
+            if callable(size):
+                try:
+                    return int(size())
+                except (TypeError, ValueError):
+                    pass
+            else:
+                return int(size)
+        return AbstractBackend._prod_shape(getattr(array, "shape", ()))
+
+    @classmethod
+    def _largest_array_memory(cls, arrays):
+        largest_bytes = 0
+        largest_elements = 0
+        for array in arrays:
+            nbytes = cls._array_nbytes(array)
+            if nbytes > largest_bytes:
+                largest_bytes = nbytes
+                largest_elements = cls._array_size(array)
+        return int(largest_bytes), int(largest_elements)
+
+    def _elements_for_nbytes(self, nbytes, reference_array):
+        itemsize = self._operand_itemsize(reference_array)
+        if itemsize <= 0:
+            return 0
+        return int(nbytes or 0) // int(itemsize)
 
     @staticmethod
     def _normalize_batch_axis(batch_axis, ndim):
@@ -4312,9 +5587,21 @@ class AbstractBackend(SingleProcessDistributedMixin):
         current_modes = groups["batch_modes"] + groups["left_only_modes"] + groups["right_only_modes"]
         return self._transpose_modes(result, current_modes, groups["output_modes"])
 
+    def _accumulate_matmul_desc_output(self, desc, result):
+        if desc.C is None:
+            return result
+        if desc.beta != 0.0:
+            result = result + desc.beta * desc.C
+        desc.C[...] = result
+        return desc.C
+
     @staticmethod
     def _is_matmul_desc(value):
         return all(hasattr(value, attr) for attr in ("A", "B", "m", "n", "k"))
+
+    @staticmethod
+    def _is_buffer_matmul_desc(value):
+        return isinstance(value, BufferMatmulDesc)
 
     @staticmethod
     def _desc_to_task(desc):
@@ -4330,24 +5617,638 @@ class AbstractBackend(SingleProcessDistributedMixin):
             beta=desc.beta,
         )
 
-    def _execute_matmul_desc(self, desc, *, stream=None, workspace=None):
+    @staticmethod
+    def _buffer_table_array(buffers, name):
+        try:
+            ref = buffers[str(name)]
+        except KeyError as exc:
+            raise BackendFeatureError("grouped_gemm buffer {0!r} is not present in BufferTable".format(name)) from exc
+        if isinstance(ref, BufferRef):
+            return ref.array
+        return ref
+
+    @staticmethod
+    def _profile_buffer_table(buffers):
+        if buffers is None:
+            return []
+        if hasattr(buffers, "items"):
+            items = buffers.items()
+        else:
+            items = ((name, buffers[name]) for name in buffers)
+        profile = []
+        for name, ref in sorted(items, key=lambda item: str(item[0])):
+            if isinstance(ref, BufferRef):
+                profile.append({
+                    "name": str(ref.name),
+                    "shape": tuple(int(dim) for dim in ref.shape),
+                    "dtype": str(getattr(ref.dtype, "name", ref.dtype)),
+                    "device": str(ref.device),
+                    "nbytes": int(ref.nbytes),
+                })
+            else:
+                array = ref
+                profile.append({
+                    "name": str(name),
+                    "shape": tuple(int(dim) for dim in getattr(array, "shape", ())),
+                    "dtype": str(getattr(array, "dtype", None)),
+                    "device": "unknown",
+                    "nbytes": int(array_nbytes(array)),
+                })
+        return profile
+
+    @staticmethod
+    def _profile_buffer_slice(buffer_slice):
+        if buffer_slice is None:
+            return None
+        return {
+            "buffer": str(buffer_slice.buffer),
+            "offset": int(buffer_slice.offset),
+            "shape": [int(dim) for dim in buffer_slice.shape],
+            "leading_dim": None if buffer_slice.leading_dim is None else int(buffer_slice.leading_dim),
+        }
+
+    @classmethod
+    def _profile_buffer_matmul_desc(cls, desc, index):
+        return {
+            "index": int(index),
+            "A_slice": cls._profile_buffer_slice(desc.A),
+            "B_slice": cls._profile_buffer_slice(desc.B),
+            "C_slice": cls._profile_buffer_slice(desc.C),
+            "trans_a": str(desc.trans_a).upper(),
+            "trans_b": str(desc.trans_b).upper(),
+            "m": int(desc.m),
+            "n": int(desc.n),
+            "k": int(desc.k),
+            "lda": int(desc.lda),
+            "ldb": int(desc.ldb),
+            "ldc": int(desc.ldc),
+            "alpha": cls._profile_scalar(desc.alpha),
+            "beta": cls._profile_scalar(desc.beta),
+            "dtype": str(getattr(desc.dtype, "name", desc.dtype)),
+            "tag": cls._profile_scalar(desc.tag),
+        }
+
+    @classmethod
+    def _profile_buffer_matmul_descs(cls, raw_tasks):
+        return [
+            cls._profile_buffer_matmul_desc(task, index)
+            for index, task in enumerate(raw_tasks)
+            if cls._is_buffer_matmul_desc(task)
+        ]
+
+    @staticmethod
+    def _is_buffer_gemv_desc(value):
+        return isinstance(value, GemvDesc)
+
+    @classmethod
+    def _profile_buffer_gemv_desc(cls, desc, index):
+        return {
+            "index": int(index),
+            "A_slice": cls._profile_buffer_slice(desc.A),
+            "x_slice": cls._profile_buffer_slice(desc.x),
+            "y_slice": cls._profile_buffer_slice(desc.y),
+            "trans_a": str(desc.trans_a).upper(),
+            "conj_a": str(desc.trans_a).upper() == "C",
+            "m": int(desc.m),
+            "n": int(desc.n),
+            "lda": int(desc.lda),
+            "incx": int(desc.incx),
+            "incy": int(desc.incy),
+            "alpha": cls._profile_scalar(desc.alpha),
+            "beta": cls._profile_scalar(desc.beta),
+            "dtype": str(getattr(desc.dtype, "name", desc.dtype)),
+            "tag": cls._profile_scalar(desc.tag),
+        }
+
+    @classmethod
+    def _profile_buffer_gemv_descs(cls, descs):
+        return [
+            cls._profile_buffer_gemv_desc(desc, index)
+            for index, desc in enumerate(descs)
+            if cls._is_buffer_gemv_desc(desc)
+        ]
+
+    def _buffer_slice_view(self, buffer_slice, buffers):
+        xp = self.array_namespace or _np
+        array = self._buffer_table_array(buffers, buffer_slice.buffer)
+        flat = xp.reshape(array, (-1,))
+        shape = tuple(int(dim) for dim in buffer_slice.shape)
+        offset = int(buffer_slice.offset)
+        leading_dim = buffer_slice.leading_dim
+        if offset < 0:
+            raise BackendFeatureError("BufferSlice offset must be non-negative")
+        flat_size = int(getattr(flat, "shape", (0,))[0])
+
+        def validate_range(required_length):
+            required_length = int(required_length)
+            end = offset + required_length
+            if offset > flat_size or end > flat_size:
+                raise BackendFeatureError(
+                    "BufferSlice {0!r} range [{1}, {2}) exceeds buffer size {3}".format(
+                        buffer_slice.buffer,
+                        offset,
+                        end,
+                        flat_size,
+                    )
+                )
+
+        if not shape:
+            validate_range(1)
+            return flat[offset]
+        if leading_dim is None or len(shape) < 2:
+            length = self._prod_shape(shape)
+            validate_range(length)
+            return xp.reshape(flat[offset:offset + length], shape)
+        leading_dim = int(leading_dim)
+        logical_cols = int(shape[-1])
+        if leading_dim < logical_cols:
+            raise BackendFeatureError(
+                "BufferSlice leading_dim {0} is smaller than logical last dimension {1}".format(
+                    leading_dim,
+                    logical_cols,
+                )
+            )
+        if leading_dim == logical_cols:
+            length = self._prod_shape(shape)
+            validate_range(length)
+            return xp.reshape(flat[offset:offset + length], shape)
+        row_count = self._prod_shape(shape[:-1])
+        padded_shape = tuple(shape[:-1]) + (leading_dim,)
+        padded_length = row_count * leading_dim
+        validate_range(padded_length)
+        padded = xp.reshape(flat[offset:offset + padded_length], padded_shape)
+        return padded[..., :logical_cols]
+
+    def _gemv_batch_from_input(self, descs, buffers):
+        if isinstance(descs, GemvBatch):
+            gemv_batch = descs
+            raw_descs = tuple(descs.descs)
+        else:
+            raw_descs = tuple(descs)
+            gemv_batch = GemvBatch.from_descs(raw_descs)
+        if buffers is None and raw_descs:
+            raise BackendFeatureError("gemv_batch BufferSlice descriptors require buffers=")
+        for desc in raw_descs:
+            if not self._is_buffer_gemv_desc(desc):
+                raise BackendFeatureError("gemv_batch expects GemvDesc descriptors")
+        return gemv_batch, raw_descs
+
+    def _buffer_gemv_vector_view(self, vector, *, increment, logical_length, name):
+        xp = self.array_namespace or _np
+        increment = int(increment)
+        logical_length = int(logical_length)
+        if logical_length < 0:
+            raise BackendFeatureError("GemvDesc {0} logical length must be non-negative".format(name))
+        flat = xp.reshape(vector, (-1,))
+        if logical_length == 0:
+            return flat[:0]
+        required = 1 + (logical_length - 1) * increment
+        flat_len = int(getattr(flat, "shape", (0,))[0])
+        if flat_len < required:
+            raise BackendFeatureError(
+                "GemvDesc {0} slice has length {1}, but increment {2} requires {3} elements".format(
+                    name,
+                    flat_len,
+                    increment,
+                    required,
+                )
+            )
+        return flat[:required:increment]
+
+    def _execute_buffer_gemv_desc(self, desc, buffers):
+        xp = self.array_namespace or _np
+        A = self._buffer_slice_view(desc.A, buffers)
+        x_raw = self._buffer_slice_view(desc.x, buffers)
+        y_raw = self._buffer_slice_view(desc.y, buffers)
+        a_shape = tuple(int(dim) for dim in getattr(A, "shape", ()))
+        expected_a = (int(desc.m), int(desc.n))
+        if a_shape != expected_a:
+            raise BackendFeatureError(
+                "GemvDesc dimensions do not match BufferSlice shape: expected A{0}; got A{1}".format(
+                    expected_a,
+                    a_shape,
+                )
+            )
+        trans_a = str(desc.trans_a).upper()
+        if trans_a == "N":
+            x_len = int(desc.n)
+            y_len = int(desc.m)
+            op_a = A
+        else:
+            x_len = int(desc.m)
+            y_len = int(desc.n)
+            op_a = xp.swapaxes(A, -1, -2)
+            if trans_a == "C":
+                op_a = xp.conj(op_a)
+        x = self._buffer_gemv_vector_view(
+            x_raw,
+            increment=desc.incx,
+            logical_length=x_len,
+            name="x",
+        )
+        y = self._buffer_gemv_vector_view(
+            y_raw,
+            increment=desc.incy,
+            logical_length=y_len,
+            name="y",
+        )
+        result = xp.matmul(op_a, x)
+        if desc.alpha != 1.0:
+            result = desc.alpha * result
+        if desc.beta != 0.0:
+            result = result + desc.beta * y
+        y[...] = result
+        return y, A, x_raw, y_raw
+
+    @staticmethod
+    def _gemv_group_key_buckets(gemv_batch):
+        items = []
+        for group_key, sorted_group_indices in gemv_batch.groups.items():
+            item = group_key.to_dict()
+            item["task_indices"] = [
+                int(gemv_batch.sorted_indices[index])
+                for index in sorted_group_indices
+            ]
+            item["task_count"] = int(len(sorted_group_indices))
+            items.append(item)
+        return items
+
+    def gemv_batch(
+        self,
+        descs,
+        *,
+        buffers=None,
+        role=None,
+        stream=None,
+        workspace=None,
+        fallback_policy=None,
+        profile_context=None,
+    ):
+        import time
+
+        self._resolve_fallback_policy(fallback_policy)
+        self._validate_workspace(workspace, required_bytes=0)
+        gemv_batch, _raw_descs = self._gemv_batch_from_input(descs, buffers)
+        buffer_names = sorted(str(name) for name in buffers) if buffers is not None else []
+        buffer_table = self._profile_buffer_table(buffers)
+        gemv_descriptors = self._profile_buffer_gemv_descs(gemv_batch.descs)
+        started = time.perf_counter()
+        results = []
+        read_bytes = 0
+        write_bytes = 0
+        with self._stream_context(stream):
+            for desc in gemv_batch.descs:
+                result, A, x_raw, y_raw = self._execute_buffer_gemv_desc(desc, buffers)
+                results.append(result)
+                read_bytes += int(array_nbytes(A)) + int(array_nbytes(x_raw))
+                if desc.beta != 0.0:
+                    read_bytes += int(array_nbytes(y_raw))
+                write_bytes += int(array_nbytes(result))
+        wall_s = time.perf_counter() - started
+
+        try:
+            from renormalizer.utils import profiling
+
+            output_shape = [tuple(int(dim) for dim in getattr(item, "shape", ())) for item in results]
+            context_payload = dict(profile_context or {})
+            context_payload.pop("event", None)
+            payload = {
+                "event": "gemv_batch_execute",
+                "backend": self.name,
+                **profiling.compute_payload(
+                    profiling.COMPUTE_CLASS_CONTRACTION_PLAN,
+                    "gemv_batch_execute",
+                    profiling.COMPUTE_ROLE_KERNEL,
+                ),
+                "lowering": "gemv",
+                "role": None if role is None else str(role),
+                "descriptor_source": "focus_buffer_slice",
+                "buffer_names": buffer_names,
+                "buffer_table": buffer_table,
+                "gemv_descriptors": gemv_descriptors,
+                **self._profile_device_execution(self.current_device()),
+                **self._profile_execution_resources(stream=stream, workspace=workspace),
+                "num_tasks": int(len(gemv_batch.descs)),
+                "num_groups": int(len(gemv_batch.groups)),
+                "group_sizes": [int(size) for size in gemv_batch.group_sizes],
+                "group_keys": [key.to_dict() for key in gemv_batch.groups],
+                "group_key_buckets": self._gemv_group_key_buckets(gemv_batch),
+                "gsta": [int(index) for index in gemv_batch.gsta],
+                "sorted_indices": [int(index) for index in gemv_batch.sorted_indices],
+                "total_flops": int(gemv_batch.total_flops),
+                "flops": int(gemv_batch.total_flops),
+                "read_bytes": int(read_bytes),
+                "write_bytes": int(write_bytes),
+                "copy_bytes": 0,
+                "workspace_bytes": 0,
+                "peak_bytes": int(write_bytes),
+                "largest_intermediate": max((array_nbytes(item) for item in results), default=0),
+                "largest_intermediate_elements": max((self._array_size(item) for item in results), default=0),
+                "largest_intermediate_bytes": max((array_nbytes(item) for item in results), default=0),
+                "max_m": int(gemv_batch.max_m),
+                "max_n": int(gemv_batch.max_n),
+                "output_shape": output_shape,
+                "output_strides": [profiling.array_strides(item) for item in results],
+                "output_order": [profiling.array_order(item) for item in results],
+                "output_contiguous": [profiling.array_contiguous(item) for item in results],
+                "output_backend": [profiling.array_backend_name(item) for item in results],
+                "output_device_kind": [profiling.array_device_kind(item) for item in results],
+                "output_location": [profiling.array_location(item) for item in results],
+                "output_is_host": [profiling.array_is_host(item) for item in results],
+                "output_is_device": [profiling.array_is_device(item) for item in results],
+                "output_is_distributed": [profiling.array_is_distributed(item) for item in results],
+                "execution_primitives": ["gemv"] if results else [],
+                "execution_policies": ["loop_gemv"] if results else [],
+                "fallback_reasons": [],
+                "fallback_reason": None,
+                "fallback_from": None,
+                "fallback_to": None,
+                "fallback_policy": None,
+                "wall_s": float(wall_s),
+                **context_payload,
+            }
+            payload = profiling.standardize_event_payload(payload)
+            self._last_execution_profile = dict(payload)
+            if profiling.should_record_op():
+                record_payload = dict(payload)
+                record_payload.pop("event", None)
+                profiling.record("gemv_batch_execute", **record_payload)
+        except Exception:
+            self._last_execution_profile = {
+                "event": "gemv_batch_execute",
+                "backend": self.name,
+                "lowering": "gemv",
+                "role": None if role is None else str(role),
+                "num_tasks": int(len(gemv_batch.descs)),
+                "num_groups": int(len(gemv_batch.groups)),
+                "group_sizes": [int(size) for size in gemv_batch.group_sizes],
+                "total_flops": int(gemv_batch.total_flops),
+                "wall_s": float(wall_s),
+            }
+        return results
+
+    def _buffer_matmul_desc_to_task(self, desc, buffers):
+        trans_a = str(desc.trans_a).upper()
+        trans_b = str(desc.trans_b).upper()
+        a = self._buffer_slice_view(desc.A, buffers)
+        b = self._buffer_slice_view(desc.B, buffers)
+        c = self._buffer_slice_view(desc.C, buffers)
+        self._validate_buffer_matmul_desc_shapes(desc, a, b, c)
+        return GemmTask(
+            a,
+            b,
+            C=c,
+            trans_a=trans_a in ("T", "C"),
+            trans_b=trans_b in ("T", "C"),
+            conj_a=trans_a == "C",
+            conj_b=trans_b == "C",
+            alpha=desc.alpha,
+            beta=desc.beta,
+            tag=desc.tag,
+        )
+
+    @staticmethod
+    def _effective_buffer_gemm_shape(array, trans_flag):
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
+        if len(shape) < 2:
+            return shape
+        if str(trans_flag).upper() in ("T", "C"):
+            return shape[:-2] + (shape[-1], shape[-2])
+        return shape
+
+    def _validate_buffer_matmul_desc_shapes(self, desc, a, b, c):
+        a_shape = self._effective_buffer_gemm_shape(a, desc.trans_a)
+        b_shape = self._effective_buffer_gemm_shape(b, desc.trans_b)
+        c_shape = tuple(int(dim) for dim in getattr(c, "shape", ()))
+        expected_a = (int(desc.m), int(desc.k))
+        expected_b = (int(desc.k), int(desc.n))
+        expected_c = (int(desc.m), int(desc.n))
+        if a_shape != expected_a or b_shape != expected_b or c_shape != expected_c:
+            raise BackendFeatureError(
+                "MatmulDesc dimensions do not match BufferSlice shapes: "
+                "expected A{0}, B{1}, C{2}; got A{3}, B{4}, C{5}".format(
+                    expected_a,
+                    expected_b,
+                    expected_c,
+                    a_shape,
+                    b_shape,
+                    c_shape,
+                )
+            )
+
+    @staticmethod
+    def _effective_raw_matmul_shape(array, trans=False):
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
+        if trans and len(shape) >= 2:
+            return shape[:-2] + (shape[-1], shape[-2])
+        return shape
+
+    @classmethod
+    def _raw_matmul_flops(cls, a_shape, output_shape):
+        if len(a_shape) < 2 or len(output_shape) < 2:
+            return 0
+        batch = cls._prod_shape(output_shape[:-2]) if len(output_shape) > 2 else 1
+        return int(2 * batch * int(output_shape[-2]) * int(output_shape[-1]) * int(a_shape[-1]))
+
+    @contextlib.contextmanager
+    def _suppress_primitive_profile(self):
+        depth = int(getattr(self, "_primitive_profile_suppression_depth", 0) or 0)
+        self._primitive_profile_suppression_depth = depth + 1
+        try:
+            yield
+        finally:
+            if depth:
+                self._primitive_profile_suppression_depth = depth
+            else:
+                try:
+                    delattr(self, "_primitive_profile_suppression_depth")
+                except AttributeError:
+                    pass
+
+    def _primitive_profile_suppressed(self):
+        return bool(getattr(self, "_primitive_profile_suppression_depth", 0))
+
+    def _record_raw_matmul_profile(
+        self,
+        lowering,
+        A,
+        B,
+        result,
+        wall_s,
+        *,
+        C=None,
+        trans_a=False,
+        trans_b=False,
+        stream=None,
+        workspace=None,
+        fallback_reason=None,
+        fallback_from=None,
+        fallback_to=None,
+        fallback_policy=None,
+    ):
+        a_shape = self._effective_raw_matmul_shape(A, trans_a)
+        output_shape = tuple(int(dim) for dim in getattr(result, "shape", ()))
+        write_bytes = self._array_nbytes(result)
+        read_bytes = self._array_nbytes(A) + self._array_nbytes(B)
+        if C is not None:
+            read_bytes += self._array_nbytes(C)
+        from renormalizer.utils import profiling
+
+        payload = {
+            "event": "matmul_execute",
+            "backend": self.name,
+            **profiling.compute_payload(
+                profiling.COMPUTE_CLASS_CONTRACTION_PLAN,
+                "matmul_execute",
+                profiling.COMPUTE_ROLE_KERNEL,
+            ),
+            "lowering": str(lowering),
+            "input_shapes": [
+                tuple(int(dim) for dim in getattr(A, "shape", ())),
+                tuple(int(dim) for dim in getattr(B, "shape", ())),
+            ],
+            "input_strides": [
+                profiling.array_strides(A),
+                profiling.array_strides(B),
+            ],
+            "input_orders": [
+                profiling.array_order(A),
+                profiling.array_order(B),
+            ],
+            "input_contiguous": [
+                profiling.array_contiguous(A),
+                profiling.array_contiguous(B),
+            ],
+            "input_dtypes": [
+                str(getattr(A, "dtype", None)),
+                str(getattr(B, "dtype", None)),
+            ],
+            "input_backends": [
+                profiling.array_backend_name(A),
+                profiling.array_backend_name(B),
+            ],
+            "input_device_kinds": [
+                profiling.array_device_kind(A),
+                profiling.array_device_kind(B),
+            ],
+            "input_locations": [
+                profiling.array_location(A),
+                profiling.array_location(B),
+            ],
+            "output_shape": output_shape,
+            "output_strides": profiling.array_strides(result),
+            "output_order": profiling.array_order(result),
+            "output_contiguous": profiling.array_contiguous(result),
+            "output_backend": profiling.array_backend_name(result),
+            "output_device_kind": profiling.array_device_kind(result),
+            "output_location": profiling.array_location(result),
+            "output_is_host": profiling.array_is_host(result),
+            "output_is_device": profiling.array_is_device(result),
+            "output_is_distributed": profiling.array_is_distributed(result),
+            "dtype": str(getattr(result, "dtype", None)),
+            "output_dtype": str(getattr(result, "dtype", None)),
+            **self._profile_device_execution(self.current_device()),
+            **self._profile_execution_resources(stream=stream, workspace=workspace),
+            "flops": self._raw_matmul_flops(a_shape, output_shape),
+            "read_bytes": int(read_bytes),
+            "write_bytes": int(write_bytes),
+            "copy_bytes": 0,
+            "workspace_bytes": 0,
+            "peak_bytes": int(write_bytes),
+            "largest_intermediate": int(write_bytes),
+            "largest_intermediate_elements": self._array_size(result),
+            "largest_intermediate_bytes": int(write_bytes),
+            "num_gemm": 1 if str(lowering) == "gemm" else 0,
+            "num_batched_gemm": 1 if str(lowering) in ("batched_gemm", "strided_batched_gemm") else 0,
+            "num_grouped_tasks": 0,
+            "num_blocks": 0,
+            "num_shape_buckets": 0,
+            "fallback_reason": fallback_reason,
+            "fallback_from": fallback_from,
+            "fallback_to": fallback_to,
+            "fallback_policy": fallback_policy,
+            "wall_s": float(wall_s),
+        }
+        payload = profiling.standardize_event_payload(payload)
+        self._last_execution_profile = dict(payload)
+        if profiling.should_record_op() and not self._primitive_profile_suppressed():
+            record_payload = dict(payload)
+            record_payload.pop("event")
+            profiling.record("matmul_execute", **record_payload)
+
+    def _grouped_gemm_tasks_from_input(self, tasks, buffers):
+        if isinstance(tasks, GemmBatch):
+            raw_tasks = tuple(tasks.descs)
+            source = "focus_buffer_slice" if any(self._is_buffer_matmul_desc(task) for task in raw_tasks) else "gemm_batch"
+        else:
+            raw_tasks = tuple(tasks)
+            source = "focus_buffer_slice" if any(self._is_buffer_matmul_desc(task) for task in raw_tasks) else "gemm_task"
+        if buffers is None and any(self._is_buffer_matmul_desc(task) for task in raw_tasks):
+            raise BackendFeatureError("grouped_gemm BufferSlice descriptors require buffers=")
+        converted = []
+        for task in raw_tasks:
+            if self._is_buffer_matmul_desc(task):
+                converted.append(self._buffer_matmul_desc_to_task(task, buffers))
+            elif self._is_matmul_desc(task):
+                converted.append(self._desc_to_task(task))
+            else:
+                converted.append(task)
+        return converted, source, raw_tasks
+
+    def _handle_direct_primitive_fallback(self, reason, *, fallback_policy=None):
+        fallback_policy = self._resolve_fallback_policy(fallback_policy)
+        if fallback_policy is FallbackPolicy.FORBID:
+            raise BackendFeatureError(reason)
+        if fallback_policy is FallbackPolicy.WARN:
+            import warnings
+
+            warnings.warn(reason, RuntimeWarning, stacklevel=3)
+        return fallback_policy
+
+    def _execute_matmul_desc(self, desc, *, stream=None, workspace=None, fallback_policy=None):
         if desc.batch_shape:
             raise BackendFeatureError("matmul received a batched descriptor; use batched_matmul")
+        if not self.supports_matmul:
+            import time
+
+            reason = "backend lacks matmul"
+            policy = self._handle_direct_primitive_fallback(reason, fallback_policy=fallback_policy)
+            started = time.perf_counter()
+            result = self._tensor_contract_matmul_fallback(desc, stream=stream, workspace=workspace)
+            self._record_raw_matmul_profile(
+                "fallback_tensordot",
+                desc.A,
+                desc.B,
+                result,
+                time.perf_counter() - started,
+                C=desc.C,
+                trans_a=desc.trans_a,
+                trans_b=desc.trans_b,
+                stream=stream,
+                workspace=workspace,
+                fallback_reason=reason,
+                fallback_from="gemm",
+                fallback_to="tensordot",
+                fallback_policy=policy.value,
+            )
+            return result
         a, b, groups = self._prepare_matmul_desc(desc)
         result = self.matmul(
             a,
             b,
-            C=desc.C,
+            C=None,
             trans_a=desc.trans_a,
             trans_b=desc.trans_b,
             conj_a=desc.conj_a,
             conj_b=desc.conj_b,
             alpha=desc.alpha,
-            beta=desc.beta,
+            beta=0.0,
             stream=stream,
             workspace=workspace,
+            fallback_policy=fallback_policy,
         )
-        return self._finalize_matmul_result(result, groups)
+        result = self._finalize_matmul_result(result, groups)
+        return self._accumulate_matmul_desc_output(desc, result)
 
     def matmul(
         self,
@@ -4363,12 +6264,58 @@ class AbstractBackend(SingleProcessDistributedMixin):
         beta=0.0,
         stream=None,
         workspace=None,
+        fallback_policy=None,
     ):
+        self._validate_workspace(workspace, required_bytes=0)
         if B is None and self._is_matmul_desc(A):
-            return self._execute_matmul_desc(A, stream=stream, workspace=workspace)
+            return self._execute_matmul_desc(
+                A,
+                stream=stream,
+                workspace=workspace,
+                fallback_policy=fallback_policy,
+            )
         xp = self.array_namespace or _np
+        import time
+
+        if not self.supports_matmul:
+            reason = "backend lacks matmul"
+            policy = self._handle_direct_primitive_fallback(reason, fallback_policy=fallback_policy)
+            started = time.perf_counter()
+            result = self._raw_tensor_contract_matmul_fallback(
+                A,
+                B,
+                C=C,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                conj_a=conj_a,
+                conj_b=conj_b,
+                alpha=alpha,
+                beta=beta,
+                stream=stream,
+                workspace=workspace,
+            )
+            self._record_raw_matmul_profile(
+                "fallback_tensordot",
+                A,
+                B,
+                result,
+                time.perf_counter() - started,
+                C=C,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                stream=stream,
+                workspace=workspace,
+                fallback_reason=reason,
+                fallback_from="gemm",
+                fallback_to="tensordot",
+                fallback_policy=policy.value,
+            )
+            return result
+
+        self._resolve_fallback_policy(fallback_policy)
+        started = time.perf_counter()
         with self._stream_context(stream):
-            return run_gemm_task(
+            result = run_gemm_task(
                 GemmTask(
                     A,
                     B,
@@ -4382,23 +6329,201 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 ),
                 xp=xp,
             )
+        self._record_raw_matmul_profile(
+            "gemm",
+            A,
+            B,
+            result,
+            time.perf_counter() - started,
+            C=C,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            stream=stream,
+            workspace=workspace,
+        )
+        return result
 
-    def _execute_batched_matmul_desc(self, desc, *, stream=None, workspace=None):
+    def _raw_tensor_contract_matmul_fallback(
+        self,
+        A,
+        B,
+        *,
+        C=None,
+        trans_a=False,
+        trans_b=False,
+        conj_a=False,
+        conj_b=False,
+        alpha=1.0,
+        beta=0.0,
+        stream=None,
+        workspace=None,
+    ):
+        xp = self.array_namespace or _np
+        with self._stream_context(stream):
+            if conj_a:
+                A = xp.conj(A)
+            if conj_b:
+                B = xp.conj(B)
+            if trans_a:
+                A = xp.swapaxes(A, -1, -2)
+            if trans_b:
+                B = xp.swapaxes(B, -1, -2)
+            if len(getattr(A, "shape", ())) > 2 or len(getattr(B, "shape", ())) > 2:
+                batch_ndim = max(
+                    len(getattr(A, "shape", ())) - 2,
+                    len(getattr(B, "shape", ())) - 2,
+                )
+                result = self._execute_einsum(self._compact_matmul_einsum(batch_ndim), (A, B))
+            else:
+                tensordot = getattr(xp, "tensordot", None)
+                if tensordot is None:
+                    result = self._execute_einsum("mk,kn->mn", (A, B))
+                else:
+                    result = tensordot(A, B, axes=([-1], [-2]))
+            if alpha != 1.0:
+                result = alpha * result
+            if C is not None:
+                if beta != 0.0:
+                    result = result + beta * C
+                C[...] = result
+                result = C
+        return result
+
+    def _raw_loop_batched_matmul(
+        self,
+        A,
+        B,
+        *,
+        C=None,
+        trans_a=False,
+        trans_b=False,
+        conj_a=False,
+        conj_b=False,
+        alpha=1.0,
+        beta=0.0,
+        stream=None,
+        workspace=None,
+    ):
+        xp = self.array_namespace or _np
+        with self._stream_context(stream):
+            if conj_a:
+                A = xp.conj(A)
+            if conj_b:
+                B = xp.conj(B)
+            if trans_a:
+                A = xp.swapaxes(A, -1, -2)
+            if trans_b:
+                B = xp.swapaxes(B, -1, -2)
+            a_shape = tuple(getattr(A, "shape", ()))
+            if len(a_shape) <= 2:
+                result = xp.matmul(A, B)
+            else:
+                batch_shape = a_shape[:-2]
+                flat_batch = int(_np.prod(batch_shape, dtype=_np.int64))
+                a_flat = xp.reshape(A, (flat_batch,) + a_shape[-2:])
+                b_shape = tuple(getattr(B, "shape", ()))
+                b_flat = xp.reshape(B, (flat_batch,) + b_shape[-2:])
+                pieces = [xp.matmul(a_flat[index], b_flat[index]) for index in range(flat_batch)]
+                result = xp.stack(pieces, axis=0)
+                result = xp.reshape(result, batch_shape + tuple(getattr(result, "shape", ())[-2:]))
+            if alpha != 1.0:
+                result = alpha * result
+            if C is not None:
+                if beta != 0.0:
+                    result = result + beta * C
+                C[...] = result
+                result = C
+        return result
+
+    def _execute_batched_matmul_desc(self, desc, *, stream=None, workspace=None, fallback_policy=None):
+        if not self.supports_batched_matmul:
+            import time
+
+            reason = "backend lacks batched_matmul for batch shape {0}".format(tuple(desc.batch_shape))
+            policy = self._handle_direct_primitive_fallback(
+                reason,
+                fallback_policy=fallback_policy,
+            )
+            started = time.perf_counter()
+            if not self.supports_matmul:
+                result = self._tensor_contract_matmul_fallback(desc, stream=stream, workspace=workspace)
+                fallback_to = "tensordot"
+            else:
+                result = self._loop_matmul(desc, stream=stream, workspace=workspace)
+                fallback_to = "loop_matmul"
+            self._record_raw_matmul_profile(
+                "fallback_tensordot",
+                desc.A,
+                desc.B,
+                result,
+                time.perf_counter() - started,
+                C=desc.C,
+                trans_a=desc.trans_a,
+                trans_b=desc.trans_b,
+                stream=stream,
+                workspace=workspace,
+                fallback_reason=reason,
+                fallback_from="batched_gemm",
+                fallback_to=fallback_to,
+                fallback_policy=policy.value,
+            )
+            return result
         a, b, groups = self._prepare_matmul_desc(desc)
         result = self.batched_matmul(
             a,
             b,
-            C=desc.C,
+            C=None,
             trans_a=desc.trans_a,
             trans_b=desc.trans_b,
             conj_a=desc.conj_a,
             conj_b=desc.conj_b,
             alpha=desc.alpha,
-            beta=desc.beta,
+            beta=0.0,
             stream=stream,
             workspace=workspace,
+            fallback_policy=fallback_policy,
         )
-        return self._finalize_matmul_result(result, groups)
+        result = self._finalize_matmul_result(result, groups)
+        return self._accumulate_matmul_desc_output(desc, result)
+
+    def _execute_grouped_matmul_descs(
+        self,
+        descs,
+        *,
+        stream=None,
+        workspace=None,
+        pack_threshold=None,
+        fallback_policy=None,
+    ):
+        tasks = []
+        groups_by_desc = []
+        for desc in descs:
+            a, b, groups = self._prepare_matmul_desc(desc)
+            tasks.append(GemmTask(
+                a,
+                b,
+                C=None,
+                trans_a=desc.trans_a,
+                trans_b=desc.trans_b,
+                conj_a=desc.conj_a,
+                conj_b=desc.conj_b,
+                alpha=desc.alpha,
+                beta=0.0,
+            ))
+            groups_by_desc.append((desc, groups))
+        threshold = 4 if pack_threshold is None else int(pack_threshold)
+        packed_results = self.grouped_gemm(
+            tasks,
+            pack_threshold=threshold,
+            stream=stream,
+            workspace=workspace,
+            fallback_policy=fallback_policy,
+        )
+        results = []
+        for packed_result, (desc, groups) in zip(packed_results, groups_by_desc):
+            result = self._finalize_matmul_result(packed_result, groups)
+            results.append(self._accumulate_matmul_desc_output(desc, result))
+        return results
 
     def batched_matmul(
         self,
@@ -4414,10 +6539,79 @@ class AbstractBackend(SingleProcessDistributedMixin):
         beta=0.0,
         stream=None,
         workspace=None,
+        fallback_policy=None,
     ):
+        self._validate_workspace(workspace, required_bytes=0)
         if B is None and self._is_matmul_desc(A):
-            return self._execute_batched_matmul_desc(A, stream=stream, workspace=workspace)
+            return self._execute_batched_matmul_desc(
+                A,
+                stream=stream,
+                workspace=workspace,
+                fallback_policy=fallback_policy,
+            )
         xp = self.array_namespace or _np
+        import time
+
+        raw_a = A
+        raw_b = B
+        if not self.supports_batched_matmul:
+            batch_shape = tuple(int(dim) for dim in getattr(A, "shape", ())[:-2])
+            reason = "backend lacks batched_matmul for batch shape {0}".format(batch_shape)
+            policy = self._handle_direct_primitive_fallback(
+                reason,
+                fallback_policy=fallback_policy,
+            )
+            started = time.perf_counter()
+            if self.supports_matmul:
+                result = self._raw_loop_batched_matmul(
+                    A,
+                    B,
+                    C=C,
+                    trans_a=trans_a,
+                    trans_b=trans_b,
+                    conj_a=conj_a,
+                    conj_b=conj_b,
+                    alpha=alpha,
+                    beta=beta,
+                    stream=stream,
+                    workspace=workspace,
+                )
+                fallback_to = "loop_matmul"
+            else:
+                result = self._raw_tensor_contract_matmul_fallback(
+                    A,
+                    B,
+                    C=C,
+                    trans_a=trans_a,
+                    trans_b=trans_b,
+                    conj_a=conj_a,
+                    conj_b=conj_b,
+                    alpha=alpha,
+                    beta=beta,
+                    stream=stream,
+                    workspace=workspace,
+                )
+                fallback_to = "tensordot"
+            self._record_raw_matmul_profile(
+                "fallback_tensordot",
+                raw_a,
+                raw_b,
+                result,
+                time.perf_counter() - started,
+                C=C,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                stream=stream,
+                workspace=workspace,
+                fallback_reason=reason,
+                fallback_from="batched_gemm",
+                fallback_to=fallback_to,
+                fallback_policy=policy.value,
+            )
+            return result
+
+        self._resolve_fallback_policy(fallback_policy)
+        started = time.perf_counter()
         with self._stream_context(stream):
             if conj_a:
                 A = xp.conj(A)
@@ -4434,8 +6628,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 if beta != 0.0:
                     result = result + beta * C
                 C[...] = result
-                return C
-            return result
+                result = C
+        self._record_raw_matmul_profile(
+            "batched_gemm",
+            raw_a,
+            raw_b,
+            result,
+            time.perf_counter() - started,
+            C=C,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            stream=stream,
+            workspace=workspace,
+        )
+        return result
 
     def _loop_matmul(self, desc, *, stream=None, workspace=None):
         xp = self.array_namespace or _np
@@ -4452,49 +6658,236 @@ class AbstractBackend(SingleProcessDistributedMixin):
             result = xp.matmul(a, b)
             if desc.alpha != 1.0:
                 result = desc.alpha * result
-        return self._finalize_matmul_result(result, groups)
+        result = self._finalize_matmul_result(result, groups)
+        return self._accumulate_matmul_desc_output(desc, result)
 
-    def grouped_gemm(self, tasks, *, pack_threshold=4, stream=None, workspace=None):
+    @staticmethod
+    def _compact_matmul_einsum(batch_ndim):
+        labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        batch_ndim = int(batch_ndim)
+        if batch_ndim + 3 > len(labels):
+            raise BackendFeatureError(
+                "cannot synthesize fallback einsum equation for {0} batch dimensions".format(batch_ndim)
+            )
+        batch = labels[:batch_ndim]
+        m_label = labels[batch_ndim]
+        k_label = labels[batch_ndim + 1]
+        n_label = labels[batch_ndim + 2]
+        return "{0}{1}{2},{0}{2}{3}->{0}{1}{3}".format(batch, m_label, k_label, n_label)
+
+    def _tensor_contract_matmul_fallback(self, desc, *, stream=None, workspace=None):
         xp = self.array_namespace or _np
-        converted = [
-            self._desc_to_task(task) if self._is_matmul_desc(task) else task
-            for task in tasks
-        ]
-        fallback_reason = self._handle_grouped_gemm_fallback()
+        a, b, groups = self._prepare_matmul_desc(desc)
+        with self._stream_context(stream):
+            if desc.conj_a:
+                a = xp.conj(a)
+            if desc.conj_b:
+                b = xp.conj(b)
+            if desc.trans_a:
+                a = xp.swapaxes(a, -1, -2)
+            if desc.trans_b:
+                b = xp.swapaxes(b, -1, -2)
+            if desc.batch_shape:
+                result = self._execute_einsum(self._compact_matmul_einsum(len(desc.batch_shape)), (a, b))
+            else:
+                tensordot = getattr(xp, "tensordot", None)
+                if tensordot is None:
+                    result = self._execute_einsum("mk,kn->mn", (a, b))
+                else:
+                    result = tensordot(a, b, axes=([-1], [-2]))
+            if desc.alpha != 1.0:
+                result = desc.alpha * result
+        result = self._finalize_matmul_result(result, groups)
+        return self._accumulate_matmul_desc_output(desc, result)
+
+    def grouped_gemm(
+        self,
+        tasks,
+        *,
+        buffers=None,
+        pack_threshold=4,
+        stream=None,
+        workspace=None,
+        policy="auto",
+        fallback_policy=None,
+        profile_context=None,
+    ):
+        import time
+
+        self._validate_workspace(workspace, required_bytes=0)
+        xp = self.array_namespace or _np
+        converted, descriptor_source, raw_tasks = self._grouped_gemm_tasks_from_input(tasks, buffers)
+        buffer_names = sorted(str(name) for name in buffers) if buffers is not None else []
+        buffer_table = self._profile_buffer_table(buffers)
+        buffer_slice_descriptors = self._profile_buffer_matmul_descs(raw_tasks)
+        execution_policy, fallback_policy = self._resolve_grouped_gemm_call_policies(
+            policy,
+            fallback_policy,
+        )
+        fallback_reason = self._handle_grouped_gemm_fallback(len(converted), policy=fallback_policy)
         flop_copy_ratio = 0 if self.supports_grouped_gemm else 10
+        allow_batched = bool(self.supports_grouped_gemm or self.supports_batched_matmul)
+        effective_pack_threshold, effective_flop_copy_ratio, effective_allow_batched = (
+            self._grouped_gemm_execution_policy_controls(
+                execution_policy,
+                pack_threshold=pack_threshold,
+                flop_copy_ratio=flop_copy_ratio,
+                allow_batched=allow_batched,
+            )
+        )
         stats = grouped_gemm_stats(
             converted,
             xp=xp,
-            pack_threshold=pack_threshold,
-            flop_copy_ratio=flop_copy_ratio,
+            pack_threshold=effective_pack_threshold,
+            flop_copy_ratio=effective_flop_copy_ratio,
+            allow_batched=effective_allow_batched,
+        )
+        batched_matmul = None
+        if self.supports_batched_matmul:
+            batched_matmul = lambda a, b: self.batched_matmul(
+                a,
+                b,
+                stream=stream,
+                workspace=workspace,
+            )
+        batched_matmul_provider = (
+            self._batched_matmul_provider_name()
+            if batched_matmul is not None
+            else None
         )
         try:
             from renormalizer.utils import profiling
 
             should_profile = profiling.should_record_op()
         except Exception:
+            profiling = None
             should_profile = False
-        if should_profile:
-            import time
 
-            started = time.perf_counter()
-            with self._stream_context(stream):
-                result = grouped_gemm_bucketed(
+        started = time.perf_counter()
+        pointer_setup_started = time.perf_counter()
+        gemm_batch = GemmBatch.from_tasks(converted, xp=xp)
+        pointer_setup_s = time.perf_counter() - pointer_setup_started
+        compute_started = time.perf_counter()
+        with self._stream_context(stream):
+            with self._suppress_primitive_profile():
+                result, bucket_execution_profile = grouped_gemm_bucketed_profiled(
                     converted,
                     xp=xp,
-                    pack_threshold=pack_threshold,
-                    flop_copy_ratio=flop_copy_ratio,
+                    pack_threshold=effective_pack_threshold,
+                    flop_copy_ratio=effective_flop_copy_ratio,
+                    allow_batched=effective_allow_batched,
+                    batched_matmul=batched_matmul,
+                    batched_matmul_provider=batched_matmul_provider,
                 )
-            wall_s = time.perf_counter() - started
-            try:
-                from renormalizer.utils import profiling
+        compute_s = time.perf_counter() - compute_started
+        wall_s = time.perf_counter() - started
+        grouped_gemm_policy = self._grouped_gemm_execution_policy(stats, fallback_reason)
+        context_payload = dict(profile_context or {})
+        context_payload.pop("event", None)
+        if profiling is not None:
+            output_shape = [tuple(getattr(item, "shape", ())) for item in result]
+            output_strides = [profiling.array_strides(item) for item in result]
+            output_order = [profiling.array_order(item) for item in result]
+            output_contiguous = [profiling.array_contiguous(item) for item in result]
+            output_backend = [profiling.array_backend_name(item) for item in result]
+            output_device_kind = [profiling.array_device_kind(item) for item in result]
+            output_location = [profiling.array_location(item) for item in result]
+            output_is_host = [profiling.array_is_host(item) for item in result]
+            output_is_device = [profiling.array_is_device(item) for item in result]
+            output_is_distributed = [profiling.array_is_distributed(item) for item in result]
+        else:
+            output_shape = [tuple(getattr(item, "shape", ())) for item in result]
+            output_strides = None
+            output_order = None
+            output_contiguous = None
+            output_backend = None
+            output_device_kind = None
+            output_location = None
+            output_is_host = None
+            output_is_device = None
+            output_is_distributed = None
 
+        execute_payload = {
+            "event": "grouped_gemm_execute",
+            "backend": self.name,
+            **self._profile_device_execution(self.current_device()),
+            **self._profile_execution_resources(stream=stream, workspace=workspace),
+            "descriptor_source": descriptor_source,
+            "buffer_names": buffer_names,
+            "buffer_table": buffer_table,
+            "buffer_slice_descriptors": buffer_slice_descriptors,
+            "requested_policy": execution_policy,
+            "policy": grouped_gemm_policy,
+            "supports_grouped_gemm": bool(self.supports_grouped_gemm),
+            "grouped_gemm_implementation": self._grouped_gemm_implementation(stats, fallback_reason),
+            **self._grouped_gemm_execution_items(grouped_gemm_policy, fallback_reason),
+            "requires_grouped_gemm_fallback": fallback_reason is not None,
+            "num_tasks": len(gemm_batch.descs),
+            "num_groups": len(gemm_batch.groups),
+            "group_sizes": list(gemm_batch.group_sizes),
+            "group_keys": [key.to_dict() for key in gemm_batch.groups],
+            "group_key_buckets": self._grouped_gemm_execute_group_key_buckets(gemm_batch),
+            "group_descriptors": self._grouped_gemm_group_descriptors(
+                gemm_batch,
+                bucket_execution_profile.bucket_execution_profiles,
+            ),
+            "shape_buckets": self._grouped_gemm_execute_shape_buckets(gemm_batch, stats),
+            "gsta": list(gemm_batch.gsta),
+            "sorted_indices": list(gemm_batch.sorted_indices),
+            "total_flops": gemm_batch.total_flops,
+            "max_m": gemm_batch.max_m,
+            "max_n": gemm_batch.max_n,
+            "max_k": gemm_batch.max_k,
+            "read_bytes": stats.read_bytes,
+            "write_bytes": stats.write_bytes,
+            "copy_bytes": stats.copy_bytes,
+            "workspace_bytes": stats.workspace_bytes,
+            "output_shape": output_shape,
+            "output_strides": output_strides,
+            "output_order": output_order,
+            "output_contiguous": output_contiguous,
+            "output_backend": output_backend,
+            "output_device_kind": output_device_kind,
+            "output_location": output_location,
+            "output_is_host": output_is_host,
+            "output_is_device": output_is_device,
+            "output_is_distributed": output_is_distributed,
+            "num_batched_gemm": stats.batched_bucket_count,
+            "num_gemm": stats.loop_task_count,
+            "batched_matmul_provider": batched_matmul_provider if stats.batched_bucket_count else None,
+            "pointer_setup_s": pointer_setup_s,
+            "compute_s": compute_s,
+            "wall_s": wall_s,
+            **bucket_execution_profile.to_dict(),
+            "fallback_from": "grouped_gemm" if fallback_reason is not None else None,
+            "fallback_reason": fallback_reason,
+            "fallback_policy": fallback_policy.value if fallback_reason is not None else None,
+            "fallback_to": self._grouped_gemm_fallback_target(stats, fallback_reason),
+            "pack_threshold": pack_threshold,
+            "effective_pack_threshold": int(effective_pack_threshold),
+            "effective_allow_batched": bool(effective_allow_batched),
+            **context_payload,
+        }
+        if profiling is not None:
+            execute_payload = profiling.standardize_event_payload(execute_payload)
+        self._last_execution_profile = dict(execute_payload)
+
+        if should_profile:
+            try:
+                task_operands = [
+                    self._profile_gemm_task_operands(task, index)
+                    for index, task in enumerate(converted)
+                ]
                 profiling.record(
                     "contraction_execute",
                     backend=self.name,
-                    **profiling.contraction_execute_compute_payload(),
+                    **profiling.contraction_execute_compute_payload("grouped_gemm"),
                     equation=None,
                     lowering="grouped_gemm",
+                    descriptor_source=descriptor_source,
+                    buffer_names=buffer_names,
+                    buffer_table=buffer_table,
+                    buffer_slice_descriptors=buffer_slice_descriptors,
                     input_shapes=[
                         [tuple(getattr(task.A, "shape", ())), tuple(getattr(task.B, "shape", ()))]
                         for task in converted
@@ -4503,10 +6896,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
                         [str(getattr(task.A, "dtype", None)), str(getattr(task.B, "dtype", None))]
                         for task in converted
                     ],
-                    task_operands=[
-                        self._profile_gemm_task_operands(task, index)
-                        for index, task in enumerate(converted)
-                    ],
+                    operands=task_operands,
+                    task_operands=task_operands,
                     task_specs=[
                         self._profile_gemm_task_spec(task, index, xp=xp)
                         for index, task in enumerate(converted)
@@ -4514,80 +6905,875 @@ class AbstractBackend(SingleProcessDistributedMixin):
                     output_shape=[tuple(getattr(item, "shape", ())) for item in result],
                     dtype=str(getattr(result[0], "dtype", None)) if result else None,
                     **self._profile_device_execution(self.current_device()),
+                    **self._profile_execution_resources(stream=stream, workspace=workspace),
                     flops=stats.flops,
                     read_bytes=stats.read_bytes,
                     write_bytes=stats.write_bytes,
                     copy_bytes=stats.copy_bytes,
                     workspace_bytes=stats.workspace_bytes,
-                    peak_bytes=stats.write_bytes + stats.workspace_bytes,
+                    peak_bytes=stats.write_bytes + stats.copy_bytes + stats.workspace_bytes,
                     largest_intermediate=max((array_nbytes(item) for item in result), default=0),
+                    largest_intermediate_elements=max((self._array_size(item) for item in result), default=0),
+                    largest_intermediate_bytes=max((array_nbytes(item) for item in result), default=0),
                     num_gemm=stats.loop_task_count,
                     num_batched_gemm=stats.batched_bucket_count,
                     num_grouped_tasks=stats.task_count,
                     num_blocks=stats.task_count,
                     num_shape_buckets=stats.shape_bucket_count,
+                    batched_matmul_provider=(
+                        batched_matmul_provider
+                        if stats.batched_bucket_count
+                        else None
+                    ),
+                    supports_grouped_gemm=bool(self.supports_grouped_gemm),
+                    grouped_gemm_policy=grouped_gemm_policy,
+                    grouped_gemm_implementation=self._grouped_gemm_implementation(stats, fallback_reason),
+                    **self._grouped_gemm_execution_items(grouped_gemm_policy, fallback_reason),
+                    requires_grouped_gemm_fallback=fallback_reason is not None,
+                    fallback_from="grouped_gemm" if fallback_reason is not None else None,
+                    fallback_to=self._grouped_gemm_fallback_target(stats, fallback_reason),
                     fallback_reason=fallback_reason,
+                    fallback_policy=fallback_policy.value if fallback_reason is not None else None,
                     bucket_task_counts=stats.bucket_task_counts,
                     shape_buckets=self._profile_shape_buckets(self._bucketed_by_task_shape(converted, xp=xp)),
+                    group_sizes=list(gemm_batch.group_sizes),
+                    gsta=list(gemm_batch.gsta),
+                    sorted_indices=list(gemm_batch.sorted_indices),
+                    group_keys=[key.to_dict() for key in gemm_batch.groups],
+                    group_key_buckets=self._grouped_gemm_execute_group_key_buckets(gemm_batch),
+                    group_descriptors=self._grouped_gemm_group_descriptors(
+                        gemm_batch,
+                        bucket_execution_profile.bucket_execution_profiles,
+                    ),
                     batched_bucket_count=stats.batched_bucket_count,
                     loop_bucket_count=stats.loop_bucket_count,
                     batched_task_count=stats.batched_task_count,
                     loop_task_count=stats.loop_task_count,
                     pack_threshold=pack_threshold,
+                    requested_policy=execution_policy,
+                    effective_pack_threshold=int(effective_pack_threshold),
+                    effective_allow_batched=bool(effective_allow_batched),
+                    **bucket_execution_profile.to_dict(),
+                    **context_payload,
                     wall_s=wall_s,
                 )
+                record_payload = dict(execute_payload)
+                record_payload.pop("event")
+                profiling.record("grouped_gemm_execute", **record_payload)
             except Exception:
                 pass
-            return result
-        with self._stream_context(stream):
-            return grouped_gemm_bucketed(
-                converted,
-                xp=xp,
+        return result
+
+    def prepack_grouped_gemm(
+        self,
+        tasks,
+        *,
+        buffers=None,
+        pack_threshold=4,
+        stream=None,
+        workspace=None,
+        policy="auto",
+        fallback_policy=None,
+    ):
+        import time
+
+        self._validate_workspace(workspace, required_bytes=0)
+        xp = self.array_namespace or _np
+        converted, descriptor_source, raw_tasks = self._grouped_gemm_tasks_from_input(tasks, buffers)
+        buffer_table = self._profile_buffer_table(buffers)
+        buffer_slice_descriptors = self._profile_buffer_matmul_descs(raw_tasks)
+        execution_policy, fallback_policy = self._resolve_grouped_gemm_call_policies(
+            policy,
+            fallback_policy,
+        )
+        fallback_reason = self._handle_grouped_gemm_fallback(len(converted), policy=fallback_policy)
+        flop_copy_ratio = 0 if self.supports_grouped_gemm else 10
+        allow_batched = bool(self.supports_grouped_gemm or self.supports_batched_matmul)
+        effective_pack_threshold, effective_flop_copy_ratio, effective_allow_batched = (
+            self._grouped_gemm_execution_policy_controls(
+                execution_policy,
                 pack_threshold=pack_threshold,
                 flop_copy_ratio=flop_copy_ratio,
+                allow_batched=allow_batched,
             )
+        )
+        started = time.perf_counter()
+        with self._stream_context(stream):
+            plan = prepack_grouped_gemm_plan(
+                converted,
+                xp=xp,
+                pack_threshold=effective_pack_threshold,
+                flop_copy_ratio=effective_flop_copy_ratio,
+                allow_batched=effective_allow_batched,
+                batched_matmul_provider=self._batched_matmul_provider_name() if effective_allow_batched else None,
+            )
+        wall_s = time.perf_counter() - started
+        task_specs = [
+            self._profile_gemm_task_spec(task, index, xp=xp)
+            for index, task in enumerate(converted)
+        ]
+        task_operands = [
+            self._profile_gemm_task_operands(task, index)
+            for index, task in enumerate(converted)
+        ]
+        gemm_batch = GemmBatch.from_tasks(converted, xp=xp)
+        group_descriptors = self._grouped_gemm_group_descriptors(
+            gemm_batch,
+            plan.profile.get("bucket_execution_profiles", ()),
+        )
+        input_dtypes = [
+            [str(getattr(task.A, "dtype", None)), str(getattr(task.B, "dtype", None))]
+            for task in converted
+        ]
+        output_dtype = None
+        if converted:
+            dtype_values = [
+                getattr(array, "dtype", None)
+                for task in converted
+                for array in (task.A, task.B)
+                if getattr(array, "dtype", None) is not None
+            ]
+            result_type = getattr(xp, "result_type", None)
+            if callable(result_type) and dtype_values:
+                try:
+                    output_dtype = str(result_type(*dtype_values))
+                except Exception:
+                    output_dtype = None
+            if output_dtype is None:
+                output_dtype = str(dtype_values[0]) if dtype_values else None
+        profile = dict(plan.profile)
+        grouped_gemm_policy = self._grouped_gemm_execution_policy(plan.stats, fallback_reason)
+        profile.update({
+            "backend": self.name,
+            **self._profile_device_execution(self.current_device()),
+            **self._profile_execution_resources(stream=stream, workspace=workspace),
+            "descriptor_source": descriptor_source,
+            "buffer_names": sorted(str(name) for name in buffers) if buffers is not None else [],
+            "buffer_table": buffer_table,
+            "buffer_slice_descriptors": buffer_slice_descriptors,
+            "input_shapes": [
+                [tuple(getattr(task.A, "shape", ())), tuple(getattr(task.B, "shape", ()))]
+                for task in converted
+            ],
+            "input_dtypes": input_dtypes,
+            "task_operands": task_operands,
+            "task_specs": task_specs,
+            "group_descriptors": group_descriptors,
+            "output_shape": [
+                tuple(spec.get("batch_shape", ())) + (int(spec["m"]), int(spec["n"]))
+                for spec in task_specs
+            ],
+            "dtype": output_dtype,
+            "requested_policy": execution_policy,
+            "policy": grouped_gemm_policy,
+            "supports_grouped_gemm": bool(self.supports_grouped_gemm),
+            "grouped_gemm_implementation": (
+                "backend_prepacked_bucketed_matmul"
+                if fallback_reason is None
+                else "fallback_prepacked_bucketed_matmul"
+            ),
+            "requires_grouped_gemm_fallback": fallback_reason is not None,
+            "fallback_from": "grouped_gemm" if fallback_reason is not None else None,
+            "fallback_to": "prepacked_bucketed_matmul" if fallback_reason is not None else None,
+            "fallback_reason": fallback_reason,
+            "fallback_policy": fallback_policy.value if fallback_reason is not None else None,
+            **self._grouped_gemm_execution_items(
+                "prepacked_bucketed_matmul",
+                fallback_reason,
+            ),
+            "pack_threshold": int(pack_threshold),
+            "effective_pack_threshold": int(effective_pack_threshold),
+            "effective_allow_batched": bool(effective_allow_batched),
+            "wall_s": float(wall_s),
+        })
+        try:
+            from renormalizer.utils import profiling
 
-    def _grouped_gemm_fallback_reason(self):
+            profile = profiling.standardize_event_payload(profile)
+            if profiling.should_record_op():
+                record_payload = dict(profile)
+                record_payload.pop("event", None)
+                profiling.record("grouped_gemm_prepack", **record_payload)
+        except Exception:
+            pass
+        return replace(plan, profile=profile)
+
+    def execute_prepacked_grouped_gemm(self, plan, *, stream=None, workspace=None, fallback_policy=None):
+        import time
+
+        self._validate_workspace(workspace, required_bytes=0)
+        xp = self.array_namespace or _np
+        fallback_policy = self._resolve_fallback_policy(fallback_policy)
+        fallback_reason = self._handle_grouped_gemm_fallback(len(plan.tasks), policy=fallback_policy)
+        batched_matmul = None
+        if self.supports_batched_matmul:
+            batched_matmul = lambda a, b: self.batched_matmul(
+                a,
+                b,
+                stream=stream,
+                workspace=workspace,
+            )
+        batched_matmul_provider = (
+            self._batched_matmul_provider_name()
+            if batched_matmul is not None
+            else None
+        )
+        started = time.perf_counter()
+        pointer_setup_s = 0.0
+        with self._stream_context(stream):
+            with self._suppress_primitive_profile():
+                result, execution_profile = execute_prepacked_grouped_gemm_plan(
+                    plan,
+                    xp=xp,
+                    batched_matmul=batched_matmul,
+                    batched_matmul_provider=batched_matmul_provider,
+                )
+        wall_s = time.perf_counter() - started
+        stats = plan.stats
+        gemm_batch = GemmBatch.from_tasks(plan.tasks, xp=xp)
+        group_descriptors = self._grouped_gemm_group_descriptors(
+            gemm_batch,
+            execution_profile.get("bucket_execution_profiles", ()),
+        )
+        try:
+            from renormalizer.utils import profiling
+
+            output_shape = [tuple(getattr(item, "shape", ())) for item in result]
+            output_strides = [profiling.array_strides(item) for item in result]
+            output_order = [profiling.array_order(item) for item in result]
+            output_contiguous = [profiling.array_contiguous(item) for item in result]
+            output_backend = [profiling.array_backend_name(item) for item in result]
+            output_device_kind = [profiling.array_device_kind(item) for item in result]
+            output_location = [profiling.array_location(item) for item in result]
+            output_is_host = [profiling.array_is_host(item) for item in result]
+            output_is_device = [profiling.array_is_device(item) for item in result]
+            output_is_distributed = [profiling.array_is_distributed(item) for item in result]
+        except Exception:
+            profiling = None
+            output_shape = [tuple(getattr(item, "shape", ())) for item in result]
+            output_strides = None
+            output_order = None
+            output_contiguous = None
+            output_backend = None
+            output_device_kind = None
+            output_location = None
+            output_is_host = None
+            output_is_device = None
+            output_is_distributed = None
+        payload = {
+            "event": "grouped_gemm_execute",
+            "backend": self.name,
+            **self._profile_device_execution(self.current_device()),
+            **self._profile_execution_resources(stream=stream, workspace=workspace),
+            "descriptor_source": plan.profile.get("descriptor_source", "prepacked_gemm_task"),
+            "buffer_names": list(plan.profile.get("buffer_names", [])),
+            "buffer_table": list(plan.profile.get("buffer_table", [])),
+            "buffer_slice_descriptors": list(plan.profile.get("buffer_slice_descriptors", [])),
+            "policy": "prepacked_bucketed_matmul",
+            "supports_grouped_gemm": bool(self.supports_grouped_gemm),
+            "grouped_gemm_implementation": (
+                "backend_prepacked_bucketed_matmul"
+                if fallback_reason is None
+                else "fallback_prepacked_bucketed_matmul"
+            ),
+            **self._grouped_gemm_execution_items(
+                "prepacked_bucketed_matmul",
+                fallback_reason,
+            ),
+            "requires_grouped_gemm_fallback": fallback_reason is not None,
+            "num_tasks": int(stats.task_count),
+            "num_groups": int(stats.shape_bucket_count),
+            "group_sizes": list(stats.bucket_task_counts),
+            "group_descriptors": group_descriptors,
+            "shape_buckets": [
+                {
+                    **dict(bucket),
+                    "batch_shape": [int(dim) for dim in bucket.get("batch_shape", ())],
+                }
+                for bucket in stats.shape_buckets
+            ],
+            "total_flops": int(stats.flops),
+            "read_bytes": int(stats.read_bytes),
+            "write_bytes": int(stats.write_bytes),
+            "copy_bytes": int(stats.copy_bytes),
+            "workspace_bytes": int(stats.workspace_bytes),
+            "output_shape": output_shape,
+            "output_strides": output_strides,
+            "output_order": output_order,
+            "output_contiguous": output_contiguous,
+            "output_backend": output_backend,
+            "output_device_kind": output_device_kind,
+            "output_location": output_location,
+            "output_is_host": output_is_host,
+            "output_is_device": output_is_device,
+            "output_is_distributed": output_is_distributed,
+            "num_batched_gemm": int(stats.batched_bucket_count),
+            "num_gemm": int(stats.loop_task_count),
+            "batched_matmul_provider": batched_matmul_provider if stats.batched_bucket_count else None,
+            "pointer_setup_s": float(pointer_setup_s),
+            "compute_s": float(wall_s),
+            "wall_s": float(wall_s),
+            **execution_profile,
+            "fallback_from": "grouped_gemm" if fallback_reason is not None else None,
+            "fallback_to": "prepacked_bucketed_matmul" if fallback_reason is not None else None,
+            "fallback_reason": fallback_reason,
+            "fallback_policy": fallback_policy.value if fallback_reason is not None else None,
+            "pack_threshold": int(plan.pack_threshold),
+        }
+        try:
+            payload = profiling.standardize_event_payload(payload)
+            self._last_execution_profile = dict(payload)
+            if profiling.should_record_op():
+                contraction_payload = dict(payload)
+                contraction_payload.update(
+                    {
+                        "event": "contraction_execute",
+                        **profiling.contraction_execute_compute_payload("grouped_gemm"),
+                        "lowering": "grouped_gemm",
+                        "input_shapes": list(plan.profile.get("input_shapes", [])),
+                        "input_dtypes": list(plan.profile.get("input_dtypes", [])),
+                        "operands": list(plan.profile.get("task_operands", [])),
+                        "task_operands": list(plan.profile.get("task_operands", [])),
+                        "task_specs": list(plan.profile.get("task_specs", [])),
+                        "dtype": plan.profile.get("dtype"),
+                        "flops": int(stats.flops),
+                        "peak_bytes": (
+                            int(stats.write_bytes)
+                            + int(stats.copy_bytes)
+                            + int(stats.workspace_bytes)
+                        ),
+                        "largest_intermediate": max(
+                            (array_nbytes(item) for item in result),
+                            default=0,
+                        ),
+                        "largest_intermediate_elements": max(
+                            (self._array_size(item) for item in result),
+                            default=0,
+                        ),
+                        "largest_intermediate_bytes": max(
+                            (array_nbytes(item) for item in result),
+                            default=0,
+                        ),
+                        "num_grouped_tasks": int(stats.task_count),
+                        "num_blocks": int(stats.task_count),
+                        "num_shape_buckets": int(stats.shape_bucket_count),
+                        "grouped_gemm_policy": "prepacked_bucketed_matmul",
+                    }
+                )
+                contraction_payload = profiling.standardize_event_payload(contraction_payload)
+                record_payload = dict(contraction_payload)
+                record_payload.pop("event", None)
+                profiling.record("contraction_execute", **record_payload)
+                record_payload = dict(payload)
+                record_payload.pop("event", None)
+                profiling.record("grouped_gemm_execute", **record_payload)
+        except Exception:
+            self._last_execution_profile = dict(payload)
+            pass
+        return result
+
+    def _grouped_gemm_fallback_reason(self, task_count=None):
+        if task_count is not None and int(task_count) == 0:
+            return None
         if self.supports_grouped_gemm:
             return None
-        reason = "native grouped_gemm unavailable; used bucketed fallback"
+        reason = "backend-owned grouped_gemm unavailable; used bucketed fallback"
         return reason
 
-    def _handle_grouped_gemm_fallback(self):
-        reason = self._grouped_gemm_fallback_reason()
+    def _resolve_fallback_policy(self, policy=None):
+        if policy is None:
+            return self.fallback_policy
+        if isinstance(policy, str) and policy.lower() == "auto":
+            return self.fallback_policy
+        return FallbackPolicy.from_value(policy)
+
+    @staticmethod
+    def _fallback_policy_value_set():
+        return {item.value for item in FallbackPolicy}
+
+    def _resolve_grouped_gemm_call_policies(self, policy="auto", fallback_policy=None):
+        if isinstance(policy, FallbackPolicy):
+            if fallback_policy is None:
+                fallback_policy = policy
+            policy = "auto"
+        elif fallback_policy is None and policy is not None:
+            value = str(policy).lower()
+            if value in self._fallback_policy_value_set():
+                fallback_policy = value
+                policy = "auto"
+        return (
+            self._normalize_grouped_gemm_execution_policy(policy),
+            self._resolve_fallback_policy(fallback_policy),
+        )
+
+    @staticmethod
+    def _normalize_grouped_gemm_execution_policy(policy):
+        if policy is None:
+            return "auto"
+        value = str(policy).lower()
+        aliases = {
+            "loop": "bucketed_loop_matmul",
+            "bucketed_loop": "bucketed_loop_matmul",
+            "batched": "bucketed_batched_matmul",
+            "bucketed_batched": "bucketed_batched_matmul",
+            "mixed": "bucketed_mixed_matmul",
+            "bucketed_mixed": "bucketed_mixed_matmul",
+        }
+        value = aliases.get(value, value)
+        allowed = {
+            "auto",
+            "bucketed_loop_matmul",
+            "bucketed_batched_matmul",
+            "bucketed_mixed_matmul",
+        }
+        if value not in allowed:
+            raise BackendFeatureError(
+                "unsupported grouped_gemm execution policy {0!r}".format(policy)
+            )
+        return value
+
+    @staticmethod
+    def _grouped_gemm_execution_policy_controls(
+        policy,
+        *,
+        pack_threshold,
+        flop_copy_ratio,
+        allow_batched,
+    ):
+        if policy == "bucketed_loop_matmul":
+            return int(pack_threshold), int(flop_copy_ratio), False
+        if policy == "bucketed_batched_matmul":
+            return 0, 0, bool(allow_batched)
+        return int(pack_threshold), int(flop_copy_ratio), bool(allow_batched)
+
+    def _handle_grouped_gemm_fallback(self, task_count=None, *, policy=None):
+        policy = self._resolve_fallback_policy(policy)
+        reason = self._grouped_gemm_fallback_reason(task_count)
         if reason is None:
             return None
-        if self.fallback_policy is FallbackPolicy.FORBID:
+        if policy is FallbackPolicy.FORBID:
             raise BackendFeatureError(reason)
-        if self.fallback_policy is FallbackPolicy.WARN:
+        if policy is FallbackPolicy.WARN:
             import warnings
 
             warnings.warn(reason, RuntimeWarning, stacklevel=3)
         return reason
 
-    def _handle_plan_fallback(self, plan):
+    @staticmethod
+    def _grouped_gemm_fallback_target(stats, fallback_reason):
+        if fallback_reason is None:
+            return None
+        if int(getattr(stats, "batched_task_count", 0) or 0) and int(getattr(stats, "loop_task_count", 0) or 0):
+            return "bucketed_mixed_matmul"
+        if int(getattr(stats, "batched_task_count", 0) or 0):
+            return "bucketed_batched_matmul"
+        return "bucketed_loop_matmul"
+
+    @staticmethod
+    def _grouped_gemm_execution_policy(stats, fallback_reason):
+        fallback_target = AbstractBackend._grouped_gemm_fallback_target(stats, fallback_reason)
+        if fallback_target is not None:
+            return fallback_target
+        if not int(getattr(stats, "task_count", 0) or 0):
+            return "empty"
+        if int(getattr(stats, "batched_task_count", 0) or 0) and int(getattr(stats, "loop_task_count", 0) or 0):
+            return "bucketed_mixed_matmul"
+        if int(getattr(stats, "batched_task_count", 0) or 0):
+            return "bucketed_batched_matmul"
+        return "bucketed_loop_matmul"
+
+    @staticmethod
+    def _grouped_gemm_execution_items(policy, fallback_reason):
+        return {
+            "execution_primitives": ["grouped_gemm"],
+            "execution_policies": [str(policy)],
+            "fallback_reasons": [] if fallback_reason is None else [str(fallback_reason)],
+        }
+
+    @staticmethod
+    def _grouped_gemm_execute_shape_buckets(gemm_batch, stats):
+        stats_by_key = {}
+        for bucket in getattr(stats, "shape_buckets", ()):
+            key = (
+                tuple(int(dim) for dim in bucket.get("batch_shape", ())),
+                int(bucket.get("m") or 0),
+                int(bucket.get("n") or 0),
+                int(bucket.get("k") or 0),
+                bool(bucket.get("trans_a")),
+                bool(bucket.get("trans_b")),
+                bool(bucket.get("conj_a")),
+                bool(bucket.get("conj_b")),
+            )
+            stats_by_key[key] = bucket
+
+        items = []
+        for group_key, indices in gemm_batch.groups.items():
+            lookup_key = (
+                tuple(int(dim) for dim in group_key.batch_shape),
+                int(group_key.m),
+                int(group_key.n),
+                int(group_key.k),
+                str(group_key.trans_a).upper() in ("T", "C"),
+                str(group_key.trans_b).upper() in ("T", "C"),
+                bool(group_key.conj_a),
+                bool(group_key.conj_b),
+            )
+            bucket = stats_by_key.get(lookup_key)
+            if bucket is None:
+                item = {
+                    "dtype_a": group_key.dtype,
+                    "dtype_b": group_key.dtype,
+                    "batch_shape": [int(dim) for dim in group_key.batch_shape],
+                    "m": int(group_key.m),
+                    "n": int(group_key.n),
+                    "k": int(group_key.k),
+                    "trans_a": str(group_key.trans_a).upper() in ("T", "C"),
+                    "trans_b": str(group_key.trans_b).upper() in ("T", "C"),
+                    "conj_a": bool(group_key.conj_a),
+                    "conj_b": bool(group_key.conj_b),
+                    "execution": "unknown",
+                    "task_count": int(len(indices)),
+                }
+            else:
+                item = dict(bucket)
+                item["batch_shape"] = [int(dim) for dim in item.get("batch_shape", ())]
+                item["task_count"] = int(len(indices))
+            items.append(item)
+        return items
+
+    @staticmethod
+    def _grouped_gemm_execute_group_key_buckets(gemm_batch):
+        items = []
+        for group_key, sorted_group_indices in gemm_batch.groups.items():
+            item = group_key.to_dict()
+            item["batch_shape"] = [int(dim) for dim in item.get("batch_shape", ())]
+            item["task_indices"] = [
+                int(gemm_batch.sorted_indices[index])
+                for index in sorted_group_indices
+            ]
+            item["task_count"] = int(len(sorted_group_indices))
+            items.append(item)
+        return items
+
+    @staticmethod
+    def _grouped_gemm_profile_key_from_group_key(group_key):
+        return (
+            str(group_key.dtype),
+            tuple(int(dim) for dim in group_key.batch_shape),
+            int(group_key.m),
+            int(group_key.n),
+            int(group_key.k),
+            str(group_key.trans_a).upper() in ("T", "C"),
+            str(group_key.trans_b).upper() in ("T", "C"),
+            bool(group_key.conj_a),
+            bool(group_key.conj_b),
+        )
+
+    @staticmethod
+    def _grouped_gemm_profile_key_from_bucket(bucket):
+        dtype_a = str(bucket.get("dtype_a"))
+        dtype_b = str(bucket.get("dtype_b"))
+        dtype = dtype_a if dtype_a == dtype_b else "{0},{1}".format(dtype_a, dtype_b)
+        return (
+            dtype,
+            tuple(int(dim) for dim in bucket.get("batch_shape", ())),
+            int(bucket.get("m") or 0),
+            int(bucket.get("n") or 0),
+            int(bucket.get("k") or 0),
+            bool(bucket.get("trans_a")),
+            bool(bucket.get("trans_b")),
+            bool(bucket.get("conj_a")),
+            bool(bucket.get("conj_b")),
+        )
+
+    @staticmethod
+    def _array_element_count(array):
+        size = getattr(array, "size", None)
+        if size is not None:
+            try:
+                return int(size)
+            except Exception:
+                pass
+        numel = getattr(array, "numel", None)
+        if callable(numel):
+            return int(numel())
+        count = 1
+        for dim in getattr(array, "shape", ()):
+            count *= int(dim)
+        return int(count)
+
+    @classmethod
+    def _array_itemsize_for_profile(cls, array):
+        dtype = getattr(array, "dtype", None)
+        itemsize = getattr(dtype, "itemsize", None)
+        if itemsize is not None:
+            return int(itemsize)
+        element_size = getattr(array, "element_size", None)
+        if callable(element_size):
+            return int(element_size())
+        count = cls._array_element_count(array)
+        return int(array_nbytes(array) // max(count, 1))
+
+    @classmethod
+    def _grouped_gemm_result_itemsize(cls, task):
+        dtypes = [
+            getattr(array, "dtype", None)
+            for array in (task.A, task.B, task.C)
+            if array is not None and getattr(array, "dtype", None) is not None
+        ]
+        if dtypes:
+            try:
+                return int(_np.dtype(_np.result_type(*dtypes)).itemsize)
+            except Exception:
+                pass
+        return max(cls._array_itemsize_for_profile(task.A), cls._array_itemsize_for_profile(task.B))
+
+    @classmethod
+    def _grouped_gemm_group_descriptors(cls, gemm_batch, bucket_execution_profiles=()):
+        profile_by_key = {}
+        for profile in bucket_execution_profiles or ():
+            profile_by_key[cls._grouped_gemm_profile_key_from_bucket(profile)] = profile
+
+        descriptors = []
+        for group_index, (group_key, sorted_group_indices) in enumerate(gemm_batch.groups.items()):
+            task_indices = [
+                int(gemm_batch.sorted_indices[index])
+                for index in sorted_group_indices
+            ]
+            tasks = [gemm_batch.descs[index] for index in sorted_group_indices]
+            batch_count = 1
+            for dim in group_key.batch_shape:
+                batch_count *= int(dim)
+
+            flops = int(len(tasks) * max(batch_count, 1) * 2 * int(group_key.m) * int(group_key.n) * int(group_key.k))
+            read_bytes = int(sum(array_nbytes(task.A) + array_nbytes(task.B) for task in tasks))
+            write_bytes = 0
+            for task in tasks:
+                if task.C is not None:
+                    write_bytes += array_nbytes(task.C)
+                else:
+                    write_bytes += int(max(batch_count, 1) * int(group_key.m) * int(group_key.n) * cls._grouped_gemm_result_itemsize(task))
+
+            profile = profile_by_key.get(cls._grouped_gemm_profile_key_from_group_key(group_key), {})
+            item = group_key.to_dict()
+            item["batch_shape"] = [int(dim) for dim in item.get("batch_shape", ())]
+            item.update({
+                "group_index": int(group_index),
+                "task_indices": task_indices,
+                "task_count": int(len(task_indices)),
+                "execution": str(profile.get("execution", "unknown")),
+                "flops": flops,
+                "read_bytes": read_bytes,
+                "write_bytes": int(write_bytes),
+                "copy_bytes": int(profile.get("pack_bytes", 0) or 0),
+                "pack_strategy": str(profile.get("pack_strategy", "unknown")),
+                "kernel_calls": int(profile.get("kernel_calls", 0) or 0),
+                "batched_matmul_provider": profile.get("batched_matmul_provider"),
+            })
+            descriptors.append(item)
+        return descriptors
+
+    @staticmethod
+    def _grouped_gemm_implementation(stats, fallback_reason):
+        policy = AbstractBackend._grouped_gemm_execution_policy(stats, fallback_reason)
+        return AbstractBackend._grouped_gemm_implementation_from_policy(policy, fallback_reason)
+
+    @staticmethod
+    def _block_grouped_gemm_plan_policy(fallback_reason):
+        return "bucketed_grouped_gemm" if fallback_reason is not None else "backend_grouped_gemm"
+
+    @staticmethod
+    def _grouped_gemm_implementation_from_policy(policy, fallback_reason):
+        if policy == "empty":
+            return "empty"
+        prefix = "fallback" if fallback_reason is not None else "backend"
+        return "{0}_{1}".format(prefix, policy)
+
+    def _batched_matmul_provider_name(self):
+        namespace = self.array_namespace or _np
+        module_name = getattr(namespace, "__name__", None)
+        if not module_name:
+            module_name = type(namespace).__module__
+        return "{0}.matmul".format(module_name)
+
+    def _handle_plan_fallback(self, plan, *, fallback_policy=None):
         if plan.fallback_reason is None:
             return
-        if self.fallback_policy is FallbackPolicy.FORBID:
+        fallback_policy = self._resolve_fallback_policy(fallback_policy)
+        if fallback_policy is FallbackPolicy.FORBID:
             raise BackendFeatureError(plan.fallback_reason)
-        if self.fallback_policy is FallbackPolicy.WARN:
+        if fallback_policy is FallbackPolicy.WARN:
             import warnings
 
             warnings.warn(plan.fallback_reason, RuntimeWarning, stacklevel=3)
 
-    def _execute_plan_impl(self, plan, *, stream=None, workspace=None):
+    @staticmethod
+    def _fallback_source(plan):
+        kind = str(getattr(plan, "kind", ""))
+        if kind == "grouped_gemm" and getattr(plan, "fallback_reason", None):
+            return "grouped_gemm"
+        if not kind.startswith("fallback_"):
+            return None
+        reason = str(getattr(plan, "fallback_reason", "") or getattr(plan, "reason", ""))
+        if "batched_matmul" in reason:
+            return "batched_gemm"
+        if "matmul" in reason:
+            return "gemm"
+        return None
+
+    def _fallback_target(self, plan):
+        kind = str(getattr(plan, "kind", ""))
+        reason = getattr(plan, "fallback_reason", None)
+        if not reason:
+            return None
+        if kind == "grouped_gemm":
+            return "bucketed_grouped_gemm"
+        if kind in ("fallback_tensordot", "fallback_einsum"):
+            if not self.supports_matmul:
+                if any(getattr(desc, "batch_shape", ()) for desc in getattr(plan, "descs", ())):
+                    return "einsum"
+                return "tensordot"
+            return "loop_matmul"
+        return None
+
+    def _primitive_plan_fallback_metadata(self, plan):
+        kind = str(getattr(plan, "kind", ""))
+        descs = tuple(getattr(plan, "descs", ()))
+        desc = descs[0] if descs else None
+        if kind == "gemm" and not self.supports_matmul:
+            return {
+                "lowering": "fallback_tensordot",
+                "fallback_reason": "backend lacks matmul",
+                "fallback_from": "gemm",
+                "fallback_to": "tensordot",
+                "execution_primitive": "tensordot",
+                "execution_policy": "fallback_tensordot",
+            }
+        if kind in ("batched_gemm", "strided_batched_gemm") and not self.supports_batched_matmul:
+            batch_shape = tuple(getattr(desc, "batch_shape", ()) or ()) if desc is not None else ()
+            if not batch_shape and desc is not None:
+                batch_shape = tuple(getattr(desc.A, "shape", ())[:-2])
+            fallback_to = "loop_matmul" if self.supports_matmul else "tensordot"
+            return {
+                "lowering": "fallback_tensordot",
+                "fallback_reason": "backend lacks batched_matmul for batch shape {0}".format(batch_shape),
+                "fallback_from": "batched_gemm",
+                "fallback_to": fallback_to,
+                "execution_primitive": fallback_to,
+                "execution_policy": "fallback_{0}".format(fallback_to),
+            }
+        return None
+
+    @staticmethod
+    def _matmul_plan_execution_primitive(kind):
+        kind = str(kind)
+        if kind == "gemm":
+            return "matmul"
+        if kind in ("batched_gemm", "strided_batched_gemm"):
+            return "batched_matmul"
+        if kind == "grouped_gemm":
+            return "grouped_gemm"
+        if kind == "fallback_tensordot":
+            return "tensordot"
+        if kind == "fallback_einsum":
+            return "einsum"
+        return kind
+
+    @classmethod
+    def _matmul_plan_execution_policy(cls, kind, *, fallback_reason=None, execution_policy=None):
+        if execution_policy is not None:
+            return str(execution_policy)
+        kind = str(kind)
+        if kind in ("fallback_tensordot", "fallback_einsum"):
+            return kind
+        if kind == "grouped_gemm" and fallback_reason is not None:
+            return "bucketed_grouped_gemm"
+        return "backend_{0}".format(cls._matmul_plan_execution_primitive(kind))
+
+    @classmethod
+    def _matmul_plan_execution_items(
+        cls,
+        plan,
+        *,
+        fallback_reason=None,
+        execution_policy=None,
+        execution_primitive=None,
+    ):
+        kind = str(getattr(plan, "kind", ""))
+        reason = fallback_reason
+        if reason is None:
+            reason = getattr(plan, "fallback_reason", None)
+        return {
+            "execution_primitives": [
+                str(execution_primitive)
+                if execution_primitive is not None
+                else cls._matmul_plan_execution_primitive(kind)
+            ],
+            "execution_policies": [
+                cls._matmul_plan_execution_policy(
+                    kind,
+                    fallback_reason=reason,
+                    execution_policy=execution_policy,
+                )
+            ],
+            "fallback_reasons": [] if reason is None else [str(reason)],
+        }
+
+    @classmethod
+    def _matmul_plan_largest_intermediate_memory(cls, plan):
+        if getattr(plan, "kind", None) == "grouped_gemm":
+            candidates = [
+                (
+                    int(desc.estimated_write_bytes),
+                    cls._prod_shape(tuple(desc.batch_shape) + (desc.m, desc.n)),
+                )
+                for desc in tuple(getattr(plan, "descs", ()))
+            ]
+            return max(candidates, default=(0, 0), key=lambda item: item[0])
+        return (
+            sum(int(desc.estimated_write_bytes) for desc in tuple(getattr(plan, "descs", ()))),
+            cls._prod_shape(getattr(plan, "output_shape", ())),
+        )
+
+    def _execute_plan_impl(
+        self,
+        plan,
+        *,
+        stream=None,
+        workspace=None,
+        pack_threshold=None,
+        fallback_policy=None,
+    ):
         if not plan.descs:
             raise ValueError("MatmulPlan has no descriptors to execute")
         if plan.kind == "gemm":
-            return self.matmul(plan.descs[0], stream=stream, workspace=workspace)
+            return self.matmul(
+                plan.descs[0],
+                stream=stream,
+                workspace=workspace,
+                fallback_policy=fallback_policy,
+            )
         if plan.kind in ("batched_gemm", "strided_batched_gemm"):
-            return self.batched_matmul(plan.descs[0], stream=stream, workspace=workspace)
+            return self.batched_matmul(
+                plan.descs[0],
+                stream=stream,
+                workspace=workspace,
+                fallback_policy=fallback_policy,
+            )
         if plan.kind == "grouped_gemm":
-            return self.grouped_gemm(plan.descs, stream=stream, workspace=workspace)
+            return self._execute_grouped_matmul_descs(
+                plan.descs,
+                stream=stream,
+                workspace=workspace,
+                pack_threshold=pack_threshold,
+                fallback_policy=fallback_policy,
+            )
         if plan.kind in ("fallback_tensordot", "fallback_einsum"):
-            self._handle_plan_fallback(plan)
+            self._handle_plan_fallback(plan, fallback_policy=fallback_policy)
             if len(plan.descs) != 1:
                 raise BackendFeatureError("fallback execution expects exactly one descriptor")
+            if not self.supports_matmul:
+                return self._tensor_contract_matmul_fallback(plan.descs[0], stream=stream, workspace=workspace)
             return self._loop_matmul(plan.descs[0], stream=stream, workspace=workspace)
         raise BackendFeatureError("Unknown MatmulPlan kind {0!r}".format(plan.kind))
 
@@ -4600,17 +7786,33 @@ class AbstractBackend(SingleProcessDistributedMixin):
         equation=None,
         input_modes=None,
         output_modes=None,
+        pack_threshold=None,
+        stream=None,
+        workspace=None,
+        fallback_policy=None,
     ):
         try:
             from renormalizer.utils import profiling
 
-            if not profiling.should_record_op():
-                return
+            should_log_profile = bool(profiling.should_record_op())
             descs = tuple(plan.descs)
             desc = descs[0] if descs else None
             grouped = plan.kind == "grouped_gemm"
+            profile_lowering = plan.kind
+            primitive_fallback = None
             if grouped:
-                fallback_reason = plan.fallback_reason or self._grouped_gemm_fallback_reason()
+                grouped_pack_threshold = 4 if pack_threshold is None else int(pack_threshold)
+                xp = self.array_namespace or _np
+                fallback_reason = plan.fallback_reason or self._grouped_gemm_fallback_reason(len(descs))
+                flop_copy_ratio = 0 if self.supports_grouped_gemm else 10
+                allow_batched = bool(self.supports_grouped_gemm or self.supports_batched_matmul)
+                stats = grouped_gemm_stats(
+                    descs,
+                    xp=xp,
+                    pack_threshold=grouped_pack_threshold,
+                    flop_copy_ratio=flop_copy_ratio,
+                    allow_batched=allow_batched,
+                )
                 input_shapes = [
                     [tuple(getattr(item.A, "shape", ())), tuple(getattr(item.B, "shape", ()))]
                     for item in descs
@@ -4630,18 +7832,43 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 if isinstance(result, (tuple, list)):
                     output_shape = [tuple(getattr(item, "shape", ())) for item in result]
                     dtype = str(getattr(result[0], "dtype", None)) if result else None
-                    largest_intermediate = max((array_nbytes(item) for item in result), default=0)
+                    largest_intermediate, largest_intermediate_elements = self._largest_array_memory(result)
                 else:
                     output_shape = tuple(getattr(result, "shape", plan.output_shape))
                     dtype = str(getattr(result, "dtype", None))
-                    largest_intermediate = getattr(result, "nbytes", None)
+                    largest_intermediate = self._array_nbytes(result)
+                    largest_intermediate_elements = self._array_size(result)
                 shape_buckets = self._bucketed_by_desc_shape(descs)
                 num_blocks = len(descs)
                 num_shape_buckets = len(shape_buckets)
                 bucket_task_counts = [len(indices) for _, indices in sorted(shape_buckets.items())]
                 shape_bucket_payload = self._profile_shape_buckets(shape_buckets)
+                group_boundaries = self._profile_group_boundaries(shape_buckets)
+                group_keys = self._profile_matmul_desc_group_keys(descs)
+                group_key_buckets = self._profile_matmul_desc_group_key_buckets(descs)
+                profile_flops = int(stats.flops)
+                profile_read_bytes = int(stats.read_bytes)
+                profile_write_bytes = int(stats.write_bytes)
+                profile_copy_bytes = int(stats.copy_bytes)
+                profile_workspace_bytes = max(int(plan.workspace_bytes), int(stats.workspace_bytes))
+                profile_num_gemm = int(stats.loop_task_count)
+                profile_num_batched_gemm = int(stats.batched_bucket_count)
+                grouped_policy = self._grouped_gemm_execution_policy(stats, fallback_reason)
+                grouped_implementation = self._grouped_gemm_implementation(stats, fallback_reason)
+                grouped_fallback_from = "grouped_gemm" if fallback_reason is not None else None
+                grouped_fallback_to = self._grouped_gemm_fallback_target(stats, fallback_reason)
             else:
-                fallback_reason = plan.fallback_reason
+                primitive_fallback = self._primitive_plan_fallback_metadata(plan)
+                fallback_reason = (
+                    primitive_fallback["fallback_reason"]
+                    if primitive_fallback is not None
+                    else plan.fallback_reason
+                )
+                profile_lowering = (
+                    primitive_fallback["lowering"]
+                    if primitive_fallback is not None
+                    else plan.kind
+                )
                 input_shapes = [
                     tuple(getattr(desc.A, "shape", ())),
                     tuple(getattr(desc.B, "shape", ())),
@@ -4665,45 +7892,169 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 task_specs = None
                 output_shape = tuple(getattr(result, "shape", plan.output_shape))
                 dtype = str(getattr(result, "dtype", None))
-                largest_intermediate = getattr(result, "nbytes", None)
+                largest_intermediate = self._array_nbytes(result)
+                largest_intermediate_elements = self._array_size(result)
                 num_blocks = 0
                 num_shape_buckets = 0
                 bucket_task_counts = None
                 shape_bucket_payload = None
-
-            profiling.record(
-                "contraction_execute",
-                backend=self.name,
-                **profiling.contraction_execute_compute_payload(),
-                equation=equation,
-                lowering=plan.kind,
-                plan_hash=plan_hash or getattr(plan, "plan_hash", ""),
-                input_modes=input_modes,
-                output_modes=output_modes,
-                input_shapes=input_shapes,
-                input_dtypes=input_dtypes,
-                operands=operands,
-                task_specs=task_specs,
-                output_shape=output_shape,
-                dtype=dtype,
-                **self._profile_device_execution(self.current_device()),
-                flops=plan.estimated_flops,
-                read_bytes=sum(desc.estimated_read_bytes for desc in plan.descs),
-                write_bytes=sum(desc.estimated_write_bytes for desc in plan.descs),
-                copy_bytes=plan.copy_bytes,
-                workspace_bytes=plan.workspace_bytes,
-                peak_bytes=sum(desc.estimated_write_bytes for desc in plan.descs) + plan.workspace_bytes,
-                largest_intermediate=largest_intermediate,
-                num_gemm=1 if plan.kind == "gemm" else 0,
-                num_batched_gemm=1 if plan.kind in ("batched_gemm", "strided_batched_gemm") else 0,
-                num_grouped_tasks=len(plan.descs) if plan.kind == "grouped_gemm" else 0,
-                num_blocks=num_blocks,
-                num_shape_buckets=num_shape_buckets,
-                bucket_task_counts=bucket_task_counts,
-                shape_buckets=shape_bucket_payload,
-                fallback_reason=fallback_reason,
-                wall_s=wall_s,
+                group_boundaries = {"group_sizes": None, "gsta": None, "sorted_indices": None}
+                group_keys = None
+                group_key_buckets = None
+                profile_flops = int(plan.estimated_flops)
+                profile_read_bytes = sum(desc.estimated_read_bytes for desc in plan.descs)
+                profile_write_bytes = sum(desc.estimated_write_bytes for desc in plan.descs)
+                profile_copy_bytes = int(plan.copy_bytes)
+                profile_workspace_bytes = int(plan.workspace_bytes)
+                if primitive_fallback is None:
+                    profile_num_gemm = 1 if plan.kind == "gemm" else 0
+                    profile_num_batched_gemm = 1 if plan.kind in ("batched_gemm", "strided_batched_gemm") else 0
+                else:
+                    profile_num_gemm = 0
+                    profile_num_batched_gemm = 0
+                grouped_pack_threshold = None
+                grouped_policy = None
+                grouped_implementation = None
+                grouped_fallback_from = (
+                    primitive_fallback["fallback_from"]
+                    if primitive_fallback is not None
+                    else self._fallback_source(plan)
+                )
+                grouped_fallback_to = (
+                    primitive_fallback["fallback_to"]
+                    if primitive_fallback is not None
+                    else None
+                )
+            pre_ops_profile = self._profile_layout_transforms(plan.pre_ops)
+            post_ops_profile = self._profile_layout_transforms(plan.post_ops)
+            input_layout_transform_copy_bytes = sum(
+                int(transform.copy_bytes) for transform in tuple(plan.pre_ops)
             )
+            output_layout_transform_copy_bytes = sum(
+                int(transform.copy_bytes) for transform in tuple(plan.post_ops)
+            )
+            layout_transform_copy_bytes = (
+                input_layout_transform_copy_bytes + output_layout_transform_copy_bytes
+            )
+            if isinstance(result, (tuple, list)):
+                output_strides = [profiling.array_strides(item) for item in result]
+                output_order = [profiling.array_order(item) for item in result]
+                output_contiguous = [profiling.array_contiguous(item) for item in result]
+                output_backend = [profiling.array_backend_name(item) for item in result]
+                output_device_kind = [profiling.array_device_kind(item) for item in result]
+                output_location = [profiling.array_location(item) for item in result]
+                output_is_host = [profiling.array_is_host(item) for item in result]
+                output_is_device = [profiling.array_is_device(item) for item in result]
+                output_is_distributed = [profiling.array_is_distributed(item) for item in result]
+            else:
+                output_strides = profiling.array_strides(result)
+                output_order = profiling.array_order(result)
+                output_contiguous = profiling.array_contiguous(result)
+                output_backend = profiling.array_backend_name(result)
+                output_device_kind = profiling.array_device_kind(result)
+                output_location = profiling.array_location(result)
+                output_is_host = profiling.array_is_host(result)
+                output_is_device = profiling.array_is_device(result)
+                output_is_distributed = profiling.array_is_distributed(result)
+
+            payload = {
+                "event": "contraction_execute",
+                "backend": self.name,
+                **profiling.contraction_execute_compute_payload("grouped_gemm" if grouped else profile_lowering),
+                "equation": equation,
+                "lowering": profile_lowering,
+                "plan_hash": plan_hash or getattr(plan, "plan_hash", ""),
+                "input_modes": input_modes,
+                "output_modes": output_modes,
+                "input_shapes": input_shapes,
+                "input_dtypes": input_dtypes,
+                "operands": operands,
+                "task_specs": task_specs,
+                "pre_ops": pre_ops_profile,
+                "post_ops": post_ops_profile,
+                "num_pre_ops": len(pre_ops_profile),
+                "num_post_ops": len(post_ops_profile),
+                "layout_transform_copy_bytes": layout_transform_copy_bytes,
+                "input_layout_transform_copy_bytes": input_layout_transform_copy_bytes,
+                "output_layout_transform_copy_bytes": output_layout_transform_copy_bytes,
+                "output_shape": output_shape,
+                "output_strides": output_strides,
+                "output_order": output_order,
+                "output_contiguous": output_contiguous,
+                "output_backend": output_backend,
+                "output_device_kind": output_device_kind,
+                "output_location": output_location,
+                "output_is_host": output_is_host,
+                "output_is_device": output_is_device,
+                "output_is_distributed": output_is_distributed,
+                "dtype": dtype,
+                "output_dtype": dtype,
+                **self._profile_device_execution(self.current_device()),
+                **self._profile_execution_resources(stream=stream, workspace=workspace),
+                "flops": profile_flops,
+                "read_bytes": profile_read_bytes,
+                "write_bytes": profile_write_bytes,
+                "copy_bytes": profile_copy_bytes,
+                "workspace_bytes": profile_workspace_bytes,
+                "peak_bytes": (
+                    profile_write_bytes
+                    + profile_copy_bytes
+                    + profile_workspace_bytes
+                ),
+                "largest_intermediate": largest_intermediate,
+                "largest_intermediate_elements": int(largest_intermediate_elements or 0),
+                "largest_intermediate_bytes": int(largest_intermediate or 0),
+                "num_gemm": profile_num_gemm,
+                "num_batched_gemm": profile_num_batched_gemm,
+                "num_grouped_tasks": len(plan.descs) if plan.kind == "grouped_gemm" else 0,
+                "num_blocks": num_blocks,
+                "num_shape_buckets": num_shape_buckets,
+                "bucket_task_counts": bucket_task_counts,
+                "shape_buckets": shape_bucket_payload,
+                **group_boundaries,
+                "group_keys": group_keys,
+                "group_key_buckets": group_key_buckets,
+                "supports_grouped_gemm": bool(self.supports_grouped_gemm) if grouped else None,
+                "grouped_gemm_policy": grouped_policy,
+                "grouped_gemm_implementation": grouped_implementation,
+                "requires_grouped_gemm_fallback": fallback_reason is not None if grouped else None,
+                "batched_bucket_count": profile_num_batched_gemm if grouped else None,
+                "loop_task_count": profile_num_gemm if grouped else None,
+                "pack_threshold": grouped_pack_threshold,
+                **self._matmul_plan_execution_items(
+                    plan,
+                    fallback_reason=fallback_reason,
+                    execution_policy=(
+                        grouped_policy
+                        if grouped
+                        else (
+                            primitive_fallback["execution_policy"]
+                            if primitive_fallback is not None
+                            else None
+                        )
+                    ),
+                    execution_primitive=(
+                        primitive_fallback["execution_primitive"]
+                        if primitive_fallback is not None
+                        else None
+                    ),
+                ),
+                "fallback_reason": fallback_reason,
+                "fallback_from": grouped_fallback_from,
+                "fallback_to": grouped_fallback_to if (grouped or primitive_fallback is not None) else self._fallback_target(plan),
+                "fallback_policy": (
+                    self._resolve_fallback_policy(fallback_policy).value
+                    if fallback_reason is not None
+                    else None
+                ),
+                "wall_s": wall_s,
+            }
+            payload = profiling.standardize_event_payload(payload)
+            self._last_execution_profile = dict(payload)
+            if should_log_profile:
+                record_payload = dict(payload)
+                record_payload.pop("event")
+                profiling.record("contraction_execute", **record_payload)
         except Exception:
             pass
 
@@ -4713,24 +8064,28 @@ class AbstractBackend(SingleProcessDistributedMixin):
         *,
         stream=None,
         workspace=None,
+        pack_threshold=None,
         plan_hash=None,
         record_profile=True,
         equation=None,
         input_modes=None,
         output_modes=None,
+        fallback_policy=None,
     ):
+        fallback_policy = self._resolve_fallback_policy(fallback_policy)
         self._validate_workspace(workspace, required_bytes=self._plan_required_workspace_bytes(plan))
-        try:
-            from renormalizer.utils import profiling
-
-            should_profile = bool(record_profile and profiling.should_record_op())
-        except Exception:
-            should_profile = False
-        if should_profile:
+        if record_profile:
             import time
 
             start = time.perf_counter()
-            result = self._execute_plan_impl(plan, stream=stream, workspace=workspace)
+            with self._suppress_primitive_profile():
+                result = self._execute_plan_impl(
+                    plan,
+                    stream=stream,
+                    workspace=workspace,
+                    pack_threshold=pack_threshold,
+                    fallback_policy=fallback_policy,
+                )
             wall_s = time.perf_counter() - start
             self._record_contraction_execute(
                 plan,
@@ -4740,9 +8095,20 @@ class AbstractBackend(SingleProcessDistributedMixin):
                 equation=equation,
                 input_modes=input_modes,
                 output_modes=output_modes,
+                pack_threshold=pack_threshold,
+                stream=stream,
+                workspace=workspace,
+                fallback_policy=fallback_policy,
             )
             return result
-        return self._execute_plan_impl(plan, stream=stream, workspace=workspace)
+        with self._suppress_primitive_profile():
+            return self._execute_plan_impl(
+                plan,
+                stream=stream,
+                workspace=workspace,
+                pack_threshold=pack_threshold,
+                fallback_policy=fallback_policy,
+            )
 
     def sync(self):
         return None

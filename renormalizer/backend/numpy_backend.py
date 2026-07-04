@@ -30,9 +30,11 @@ class NumpyBackend(AbstractBackend):
         if kwargs.get("copy", True) is None:
             kwargs = dict(kwargs)
             kwargs.pop("copy")
+        kwargs = self._kwargs_with_default_dtype(args, kwargs)
         return np.array(*args, **kwargs)
 
     def asarray(self, *args, **kwargs):
+        kwargs = self._kwargs_with_default_dtype(args, kwargs)
         return np.asarray(*args, **kwargs)
 
     def from_numpy(self, x):
@@ -73,4 +75,6 @@ class NumpyBackend(AbstractBackend):
             return np.asarray(x, dtype=dtype)
         if copy is CopyPolicy.NEVER:
             raise BackendCopyError("to_backend would require creating a NumPy array")
+        if dtype is None:
+            dtype = self._default_dtype_for(x)
         return np.asarray(x, dtype=dtype)

@@ -476,8 +476,9 @@ class TTNS(TTNBase):
                 # here only the site qn (rather than bond qn) is set
                 qn = 0
                 for i in mps_indices:
-                    tensor = np.tensordot(tensor, mps[i].array, axes=1)
+                    tensor = tensordot(tensor, mps[i].array, axes=1)
                     qn += site_qn[i]
+                tensor = asnumpy(tensor)
                 tensor = tensor.reshape([1] * len(node_basis.children) + list(tensor.shape)[1:-1] + [1])
                 node_list_state.append(TreeNodeTensor(tensor, qn))
 

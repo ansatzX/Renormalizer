@@ -1310,7 +1310,7 @@ def test_torch_backend_does_not_patch_global_torch_tensordot(monkeypatch):
     assert backend.array_namespace is FakeTorch
 
 
-def test_torch_matrix_tensordot_promotes_dtype_without_global_patch():
+def test_torch_matrix_tensordot_ir_is_not_implemented_in_np2_cupy_phase():
     try:
         import torch
     except ImportError as exc:
@@ -1319,7 +1319,7 @@ def test_torch_matrix_tensordot_promotes_dtype_without_global_patch():
         pytest.skip("torch is installed but failed to load: {0}".format(exc))
 
     import renormalizer as r
-    from renormalizer.mps.matrix import asnumpy, tensordot
+    from renormalizer.mps.matrix import tensordot
 
     original_tensordot = torch.tensordot
     try:
@@ -1327,16 +1327,10 @@ def test_torch_matrix_tensordot_promotes_dtype_without_global_patch():
         left = torch.arange(6, dtype=torch.float64).reshape(2, 3)
         right = torch.arange(12, dtype=torch.float64).reshape(3, 4).to(torch.complex128)
 
-        result = tensordot(left, right, axes=(-1, 0))
+        with pytest.raises(NotImplementedError, match="only implemented for NumPy and CuPy"):
+            tensordot(left, right, axes=(-1, 0))
 
         assert torch.tensordot is original_tensordot
-        assert result.dtype is torch.complex128
-        expected = np.tensordot(
-            left.numpy(),
-            right.numpy(),
-            axes=([-1], [0]),
-        )
-        assert np.allclose(asnumpy(result), expected)
     finally:
         r.set_backend("numpy", precision=64)
 
@@ -1701,6 +1695,54 @@ def test_matrix_contract_helpers_follow_backend_conversion_boundary():
     assert np.allclose(asnumpy(contracted), np.einsum("abc,cde->abde", left.array, right.array))
 
 
+def test_matrix_tensordot_forwards_stream_and_workspace_to_backend_execute(monkeypatch):
+    from renormalizer.mps import matrix
+
+    calls = []
+    current_backend = matrix.backend.current
+    original_execute = current_backend.execute
+    stream = object()
+    workspace = current_backend.allocate_workspace(64)
+
+    def counting_execute(plan, **kwargs):
+        calls.append((plan, kwargs))
+        return original_execute(plan, **kwargs)
+
+    monkeypatch.setattr(current_backend, "execute", counting_execute)
+    left = np.arange(6.0).reshape(2, 3)
+    right = np.arange(12.0).reshape(3, 4)
+
+    result = matrix.tensordot(
+        left,
+        right,
+        axes=([1], [0]),
+        stream=stream,
+        workspace=workspace,
+    )
+
+    assert np.allclose(matrix.asnumpy(result), left @ right)
+    assert len(calls) == 1
+    assert calls[0][1]["stream"] is stream
+    assert calls[0][1]["workspace"] is workspace
+
+
+def test_matrix_tensordot_does_not_use_raw_backend_tensordot(monkeypatch):
+    from renormalizer.mps import matrix
+
+    current_backend = matrix.backend.current
+
+    def forbidden_tensordot(*_args, **_kwargs):
+        raise AssertionError("matrix.tensordot must lower through backend execution IR")
+
+    monkeypatch.setattr(current_backend, "tensordot", forbidden_tensordot)
+    left = np.arange(24.0).reshape(2, 3, 4)
+    right = np.arange(20.0).reshape(4, 5)
+
+    result = matrix.tensordot(left, right, axes=([2], [0]))
+
+    assert np.allclose(matrix.asnumpy(result), np.tensordot(left, right, axes=([2], [0])))
+
+
 def test_matrix_einsum_uses_backend_contract(monkeypatch):
     from renormalizer.mps import matrix
 
@@ -1785,6 +1827,187 @@ def test_multi_tensor_contract_profiles_parent_trace_for_pair_steps(tmp_path):
     assert len(executes) == 2
     assert all(event["span_id"] == trace["span_id"] for event in executes)
     assert all(event["span_name"] == "multi_tensor_contract" for event in executes)
+
+
+def test_multi_tensor_contract_forwards_stream_and_workspace_to_pair_steps(monkeypatch):
+    from renormalizer.mps import matrix
+
+    calls = []
+    current_backend = matrix.backend.current
+    original_execute = current_backend.execute
+    stream = object()
+    workspace = current_backend.allocate_workspace(128)
+
+    def counting_execute(plan, **kwargs):
+        calls.append((plan, kwargs))
+        return original_execute(plan, **kwargs)
+
+    monkeypatch.setattr(current_backend, "execute", counting_execute)
+    left = np.arange(6.0).reshape(2, 3)
+    middle = np.arange(12.0).reshape(3, 4)
+    right = np.arange(20.0).reshape(4, 5)
+    path = [
+        ([0, 1], "ab,bc->ac"),
+        ([1, 0], "ac,cd->ad"),
+    ]
+
+    contracted = matrix.multi_tensor_contract(
+        path,
+        left,
+        middle,
+        right,
+        stream=stream,
+        workspace=workspace,
+    )
+
+    assert np.allclose(matrix.asnumpy(contracted), left @ middle @ right)
+    assert len(calls) == 2
+    assert all(kwargs["stream"] is stream for _plan, kwargs in calls)
+    assert all(kwargs["workspace"] is workspace for _plan, kwargs in calls)
+
+
+def test_contract_one_site_multi_mpo_routes_through_backend_pair_plans(monkeypatch):
+    from renormalizer import BasisHalfSpin, Model, Mpo, Mps, Op
+    from renormalizer.mps import lib
+    from renormalizer.mps.matrix import asnumpy
+
+    model = Model([BasisHalfSpin(0), BasisHalfSpin(1)], [])
+    mps = Mps.hartree_product_state(model, condition={})
+    mps_conj = mps.conj()
+    mpos = [Mpo(model, Op("X", 0)), Mpo(model, Op("X", 1))]
+    environ = np.ones((1, 1, 1, 1), dtype=float)
+    mos = [mp[0] for mp in mpos]
+    expected = asnumpy(
+        lib.contract_one_site_multi_mpo(
+            environ,
+            mps[0],
+            mos,
+            "L",
+            ms_conj=mps_conj[0],
+        )
+    )
+
+    def forbidden_tensordot(*_args, **_kwargs):
+        raise AssertionError("multi-MPO environment contraction must use backend pair plans")
+
+    monkeypatch.setattr(lib, "tensordot", forbidden_tensordot)
+
+    contracted = lib.contract_one_site_multi_mpo(
+        environ,
+        mps[0],
+        mos,
+        "L",
+        ms_conj=mps_conj[0],
+    )
+
+    assert np.allclose(asnumpy(contracted), expected)
+
+
+def test_projector_uses_backend_tensordot_boundary(monkeypatch):
+    from renormalizer.mps import mps
+
+    original_tensordot = mps.tensordot
+    calls = []
+
+    def counting_tensordot(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_tensordot(*args, **kwargs)
+
+    monkeypatch.setattr(mps, "tensordot", counting_tensordot)
+    ms = np.arange(6.0).reshape(1, 2, 3)
+
+    result = mps.projector(ms, left=True)
+
+    assert len(calls) == 1
+    assert calls[0][1] == {"axes": (-1, -1)}
+    expected_overlap = np.tensordot(ms, ms.conj(), axes=(-1, -1))
+    expected = np.eye(2).reshape(expected_overlap.shape) - expected_overlap
+    assert np.allclose(result, expected)
+
+
+def test_mps_hot_path_does_not_call_xp_tensordot_directly():
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[3]
+    text = (repo / "renormalizer" / "mps" / "mps.py").read_text(encoding="utf-8")
+
+    assert "xp.tensordot" not in text
+
+
+def test_cv_hot_paths_do_not_call_xp_tensordot_directly():
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[3]
+    checked = [
+        repo / "renormalizer" / "cv" / "zerot.py",
+        repo / "renormalizer" / "cv" / "finitet.py",
+    ]
+
+    for path in checked:
+        assert "xp.tensordot" not in path.read_text(encoding="utf-8")
+
+
+def test_mps_todense_uses_backend_tensordot_boundary(monkeypatch):
+    from renormalizer import BasisHalfSpin, Model, Mps
+    from renormalizer.mps import mps
+
+    original_tensordot = mps.tensordot
+    calls = []
+
+    def counting_tensordot(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_tensordot(*args, **kwargs)
+
+    monkeypatch.setattr(mps, "tensordot", counting_tensordot)
+    model = Model([BasisHalfSpin(0), BasisHalfSpin(1)], [])
+    state = Mps.hartree_product_state(model, condition={})
+
+    dense = state.todense()
+
+    assert isinstance(dense, np.ndarray)
+    assert len(calls) == len(state)
+
+
+def test_mps_digest_uses_backend_tensordot_boundary_and_numpy_ptp(monkeypatch):
+    from renormalizer import BasisHalfSpin, Model, Mps
+    from renormalizer.mps import mps
+
+    original_tensordot = mps.tensordot
+    calls = []
+
+    def counting_tensordot(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_tensordot(*args, **kwargs)
+
+    monkeypatch.setattr(mps, "tensordot", counting_tensordot)
+    model = Model([BasisHalfSpin(0), BasisHalfSpin(1)], [])
+    state = Mps.hartree_product_state(model, condition={})
+
+    digest = state.digest
+
+    assert set(digest) == {"var", "mean", "ptp"}
+    assert len(calls) == len(state)
+
+
+def test_mpo_todense_uses_backend_tensordot_boundary(monkeypatch):
+    from renormalizer import BasisHalfSpin, Model, Mpo, Op
+    from renormalizer.mps import mpo
+
+    original_tensordot = mpo.tensordot
+    calls = []
+
+    def counting_tensordot(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_tensordot(*args, **kwargs)
+
+    monkeypatch.setattr(mpo, "tensordot", counting_tensordot)
+    model = Model([BasisHalfSpin(0), BasisHalfSpin(1)], [Op("X", 0)])
+    operator = Mpo(model)
+
+    dense = operator.todense()
+
+    assert isinstance(dense, np.ndarray)
+    assert len(calls) == len(operator)
 
 
 def test_cupy_backend_compute_boundaries_when_available():

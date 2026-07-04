@@ -27,7 +27,7 @@ from renormalizer.mps import Mpo, Mps, StackedMpo
 from renormalizer.mps.lib import Environ, cvec2cmat
 from renormalizer.mps.oe_contract_wrap import oe_contract
 from renormalizer.utils import Quantity, CompressConfig, CompressCriteria, profiling
-from renormalizer.backend import PackedVectorSpec
+from renormalizer.backend import BackendFeatureError, FallbackPolicy, PackedVectorSpec
 
 
 logger = logging.getLogger(__name__)
@@ -502,6 +502,7 @@ def _batched_rhs_path_profile(expr):
             "num_batched_gemm": 1,
             "fallback_reason": None,
             "path_fields": {},
+            "path_source": "batched_rhs_expression",
         }
 
     path_fields = {}
@@ -536,7 +537,173 @@ def _batched_rhs_path_profile(expr):
         "num_batched_gemm": batched_gemm,
         "fallback_reason": fallback_reason,
         "path_fields": path_fields,
+        "path_source": "oe_batched_rhs_expression",
     }
+
+
+def _batched_rhs_execution_items(path_profile):
+    fallback_reason = path_profile["fallback_reason"]
+    path_source = path_profile.get("path_source")
+    if fallback_reason is not None:
+        return {
+            "execution_primitives": ["einsum"],
+            "execution_policies": ["fallback_generic_batched_rhs_expression"],
+            "fallback_reasons": [str(fallback_reason)],
+            "fallback_from": "batched_gemm",
+            "fallback_to": "generic_einsum",
+            "fallback_policy": backend.fallback_policy.value,
+        }
+    if path_source == "oe_batched_rhs_expression" and int(path_profile["num_batched_gemm"]) > 0:
+        return {
+            "execution_primitives": ["batched_matmul"],
+            "execution_policies": ["oe_batched_rhs_expression"],
+            "fallback_reasons": [],
+            "fallback_from": None,
+            "fallback_to": None,
+            "fallback_policy": None,
+        }
+    return {
+        "execution_primitives": ["batched_rhs_expression"],
+        "execution_policies": ["backend_batched_rhs_expression"],
+        "fallback_reasons": [],
+        "fallback_from": None,
+        "fallback_to": None,
+        "fallback_policy": None,
+    }
+
+
+def _handle_batched_rhs_fallback_policy(fallback_reason):
+    if fallback_reason is None:
+        return None
+    reason = str(fallback_reason)
+    if backend.fallback_policy is FallbackPolicy.FORBID:
+        raise BackendFeatureError(reason)
+    if backend.fallback_policy is FallbackPolicy.WARN:
+        import warnings
+
+        warnings.warn(reason, RuntimeWarning, stacklevel=3)
+    return reason
+
+
+def _hmm_execution_profile_fields(expr):
+    plan_hash = getattr(expr, "hmm_plan_hash", None)
+    if plan_hash is None:
+        return {}
+    fields = {
+        "hmm_plan_hash": plan_hash,
+        "hmm_matmul_plan_hashes": list(getattr(expr, "hmm_matmul_plan_hashes", ())),
+        "hmm_step_lowerings": list(getattr(expr, "hmm_step_lowerings", ())),
+        "hmm_num_shape_buckets": int(getattr(expr, "hmm_num_shape_buckets", 0)),
+        "hmm_num_batched_gemm": int(getattr(expr, "hmm_num_batched_gemm", 0)),
+    }
+    for name in (
+        "hmm_flops",
+        "hmm_read_bytes",
+        "hmm_write_bytes",
+        "hmm_copy_bytes",
+        "hmm_workspace_bytes",
+        "hmm_largest_intermediate",
+        "hmm_steps",
+        "hmm_shape_buckets",
+        "hmm_gemv_shape_buckets",
+        "hmm_hx_blocks",
+        "hmm_batches",
+        "hmm_gemv_batches",
+        "hmm_execution_trace",
+        "hmm_num_batches",
+        "hmm_batch_size",
+        "hmm_num_gemv_desc",
+        "hmm_center_kind",
+        "hmm_direct_intermediate",
+        "hmm_largest_intermediate_elements",
+        "hmm_largest_intermediate_bytes",
+    ):
+        if hasattr(expr, name):
+            fields[name] = getattr(expr, name)
+    if hasattr(expr, "hmm_rhs_batch_mode"):
+        fields["hmm_rhs_batch_mode"] = str(getattr(expr, "hmm_rhs_batch_mode"))
+    if hasattr(expr, "hmm_num_rhs"):
+        fields["hmm_num_rhs"] = int(getattr(expr, "hmm_num_rhs", 0))
+    if hasattr(expr, "hmm_num_rhs_loop_calls"):
+        fields["hmm_num_rhs_loop_calls"] = int(getattr(expr, "hmm_num_rhs_loop_calls", 0))
+    fields.update(_hmm_phase_breakdown_fields(expr))
+    return fields
+
+
+def _hmm_phase_breakdown_fields(expr):
+    trace = getattr(expr, "hmm_execution_trace", ()) or ()
+    phase_order = []
+    counts = {}
+    tasks = {}
+    groups = {}
+    flops = {}
+    primitives = {}
+    policies = {}
+    fallback_reasons = {}
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        phase = str(item.get("phase") or "unknown")
+        if phase not in counts:
+            phase_order.append(phase)
+            counts[phase] = 0
+            tasks[phase] = 0
+            groups[phase] = 0
+            flops[phase] = 0
+            default_primitives, default_policies = _default_hmm_phase_execution(phase)
+            primitives[phase] = list(default_primitives)
+            policies[phase] = list(default_policies)
+            fallback_reasons[phase] = []
+        counts[phase] += 1
+        tasks[phase] += int(item.get("num_tasks") or 0)
+        groups[phase] += int(item.get("num_groups") or 0)
+        flops[phase] += int(item.get("total_flops") or 0)
+        _append_unique(primitives[phase], item.get("execution_primitives") or ())
+        _append_unique(policies[phase], item.get("execution_policies") or ())
+        _append_unique(fallback_reasons[phase], item.get("fallback_reasons") or ())
+        if item.get("fallback_reason"):
+            _append_unique(fallback_reasons[phase], (str(item["fallback_reason"]),))
+    if not phase_order:
+        return {}
+    return {
+        "hmm_phase_counts": {phase: int(counts[phase]) for phase in phase_order},
+        "hmm_phase_tasks": {phase: int(tasks[phase]) for phase in phase_order},
+        "hmm_phase_groups": {phase: int(groups[phase]) for phase in phase_order},
+        "hmm_phase_flops": {phase: int(flops[phase]) for phase in phase_order},
+        "hmm_phase_breakdown": [
+            {
+                "phase": phase,
+                "occurrences": int(counts[phase]),
+                "num_tasks": int(tasks[phase]),
+                "num_groups": int(groups[phase]),
+                "flops": int(flops[phase]),
+                "execution_primitives": list(primitives[phase]),
+                "execution_policies": list(policies[phase]),
+                "fallback_reasons": list(fallback_reasons[phase]),
+                "fallback_required": bool(fallback_reasons[phase]),
+            }
+            for phase in phase_order
+        ],
+    }
+
+
+def _append_unique(values, items):
+    for item in items or ():
+        if item not in values:
+            values.append(item)
+
+
+def _default_hmm_phase_execution(phase):
+    if phase in {"inter_gemv", "reduce_gemv"}:
+        return ["gemv"], ["loop_gemv"]
+    return [], []
+
+
+def _cache_backend_execution_profile(payload):
+    try:
+        setattr(backend.current, "_last_execution_profile", profiling.standardize_event_payload(payload))
+    except Exception:
+        pass
 
 
 def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
@@ -551,6 +718,12 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
     )
     packed = asxp(x)
     active_expr = expr if x.ndim == 1 else batched_expr
+    path_profile = None
+    handled_fallback_reason = None
+    if x.ndim == 2:
+        if getattr(active_expr, "path_summary", None):
+            path_profile = _batched_rhs_path_profile(active_expr)
+            handled_fallback_reason = _handle_batched_rhs_fallback_policy(path_profile["fallback_reason"])
     if x.ndim == 1:
         cstruct = backend.unpack_masked_vectors(packed, spec)
         cout = expr(cstruct) * inverse
@@ -566,43 +739,81 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
         cstruct_nbytes = int(getattr(cstruct, "nbytes", 0))
         cout_nbytes = int(getattr(cout, "nbytes", 0))
         path_profile = _batched_rhs_path_profile(active_expr)
+        if path_profile["fallback_reason"] != handled_fallback_reason:
+            _handle_batched_rhs_fallback_policy(path_profile["fallback_reason"])
+        execution_items = _batched_rhs_execution_items(path_profile)
+        buffer_largest_intermediate = max(input_nbytes, output_nbytes, cstruct_nbytes, cout_nbytes)
+        hmm_largest_intermediate_bytes = int(
+            getattr(active_expr, "hmm_largest_intermediate_bytes", 0) or 0
+        )
+        largest_intermediate = max(buffer_largest_intermediate, hmm_largest_intermediate_bytes)
+        dtype = getattr(result, "dtype", None)
+        itemsize = int(getattr(dtype, "itemsize", 0) or 0)
+        buffer_largest_intermediate_elements = (
+            buffer_largest_intermediate // itemsize if itemsize else 0
+        )
+        hmm_largest_intermediate_elements = int(
+            getattr(active_expr, "hmm_largest_intermediate_elements", 0) or 0
+        )
+        largest_intermediate_elements = max(
+            buffer_largest_intermediate_elements,
+            hmm_largest_intermediate_elements,
+        )
 
         input_modes = ("packed",) if x.ndim == 1 else ("packed", "rhs")
-        profiling.record(
-            "contraction_execute",
-            backend=backend.name,
-            **profiling.contraction_execute_compute_payload(),
-            equation=getattr(active_expr, "equation", None),
-            lowering="batched_rhs_hop",
-            input_shapes=[tuple(x.shape)],
-            input_dtypes=[str(getattr(packed, "dtype", None))],
-            operands=[
+        payload = {
+            "event": "contraction_execute",
+            "backend": backend.name,
+            **profiling.contraction_execute_compute_payload("batched_rhs_hop"),
+            "equation": getattr(active_expr, "equation", None),
+            "lowering": "batched_rhs_hop",
+            "input_shapes": [tuple(x.shape)],
+            "input_dtypes": [str(getattr(packed, "dtype", None))],
+            "operands": [
                 profiling.array_operand_payload(backend, "packed_rhs", packed, input_modes),
             ],
-            output_shape=tuple(result.shape),
-            dtype=str(getattr(result, "dtype", None)),
+            "output_shape": tuple(result.shape),
+            "output_strides": profiling.array_strides(result),
+            "output_order": profiling.array_order(result),
+            "output_contiguous": profiling.array_contiguous(result),
+            "output_backend": profiling.array_backend_name(result),
+            "output_device_kind": profiling.array_device_kind(result),
+            "output_location": profiling.array_location(result),
+            "output_is_host": profiling.array_is_host(result),
+            "output_is_device": profiling.array_is_device(result),
+            "output_is_distributed": profiling.array_is_distributed(result),
+            "dtype": str(getattr(result, "dtype", None)),
             **profiling.device_execution_payload(backend.current_device()),
-            center_shape=tuple(spec.center_shape),
-            packed_dim=int(spec.packed_dim),
-            qn_mask_true_count=int(np.sum(qn_mask)),
-            center_tensor_shape=tuple(getattr(cstruct, "shape", ())),
-            output_center_shape=tuple(getattr(cout, "shape", ())),
-            flops=int(path_profile["flops"]),
-            read_bytes=input_nbytes,
-            write_bytes=output_nbytes,
-            copy_bytes=0,
-            workspace_bytes=max(cstruct_nbytes, cout_nbytes),
-            largest_intermediate=max(input_nbytes, output_nbytes, cstruct_nbytes, cout_nbytes),
-            num_gemm=int(path_profile["num_gemm"]),
-            num_batched_gemm=int(path_profile["num_batched_gemm"]),
-            num_grouped_tasks=0,
-            num_blocks=0,
-            num_shape_buckets=0,
-            num_rhs=int(nrhs),
-            fallback_reason=path_profile["fallback_reason"],
+            "center_shape": tuple(spec.center_shape),
+            "packed_dim": int(spec.packed_dim),
+            "qn_mask_true_count": int(np.sum(qn_mask)),
+            "center_tensor_shape": tuple(getattr(cstruct, "shape", ())),
+            "output_center_shape": tuple(getattr(cout, "shape", ())),
+            "flops": int(path_profile["flops"]),
+            "read_bytes": input_nbytes,
+            "write_bytes": output_nbytes,
+            "copy_bytes": 0,
+            "workspace_bytes": max(cstruct_nbytes, cout_nbytes, hmm_largest_intermediate_bytes),
+            "largest_intermediate": largest_intermediate,
+            "largest_intermediate_elements": largest_intermediate_elements,
+            "largest_intermediate_bytes": largest_intermediate,
+            "num_gemm": int(path_profile["num_gemm"]),
+            "num_batched_gemm": int(path_profile["num_batched_gemm"]),
+            "num_grouped_tasks": 0,
+            "num_blocks": 0,
+            "num_shape_buckets": 0,
+            "num_rhs": int(nrhs),
+            "num_rhs_loop_calls": 0,
+            **execution_items,
+            "fallback_reason": path_profile["fallback_reason"],
+            **_hmm_execution_profile_fields(active_expr),
             **path_profile["path_fields"],
-            wall_s=time.perf_counter() - started,
-        )
+            "wall_s": time.perf_counter() - started,
+        }
+        _cache_backend_execution_profile(payload)
+        record_payload = dict(payload)
+        record_payload.pop("event", None)
+        profiling.record("contraction_execute", **record_payload)
     return result
 
 

@@ -9,7 +9,7 @@ import scipy.sparse
 
 from renormalizer.model import Model, HolsteinModel
 from renormalizer.mps.backend import xp
-from renormalizer.mps.matrix import moveaxis, tensordot
+from renormalizer.mps.matrix import asnumpy, moveaxis, tensordot
 from renormalizer.mps.mp import MatrixProduct
 from renormalizer.mps.svd_qn import add_outer
 from renormalizer.mps import svd_qn
@@ -469,8 +469,8 @@ class Mpo(MatrixProduct):
             dim1 = res.shape[1] * mt.shape[1]
             dim2 = res.shape[2] * mt.shape[2]
             dim3 = mt.shape[-1]
-            res = np.tensordot(res, mt.array, axes=1).transpose((0, 1, 3, 2, 4, 5)).reshape(1, dim1, dim2, dim3)
-        return res[0, :, :, 0]
+            res = tensordot(res, mt.array, axes=1).transpose((0, 1, 3, 2, 4, 5)).reshape(1, dim1, dim2, dim3)
+        return asnumpy(res)[0, :, :, 0]
 
     def is_hermitian(self):
         full = self.todense()
