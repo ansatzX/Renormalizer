@@ -5,11 +5,14 @@ import os
 import numpy as np
 import pytest
 
+import renormalizer.mps.mp as mp_module
+import renormalizer.mps.mps as mps_module
 from renormalizer.mps import Mps, Mpo, MpDm
-from renormalizer.mps.matrix import tensordot, asnumpy
-from renormalizer.mps.lib import Environ
+from renormalizer.mps.matrix import Matrix, tensordot, asnumpy
+from renormalizer.mps.lib import Environ, compressed_sum
+from renormalizer.sbm import param2mollist
 from renormalizer.tests.parameter import custom_model, holstein_model
-from renormalizer.utils import CompressCriteria
+from renormalizer.utils import CompressCriteria, Quantity
 
 def test_save_load():
     model = holstein_model
@@ -46,6 +49,282 @@ def test_distance():
         a = a.evolve(h, 10)
         b = b.evolve(h, 10)
         check_distance(a, b)
+
+
+def test_mps_dot_uses_fast_path_without_generic_tensordot(monkeypatch):
+    model = custom_model(n_phys_dim=(2, 2))
+    a = Mps.random(model, 1, 10)
+    b = Mps.random(model, 1, 10)
+    expected = np.vdot(a.todense(), b.todense())
+
+    def forbidden_tensordot(*args, **kwargs):
+        raise AssertionError("MPS dot should not call generic tensordot")
+
+    monkeypatch.setattr(mp_module, "tensordot", forbidden_tensordot)
+    assert a.conj().dot(b) == pytest.approx(expected)
+
+
+def test_mps_canonicalise_absorbs_center_without_generic_tensordot(monkeypatch):
+    model = custom_model(n_phys_dim=(2, 2))
+    mps = Mps.random(model, 1, 10)
+    expected = mps.todense()
+
+    def forbidden_tensordot(*args, **kwargs):
+        raise AssertionError("MPS canonicalise should not call generic tensordot")
+
+    monkeypatch.setattr(mp_module, "tensordot", forbidden_tensordot)
+    mps.canonicalise()
+    assert np.allclose(mps.todense(), expected)
+
+
+def test_matrix_pdim_prod_uses_shape_tuple_product(monkeypatch):
+    matrix = Matrix(np.zeros((2, 3, 5, 7)))
+
+    def forbidden_numpy_prod(*args, **kwargs):
+        raise AssertionError("Matrix.pdim_prod should avoid NumPy reducer overhead")
+
+    monkeypatch.setattr(mps_module.np, "prod", forbidden_numpy_prod)
+
+    assert matrix.pdim_prod == 15
+
+
+def _small_no_qn_sbm_mps():
+    model = param2mollist(0.05, Quantity(1), Quantity(20), 1, 4)
+    return Mpo(model).apply(Mps.ground_state(model, max_entangled=False))
+
+
+def test_no_qn_mps_canonicalise_uses_dense_decomposition(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    expected = mps.todense()
+
+    def forbidden_get_big_qn(*args, **kwargs):
+        raise AssertionError("no-QN canonicalise should not construct QN blocks")
+
+    def forbidden_svd_qn(*args, **kwargs):
+        raise AssertionError("no-QN canonicalise should call dense QR directly")
+
+    monkeypatch.setattr(mp_module.MatrixProduct, "_get_big_qn", forbidden_get_big_qn)
+    monkeypatch.setattr(mp_module.svd_qn, "svd_qn", forbidden_svd_qn)
+
+    mps.canonicalise()
+
+    assert np.allclose(mps.todense(), expected)
+
+
+def test_no_qn_mps_compress_uses_dense_decomposition(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    mps.canonicalise()
+    mps.compress_config.threshold = 1e-12
+    expected = mps.todense()
+
+    def forbidden_get_big_qn(*args, **kwargs):
+        raise AssertionError("no-QN compress should not construct QN blocks")
+
+    def forbidden_svd_qn(*args, **kwargs):
+        raise AssertionError("no-QN compress should call dense SVD directly")
+
+    monkeypatch.setattr(mp_module.MatrixProduct, "_get_big_qn", forbidden_get_big_qn)
+    monkeypatch.setattr(mp_module.svd_qn, "svd_qn", forbidden_svd_qn)
+
+    mps.compress()
+
+    assert np.allclose(mps.todense(), expected, atol=1e-10)
+
+
+def test_no_qn_dense_svd_uses_numpy_for_small_matrices(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    mps.canonicalise()
+    mps.compress_config.threshold = 1e-12
+    expected = mps.todense()
+
+    def forbidden_optimized_svd(*args, **kwargs):
+        raise AssertionError("small no-QN dense SVD should use numpy.linalg.svd")
+
+    monkeypatch.setattr(mp_module.svd_qn, "optimized_svd", forbidden_optimized_svd)
+
+    mps.compress()
+
+    assert np.allclose(mps.todense(), expected, atol=1e-10)
+
+
+def test_no_qn_dense_qr_uses_numpy_for_to_right_qr(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    zero_qn = mps._single_zero_qn_center([0])
+    mps.to_right = True
+
+    def forbidden_scipy_qr(*args, **kwargs):
+        raise AssertionError("small no-QN QR should use numpy.linalg.qr")
+
+    monkeypatch.setattr(mp_module.svd_qn.scipy.linalg, "qr", forbidden_scipy_qr)
+
+    u, vt, qnlset, qnrset = mps._dense_qr_no_qn(0, zero_qn)
+
+    assert u.shape[1] == vt.shape[0] == len(qnlset) == len(qnrset)
+
+
+def test_no_qn_dense_rq_uses_numpy_transposed_qr(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    zero_qn = mps._single_zero_qn_center([1])
+    mps.to_right = False
+    mt = mps[1]
+    coef_matrix = mt.array.reshape((mt.shape[0], mt.pdim_prod * mt.shape[-1]))
+
+    def forbidden_scipy_rq(*args, **kwargs):
+        raise AssertionError("small no-QN RQ should use transposed numpy.linalg.qr")
+
+    monkeypatch.setattr(mp_module.svd_qn.scipy.linalg, "rq", forbidden_scipy_rq)
+
+    u, vt, qnlset, qnrset = mps._dense_qr_no_qn(1, zero_qn)
+
+    assert np.allclose(u @ vt, coef_matrix)
+    assert np.allclose(vt @ vt.T.conj(), np.eye(vt.shape[0]))
+    assert u.shape[1] == vt.shape[0] == len(qnlset) == len(qnrset)
+
+
+def test_no_qn_fast_path_reuses_zero_qn_metadata(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    zero_qn = mps._single_zero_qn_center([0])
+    assert zero_qn is not None
+
+    def forbidden_get_sigmaqn(*args, **kwargs):
+        raise AssertionError("cached no-QN fast path should not re-read sigma qn")
+
+    monkeypatch.setattr(mps.__class__, "_get_sigmaqn", forbidden_get_sigmaqn)
+    assert mps._single_zero_qn_center([1]) == zero_qn
+
+
+def test_no_qn_array_assignment_uses_fast_matrix_wrapper(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    assert mps._single_zero_qn_center([0]) is not None
+    array = mps[0].array.copy()
+
+    def forbidden_matrix_init(*args, **kwargs):
+        raise AssertionError("no-QN ndarray assignment should bypass Matrix.__init__")
+
+    def forbidden_get_sigmaqn(*args, **kwargs):
+        raise AssertionError("fast no-QN assignment should reuse cached sigma qn")
+
+    monkeypatch.setattr(mp_module.Matrix, "__init__", forbidden_matrix_init)
+    monkeypatch.setattr(mps.__class__, "_get_sigmaqn", forbidden_get_sigmaqn)
+    mps[0] = array
+
+    assert np.allclose(mps[0].array, array)
+
+
+def test_no_qn_array_assignment_bypasses_generic_array2mt(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    assert mps._single_zero_qn_center([0]) is not None
+    array = mps[0].array.copy()
+
+    def forbidden_array2mt(*args, **kwargs):
+        raise AssertionError("no-QN ndarray setitem should bypass generic _array2mt")
+
+    monkeypatch.setattr(mp_module.MatrixProduct, "_array2mt", forbidden_array2mt)
+
+    mps[0] = array
+
+    assert np.allclose(mps[0].array, array)
+
+
+def test_no_qn_canonicalise_updates_tensors_without_setitem(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    expected = mps.todense()
+
+    def forbidden_setitem(*args, **kwargs):
+        raise AssertionError("no-QN canonicalise should update tensors through the direct fast path")
+
+    monkeypatch.setattr(mp_module.MatrixProduct, "__setitem__", forbidden_setitem)
+
+    mps.canonicalise()
+
+    assert np.allclose(mps.todense(), expected)
+
+
+def test_calc_1site_rdm_single_idx_uses_transfer_without_environment(monkeypatch):
+    model = custom_model(n_phys_dim=(2, 2, 2))
+    mps = Mps.random(model, 1, 10)
+    dense = mps.todense().reshape(mps.pbond_list)
+    trace_axes = tuple(axis for axis in range(dense.ndim) if axis != 1)
+    expected = np.tensordot(
+        dense.conj(),
+        dense,
+        axes=(trace_axes, trace_axes),
+    )
+
+    def forbidden_environ(*args, **kwargs):
+        raise AssertionError("single-site RDM should not build a full environment")
+
+    monkeypatch.setattr(mps_module.Environ, "__init__", forbidden_environ)
+    rdm = mps.calc_1site_rdm(idx=1)
+
+    assert set(rdm) == {1}
+    assert np.allclose(rdm[1], expected)
+
+
+def test_calc_1site_rdm_transfer_avoids_planned_backend_einsum(monkeypatch):
+    model = custom_model(n_phys_dim=(2, 2, 2))
+    mps = Mps.random(model, 1, 10)
+
+    def forbidden_einsum(self, *args, **kwargs):
+        raise AssertionError("single-site transfer RDM should use native fixed contractions")
+
+    monkeypatch.setattr(type(mps_module.backend.current), "einsum", forbidden_einsum)
+
+    rdm = mps.calc_1site_rdm(idx=1)
+
+    assert set(rdm) == {1}
+
+
+def test_calc_1site_rdm_boundary_uses_canonical_local_tensor(monkeypatch):
+    mps = _small_no_qn_sbm_mps().ensure_right_canonical()
+    dense = mps.todense().reshape(mps.pbond_list)
+    expected = np.tensordot(
+        dense.conj(),
+        dense,
+        axes=(tuple(range(1, dense.ndim)), tuple(range(1, dense.ndim))),
+    )
+
+    def forbidden_environ(*args, **kwargs):
+        raise AssertionError("boundary canonical RDM should not build a full environment")
+
+    monkeypatch.setattr(mps_module.Environ, "__init__", forbidden_environ)
+    rdm = mps.calc_1site_rdm(idx=0)
+
+    assert set(rdm) == {0}
+    assert np.allclose(rdm[0], expected)
+
+
+def test_scaled_mps_for_sum_avoids_full_copy(monkeypatch):
+    mps = _small_no_qn_sbm_mps()
+    original = mps.todense()
+
+    def forbidden_copy(*args, **kwargs):
+        raise AssertionError("temporary Taylor scaling should not deep-copy the full MPS")
+
+    monkeypatch.setattr(mp_module.MatrixProduct, "copy", forbidden_copy)
+
+    scaled = mps_module._scaled_mps_for_sum(mps, 2.0)
+
+    assert np.allclose(mps.todense(), original)
+    assert np.allclose(scaled.todense(), 2.0 * original)
+    assert scaled[scaled.qnidx] is not mps[mps.qnidx]
+
+
+def test_compressed_sum_skips_redundant_canonical_check(monkeypatch):
+    left = _small_no_qn_sbm_mps()
+    right = _small_no_qn_sbm_mps()
+    left.compress_config.threshold = 1e-14
+    right.compress_config.threshold = 1e-14
+    expected = left.todense() + right.todense()
+
+    def forbidden_check(*args, **kwargs):
+        raise AssertionError("compressed_sum should not re-check immediately after canonicalise")
+
+    monkeypatch.setattr(mp_module.MatrixProduct, "check_right_canonical", forbidden_check)
+
+    result = compressed_sum([left, right])
+
+    assert np.allclose(result.todense(), expected, atol=1e-10)
 
 
 def test_environ():

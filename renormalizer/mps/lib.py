@@ -536,7 +536,7 @@ def compressed_sum(mps_list, batchsize=5, temp_m_trunc=None):
         return mps_queue[0]
     else:
         new_mps = mps_list[0].canonicalise()
-        new_mps.compress(temp_m_trunc=temp_m_trunc)
+        new_mps.compress(temp_m_trunc=temp_m_trunc, check_canonical=False)
         return new_mps
 
 
@@ -544,7 +544,7 @@ def _sum(mps_list, compress=True, temp_m_trunc=None):
     new_mps = reduce(lambda mps1, mps2: mps1.add(mps2), mps_list)
     if compress:
         new_mps.canonicalise()
-        new_mps.compress(temp_m_trunc=temp_m_trunc)
+        new_mps.compress(temp_m_trunc=temp_m_trunc, check_canonical=False)
     return new_mps
 
 

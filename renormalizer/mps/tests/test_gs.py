@@ -5,6 +5,7 @@ import os
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from renormalizer.model import Model, h_qc
 from renormalizer.mps.backend import primme
@@ -19,6 +20,57 @@ nexciton = 1
 procedure = [[10, 0.4], [20, 0.2], [30, 0.1], [40, 0], [40, 0]]
 
 GS_E = 0.08401412 + holstein_model.gs_zpe
+
+
+def test_eigh_iterative_davidson_uses_matrix_rhs_hop(monkeypatch):
+    import renormalizer.mps.gs as gs
+
+    calls = {"scalar": 0, "batched": 0, "davidson1": 0}
+    qn_mask = np.array([True, True])
+
+    def scalar_expr(struct):
+        calls["scalar"] += 1
+        return struct
+
+    def batched_factory(nrhs):
+        assert nrhs == 2
+
+        def batched_expr(struct):
+            calls["batched"] += 1
+            return struct
+
+        return batched_expr
+
+    def fake_get_ham_iterative(*_args, **_kwargs):
+        return np.array([1.0, 2.0]), scalar_expr, batched_factory
+
+    def fake_davidson1(aop, x0, precond, **_kwargs):
+        calls["davidson1"] += 1
+        xs = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+        ys = aop(xs)
+        assert len(ys) == 2
+        assert all(y.shape == (2,) for y in ys)
+        return np.array([True]), np.array([1.0]), [np.array([1.0, 0.0])]
+
+    monkeypatch.setattr(gs, "get_ham_iterative", fake_get_ham_iterative)
+    monkeypatch.setattr(gs, "davidson1", fake_davidson1, raising=False)
+
+    mps = SimpleNamespace(optimize_config=SimpleNamespace(inverse=1.0, algo="davidson", nroots=1))
+
+    energy, coeff = gs.eigh_iterative(
+        mps,
+        qn_mask,
+        ltensor=np.array([1.0]),
+        rtensor=np.array([1.0]),
+        cmo=[np.array([1.0])],
+        omega=0.0,
+        cguess=[np.array([1.0, 0.0])],
+    )
+
+    assert energy == 1.0
+    assert np.array_equal(coeff, np.array([1.0, 0.0]))
+    assert calls == {"scalar": 0, "batched": 1, "davidson1": 1}
+
 
 @pytest.mark.parametrize("scheme", (
         1,

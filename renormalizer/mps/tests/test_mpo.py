@@ -4,6 +4,7 @@
 import os
 import random
 import pickle
+import json
 
 import numpy as np
 import pytest
@@ -12,9 +13,17 @@ from renormalizer.model import Mol, Phonon, HolsteinModel, Model, Op
 from renormalizer.model.basis import BasisHalfSpin
 from renormalizer.mps import Mpo, Mps
 from renormalizer.mps.tests import cur_dir
-from renormalizer.tests.parameter import holstein_model
+from renormalizer.tests.parameter import custom_model, holstein_model
 from renormalizer.utils import Quantity
 from renormalizer.utils.qutip_utils import get_spin_hamiltonian
+
+
+def _jsonl_payloads(path):
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 @pytest.mark.parametrize("nsites", [5, 10])
@@ -106,6 +115,137 @@ def test_identity():
     identity = Mpo.identity(holstein_model)
     mps = Mps.random(holstein_model, qntot=1, m_max=5)
     assert mps.expectation(identity) == pytest.approx(mps.mp_norm) == pytest.approx(1)
+
+
+def test_mpo_apply_mps_profiles_grouped_gemm_for_same_shape_sites(caplog, tmp_path):
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import PROFILING
+
+    caplog.set_level(PROFILING, logger="renormalizer")
+    event_path = tmp_path / "profile-events.jsonl"
+    profiling.register_event_output(event_path)
+
+    try:
+        model = custom_model(n_phys_dim=(2, 2))
+        identity = Mpo.identity(model)
+        mps = Mps.ground_state(model, max_entangled=False)
+
+        applied = identity.apply(mps)
+        profiling.flush_event_output()
+    finally:
+        profiling.close_event_output()
+
+    assert applied.distance(mps) == pytest.approx(0.0, abs=1e-12)
+    grouped_events = [
+        payload
+        for payload in _jsonl_payloads(event_path)
+        if payload.get("event") == "grouped_gemm_execute"
+    ]
+    assert grouped_events
+    assert max(event["num_tasks"] for event in grouped_events) >= model.nsite
+
+
+def test_mpo_apply_mps_uses_grouped_loop_for_repeated_small_site_gemv(monkeypatch):
+    import renormalizer.mps.mpo as mpo_module
+
+    model = custom_model(n_phys_dim=(2, 2))
+    identity = Mpo.identity(model)
+    mps = Mps.ground_state(model, max_entangled=False)
+    calls = []
+    backend_impl = mpo_module.backend.current
+    original_grouped_gemm = backend_impl.grouped_gemm
+
+    def counting_grouped_gemm(tasks, *args, **kwargs):
+        tasks = list(tasks)
+        calls.append(len(tasks))
+        return original_grouped_gemm(tasks, *args, **kwargs)
+
+    monkeypatch.setattr(mpo_module.profiling, "should_record_op", lambda: True)
+    monkeypatch.setattr(backend_impl, "grouped_gemm", counting_grouped_gemm)
+
+    applied = identity.apply(mps)
+
+    assert applied.distance(mps) == pytest.approx(0.0, abs=1e-12)
+    assert calls == [model.nsite]
+
+
+def test_mpo_apply_mps_skips_grouped_for_tiny_non_profiled_workload(monkeypatch):
+    import renormalizer.mps.mpo as mpo_module
+
+    model = custom_model(n_phys_dim=(2, 2))
+    identity = Mpo.identity(model)
+    mps = Mps.ground_state(model, max_entangled=False)
+    backend_impl = mpo_module.backend.current
+
+    def forbidden_grouped_gemm(*args, **kwargs):
+        raise AssertionError("tiny non-profiled MPO.apply should avoid grouped_gemm setup")
+
+    monkeypatch.setattr(mpo_module.profiling, "should_record_op", lambda: False)
+    monkeypatch.setattr(backend_impl, "grouped_gemm", forbidden_grouped_gemm)
+
+    applied = identity.apply(mps)
+
+    assert applied.distance(mps) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_mpo_apply_mps_does_not_precompute_grouped_stats_before_dispatch(monkeypatch):
+    import renormalizer.mps.mpo as mpo_module
+
+    model = custom_model(n_phys_dim=(2, 2))
+    identity = Mpo.identity(model)
+    mps = Mps.ground_state(model, max_entangled=False)
+    calls = []
+    backend_impl = mpo_module.backend.current
+    original_grouped_gemm = backend_impl.grouped_gemm
+
+    def counting_grouped_gemm(tasks, *args, **kwargs):
+        tasks = list(tasks)
+        calls.append(len(tasks))
+        return original_grouped_gemm(tasks, *args, **kwargs)
+
+    def stats_must_not_run(*args, **kwargs):
+        raise AssertionError("Mpo.apply should not run grouped_gemm_stats before backend dispatch")
+
+    monkeypatch.setattr(backend_impl, "grouped_gemm", counting_grouped_gemm)
+    monkeypatch.setattr(mpo_module, "grouped_gemm_stats", stats_must_not_run, raising=False)
+    monkeypatch.setattr(mpo_module.profiling, "should_record_op", lambda: True)
+
+    applied = identity.apply(mps)
+
+    assert applied.distance(mps) == pytest.approx(0.0, abs=1e-12)
+    assert calls == [model.nsite]
+
+
+def test_mpo_apply_mps_does_not_copy_overwritten_input_tensors(monkeypatch):
+    model = custom_model(n_phys_dim=(2, 2))
+    identity = Mpo.identity(model)
+    mps = Mps.ground_state(model, max_entangled=False)
+
+    def copy_must_not_run(self):
+        raise AssertionError("Mpo.apply should metadata-copy before overwriting tensors")
+
+    monkeypatch.setattr(Mps, "copy", copy_must_not_run)
+
+    applied = identity.apply(mps)
+
+    assert applied.distance(mps) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_mpo_contract_skips_redundant_canonical_check(monkeypatch):
+    import renormalizer.mps.mp as mp_module
+
+    model = custom_model(n_phys_dim=(2, 2))
+    identity = Mpo.identity(model)
+    mps = Mps.ground_state(model, max_entangled=False)
+
+    def forbidden_check(*args, **kwargs):
+        raise AssertionError("Mpo.contract should not re-check immediately after canonicalise")
+
+    monkeypatch.setattr(mp_module.MatrixProduct, "check_right_canonical", forbidden_check)
+
+    contracted = identity.contract(mps)
+
+    assert contracted.distance(mps) == pytest.approx(0.0, abs=1e-12)
 
 
 def test_scheme4():

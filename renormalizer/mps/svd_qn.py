@@ -98,6 +98,23 @@ def blockrecover(indices, U, dim):
     return resortU
 
 
+def _single_qn_block(qnbigl, qnbigr, qntot):
+    qn_size = len(qntot)
+    localqnl = qnbigl.reshape(-1, qn_size)
+    localqnr = qnbigr.reshape(-1, qn_size)
+    if len(localqnl) == 0 or len(localqnr) == 0:
+        return None
+    nl = localqnl[0]
+    nr = localqnr[0]
+    if not np.all(localqnl == nl):
+        return None
+    if not np.all(localqnr == nr):
+        return None
+    if not np.all(nl + nr == qntot):
+        return None
+    return tuple(int(item) for item in nl), tuple(int(item) for item in nr)
+
+
 def svd_qn(
         coef_array: np.ndarray,
         qnbigl: np.ndarray,
@@ -162,6 +179,70 @@ def svd_qn(
 
     assert qntot.ndim == 1
     qn_size = len(qntot)
+    if not full_matrices:
+        single_block = _single_qn_block(qnbigl, qnbigr, qntot)
+        if single_block is not None:
+            nl, nr = single_block
+            blocks = None
+            if profile_enabled:
+                blocks = [
+                    profiling.svd_qn_block_payload(
+                        nl,
+                        nr,
+                        np.arange(coef_matrix.shape[0]),
+                        np.arange(coef_matrix.shape[1]),
+                        coef_matrix,
+                        min(coef_matrix.shape),
+                    )
+                ]
+            if SVD:
+                u, su, vt = optimized_svd(
+                    coef_matrix,
+                    full_matrices=False,
+                    opt_full_matrices=opt_full_matrices,
+                )
+                v = vt.T
+                qnl = [nl] * len(su)
+                qnr = [nr] * len(su)
+                if profile_enabled:
+                    profiling.record(
+                        "svd_qn",
+                        mode="SVD",
+                        system=system,
+                        coef_shape=tuple(coef_array.shape),
+                        qn_size=qn_size,
+                        blocks=blocks,
+                        output_rank=int(u.shape[1]),
+                        singular_value_count=int(len(su)),
+                        full_matrices=full_matrices,
+                        **profiling.svd_qn_compute_payload("SVD", coef_array, coef_matrix, blocks, (u, su, v, su)),
+                        wall_s=time.perf_counter() - started,
+                    )
+                return u, su, qnl, v, su, qnr
+            if system == "R":
+                u, vt = scipy.linalg.rq(coef_matrix, mode="economic")
+            elif system == "L":
+                u, vt = scipy.linalg.qr(coef_matrix, mode="economic")
+            else:
+                assert False
+            v = vt.T
+            qnl = [nl] * u.shape[1]
+            qnr = [nr] * u.shape[1]
+            if profile_enabled:
+                profiling.record(
+                    "svd_qn",
+                    mode="QR",
+                    system=system,
+                    coef_shape=tuple(coef_array.shape),
+                    qn_size=qn_size,
+                    blocks=blocks,
+                    output_rank=int(u.shape[1]),
+                    full_matrices=full_matrices,
+                    **profiling.svd_qn_compute_payload("QR", coef_array, coef_matrix, blocks, (u, v)),
+                    wall_s=time.perf_counter() - started,
+                )
+            return u, qnl, v, qnr
+
     localqnl = qnbigl.reshape(-1, qn_size)
     localqnr = qnbigr.reshape(-1, qn_size)
 

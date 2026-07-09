@@ -6,6 +6,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import replace
+from math import prod
 from typing import List, Union
 
 from renormalizer.backend.boundary import eye_like, scalar_to_python as _scalar_to_python
@@ -107,7 +108,7 @@ class Matrix:
 
     @property
     def pdim_prod(self):
-        return np.prod(self.pdim)
+        return prod(self.pdim)
 
     @property
     def bond_dim(self):

@@ -8,14 +8,15 @@ import scipy
 import scipy.sparse
 
 from renormalizer.model import Model, HolsteinModel
-from renormalizer.mps.backend import xp
-from renormalizer.mps.matrix import asnumpy, moveaxis, tensordot
+from renormalizer.backend import GemmTask
+from renormalizer.mps.backend import backend, xp
+from renormalizer.mps.matrix import asnumpy, asxp, moveaxis, tensordot
 from renormalizer.mps.mp import MatrixProduct
 from renormalizer.mps.svd_qn import add_outer
 from renormalizer.mps import svd_qn
 from renormalizer.mps.lib import update_cv
 from renormalizer.mps.symbolic_mpo import construct_symbolic_mpo, _terms_to_table, symbolic_mo_to_numeric_mo, swap_site
-from renormalizer.utils import Quantity
+from renormalizer.utils import Quantity, profiling
 from renormalizer.model.op import Op
 from renormalizer.utils.elementop import (
     construct_ph_op_dict,
@@ -23,6 +24,85 @@ from renormalizer.utils.elementop import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _mpo_mps_gemm_operands(mt_self, mt_other):
+    mpo_array = asxp(mt_self.array)
+    mps_array = asxp(mt_other.array)
+    left_bond_mpo, physical_out, physical_in, right_bond_mpo = mpo_array.shape
+    left_bond_mps, physical_mps, right_bond_mps = mps_array.shape
+    assert physical_in == physical_mps
+    left = xp.reshape(
+        xp.transpose(mpo_array, (0, 1, 3, 2)),
+        (left_bond_mpo * physical_out * right_bond_mpo, physical_in),
+    )
+    right = xp.reshape(
+        xp.transpose(mps_array, (1, 0, 2)),
+        (physical_in, left_bond_mps * right_bond_mps),
+    )
+    output_shape = (
+        left_bond_mpo,
+        physical_out,
+        right_bond_mpo,
+        left_bond_mps,
+        right_bond_mps,
+    )
+    final_shape = (
+        left_bond_mpo * left_bond_mps,
+        physical_out,
+        right_bond_mpo * right_bond_mps,
+    )
+    return left, right, output_shape, final_shape
+
+
+def _finalize_mpo_mps_gemm_result(result, output_shape, final_shape):
+    tensor = xp.reshape(result, output_shape)
+    tensor = xp.moveaxis(tensor, 3, 1)
+    return asnumpy(xp.reshape(tensor, final_shape))
+
+
+def _gemm_task_work_estimate(task):
+    a = task.A
+    b = task.B
+    if len(a.shape) < 2 or len(b.shape) < 2:
+        return 0, 0
+    m, k_left = int(a.shape[-2]), int(a.shape[-1])
+    k_right, n = int(b.shape[-2]), int(b.shape[-1])
+    if k_left != k_right:
+        return 0, 0
+    batch = int(np.prod(a.shape[:-2])) if len(a.shape) > 2 else 1
+    flops = int(2 * batch * m * n * k_left)
+    itemsize = max(
+        int(getattr(getattr(a, "dtype", None), "itemsize", 0) or 0),
+        int(getattr(getattr(b, "dtype", None), "itemsize", 0) or 0),
+    )
+    output_bytes = int(batch * m * n * itemsize)
+    copy_bytes = int(getattr(a, "nbytes", 0) or 0) + int(getattr(b, "nbytes", 0) or 0) + output_bytes
+    return flops, copy_bytes
+
+
+def _should_use_grouped_mpo_mps_apply(tasks):
+    if profiling.should_record_op():
+        return True
+    if len(tasks) <= 1:
+        return False
+    total_flops = 0
+    total_copy_bytes = 0
+    for task in tasks:
+        flops, copy_bytes = _gemm_task_work_estimate(task)
+        total_flops += flops
+        total_copy_bytes += copy_bytes
+    if total_flops < 1_000_000:
+        return False
+    return total_flops >= 10 * total_copy_bytes
+
+
+def _run_mpo_mps_gemm_loop(tasks, result_shapes):
+    results = []
+    for task, (output_shape, final_shape) in zip(tasks, result_shapes):
+        result = task.A @ task.B
+        results.append(_finalize_mpo_mps_gemm_result(result, output_shape, final_shape))
+    return results
 
 
 class Mpo(MatrixProduct):
@@ -325,32 +405,37 @@ class Mpo(MatrixProduct):
 
     def promote_mt_type(self, mp):
         if self.is_complex and not mp.is_complex:
-            mp.to_complex(inplace=True)
+            mp.dtype = backend.complex_dtype
         return mp
 
     def apply(self, mp: MatrixProduct, canonicalise: bool=False) -> MatrixProduct:
-        # todo: use meta copy to save time, could be subtle when complex type is involved
         # todo: inplace version (saved memory and can be used in `hybrid_exact_propagator`)
         # the model is the same as the mps.model
 
         assert self.site_num == mp.site_num
-        new_mps = self.promote_mt_type(mp.copy())
+        new_mps = self.promote_mt_type(mp.metacopy())
         if mp.is_mps:
             # mpo x mps
+            tasks = []
+            result_shapes = []
             for i, (mt_self, mt_other) in enumerate(zip(self, mp)):
-                assert mt_self.shape[2] == mt_other.shape[1]
-                # mt=np.einsum("apqb,cqd->acpbd",mpo[i],mps[i])
-                mt = xp.moveaxis(
-                    tensordot(mt_self.array, mt_other.array, axes=([2], [1])), 3, 1
+                left, right, output_shape, final_shape = _mpo_mps_gemm_operands(mt_self, mt_other)
+                tasks.append(GemmTask(left, right, tag={"site": i, "operation": "mpo_apply_mps"}))
+                result_shapes.append((output_shape, final_shape))
+
+            if _should_use_grouped_mpo_mps_apply(tasks):
+                results = backend.grouped_gemm(
+                    tasks,
+                    profile_context={
+                        "operation": "mpo_apply_mps",
+                        "site_count": len(tasks),
+                    },
                 )
-                mt = mt.reshape(
-                    (
-                        mt_self.shape[0] * mt_other.shape[0],
-                        mt_self.shape[1],
-                        mt_self.shape[-1] * mt_other.shape[-1],
-                    )
-                )
-                new_mps[i] = mt
+                for i, (result, (output_shape, final_shape)) in enumerate(zip(results, result_shapes)):
+                    new_mps[i] = _finalize_mpo_mps_gemm_result(result, output_shape, final_shape)
+            else:
+                for i, mt in enumerate(_run_mpo_mps_gemm_loop(tasks, result_shapes)):
+                    new_mps[i] = mt
         elif mp.is_mpo or mp.is_mpdm:
             # mpo x mpo
             for i, (mt_self, mt_other) in enumerate(zip(self, mp)):
@@ -416,7 +501,7 @@ class Mpo(MatrixProduct):
             # mapply->canonicalise->compress
             new_mps = self.apply(mps)
             new_mps.canonicalise()
-            new_mps.compress()
+            new_mps.compress(check_canonical=False)
         elif algo == "variational":
             new_mps = mps.variational_compress(self)
         else:

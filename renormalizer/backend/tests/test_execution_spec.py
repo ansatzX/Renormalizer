@@ -7507,6 +7507,40 @@ def test_grouped_gemm_caches_execution_profile_without_profiling_log_level():
     assert loop_bucket["fallback_reason"] == "task_count below pack_threshold"
 
 
+def test_grouped_gemm_without_profiling_uses_lightweight_profile_cache(monkeypatch):
+    from renormalizer.backend.gemm import GemmTask
+    from renormalizer.backend.numpy_backend import NumpyBackend
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, init_log, package_logger
+
+    backend = NumpyBackend()
+    tasks = [
+        GemmTask(np.ones((128, 128), dtype=np.float64), np.ones((128, 128), dtype=np.float64)),
+        GemmTask(np.full((128, 128), 2.0, dtype=np.float64), np.ones((128, 128), dtype=np.float64)),
+    ]
+    old_level = package_logger.level
+
+    def group_descriptors_must_not_run(*args, **kwargs):
+        raise AssertionError("group descriptors are full profiling metadata")
+
+    monkeypatch.setattr(backend, "_grouped_gemm_group_descriptors", group_descriptors_must_not_run)
+    try:
+        init_log(DEBUG)
+        profiling.flush_summaries()
+
+        results = backend.grouped_gemm(tasks, pack_threshold=2)
+    finally:
+        profiling.flush_summaries()
+        init_log(old_level or DEBUG)
+
+    assert np.allclose(results[0], tasks[0].A @ tasks[0].B)
+    profile = backend.last_execution_profile()
+    assert profile["event"] == "grouped_gemm_execute"
+    assert profile["num_tasks"] == 2
+    assert profile["num_batched_gemm"] == 1
+    assert profile["compute_profile"]["compute_class"] == "contraction_plan"
+
+
 def test_grouped_gemm_rejects_workspace_on_wrong_device():
     from renormalizer.backend.execution import BackendFeatureError, DeviceSpec, Workspace
     from renormalizer.backend.gemm import GemmTask

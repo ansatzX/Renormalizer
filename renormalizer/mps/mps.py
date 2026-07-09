@@ -118,6 +118,66 @@ def adaptive_tdvp(fun):
     return adaptive_fun
 
 
+def _scaled_mps_for_sum(mps: MatrixProduct, val):
+    """Create an internal temporary with only the canonical-center tensor scaled."""
+    if any(isinstance(mt, str) for mt in mps._mp):
+        return mps.scale(val)
+    new_mps = mps.metacopy()
+    new_mps._mp = list(mps._mp)
+    if np.iscomplex(val):
+        new_mps.dtype = backend.complex_dtype
+    else:
+        val = val.real
+    assert new_mps[new_mps.qnidx].array.any()
+    new_mps[new_mps.qnidx] = new_mps[new_mps.qnidx] * val
+    return new_mps
+
+
+def _boundary_1site_rdm_from_canonical(mps: MatrixProduct, idx: int):
+    if idx == 0:
+        if not mps.check_right_canonical():
+            return None
+    elif idx == mps.site_num - 1:
+        if not mps.check_left_canonical():
+            return None
+    else:
+        return None
+
+    mt = mps[idx]
+    if mt.ndim != 3:
+        return None
+    tensor = xp.tensordot(mt.array.conj(), mt.array, axes=([0, 2], [0, 2]))
+    assert xp.allclose(tensor, tensor.T.conj())
+    return asnumpy(tensor)
+
+
+def _transfer_1site_rdm(mps: MatrixProduct, idx: int):
+    if any(isinstance(mt, str) or mt.ndim != 3 for mt in mps):
+        return None
+
+    array_namespace = backend.array_namespace
+    left = array_namespace.ones((1, 1), dtype=mps.dtype)
+    for ims in range(idx):
+        tensor = mps[ims].array
+        left = array_namespace.einsum(
+            "ij,ipr,jps->rs", left, tensor.conj(), tensor, optimize=False
+        )
+
+    right = array_namespace.ones((1, 1), dtype=mps.dtype)
+    for ims in range(mps.site_num - 1, idx, -1):
+        tensor = mps[ims].array
+        right = array_namespace.einsum(
+            "ipr,rs,jps->ij", tensor.conj(), right, tensor, optimize=False
+        )
+
+    tensor = mps[idx].array
+    rdm = array_namespace.einsum(
+        "ij,ipr,rs,jqs->pq", left, tensor.conj(), right, tensor, optimize=False
+    )
+    assert xp.allclose(rdm, rdm.T.conj())
+    return asnumpy(rdm)
+
+
 class Mps(MatrixProduct):
     @classmethod
     def random(cls, model: Model, qntot, m_max, percent=1.0) -> "Mps":
@@ -856,7 +916,7 @@ class Mps(MatrixProduct):
                 logger.debug(f"guess_dt: {config.guess_dt}, try time step size: {dt}")
                 for idx, term in enumerate(termlist):
                     scale = (-1.0j * dt) ** idx * propagation_c[idx]
-                    scaled_termlist.append(term.scale(scale))
+                    scaled_termlist.append(_scaled_mps_for_sum(term, scale))
                     del term
                 
                 new_mps1 = compressed_sum(scaled_termlist[:-1])
@@ -1625,18 +1685,59 @@ class Mps(MatrixProduct):
             :math:`\{0:\rho_0, 1:\rho_1, \cdots\}`. The key is the index of the site.
         """
 
-        identity = Mpo.identity(self.model)
-        environ = Environ(self, identity, "R")
         if idx is None:
             idx = list(range(self.site_num))
         elif type(idx) is int:
             idx = [idx]
-        elif (type(idx) is list) or (type(idx) is tuple):  
+        elif (type(idx) is list) or (type(idx) is tuple):
             idx = list(idx)
         else:
             assert False
 
         rdm = {}
+
+        if len(idx) != self.site_num:
+            remaining_idx = []
+            for ims in idx:
+                local_rdm = _boundary_1site_rdm_from_canonical(self, ims)
+                if local_rdm is None:
+                    local_rdm = _transfer_1site_rdm(self, ims)
+                if local_rdm is None:
+                    remaining_idx.append(ims)
+                else:
+                    rdm[ims] = local_rdm
+            if not remaining_idx:
+                return rdm
+            idx = remaining_idx
+
+        identity = Mpo.identity(self.model)
+        environ = Environ(self, identity, "R")
+
+        def compute_site_rdm(ims):
+            ms = self[ims]
+            ltensor = environ.GetLR(
+                "L", ims-1, self, identity, itensor=None, method="Scratch"
+            )
+            rtensor = environ.GetLR(
+                "R", ims+1, self, identity, itensor=None, method="Enviro"
+            )
+            ltensor = ltensor.reshape(ltensor.shape[0], ltensor.shape[-1])
+            rtensor = rtensor.reshape(rtensor.shape[0], rtensor.shape[-1])
+
+            tensor = tensordot(ltensor, ms.conj(), ([0], [0]))
+            tensor = tensordot(tensor, rtensor, ([-1], [0]))
+            if ms.ndim == 3:
+                tensor = tensordot(tensor, ms, ([0, -1], [0, -1]))
+            else:
+                tensor = tensordot(tensor, ms, ([0, -1, -2], [0, -1, -2]))
+            assert xp.allclose(tensor, tensor.T.conj())
+            rdm[ims] = asnumpy(tensor)
+
+        if len(idx) != self.site_num:
+            for ims in idx:
+                compute_site_rdm(ims)
+            return rdm
+
         for ims, ms in enumerate(self):
             ltensor = environ.GetLR(
                 "L", ims-1, self, identity, itensor=None, method="System"

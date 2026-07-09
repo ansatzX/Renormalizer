@@ -99,6 +99,12 @@ def test_from_mps():
     np.testing.assert_allclose(e, e_ref)
 
 
+def test_ttns_compress_accepts_check_canonical_keyword():
+    ttns = TTNS.random(basis_binary, 0, 4, 1)
+
+    assert ttns.compress(check_canonical=False) is ttns
+
+
 @pytest.mark.parametrize("basis_tree", [basis_binary, basis_multi_basis])
 @pytest.mark.parametrize("ite", [False, True])
 def test_gs_heisenberg(basis_tree, ite):

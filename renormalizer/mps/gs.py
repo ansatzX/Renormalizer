@@ -16,7 +16,7 @@ import time
 import numpy as np
 import scipy
 
-from renormalizer.lib import davidson
+from renormalizer.lib.davidson.davidson import davidson1
 from renormalizer.model.h_qc import qc_model, int_to_h, generate_ladder_operator, simplify_op
 from renormalizer.model import Model, Op
 from renormalizer.mps.backend import backend, xp, primme, IMPORT_PRIMME_EXCEPTION
@@ -817,6 +817,24 @@ def _apply_hop_to_packed_vectors(x, qn_mask, expr, batched_expr, inverse):
     return result
 
 
+def _apply_hop_to_trial_vectors(xs, hop):
+    xs = list(xs)
+    if not xs:
+        return []
+    if len(xs) == 1:
+        return [hop(xs[0])]
+    xmat = np.stack(xs, axis=1)
+    ymat = hop(xmat)
+    expected_shape = xmat.shape
+    actual_shape = tuple(getattr(ymat, "shape", ()))
+    if actual_shape != expected_shape:
+        raise ValueError(
+            "batched Davidson hop returned shape {0}, expected {1}"
+            .format(actual_shape, expected_shape)
+        )
+    return [ymat[:, index] for index in range(ymat.shape[1])]
+
+
 def eigh_iterative(
     mps: Mps,
     qn_mask: np.ndarray,
@@ -855,10 +873,17 @@ def eigh_iterative(
     if algo == "davidson":
         precond = lambda x, e, *args: x / (hdiag - e + 1e-4)
 
-        e, c = davidson(
-            hop, cguess, precond, max_cycle=100, nroots=nroots, max_memory=64000
+        _conv, e, c = davidson1(
+            lambda xs: _apply_hop_to_trial_vectors(xs, hop),
+            cguess,
+            precond,
+            max_cycle=100,
+            nroots=nroots,
+            max_memory=64000,
         )
-        # if one root, davidson return e as np.float
+        # Match the public davidson() return shape.
+        if nroots == 1:
+            e, c = e[0], c[0]
 
     # elif algo == "arpack":
     #    # scipy arpack solver : much slower than pyscf/davidson

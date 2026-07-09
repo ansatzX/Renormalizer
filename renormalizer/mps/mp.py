@@ -32,6 +32,67 @@ from renormalizer.utils import sizeof_fmt, CompressConfig, CompressCriteria, OFS
 logger = logging.getLogger(__name__)
 
 
+def _dot_mps_matrices(left, right):
+    """Contract two MPS tensor trains using direct matrix products."""
+    env = xp.eye(1, 1)
+    for mt1, mt2 in zip(left, right):
+        a = asxp(mt1.array)
+        b = asxp(mt2.array)
+        l1, phys1, r1 = a.shape
+        l2, phys2, r2 = b.shape
+        assert phys1 == phys2
+        env = env @ b.reshape(l2, phys2 * r2)
+        env = env.reshape(l1 * phys1, r2)
+        env = a.reshape(l1 * phys1, r1).T @ env
+    return complex(env[0, 0])
+
+
+def _absorb_left_matrix_into_mps(matrix, mt):
+    """Compute ``matrix @ mt`` over the left bond of a rank-3 MPS tensor."""
+    tensor = asxp(mt.array)
+    matrix = asxp(matrix)
+    left_dim, phys_dim, right_dim = tensor.shape
+    result = matrix @ tensor.reshape(left_dim, phys_dim * right_dim)
+    return result.reshape(matrix.shape[0], phys_dim, right_dim)
+
+
+def _absorb_right_matrix_into_mps(mt, matrix):
+    """Compute ``mt @ matrix`` over the right bond of a rank-3 MPS tensor."""
+    tensor = asxp(mt.array)
+    matrix = asxp(matrix)
+    left_dim, phys_dim, right_dim = tensor.shape
+    result = tensor.reshape(left_dim * phys_dim, right_dim) @ matrix
+    return result.reshape(left_dim, phys_dim, matrix.shape[1])
+
+
+def _zero_qn_tuple(qn_size):
+    return tuple(0 for _ in range(int(qn_size)))
+
+
+def _reduced_svd(coef_matrix):
+    try:
+        return np.linalg.svd(coef_matrix, full_matrices=False)
+    except np.linalg.LinAlgError:
+        logger.warning("NumPy SVD failed to converge")
+        return svd_qn.optimized_svd(
+            coef_matrix,
+            full_matrices=False,
+            opt_full_matrices=False,
+        )
+
+
+def _reduced_rq(coef_matrix):
+    try:
+        q, r = np.linalg.qr(coef_matrix.T, mode="reduced")
+        return r.T, q.T
+    except np.linalg.LinAlgError:
+        logger.warning("NumPy transposed QR failed to converge")
+        return svd_qn.scipy.linalg.rq(coef_matrix, mode="economic")
+
+
+_ZERO_QN_FAST_PATH_DISABLED = object()
+
+
 class MatrixProduct:
 
     @classmethod
@@ -76,6 +137,7 @@ class MatrixProduct:
         self.qntot: np.ndarray = None
         # if sweeping to right: True else False
         self.to_right: bool = None
+        self._zero_qn_fast_path = None
 
 
     @property
@@ -143,6 +205,7 @@ class MatrixProduct:
         return np.minimum(dims1, dims2)
 
     def build_empty_qn(self):
+        self._zero_qn_fast_path = None
         self.qntot = np.array([0] * self.model.qn_size)
         # set qnidx to the right to be consistent with most MPS/MPO setups
         if self.qnidx is None:
@@ -152,6 +215,7 @@ class MatrixProduct:
             self.to_right = False
 
     def build_none_qn(self):
+        self._zero_qn_fast_path = None
         self.qntot = None
         self.qnidx = None
         self.qn = None
@@ -272,7 +336,13 @@ class MatrixProduct:
             else:
                 u = np.einsum("ji, i -> ji", u, sigma)
         if self.to_right:
-            self[idx + 1] = tensordot(vt, self[idx + 1], axes=1)
+            next_mt = self[idx + 1]
+            if next_mt.ndim == 3:
+                next_array = _absorb_left_matrix_into_mps(vt, next_mt)
+            else:
+                next_array = tensordot(vt, next_mt, axes=1)
+            if not self._set_array_no_qn_fast(idx + 1, next_array):
+                self[idx + 1] = next_array
             ret_mpsi = u.reshape(
                 [u.shape[0] // self[idx].pdim_prod] + list(self[idx].pdim) + [m_trunc]
             )
@@ -280,7 +350,13 @@ class MatrixProduct:
                 self.qn[idx + 1] = np.array(qnlset[:m_trunc])
                 self.qnidx = idx + 1
         else:
-            self[idx - 1] = tensordot(self[idx - 1], u, axes=1)
+            prev_mt = self[idx - 1]
+            if prev_mt.ndim == 3:
+                prev_array = _absorb_right_matrix_into_mps(prev_mt, u)
+            else:
+                prev_array = tensordot(prev_mt, u, axes=1)
+            if not self._set_array_no_qn_fast(idx - 1, prev_array):
+                self[idx - 1] = prev_array
             ret_mpsi = vt.reshape(
                 [m_trunc] + list(self[idx].pdim) + [vt.shape[1] // self[idx].pdim_prod]
             )
@@ -293,7 +369,8 @@ class MatrixProduct:
             # `u` or `vt` is not garbage collected.
             ret_mpsi = ret_mpsi.copy()
         assert ret_mpsi.any()
-        self[idx] = ret_mpsi
+        if not self._set_array_no_qn_fast(idx, ret_mpsi):
+            self[idx] = ret_mpsi
 
     def _switch_direction(self):
         assert self.to_right is not None
@@ -351,6 +428,59 @@ class MatrixProduct:
             qnbigr = add_outer(sigmaqn[1], qnr)
         qnmat = add_outer(qnbigl, qnbigr)
         return qnbigl, qnbigr, qnmat
+
+    def _detect_zero_qn_fast_path(self):
+        qntot = np.asarray(self.qntot)
+        if qntot.ndim != 1 or np.any(qntot):
+            return None
+        qn_size = len(qntot)
+        for qn in self.qn:
+            qn = np.asarray(qn)
+            if qn.ndim != 2 or qn.shape[-1] != qn_size or np.any(qn):
+                return None
+        basis_list = getattr(self.model, "basis", None)
+        if basis_list is None or len(basis_list) != self.site_num:
+            return None
+        for basis in basis_list:
+            sigmaqn = np.asarray(basis.sigmaqn)
+            if sigmaqn.ndim == 0 or sigmaqn.shape[-1] != qn_size:
+                return None
+            if np.any(sigmaqn):
+                return None
+        return _zero_qn_tuple(qn_size)
+
+    def _single_zero_qn_center(self, cidx):
+        if profiling.should_record_op() or not self.is_mps or len(cidx) != 1:
+            return None
+        cached = getattr(self, "_zero_qn_fast_path", None)
+        if cached is _ZERO_QN_FAST_PATH_DISABLED:
+            return None
+        if cached is not None:
+            return cached
+        zero_qn = self._detect_zero_qn_fast_path()
+        self._zero_qn_fast_path = zero_qn if zero_qn is not None else _ZERO_QN_FAST_PATH_DISABLED
+        return zero_qn
+
+    def _dense_qr_no_qn(self, idx, zero_qn):
+        mt = self[idx]
+        if self.to_right:
+            coef_matrix = mt.array.reshape((mt.shape[0] * mt.pdim_prod, mt.shape[-1]))
+            u, vt = np.linalg.qr(coef_matrix, mode="reduced")
+        else:
+            coef_matrix = mt.array.reshape((mt.shape[0], mt.pdim_prod * mt.shape[-1]))
+            u, vt = _reduced_rq(coef_matrix)
+        qnset = [zero_qn] * u.shape[1]
+        return u, vt, qnset, qnset
+
+    def _dense_svd_no_qn(self, idx, zero_qn):
+        mt = self[idx]
+        if self.to_right:
+            coef_matrix = mt.array.reshape((mt.shape[0] * mt.pdim_prod, mt.shape[-1]))
+        else:
+            coef_matrix = mt.array.reshape((mt.shape[0], mt.pdim_prod * mt.shape[-1]))
+        u, sigma, vt = _reduced_svd(coef_matrix)
+        qnset = [zero_qn] * len(sigma)
+        return u, sigma, vt, qnset, qnset
 
     @property
     def mp_norm(self) -> float:
@@ -433,9 +563,10 @@ class MatrixProduct:
         # qn at the boundary should have dimension 1
         new_mps.qn[0] = np.zeros((1, new_mps.qn[0].shape[1]), dtype=int)
         new_mps.qn[-1] = np.zeros((1, new_mps.qn[0].shape[1]), dtype=int)
+        new_mps._zero_qn_fast_path = None
         return new_mps
 
-    def compress(self, temp_m_trunc=None, ret_s=False):
+    def compress(self, temp_m_trunc=None, ret_s=False, check_canonical=True):
         """
         inp: canonicalise MPS (or MPO)
 
@@ -461,7 +592,7 @@ class MatrixProduct:
             self.compress_config.set_bonddim(len(self)+1)
         # used for logging at exit
         sz_before = self.total_bytes
-        if not self.is_mpo:
+        if check_canonical and not self.is_mpo:
             # ensure mps is canonicalised. This is time consuming.
             # to disable this, run python as `python -O`
             if self.is_left_canonical:
@@ -473,16 +604,20 @@ class MatrixProduct:
         s_list = []
         for idx in self.iter_idx_list(full=False):
             mt: Matrix = self[idx]
-            qnbigl, qnbigr, _ = self._get_big_qn([idx])
-            u, sigma, qnlset, v, sigma, qnrset = svd_qn.svd_qn(
-                mt.array,
-                qnbigl,
-                qnbigr,
-                self.qntot,
-                system=system,
-                full_matrices=False,
-            )
-            vt = v.T
+            zero_qn = self._single_zero_qn_center([idx])
+            if zero_qn is None:
+                qnbigl, qnbigr, _ = self._get_big_qn([idx])
+                u, sigma, qnlset, v, sigma, qnrset = svd_qn.svd_qn(
+                    mt.array,
+                    qnbigl,
+                    qnbigr,
+                    self.qntot,
+                    system=system,
+                    full_matrices=False,
+                )
+                vt = v.T
+            else:
+                u, sigma, vt, qnlset, qnrset = self._dense_svd_no_qn(idx, zero_qn)
             s_list.append(sigma)
             if temp_m_trunc is None:
                 m_trunc = self.compress_config.compute_m_trunc(
@@ -893,19 +1028,24 @@ class MatrixProduct:
         # idx is the current canonical center
         mt: Matrix = self[idx]
         assert mt.any()
-        qnbigl, qnbigr, _ = self._get_big_qn([idx])
         system = "L" if self.to_right else "R"
-        u, qnlset, v, qnrset = svd_qn.svd_qn(
-            mt.array,
-            qnbigl,
-            qnbigr,
-            self.qntot,
-            QR=True,
-            system=system,
-            full_matrices=False,
-        )
+        zero_qn = self._single_zero_qn_center([idx])
+        if zero_qn is None:
+            qnbigl, qnbigr, _ = self._get_big_qn([idx])
+            u, qnlset, v, qnrset = svd_qn.svd_qn(
+                mt.array,
+                qnbigl,
+                qnbigr,
+                self.qntot,
+                QR=True,
+                system=system,
+                full_matrices=False,
+            )
+            vt = v.T
+        else:
+            u, vt, qnlset, qnrset = self._dense_qr_no_qn(idx, zero_qn)
         self._update_ms(
-            idx, u, v.T, sigma=None, qnlset=qnlset, qnrset=qnrset
+            idx, u, vt, sigma=None, qnlset=qnlset, qnrset=qnrset
         )
 
     def canonicalise(self, stop_idx: int=None):
@@ -939,6 +1079,9 @@ class MatrixProduct:
         """
 
         assert len(self) == len(other)
+        if self[0].ndim == other[0].ndim == 3:
+            return _dot_mps_matrices(self, other)
+
         e0 = xp.eye(1, 1)
         # for debugging. It has little computational cost anyway
         debug_t = []
@@ -1068,18 +1211,63 @@ class MatrixProduct:
         new.qnidx = self.qnidx
         new.qntot = self.qntot.copy()
         new.to_right = self.to_right
+        new._zero_qn_fast_path = getattr(self, "_zero_qn_fast_path", None)
         return new
+
+    def _zero_qn_fast_path_cached(self, idx):
+        cached = getattr(self, "_zero_qn_fast_path", None)
+        if cached is _ZERO_QN_FAST_PATH_DISABLED:
+            return None
+        if cached is None:
+            if self.qntot is None or self.qn is None or len(self.qn) != self.site_num + 1:
+                return None
+            cached = self._single_zero_qn_center([idx])
+        return cached
+
+    def _array2mt_no_qn_fast(self, array, idx, allow_dump):
+        if isinstance(array, Matrix) or not isinstance(array, np.ndarray):
+            return None
+        if self._zero_qn_fast_path_cached(idx) is None:
+            return None
+        if self.dtype == backend.real_dtype and np.iscomplexobj(array):
+            return None
+        converted = array if array.dtype == self.dtype else np.asarray(array, dtype=self.dtype)
+        if converted.ndim < 3 or converted.shape[1] != self.model.pbond_list[idx]:
+            raise ValueError("Matrix physical bond dimension does not match system information")
+        if allow_dump and self.compress_config.dump_matrix_size < converted.nbytes:
+            return None
+
+        mt = Matrix.__new__(Matrix)
+        mt.array = converted
+        mt.original_shape = mt.array.shape
+        mt.sigmaqn = self.model.basis[idx].sigmaqn
+        return mt
+
+    def _set_array_no_qn_fast(self, idx, array, *, allow_dump=True):
+        if isinstance(self._mp[idx], str):
+            return False
+        mt = self._array2mt_no_qn_fast(array, idx, allow_dump)
+        if mt is None:
+            return False
+        self._mp[idx] = mt
+        return True
 
     def _array2mt(self, array, idx, allow_dump=True):
         # convert dtype
+        sigmaqn_set = False
         if isinstance(array, Matrix):
             mt = array.astype(self.dtype)
         else:
-            mt = Matrix(array, dtype=self.dtype)
-        if mt.pdim[0] != self.pbond_list[idx]:
+            mt = self._array2mt_no_qn_fast(array, idx, allow_dump)
+            if mt is None:
+                mt = Matrix(array, dtype=self.dtype)
+            else:
+                sigmaqn_set = True
+        if not sigmaqn_set and mt.pdim[0] != self.pbond_list[idx]:
             raise ValueError("Matrix physical bond dimension does not match system information")
         # setup the matrix
-        mt.sigmaqn = self._get_sigmaqn(idx)
+        if not sigmaqn_set:
+            mt.sigmaqn = self._get_sigmaqn(idx)
 
         # array too large. Should be stored in disk
         # use ``while`` to handle the multiple-exit logic
@@ -1197,7 +1385,12 @@ class MatrixProduct:
 
     def __setitem__(self, key, array):
         old_mt = self._mp[key]
-        if isinstance(old_mt, str):
+        if not isinstance(old_mt, str):
+            new_mt = self._array2mt_no_qn_fast(array, key, allow_dump=True)
+            if new_mt is not None:
+                self._mp[key] = new_mt
+                return
+        else:
             try:
                 os.remove(old_mt)
             except:

@@ -837,7 +837,7 @@ class TTNS(TTNBase):
             self.push_cano_to_parent(node)
         return self
 
-    def compress(self, temp_m_trunc=None, ret_s=False):
+    def compress(self, temp_m_trunc=None, ret_s=False, check_canonical=True):
         """
         Compress the TTNS based on SVD
 
@@ -849,6 +849,8 @@ class TTNS(TTNBase):
         ret_s: bool
             Whether return the singular values at the bonds.
             The singular values are padded to a rectangular array with zero values.
+        check_canonical: bool
+            Whether to check canonical form after compression.
 
         Returns
         -------
@@ -859,7 +861,8 @@ class TTNS(TTNBase):
         s_dict: Dict[TreeNodeTensor, np.ndarray] = {self.root: np.array([1])}
         compress_recursion(self.root, self, s_dict, temp_m_trunc)
         self.check_shape()
-        self.check_canonical()
+        if check_canonical:
+            self.check_canonical()
         if not ret_s:
             return self
         else:

@@ -6784,7 +6784,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
         grouped_gemm_policy = self._grouped_gemm_execution_policy(stats, fallback_reason)
         context_payload = dict(profile_context or {})
         context_payload.pop("event", None)
-        if profiling is not None:
+        if should_profile:
             output_shape = [tuple(getattr(item, "shape", ())) for item in result]
             output_strides = [profiling.array_strides(item) for item in result]
             output_order = [profiling.array_order(item) for item in result]
@@ -6807,6 +6807,19 @@ class AbstractBackend(SingleProcessDistributedMixin):
             output_is_device = None
             output_is_distributed = None
 
+        group_key_buckets = self._grouped_gemm_execute_group_key_buckets(gemm_batch)
+        if should_profile:
+            group_keys = [key.to_dict() for key in gemm_batch.groups]
+            group_descriptors = self._grouped_gemm_group_descriptors(
+                gemm_batch,
+                bucket_execution_profile.bucket_execution_profiles,
+            )
+            shape_buckets = self._grouped_gemm_execute_shape_buckets(gemm_batch, stats)
+        else:
+            group_keys = [key.to_dict() for key in gemm_batch.groups]
+            group_descriptors = None
+            shape_buckets = [dict(bucket) for bucket in stats.shape_buckets]
+
         execute_payload = {
             "event": "grouped_gemm_execute",
             "backend": self.name,
@@ -6825,13 +6838,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "num_tasks": len(gemm_batch.descs),
             "num_groups": len(gemm_batch.groups),
             "group_sizes": list(gemm_batch.group_sizes),
-            "group_keys": [key.to_dict() for key in gemm_batch.groups],
-            "group_key_buckets": self._grouped_gemm_execute_group_key_buckets(gemm_batch),
-            "group_descriptors": self._grouped_gemm_group_descriptors(
-                gemm_batch,
-                bucket_execution_profile.bucket_execution_profiles,
-            ),
-            "shape_buckets": self._grouped_gemm_execute_shape_buckets(gemm_batch, stats),
+            "group_keys": group_keys,
+            "group_key_buckets": group_key_buckets,
+            "shape_buckets": shape_buckets,
             "gsta": list(gemm_batch.gsta),
             "sorted_indices": list(gemm_batch.sorted_indices),
             "total_flops": gemm_batch.total_flops,
@@ -6868,6 +6877,8 @@ class AbstractBackend(SingleProcessDistributedMixin):
             "effective_allow_batched": bool(effective_allow_batched),
             **context_payload,
         }
+        if group_descriptors is not None:
+            execute_payload["group_descriptors"] = group_descriptors
         if profiling is not None:
             execute_payload = profiling.standardize_event_payload(execute_payload)
         self._last_execution_profile = dict(execute_payload)
