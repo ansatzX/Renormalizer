@@ -34,6 +34,9 @@ init_log(log_level)
 del os, log_level, init_log
 
 
+from renormalizer.cons import BackendConfig, get_backend, set_backend
+
+
 # user interfaces
 from renormalizer.model import Model, HolsteinModel, SpinBosonModel, TI1DModel, Op, OpSum
 from renormalizer.model.basis import BasisSHO, BasisHopsBoson, BasisSineDVR, BasisMultiElectron, \
@@ -48,4 +51,3 @@ from renormalizer.utils.configs import (
     EvolveConfig,
     EvolveMethod,
 )
-
