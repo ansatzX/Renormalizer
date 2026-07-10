@@ -1,8 +1,24 @@
 from unittest.mock import patch
+
 import pytest
 
 from renormalizer.mps.oe_contract_wrap import oe_contract, oe_contract_expression
-from renormalizer.mps.backend import np, MEMORY_ERRORS
+from renormalizer.mps.backend import MEMORY_ERRORS, np, xp
+from renormalizer.mps.matrix import asnumpy
+
+
+def test_oe_contract_expression_matches_numpy():
+    rng = np.random.default_rng(11)
+    left = rng.normal(size=(2, 3))
+    right = rng.normal(size=(3, 4))
+    expr = oe_contract_expression(
+        "ab,bc->ac", xp.asarray(left), right.shape, constants=[0]
+    )
+
+    actual = asnumpy(expr(xp.asarray(right)))
+    expected = np.einsum("ab,bc->ac", left, right)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
 
 def test_oe_contract():
@@ -41,4 +57,3 @@ def test_oe_contract_expression():
         assert "Out of memory error calling oe contract expression" in messages, (
             "Expected message not found in logger.fatal calls"
         )
-
