@@ -5,6 +5,7 @@ import weakref
 import logging
 from typing import List, Union
 
+from renormalizer.backend.boundary import eye_like, to_numpy_dtype
 from renormalizer.mps.backend import np, backend, xp
 
 logger = logging.getLogger(__name__)
@@ -15,14 +16,17 @@ class Matrix:
     def __init__(self, array, dtype=None):
         assert array is not None
         array = asnumpy(array)
-        if dtype == backend.real_dtype:
+        dtype = to_numpy_dtype(dtype)
+        real_dtype = to_numpy_dtype(backend.real_dtype)
+        complex_dtype = to_numpy_dtype(backend.complex_dtype)
+        if dtype == real_dtype:
             # forbid unchecked casting
             assert not np.iscomplexobj(array)
         if dtype is None:
             if np.iscomplexobj(array):
-                dtype = backend.complex_dtype
+                dtype = complex_dtype
             else:
-                dtype = backend.real_dtype
+                dtype = real_dtype
         self.array: np.ndarray = np.asarray(array, dtype=dtype)
         self.original_shape = self.array.shape
         self.sigmaqn = None
@@ -53,7 +57,11 @@ class Matrix:
         return self.array.dtype
 
     def astype(self, dtype):
-        assert not (self.dtype == backend.complex_dtype and dtype == backend.real_dtype)
+        dtype = to_numpy_dtype(dtype)
+        assert not (
+            self.dtype == to_numpy_dtype(backend.complex_dtype)
+            and dtype == to_numpy_dtype(backend.real_dtype)
+        )
         self.array = np.asarray(self.array, dtype=dtype)
         return self
 
@@ -100,7 +108,7 @@ class Matrix:
             rtol = backend.canonical_rtol
         tensm = asxp(self.array.reshape([np.prod(self.shape[:-1]), self.shape[-1]]))
         s = tensm.T.conj() @ tensm
-        return xp.allclose(s, xp.eye(s.shape[0]), rtol=rtol, atol=atol)
+        return xp.allclose(s, eye_like(s.shape[0], s, xp), rtol=rtol, atol=atol)
 
     def check_rortho(self, rtol: float = None, atol: float = None):
         """
@@ -112,12 +120,12 @@ class Matrix:
             rtol = backend.canonical_rtol
         tensm = asxp(self.array.reshape([self.shape[0], np.prod(self.shape[1:])]))
         s = tensm @ tensm.T.conj()
-        return xp.allclose(s, xp.eye(s.shape[0]), rtol=rtol, atol=atol)
+        return xp.allclose(s, eye_like(s.shape[0], s, xp), rtol=rtol, atol=atol)
 
     def to_complex(self):
         # `xp.array` always creates new array, so to_complex means copy, which is
         # in accordance with NumPy
-        return np.array(self.array, dtype=backend.complex_dtype)
+        return np.array(self.array, dtype=to_numpy_dtype(backend.complex_dtype))
 
     def copy(self):
         new = self.__class__(self.array.copy(), self.array.dtype)

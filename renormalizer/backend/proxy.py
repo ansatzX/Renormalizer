@@ -10,7 +10,12 @@ from renormalizer.backend.protocol import BackendProtocol
 class BackendManager:
     def __init__(self, initial_backend=None, *, config=None, **options):
         selected = create_backend(initial_backend, config=config, **options)
-        self._seed_backend(selected)
+        try:
+            selected.activate()
+            self._seed_backend(selected)
+        except Exception:
+            selected.deactivate()
+            raise
         self.current: BackendProtocol = selected
 
     @staticmethod
@@ -19,8 +24,20 @@ class BackendManager:
         selected.random.seed(seed)
 
     def set_backend(self, name: str, *, config=None, **options):
-        selected = create_backend(name, config=config, **options)
-        self._seed_backend(selected)
+        previous = self.current
+        previous.deactivate()
+        selected = None
+        try:
+            selected = create_backend(name, config=config, **options)
+            selected.activate()
+            self._seed_backend(selected)
+        except Exception:
+            try:
+                if selected is not None:
+                    selected.deactivate()
+            finally:
+                previous.activate()
+            raise
         self.current = selected
         return selected
 

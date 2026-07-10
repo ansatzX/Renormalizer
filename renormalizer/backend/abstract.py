@@ -3,12 +3,49 @@
 
 """Shared behavior for selectable numerical backends."""
 
+import functools
+from types import ModuleType
 from typing import Any
 
 import numpy as np
 
 from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.transforms import UnavailableTransforms
+
+
+class _DeviceBoundNamespace:
+    """Delegate namespace calls inside one configured device context."""
+
+    def __init__(self, namespace, on_device):
+        self._namespace = namespace
+        self._on_device = on_device
+        self._cache = {}
+
+    def __getattr__(self, name):
+        if name in self._cache:
+            return self._cache[name]
+
+        value = getattr(self._namespace, name)
+        if isinstance(value, ModuleType):
+            result = type(self)(value, self._on_device)
+        elif callable(value) and not isinstance(value, type):
+            def device_bound_call(*args, **kwargs):
+                return self._on_device(value, *args, **kwargs)
+
+            try:
+                result = functools.update_wrapper(device_bound_call, value)
+            except (AttributeError, TypeError):
+                result = device_bound_call
+        else:
+            result = value
+        self._cache[name] = result
+        return result
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(dir(self._namespace)))
+
+    def __repr__(self):
+        return repr(self._namespace)
 
 
 class AbstractBackend:
@@ -22,6 +59,7 @@ class AbstractBackend:
     supports_jit = False
     supports_sparse = False
     supports_functional_update = True
+    supports_execution_ir = False
     host_array_types = (np.ndarray,)
     device_array_types = ()
 
@@ -126,12 +164,20 @@ class AbstractBackend:
             return None
         return self.to_numpy(value)
 
-    def to_backend(self, value: Any):
+    def to_backend(self, value: Any, *, dtype=None):
         if value is None:
             return None
+        if dtype is not None:
+            return self.asarray(value, dtype=dtype)
         if self.is_host_array(value):
             return self.from_numpy(value)
         return self.asarray(value)
+
+    def activate(self):
+        return None
+
+    def deactivate(self):
+        return None
 
     def current_device(self):
         return self.device

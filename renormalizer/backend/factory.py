@@ -11,12 +11,22 @@ from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.numpy_backend import NumpyBackend
 
 
-SUPPORTED_BACKENDS = ("numpy", "cupy")
+SUPPORTED_BACKENDS = ("numpy", "cupy", "jax", "torch")
 _BACKEND_ALIASES = {
     "np": "numpy",
     "numpy": "numpy",
     "cp": "cupy",
     "cupy": "cupy",
+    "jax": "jax",
+    "jnp": "jax",
+    "pytorch": "torch",
+    "torch": "torch",
+}
+
+_BACKEND_PACKAGES = {
+    "cupy": "cupy",
+    "jax": "jax",
+    "torch": "torch",
 }
 
 
@@ -51,16 +61,24 @@ def create_backend(name=None, *, config=None, **options):
         if backend_config.device != "cpu":
             raise ValueError("backend 'numpy' only supports device='cpu' in Stage 1")
         return NumpyBackend(backend_config)
-    from renormalizer.backend.cupy_backend import CupyBackend
+    if normalized == "cupy":
+        from renormalizer.backend.cupy_backend import CupyBackend
 
-    return CupyBackend(backend_config)
+        return CupyBackend(backend_config)
+    if normalized == "jax":
+        from renormalizer.backend.jax_backend import JaxBackend
+
+        return JaxBackend(backend_config)
+    from renormalizer.backend.torch_backend import TorchBackend
+
+    return TorchBackend(backend_config)
 
 
 def is_backend_available(name):
     normalized = normalize_backend_name(name)
     if normalized == "numpy":
         return True
-    return importlib.util.find_spec("cupy") is not None
+    return importlib.util.find_spec(_BACKEND_PACKAGES[normalized]) is not None
 
 
 def available_backends():

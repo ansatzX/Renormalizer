@@ -3,13 +3,11 @@
 
 """CuPy backend adapter with lazy package loading and indexed CUDA devices."""
 
-import functools
 import logging
-from types import ModuleType
 
 import numpy as np
 
-from renormalizer.backend.abstract import AbstractBackend
+from renormalizer.backend.abstract import AbstractBackend, _DeviceBoundNamespace
 
 
 logger = logging.getLogger(__name__)
@@ -23,41 +21,6 @@ def _import_cupy():
             "CuPy is not installed. Install cupy or select the NumPy backend."
         ) from error
     return cupy
-
-
-class _DeviceBoundNamespace:
-    """Delegate CuPy namespace calls inside one configured device context."""
-
-    def __init__(self, namespace, on_device):
-        self._namespace = namespace
-        self._on_device = on_device
-        self._cache = {}
-
-    def __getattr__(self, name):
-        if name in self._cache:
-            return self._cache[name]
-
-        value = getattr(self._namespace, name)
-        if isinstance(value, ModuleType):
-            result = type(self)(value, self._on_device)
-        elif callable(value) and not isinstance(value, type):
-            def device_bound_call(*args, **kwargs):
-                return self._on_device(value, *args, **kwargs)
-
-            try:
-                result = functools.update_wrapper(device_bound_call, value)
-            except (AttributeError, TypeError):
-                result = device_bound_call
-        else:
-            result = value
-        self._cache[name] = result
-        return result
-
-    def __dir__(self):
-        return sorted(set(super().__dir__()) | set(dir(self._namespace)))
-
-    def __repr__(self):
-        return repr(self._namespace)
 
 
 class CupyBackend(AbstractBackend):
@@ -122,10 +85,10 @@ class CupyBackend(AbstractBackend):
     def to_host(self, value):
         return self.to_numpy(value)
 
-    def to_backend(self, value):
+    def to_backend(self, value, *, dtype=None):
         if value is None:
             return None
-        return self.asarray(value)
+        return self.asarray(value, dtype=dtype)
 
     def tensordot(self, a, b, axes=2):
         return self._on_device(self._cupy.tensordot, a, b, axes=axes)

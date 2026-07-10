@@ -46,10 +46,10 @@ def test_scalar_to_python_rejects_nonscalar_input():
         scalar_to_python(np.array([1.0]), selected)
 
 
-def test_factory_exposes_only_numpy_and_cupy_adapters():
+def test_factory_keeps_numpy_adapter_after_optional_backends_are_registered():
     from renormalizer.backend.numpy_backend import NumpyBackend
 
-    assert SUPPORTED_BACKENDS == ("numpy", "cupy")
+    assert SUPPORTED_BACKENDS == ("numpy", "cupy", "jax", "torch")
     assert isinstance(create_backend("numpy"), NumpyBackend)
 
 

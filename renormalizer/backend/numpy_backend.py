@@ -39,7 +39,7 @@ class NumpyBackend(AbstractBackend):
     def to_host(self, value):
         return self.to_numpy(value)
 
-    def to_backend(self, value):
+    def to_backend(self, value, *, dtype=None):
         if value is None:
             return None
-        return np.asarray(value)
+        return np.asarray(value, dtype=dtype)
