@@ -25,6 +25,8 @@ example/.ipynb_checkpoints/
 doc/html
 doc/doctrees
 doc/build
+docs/
+.worktrees/
 
 build/
 dist/
