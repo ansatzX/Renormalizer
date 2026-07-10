@@ -4,14 +4,20 @@
 """Backend construction without importing optional backend packages."""
 
 import os
+import importlib.util
 from dataclasses import replace
 
-from renormalizer.backend.abstract import AbstractBackend
 from renormalizer.backend.config import BackendConfig
+from renormalizer.backend.numpy_backend import NumpyBackend
 
 
-SUPPORTED_BACKENDS = ("numpy",)
-_BACKEND_ALIASES = {"np": "numpy", "numpy": "numpy"}
+SUPPORTED_BACKENDS = ("numpy", "cupy")
+_BACKEND_ALIASES = {
+    "np": "numpy",
+    "numpy": "numpy",
+    "cp": "cupy",
+    "cupy": "cupy",
+}
 
 
 def normalize_backend_name(name):
@@ -38,15 +44,24 @@ def _make_config(config, options):
 
 def create_backend(name=None, *, config=None, **options):
     normalized = normalize_backend_name(name)
+    if normalized == "cupy" and config is None and "device" not in options:
+        options = {**options, "device": "gpu"}
     backend_config = _make_config(config, options)
-    if backend_config.device != "cpu":
-        raise ValueError("backend 'numpy' only supports device='cpu' in Stage 1")
-    return AbstractBackend(backend_config)
+    if normalized == "numpy":
+        if backend_config.device != "cpu":
+            raise ValueError("backend 'numpy' only supports device='cpu' in Stage 1")
+        return NumpyBackend(backend_config)
+    from renormalizer.backend.cupy_backend import CupyBackend
+
+    return CupyBackend(backend_config)
 
 
 def is_backend_available(name):
-    return normalize_backend_name(name) == "numpy"
+    normalized = normalize_backend_name(name)
+    if normalized == "numpy":
+        return True
+    return importlib.util.find_spec("cupy") is not None
 
 
 def available_backends():
-    return {"numpy": True}
+    return {name: is_backend_available(name) for name in SUPPORTED_BACKENDS}

@@ -5,7 +5,17 @@ from typing import List, Union, Tuple, Dict
 
 import numpy as np
 
+from renormalizer.backend.boundary import scalar_to_python
+from renormalizer.cons import backend
 from renormalizer.utils import Quantity
+
+
+def _normalize_scalar(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if backend.is_array(value) and getattr(value, "ndim", None) == 0:
+        return scalar_to_python(value, backend)
+    return value
 
 
 class Op:
@@ -381,9 +391,7 @@ class Op:
 
     def __mul__(self, other) -> Union["Op", List["Op"]]:
         # multiplication with another Op or with scalar
-        # convert numpy scalar to python scalar
-        if isinstance(other, np.generic):
-            other = other.item()
+        other = _normalize_scalar(other)
         if isinstance(other, Op):
             return Op.product([self, other])
         elif isinstance(other, (int, float, complex)):
@@ -397,6 +405,7 @@ class Op:
             raise TypeError(f"Unsupported type: {type(other)}")
 
     def __rmul__(self, other) -> "Op":
+        other = _normalize_scalar(other)
         if isinstance(other, (int, float, complex, np.generic)):
             return self * other
         elif isinstance(other, list):
@@ -508,6 +517,7 @@ class OpSum(list):
         return self + (-other)
 
     def __mul__(self, other):
+        other = _normalize_scalar(other)
         if isinstance(other, list):
             res = []
             for op1 in self:
@@ -520,11 +530,13 @@ class OpSum(list):
             return OpSum(super().__mul__(other))
 
     def __rmul__(self, other):
+        other = _normalize_scalar(other)
         if isinstance(other, (int, float, complex, np.generic)):
             return self * other
         return OpSum(super().__rmul__(other))
 
     def __truediv__(self, other):
+        other = _normalize_scalar(other)
         assert isinstance(other, (int, float, complex, np.generic))
         return self * (1/other)
 

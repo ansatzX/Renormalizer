@@ -8,6 +8,7 @@ import math
 import logging
 import numpy as np
 
+from renormalizer.cons import backend
 from renormalizer.utils import constant
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,9 @@ class Quantity:
     def __init__(self, value, unit="a.u."):
         if unit not in allowed_units:
             raise ValueError(f"Unit not in {allowed_units}, got {unit}.")
+
+        if backend.is_device_array(value):
+            value = backend.to_host(value)
 
         # Store as numpy array for unified handling
         self._data = np.array(value, dtype=float, ndmin=1)  # Ensure at least 1D
@@ -212,21 +216,23 @@ class Quantity:
             yield Quantity(float(value), self.unit)
 
     # Numpy compatibility
-    def __array__(self):
+    def __array__(self, dtype=None, copy=None):
         """Allow numpy to convert this to array."""
-        return self._data
+        if copy is None:
+            return np.asarray(self._data, dtype=dtype)
+        return np.array(self._data, dtype=dtype, copy=copy)
 
     def __str__(self):
         if self._data.size == 1:
             return f"{float(self._data[0])} {self.unit}"
         else:
-            return f"{list(self._data)} {self.unit}"
+            return f"{self._data.tolist()} {self.unit}"
 
     def __repr__(self):
         if self._data.size == 1:
             return f"Quantity({float(self._data[0])}, '{self.unit}')"
         else:
-            return f"Quantity({list(self._data)}, '{self.unit}')"
+            return f"Quantity({self._data.tolist()}, '{self.unit}')"
 
     # TODO: magic methods such as `__lt__` and so on
 
@@ -297,4 +303,3 @@ def parse_quantity_str(quantity_str: str):
             return Quantity(value, unit_str)
         except ValueError as e:
             raise ValueError(f"Invalid numeric value '{value_str}': {e}")
-        

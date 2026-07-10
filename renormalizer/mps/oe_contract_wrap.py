@@ -3,17 +3,26 @@ import logging
 
 import opt_einsum as oe
 
-from renormalizer.mps.backend import MEMORY_ERRORS, ARRAY_TYPES, xp
+from renormalizer.mps.backend import backend, xp
 
 
 logger = logging.getLogger(__name__)
+
+
+def active_memory_errors():
+    return backend.memory_errors
+
+
+def active_array_types():
+    array_types = backend.ndarray
+    return array_types if isinstance(array_types, tuple) else (array_types,)
 
 
 def log_error(e, args, kwargs):
     logger.exception(e)
     logger.fatal("The arguments are:")
     for i, arg in enumerate(args):
-        if isinstance(arg, ARRAY_TYPES):
+        if isinstance(arg, active_array_types()):
             logger.fatal(f"{i} Array type: {type(arg)}, shape:{arg.shape}")
         else:
             logger.fatal(f"{i} Non-array argument: {arg}")
@@ -38,7 +47,7 @@ def oe_contract(*args, **kwargs):
     update_kwargs(args, kwargs)
     try:
         return oe.contract(*args, **kwargs)
-    except MEMORY_ERRORS as e:
+    except active_memory_errors() as e:
         logger.fatal("Out of memory error calling oe.contract")
         log_error(e, args, kwargs)
         raise e
@@ -50,7 +59,7 @@ def oe_contract_expression(*args, **kwargs):
     def expr_wrapped(matrix: xp.ndarray, *args2, **kwargs2):
         try:
             return expr(matrix, *args2, **kwargs2)
-        except MEMORY_ERRORS as e:
+        except active_memory_errors() as e:
             logger.fatal("Out of memory error calling oe contract expression")
             log_error(e, args, kwargs)
             logger.fatal(f"Input matrix type: {type(matrix)}, shape: {matrix.shape}")

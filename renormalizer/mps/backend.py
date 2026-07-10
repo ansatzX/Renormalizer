@@ -2,8 +2,6 @@
 
 """Legacy import compatibility for the process-wide backend facade."""
 
-import os
-
 import numpy as np
 
 from renormalizer.cons import backend, get_backend, get_git_commit_hash, runtime_backend, set_backend, xp
@@ -31,7 +29,10 @@ def __getattr__(name):
     if name == "USE_GPU":
         return backend.supports_gpu
     if name == "GPU_ID":
-        return os.environ.get("RENO_GPU")
+        device = backend.current_device()
+        if device.startswith("cuda:"):
+            return int(device.split(":", 1)[1])
+        return None
     if name == "OE_BACKEND":
         return backend.opt_einsum_name
     if name == "MEMORY_ERRORS":

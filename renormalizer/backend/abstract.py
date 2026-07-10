@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Author: Cunxi Gong <ansatzMe@outlook.com>
 
-"""Shared NumPy-backed implementation used until dedicated adapters arrive."""
+"""Shared behavior for selectable numerical backends."""
 
 from typing import Any
 
@@ -12,7 +12,7 @@ from renormalizer.backend.transforms import UnavailableTransforms
 
 
 class AbstractBackend:
-    name = "numpy"
+    name = "abstract"
     array_namespace = np
     ndarray = np.ndarray
     memory_errors = (MemoryError,)
@@ -129,7 +129,21 @@ class AbstractBackend:
     def to_backend(self, value: Any):
         if value is None:
             return None
-        return np.asarray(value)
+        if self.is_host_array(value):
+            return self.from_numpy(value)
+        return self.asarray(value)
+
+    def current_device(self):
+        return self.device
+
+    def tensordot(self, a, b, axes=2):
+        return self.array_namespace.tensordot(a, b, axes=axes)
+
+    def transpose(self, value, axes=None):
+        return self.array_namespace.transpose(value, axes=axes)
+
+    def matmul(self, a, b, *args, **kwargs):
+        return self.array_namespace.matmul(a, b, *args, **kwargs)
 
     def is_array(self, value: Any) -> bool:
         return isinstance(value, self.ndarray)
@@ -138,7 +152,7 @@ class AbstractBackend:
         return isinstance(value, self.host_array_types)
 
     def is_device_array(self, value: Any) -> bool:
-        return False
+        return isinstance(value, self.device_array_types)
 
     def sync(self):
         return None

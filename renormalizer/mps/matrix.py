@@ -5,7 +5,7 @@ import weakref
 import logging
 from typing import List, Union
 
-from renormalizer.mps.backend import np, backend, xp, USE_GPU
+from renormalizer.mps.backend import np, backend, xp
 
 logger = logging.getLogger(__name__)
 
@@ -300,15 +300,9 @@ def asnumpy(array: Union[np.ndarray, xp.ndarray, Matrix, List]) -> np.ndarray:
         return None
     if isinstance(array, Matrix):
         return array.array
-    if isinstance(array, List):
+    if isinstance(array, list):
         return np.array(array)
-    if not USE_GPU:
-        assert isinstance(array, np.ndarray)
-        return array
-    if isinstance(array, np.ndarray):
-        return array
-    stream = xp.cuda.get_current_stream()
-    return xp.asnumpy(array, stream=stream)
+    return backend.to_host(array)
 
 
 def asxp(array: Union[np.ndarray, xp.ndarray, Matrix]) -> xp.ndarray:
@@ -316,10 +310,7 @@ def asxp(array: Union[np.ndarray, xp.ndarray, Matrix]) -> xp.ndarray:
         return None
     if isinstance(array, Matrix):
         array = array.array
-    if not USE_GPU:
-        assert isinstance(array, np.ndarray)
-        return array
-    return xp.asarray(array)
+    return backend.to_backend(array)
 
 
 def asxp_oe_args(oe_args):

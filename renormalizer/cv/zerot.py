@@ -2,7 +2,7 @@
 # Author: Tong Jiang <tongjiang1000@gmail.com>
 # zero temperature absorption/emission spectrum based on DDMRG
 from renormalizer.cv.spectra_cv import SpectraCv
-from renormalizer.mps.backend import np, xp, USE_GPU
+from renormalizer.mps.backend import backend, np, xp
 from renormalizer.mps.lib import cvec2cmat
 from renormalizer.mps import Mpo, Mps, gs
 from renormalizer.mps.svd_qn import get_qn_mask
@@ -259,11 +259,7 @@ class SpectraZtCV(SpectraCv):
                 # ax1 = oe_contract("abcd, befh, cfgi, hjkn, iklo, mnop, dglp -> aejm",
                 #        first_L, a_oper_isite2, a_oper_isite2, a_oper_isite1,
                 #        a_oper_isite1, first_R, xstruct)
-                if USE_GPU:
-                    oe_backend = "cupy"
-                else:
-                    oe_backend = "numpy"
-                ax1 = expr(xstruct, backend=oe_backend)   
+                ax1 = expr(xstruct, backend=backend.opt_einsum_name)
                 #print(oe_contract_path("abcd, befh, cfgi, hjkn, iklo, mnop, dglp -> aejm",
                 #        first_L, a_oper_isite2, a_oper_isite2, a_oper_isite1,
                 #        a_oper_isite1, first_R, xstruct))

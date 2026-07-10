@@ -7,10 +7,10 @@ import numpy as np
 
 
 def scalar_to_python(value, active_backend):
-    scalar = np.asarray(active_backend.to_numpy(value)).reshape(-1)[0]
-    if np.iscomplexobj(scalar) and not np.isclose(scalar.imag, 0):
-        return complex(scalar)
-    return float(np.real(scalar))
+    scalar = np.asarray(active_backend.to_numpy(value))
+    if scalar.ndim != 0:
+        raise ValueError("expected a scalar value, got shape {}".format(scalar.shape))
+    return scalar.item()
 
 
 def flatten_backend(value, active_backend):
