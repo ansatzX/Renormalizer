@@ -10,6 +10,7 @@ from renormalizer.mps.matrix import asnumpy, asxp
 from renormalizer.tn.node import TreeNodeTensor
 from renormalizer.tn.tree import TTNS, TTNO, TTNEnviron
 from renormalizer.tn.hop_expr import hop_expr2
+from renormalizer.utils import profiling
 
 
 logger = logging.getLogger(__name__)
@@ -18,14 +19,40 @@ logger = logging.getLogger(__name__)
 def optimize_ttns(ttns: TTNS, ttno: TTNO, procedure=None):
     if procedure is None:
         procedure = ttns.optimize_config.procedure
+    profile_enabled = profiling.enabled()
+    if profile_enabled:
+        from time import perf_counter
+
+        phase_start = perf_counter()
     ttne = TTNEnviron(ttns, ttno)
+    if profile_enabled:
+        _record_phase_summary("environment_construction", "construct", perf_counter() - phase_start)
     e_list = []
     for m, percent in procedure:
         # todo: better converge condition
+        if profile_enabled:
+            phase_start = perf_counter()
         micro_e = optimize_recursion(ttns.root, ttns, ttno, ttne, m, percent)
+        if profile_enabled:
+            _record_phase_summary(
+                "optimization_sweep", "ttns_optimization_sweep", perf_counter() - phase_start
+            )
         logger.info(f"Micro e: {micro_e}")
         e_list.append(micro_e[-1])
     return e_list
+
+
+def _record_phase_summary(phase, operation, wall_s):
+    from renormalizer.backend._execution.profiling import phase_summary_payload
+
+    payload = phase_summary_payload(
+        phase=phase,
+        network="ttns",
+        operation=operation,
+        operation_count=1,
+        wall_s=wall_s,
+    )
+    profiling.record("phase_summary", **payload)
 
 
 def optimize_recursion(

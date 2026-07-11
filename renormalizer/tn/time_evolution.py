@@ -10,6 +10,7 @@ from renormalizer.mps.backend import np, xp
 from renormalizer.mps.matrix import asxp
 from renormalizer.mps.oe_contract_wrap import oe_contract
 from renormalizer.lib import solve_ivp, expm_krylov
+from renormalizer.utils import profiling
 from renormalizer.utils.configs import EvolveMethod
 from renormalizer.tn.node import TreeNodeTensor
 from renormalizer.tn.tree import TTNO, TTNS, TTNEnviron, EVOLVE_METHODS
@@ -22,8 +23,15 @@ logger = logging.getLogger(__name__)
 def time_derivative_vmf(ttns: TTNS, ttno: TTNO):
     # todo: benchmark and optimize
     # parallel over multiple processors?
+    profile_enabled = profiling.enabled()
+    if profile_enabled:
+        from time import perf_counter
+
+        phase_start = perf_counter()
     environ_s = TTNEnviron(ttns, TTNO.dummy(ttns.basis))
     environ_h = TTNEnviron(ttns, ttno)
+    if profile_enabled:
+        _record_phase_summary("environment_construction", "construct", 2, perf_counter() - phase_start)
 
     deriv_list = []
     for inode, node in enumerate(ttns.node_list):
@@ -79,12 +87,27 @@ def evolve_prop_and_compress_tdrk4(ttns: TTNS, ttno: TTNO, coeff: Union[complex,
 def evolve_tdvp_ps(ttns: TTNS, ttno: TTNO, coeff: Union[complex, float], tau: float):
     ttns.check_canonical()
     # second order 1-site projector splitting
+    profile_enabled = profiling.enabled()
+    if profile_enabled:
+        from time import perf_counter
+
+        phase_start = perf_counter()
     ttne = TTNEnviron(ttns, ttno)
+    if profile_enabled:
+        _record_phase_summary("environment_construction", "construct", 1, perf_counter() - phase_start)
 
     # in MPS language: left to right sweep
+    if profile_enabled:
+        phase_start = perf_counter()
     local_steps1 = _tdvp_ps_forward(ttns, ttno, ttne, coeff, tau / 2)
+    if profile_enabled:
+        _record_phase_summary("tdvp_sweep", "tdvp_forward_sweep", 1, perf_counter() - phase_start)
     # in MPS language: right to left sweep
+    if profile_enabled:
+        phase_start = perf_counter()
     local_steps2 = _tdvp_ps_backward(ttns, ttno, ttne, coeff, tau / 2)
+    if profile_enabled:
+        _record_phase_summary("tdvp_sweep", "tdvp_backward_sweep", 1, perf_counter() - phase_start)
 
     # Used for consistency with MPS
     # # in MPS language: right to left sweep
@@ -177,14 +200,42 @@ def _tdvp_ps_backward(ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, coeff: Union[com
 def evolve_tdvp_ps2(ttns: TTNS, ttno: TTNO, coeff: Union[complex, float], tau: float):
     ttns.check_canonical()
     # second order 2-site projector splitting
+    profile_enabled = profiling.enabled()
+    if profile_enabled:
+        from time import perf_counter
+
+        phase_start = perf_counter()
     tte = TTNEnviron(ttns, ttno)
+    if profile_enabled:
+        _record_phase_summary("environment_construction", "construct", 1, perf_counter() - phase_start)
     # in MPS language: left to right sweep
+    if profile_enabled:
+        phase_start = perf_counter()
     local_steps1 = _tdvp_ps2_recursion_forward(ttns.root, ttns, ttno, tte, coeff, tau / 2)
+    if profile_enabled:
+        _record_phase_summary("tdvp_sweep", "tdvp_forward_sweep", 1, perf_counter() - phase_start)
     # in MPS language: right to left sweep
+    if profile_enabled:
+        phase_start = perf_counter()
     local_steps2 = _tdvp_ps2_recursion_backward(ttns.root, ttns, ttno, tte, coeff, tau / 2)
+    if profile_enabled:
+        _record_phase_summary("tdvp_sweep", "tdvp_backward_sweep", 1, perf_counter() - phase_start)
     steps_stat = stats.describe(local_steps1 + local_steps2)
     logger.debug(f"TDVP-PS Krylov space: {steps_stat}")
     return ttns
+
+
+def _record_phase_summary(phase, operation, operation_count, wall_s):
+    from renormalizer.backend._execution.profiling import phase_summary_payload
+
+    payload = phase_summary_payload(
+        phase=phase,
+        network="ttns",
+        operation=operation,
+        operation_count=operation_count,
+        wall_s=wall_s,
+    )
+    profiling.record("phase_summary", **payload)
 
 
 def _tdvp_ps2_recursion_forward(

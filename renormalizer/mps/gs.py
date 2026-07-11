@@ -25,6 +25,7 @@ from renormalizer.mps.svd_qn import get_qn_mask
 from renormalizer.mps import Mpo, Mps, StackedMpo
 from renormalizer.mps.lib import Environ, cvec2cmat
 from renormalizer.mps.oe_contract_wrap import oe_contract
+from renormalizer.utils import profiling
 from renormalizer.utils import Quantity, CompressConfig, CompressCriteria
 
 
@@ -102,6 +103,12 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
 
     compress_config_bk = mps.compress_config
 
+    profile_enabled = profiling.enabled()
+    if profile_enabled:
+        from time import perf_counter
+
+        phase_start = perf_counter()
+
     # construct the environment matrix
     if omega is not None:
         if isinstance(mpo, StackedMpo):
@@ -114,6 +121,8 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
             environ = [Environ(mps, item, env) for item in mpo.mpos]
         else:
             environ = Environ(mps, mpo, env)
+    if profile_enabled:
+        _record_phase_summary("environment_construction", "construct", perf_counter() - phase_start)
 
     macro_iteration_result = []
     # Idx of the active site with lowest energy for each sweep
@@ -134,7 +143,11 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
 
         logger.debug(f"{mps}")
 
+        if profile_enabled:
+            phase_start = perf_counter()
         micro_iteration_result, res_mps, mpo = single_sweep(mps, mpo, environ, omega, percent, opt_e_idx)
+        if profile_enabled:
+            _record_phase_summary("optimization_sweep", "dmrg_sweep", perf_counter() - phase_start)
 
         opt_e = min(micro_iteration_result)
         macro_iteration_result.append(opt_e[0])
@@ -169,6 +182,19 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
         logger.info(f"{res_mps[0]}")
 
     return macro_iteration_result, res_mps
+
+
+def _record_phase_summary(phase, operation, wall_s):
+    from renormalizer.backend._execution.profiling import phase_summary_payload
+
+    payload = phase_summary_payload(
+        phase=phase,
+        network="mps",
+        operation=operation,
+        operation_count=1,
+        wall_s=wall_s,
+    )
+    profiling.record("phase_summary", **payload)
 
 
 def single_sweep(

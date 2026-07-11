@@ -35,7 +35,9 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
             expr = oe_contract_expression(
                 "abcd, befg, cfhi, jgik, aej -> dhk",
                 ltensor, cmo[0], cmo[0], rtensor, cshape,
-                constants=[0, 1, 2, 3]
+                constants=[0, 1, 2, 3],
+                _profile_network="mps",
+                _profile_center_kind="one_site",
             )
         else:
             #   S-a e   j o-S
@@ -47,6 +49,8 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
                 "abcd, befg, cfhi, gjkl, ikmn, olnp, aejo -> dhmp",
                 ltensor, cmo[0], cmo[0], cmo[1], cmo[1], rtensor, cshape,
                 constants=[0, 1, 2, 3, 4, 5],
+                _profile_network="mps",
+                _profile_center_kind="two_site",
             )
         # early return
         return expr
@@ -64,6 +68,8 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
             "abc, lbk, ck -> al",
             ltensor, rtensor, cshape,
             constants=[0, 1],
+            _profile_network="mps",
+            _profile_center_kind="zero_site",
         )
     elif nsite == 1:
         if not ancilla:
@@ -76,6 +82,8 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
                 "abc, bdef, lfk, cek -> adl",
                 ltensor, cmo[0], rtensor, cshape,
                 constants=[0, 1, 2],
+                _profile_network="mps",
+                _profile_center_kind="one_site",
             )
         else:
             # S-a   l-S
@@ -88,6 +96,8 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
                 "abc, bdef, lfk, cegk -> adgl",
                 ltensor, cmo[0], rtensor, cshape,
                 constants=[0, 1, 2],
+                _profile_network="mps",
+                _profile_center_kind="one_site",
             )
     else:
         if not ancilla:
@@ -100,6 +110,8 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
                 "abc, bdef, fghj, ljk, cehk -> adgl",
                 ltensor, cmo[0], cmo[1], rtensor, cshape,
                 constants=[0, 1, 2, 3],
+                _profile_network="mps",
+                _profile_center_kind="two_site",
             )
         else:
             # S-a       l-S
@@ -112,6 +124,8 @@ def hop_expr(ltensor, rtensor, cmo, cshape, twolayer:bool=False):
                 "abc, bdef, fghj, ljk, cemhnk -> admgnl",
                 ltensor, cmo[0], cmo[1], rtensor, cshape,
                 constants=[0, 1, 2, 3],
+                _profile_network="mps",
+                _profile_center_kind="two_site",
             )
 
     return expr

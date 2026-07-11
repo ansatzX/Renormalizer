@@ -38,7 +38,7 @@ def hop_expr0(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron):
     input_indices.append(indices[2])
     args.append(indices)
 
-    expr = _contract_expression(args, shape, input_indices, output_indices)
+    expr = _contract_expression(args, shape, input_indices, output_indices, "zero_site")
 
     return expr
 
@@ -65,7 +65,7 @@ def hop_expr1(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, r
 
     shape = snode.shape
     # cache the contraction path
-    expr = _contract_expression(args, shape, input_indices, output_indices)
+    expr = _contract_expression(args, shape, input_indices, output_indices, "one_site")
     if not return_hdiag:
         return expr
     else:
@@ -112,12 +112,12 @@ def hop_expr2(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron):
     del shape_parent[snode.parent.children.index(snode)]
     shape += shape_parent
     # cache the contraction path
-    expr = _contract_expression(args, shape, input_indices, output_indices)
+    expr = _contract_expression(args, shape, input_indices, output_indices, "two_site")
     hdiag = _get_hdiag(args, input_indices)
     return expr, hdiag
 
 
-def _contract_expression(args, x_shape, x_indices, y_indices):
+def _contract_expression(args, x_shape, x_indices, y_indices, center_kind):
     # contract_expression in interleaved format
     args_fake = args.copy()
     args_fake.extend([np.empty(x_shape), x_indices])
@@ -128,6 +128,8 @@ def _contract_expression(args, x_shape, x_indices, y_indices):
         indices,
         *args,
         constants=list(range(len(tensors)))[:-1],
+        _profile_network="ttns",
+        _profile_center_kind=center_kind,
     )
     return expr
 

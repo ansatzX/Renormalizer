@@ -5,6 +5,7 @@ import logging
 import scipy.linalg
 
 from renormalizer.mps.backend import np, backend
+from renormalizer.utils import profiling
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,12 @@ def svd_qn(
     new_qnr: list
         New quantum number for V (super-R-block).
     """
+    profile_enabled = profiling.enabled()
+    if profile_enabled:
+        from time import perf_counter
+
+        phase_start = perf_counter()
+
     SVD = not QR
     coef_matrix = coef_array.reshape((np.prod(qnbigl.shape[:-1]), np.prod(qnbigr.shape[:-1])))
 
@@ -224,6 +231,8 @@ def svd_qn(
     new_qnl = qnl_list + qnl_list0
     new_qnr = qnr_list + qnr_list0
     if QR:
+        if profile_enabled:
+            _record_qn_decomposition("qr", perf_counter() - phase_start)
         return u, new_qnl, v, new_qnr
 
     su = np.concatenate(block_s_list + block_su_list0)
@@ -237,7 +246,22 @@ def svd_qn(
         su = sv = su[s_order]
         new_qnl = np.array(new_qnl)[s_order].tolist()
         new_qnr = np.array(new_qnr)[s_order].tolist()
+    if profile_enabled:
+        _record_qn_decomposition("svd", perf_counter() - phase_start)
     return u, su, new_qnl, v, sv, new_qnr
+
+
+def _record_qn_decomposition(operation, wall_s):
+    from renormalizer.backend._execution.profiling import phase_summary_payload
+
+    payload = phase_summary_payload(
+        phase="qn_decomposition",
+        network="tensor_network",
+        operation=operation,
+        operation_count=1,
+        wall_s=wall_s,
+    )
+    profiling.record("phase_summary", **payload)
 
 
 def eigh_qn(dm, qnbigl, qnbigr, qntot, system):
