@@ -1,6 +1,10 @@
 import opt_einsum as oe
 
-from renormalizer.mps.backend import np
+from renormalizer.backend._gemm.experimental_einsum import (
+    UnsupportedRuntimeDtypeError,
+)
+from renormalizer.backend._gemm.ttns_lowering import build_ttns_ir_hop
+from renormalizer.mps.backend import backend, np
 from renormalizer.mps.matrix import asxp
 from renormalizer.mps.oe_contract_wrap import oe_contract, oe_contract_expression
 from renormalizer.tn.node import TreeNodeTensor
@@ -124,14 +128,65 @@ def _contract_expression(args, x_shape, x_indices, y_indices, center_kind):
     args_fake.append(y_indices)
     indices, tensors = oe.parser.convert_interleaved_input(args_fake)
     args = [asxp(t) for t in tensors[:-1]] + [x_shape]
-    expr = oe_contract_expression(
-        indices,
-        *args,
-        constants=list(range(len(tensors)))[:-1],
-        _profile_network="ttns",
-        _profile_center_kind=center_kind,
-    )
-    return expr
+
+    def legacy_expression(
+        *, requested_policy="legacy_oe", fallback_reason=None, resolved_oe_path=None
+    ):
+        options = {}
+        if resolved_oe_path is not None:
+            options["optimize"] = resolved_oe_path
+            options["_resolved_oe_path"] = resolved_oe_path
+        return oe_contract_expression(
+            indices,
+            *args,
+            constants=list(range(len(tensors)))[:-1],
+            _profile_network="ttns",
+            _profile_center_kind=center_kind,
+            _requested_policy=requested_policy,
+            _fallback_reason=fallback_reason,
+            _skip_experimental_oe_ir=requested_policy == "execution_ir",
+            **options,
+        )
+
+    config = backend.config
+    if config.execution_policy == "execution_ir":
+        try:
+            ir_expression = build_ttns_ir_hop(
+                indices, args[:-1], x_shape, center_kind
+            )
+        except NotImplementedError as error:
+            if config.fallback_policy == "error":
+                raise
+            fallback_reason = "{}: {}".format(type(error).__name__, error)
+            return legacy_expression(
+                requested_policy="execution_ir", fallback_reason=fallback_reason
+            )
+        if config.fallback_policy == "error":
+            return ir_expression
+        runtime_fallback = legacy_expression(
+            requested_policy="execution_ir",
+            resolved_oe_path=ir_expression.resolved_oe_path,
+        )
+
+        def policy_expression(matrix, *args2, **kwargs2):
+            try:
+                return ir_expression(matrix, *args2, **kwargs2)
+            except UnsupportedRuntimeDtypeError as error:
+                reason = "{}: {}".format(type(error).__name__, error)
+                return runtime_fallback._call_with_fallback_reason(
+                    reason, matrix, *args2, **kwargs2
+                )
+
+        for attribute in (
+            "execution_plans",
+            "execution_plan_selector",
+            "resolved_oe_path",
+            "execution_plan",
+        ):
+            if hasattr(ir_expression, attribute):
+                setattr(policy_expression, attribute, getattr(ir_expression, attribute))
+        return policy_expression
+    return legacy_expression()
 
 
 def _get_hdiag(args, input_indices):

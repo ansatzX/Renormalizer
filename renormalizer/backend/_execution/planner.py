@@ -1,7 +1,9 @@
 """Lower explicit einsum equations into immutable execution metadata."""
 
+import hashlib
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import numpy as np
 import opt_einsum as oe
@@ -21,6 +23,16 @@ from renormalizer.backend._execution.workspace import workspace_bytes_for_steps
 
 
 _TERM_PATTERN = re.compile(r"[A-Za-z]*\Z")
+
+
+@dataclass(frozen=True)
+class _EinsumPathMetadata:
+    equation: str
+    shapes: tuple
+    optimize: object
+    oe_path: tuple
+    contraction_list: tuple
+    fingerprint: str
 
 
 def _parse_equation(equation):
@@ -84,8 +96,155 @@ def _axes_for_modes(current_modes, target_modes):
     return tuple(current_modes.index(mode) for mode in target_modes)
 
 
+def _canonical_optimizer(optimize):
+    if isinstance(optimize, str):
+        return optimize
+    if not isinstance(optimize, (tuple, list)):
+        raise TypeError(
+            "reusable path metadata optimizer must be a strategy string or "
+            "an explicit integer path"
+        )
+    canonical = []
+    try:
+        for step in optimize:
+            step = tuple(step)
+            if any(
+                isinstance(index, bool)
+                or not isinstance(index, (int, np.integer))
+                for index in step
+            ):
+                raise TypeError
+            canonical.append(tuple(int(index) for index in step))
+    except TypeError as error:
+        raise TypeError(
+            "reusable path metadata explicit optimizer must contain integer steps"
+        ) from error
+    return tuple(canonical)
+
+
+def _freeze_metadata_value(value):
+    if isinstance(value, np.integer):
+        return int(value)
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_metadata_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_metadata_value(item) for item in value)
+    raise TypeError(
+        "opt_einsum contraction metadata contains unsupported value {!r}".format(
+            type(value).__name__
+        )
+    )
+
+
+def _fingerprint_value(value):
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_fingerprint_value(item) for item in value))
+    if isinstance(value, frozenset):
+        items = tuple(
+            sorted(
+                (_fingerprint_value(item) for item in value),
+                key=repr,
+            )
+        )
+        return ("set", items)
+    return (type(value).__name__, value)
+
+
+def _path_metadata_fingerprint(
+    equation, shapes, optimize, oe_path, contraction_list
+):
+    canonical = _fingerprint_value(
+        (equation, shapes, optimize, oe_path, contraction_list)
+    )
+    return hashlib.sha256(repr(canonical).encode("utf-8")).hexdigest()
+
+
+def _validate_path_metadata(metadata, equation, shapes, optimize):
+    if not isinstance(metadata, _EinsumPathMetadata):
+        raise TypeError("path metadata must come from _resolve_einsum_path")
+    if metadata.equation != equation:
+        raise ValueError("path metadata equation does not match lowering equation")
+    if metadata.shapes != shapes:
+        raise ValueError("path metadata shapes do not match lowering shapes")
+    canonical_optimize = _canonical_optimizer(optimize)
+    if metadata.optimize != canonical_optimize:
+        raise ValueError("path metadata optimizer does not match lowering optimizer")
+    if not isinstance(metadata.oe_path, tuple) or any(
+        not isinstance(step, tuple)
+        or any(not isinstance(index, int) for index in step)
+        for step in metadata.oe_path
+    ):
+        raise ValueError("path metadata path must contain immutable integer steps")
+    if not isinstance(metadata.contraction_list, tuple) or any(
+        not isinstance(contraction, tuple) or len(contraction) != 5
+        for contraction in metadata.contraction_list
+    ):
+        raise ValueError("path metadata contraction list is malformed")
+    if len(metadata.contraction_list) != len(metadata.oe_path):
+        raise ValueError("path metadata has inconsistent path and contraction lengths")
+    expected_fingerprint = _path_metadata_fingerprint(
+        metadata.equation,
+        metadata.shapes,
+        metadata.optimize,
+        metadata.oe_path,
+        metadata.contraction_list,
+    )
+    if metadata.fingerprint != expected_fingerprint:
+        raise ValueError("path metadata integrity fingerprint does not match content")
+    return metadata
+
+
+def _search_einsum_path(equation, shapes, optimize):
+    try:
+        raw_path, path_info = oe.contract_path(
+            equation, *shapes, shapes=True, optimize=optimize
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "opt_einsum rejected contraction metadata: {}".format(error)
+        ) from error
+    try:
+        oe_path = tuple(tuple(int(index) for index in step) for step in raw_path)
+        contraction_list = tuple(
+            tuple(_freeze_metadata_value(value) for value in contraction)
+            for contraction in path_info.contraction_list
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("opt_einsum returned malformed path metadata") from error
+    if len(contraction_list) != len(oe_path):
+        raise ValueError("opt_einsum returned inconsistent path metadata")
+    return oe_path, contraction_list
+
+
+def _resolve_einsum_path(equation, shapes, optimize="optimal"):
+    equation, input_modes, _ = _parse_equation(equation)
+    shapes, _ = _validate_shapes(input_modes, shapes)
+    canonical_optimize = _canonical_optimizer(optimize)
+    oe_path, contraction_list = _search_einsum_path(equation, shapes, optimize)
+    fingerprint = _path_metadata_fingerprint(
+        equation, shapes, canonical_optimize, oe_path, contraction_list
+    )
+    metadata = _EinsumPathMetadata(
+        equation=equation,
+        shapes=shapes,
+        optimize=canonical_optimize,
+        oe_path=oe_path,
+        contraction_list=contraction_list,
+        fingerprint=fingerprint,
+    )
+    return _validate_path_metadata(metadata, equation, shapes, optimize)
+
+
 def lower_einsum_path(
-    equation, shapes, dtype="float64", optimize="optimal", *, layouts=None
+    equation,
+    shapes,
+    dtype="float64",
+    optimize="optimal",
+    *,
+    layouts=None,
+    _path_metadata=None,
 ):
     equation, input_modes, declared_output_modes = _parse_equation(equation)
     shapes, mode_sizes = _validate_shapes(input_modes, shapes)
@@ -109,16 +268,16 @@ def lower_einsum_path(
             zip(shapes, input_modes, layouts)
         )
     )
-    try:
-        raw_path, path_info = oe.contract_path(
-            equation, *shapes, shapes=True, optimize=optimize
+    if _path_metadata is None:
+        oe_path, contraction_list = _search_einsum_path(
+            equation, shapes, optimize
         )
-    except (TypeError, ValueError) as error:
-        raise ValueError("opt_einsum rejected contraction metadata: {}".format(error)) from error
-    oe_path = tuple(tuple(int(index) for index in indices) for indices in raw_path)
-    contraction_list = tuple(path_info.contraction_list)
-    if len(contraction_list) != len(oe_path):
-        raise ValueError("opt_einsum returned inconsistent path metadata")
+    else:
+        path_metadata = _validate_path_metadata(
+            _path_metadata, equation, shapes, optimize
+        )
+        oe_path = path_metadata.oe_path
+        contraction_list = path_metadata.contraction_list
 
     active = [(ref, ref.spec.modes) for ref in inputs]
     steps = []

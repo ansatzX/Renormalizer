@@ -115,6 +115,17 @@ def test_backend_runs_tiny_matrix_hop_expr_path(name):
     np.testing.assert_allclose(actual, expected)
 
 
+def test_matrix_omitted_dtype_infers_complex_but_explicit_real_rejects():
+    selected = set_backend("numpy", precision=64)
+    source = np.array([1.0 + 2.0j])
+
+    inferred = Matrix(source)
+
+    assert inferred.dtype == np.dtype(selected.complex_dtype)
+    with pytest.raises(AssertionError):
+        Matrix(source, dtype=selected.real_dtype)
+
+
 @pytest.mark.skipif(importlib.util.find_spec("jax") is None, reason="JAX is not installed")
 def test_jax_honors_precision_and_deterministic_seed():
     first = _select_or_skip("jax", precision=64, seed=7)

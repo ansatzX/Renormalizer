@@ -5,6 +5,7 @@ import numpy as np
 import opt_einsum as oe
 import pytest
 
+from renormalizer.backend._execution import planner as planner_module
 from renormalizer.backend._execution.model import (
     BatchedMatmulStep,
     BufferRef,
@@ -104,6 +105,109 @@ def test_single_site_path_uses_opt_einsum_or_records_override():
     ) == len(plan.oe_path)
     assert any(isinstance(step, TransformStep) for step in plan.steps)
     assert plan.override_reason is None
+
+
+def test_resolved_path_metadata_reuses_oracle_and_rejects_stale_input(monkeypatch):
+    equation = "ab,bc->ac"
+    shapes = ((2, 3), (3, 4))
+    metadata = planner_module._resolve_einsum_path(
+        equation, shapes, optimize="optimal"
+    )
+    assert metadata.equation == equation
+    assert metadata.shapes == shapes
+    assert metadata.optimize == "optimal"
+    assert len(metadata.oe_path) == len(metadata.contraction_list)
+    monkeypatch.setattr(
+        planner_module.oe,
+        "contract_path",
+        lambda *args, **kwargs: pytest.fail("reused metadata searched OE path"),
+    )
+
+    plan = lower_einsum_path(
+        equation,
+        shapes,
+        dtype="float64",
+        layouts=("F", "strided"),
+        _path_metadata=metadata,
+    )
+
+    assert plan.oe_path == metadata.oe_path
+    assert tuple(ref.spec.layout for ref in plan.inputs) == ("F", "strided")
+    assert plan.override_reason is None
+    with pytest.raises(ValueError, match="equation"):
+        lower_einsum_path(
+            "ab,bc->ca", shapes, _path_metadata=metadata
+        )
+    with pytest.raises(ValueError, match="shapes"):
+        lower_einsum_path(
+            equation, ((5, 3), (3, 4)), _path_metadata=metadata
+        )
+    with pytest.raises(ValueError, match="optimizer"):
+        lower_einsum_path(
+            equation, shapes, optimize="greedy", _path_metadata=metadata
+        )
+    with pytest.raises(TypeError, match="path metadata"):
+        lower_einsum_path(equation, shapes, _path_metadata=object())
+    malformed = dataclasses.replace(metadata, oe_path=((0, 0),))
+    with pytest.raises(ValueError, match="path"):
+        lower_einsum_path(equation, shapes, _path_metadata=malformed)
+
+
+def test_resolved_path_metadata_fingerprint_rejects_replaced_optimizer():
+    metadata = planner_module._resolve_einsum_path(
+        SINGLE_SITE_EQUATION, SINGLE_SITE_SHAPES, optimize="greedy"
+    )
+    replaced = dataclasses.replace(metadata, optimize="optimal")
+
+    with pytest.raises(ValueError, match="integrity fingerprint"):
+        lower_einsum_path(
+            SINGLE_SITE_EQUATION,
+            SINGLE_SITE_SHAPES,
+            optimize="optimal",
+            _path_metadata=replaced,
+        )
+
+
+def test_reusable_path_metadata_snapshots_explicit_path_and_rejects_mutation():
+    equation = "ab,bc->ac"
+    shapes = ((2, 3), (3, 4))
+    mutable_path = [(0, 1)]
+    metadata = planner_module._resolve_einsum_path(
+        equation, shapes, optimize=mutable_path
+    )
+    assert metadata.optimize == ((0, 1),)
+
+    mutable_path[0] = (1, 0)
+    with pytest.raises(ValueError, match="optimizer"):
+        lower_einsum_path(
+            equation,
+            shapes,
+            optimize=mutable_path,
+            _path_metadata=metadata,
+        )
+
+
+def test_custom_mutable_optimizer_remains_ordinary_only():
+    class MutableOptimizer(oe.paths.PathOptimizer):
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, inputs, output, size_dict, memory_limit=None):
+            self.calls += 1
+            return [(0, 1), (0, 1)]
+
+    optimizer = MutableOptimizer()
+    plan = lower_einsum_path(
+        "ab,bc,cd->ad", ((2, 3), (3, 4), (4, 5)), optimize=optimizer
+    )
+    assert plan.oe_path == ((0, 1), (0, 1))
+    assert optimizer.calls == 1
+
+    with pytest.raises(TypeError, match="reusable path metadata optimizer"):
+        planner_module._resolve_einsum_path(
+            "ab,bc,cd->ad", ((2, 3), (3, 4), (4, 5)), optimize=optimizer
+        )
+    assert optimizer.calls == 1
 
 
 def test_explicit_packing_simple_matrix_product_is_direct():

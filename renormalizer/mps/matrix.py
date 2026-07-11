@@ -19,7 +19,7 @@ class Matrix:
         dtype = to_numpy_dtype(dtype)
         real_dtype = to_numpy_dtype(backend.real_dtype)
         complex_dtype = to_numpy_dtype(backend.complex_dtype)
-        if dtype == real_dtype:
+        if dtype is not None and dtype == real_dtype:
             # forbid unchecked casting
             assert not np.iscomplexobj(array)
         if dtype is None:

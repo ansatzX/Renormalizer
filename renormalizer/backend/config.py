@@ -14,6 +14,9 @@ _DEVICE_ALIASES = {
     "cuda": "gpu",
 }
 
+_EXECUTION_POLICIES = frozenset({"legacy_oe", "execution_ir"})
+_FALLBACK_POLICIES = frozenset({"error", "legacy_oe"})
+
 
 def _normalize_device(device):
     if not isinstance(device, str):
@@ -42,9 +45,17 @@ class BackendConfig:
             raise ValueError("unsupported backend precision: {!r}".format(self.precision))
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("backend seed must be an integer or None")
-        if self.execution_policy != "legacy_oe":
-            raise ValueError("execution_policy={!r} is unavailable before Stage 3".format(self.execution_policy))
-        if self.fallback_policy != "error":
-            raise ValueError("fallback_policy={!r} is unavailable before Stage 3".format(self.fallback_policy))
-        if self.experimental_oe_ir is not False:
-            raise ValueError("experimental_oe_ir is unavailable before Stage 3")
+        if self.execution_policy not in _EXECUTION_POLICIES:
+            raise ValueError(
+                "unsupported execution_policy={!r}; expected one of {}".format(
+                    self.execution_policy, ", ".join(sorted(_EXECUTION_POLICIES))
+                )
+            )
+        if self.fallback_policy not in _FALLBACK_POLICIES:
+            raise ValueError(
+                "unsupported fallback_policy={!r}; expected one of {}".format(
+                    self.fallback_policy, ", ".join(sorted(_FALLBACK_POLICIES))
+                )
+            )
+        if type(self.experimental_oe_ir) is not bool:
+            raise TypeError("experimental_oe_ir must be a boolean")

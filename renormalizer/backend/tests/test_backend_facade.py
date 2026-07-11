@@ -26,13 +26,31 @@ def test_unknown_backend_fails_explicitly():
 @pytest.mark.parametrize(
     "option, value",
     [
-        ("execution_policy", "eager"),
-        ("fallback_policy", "numpy"),
+        ("execution_policy", "legacy_oe"),
+        ("execution_policy", "execution_ir"),
+        ("fallback_policy", "error"),
+        ("fallback_policy", "legacy_oe"),
+        ("experimental_oe_ir", False),
         ("experimental_oe_ir", True),
     ],
 )
-def test_stage_three_options_are_rejected(option, value):
-    with pytest.raises(ValueError, match="Stage 3"):
+def test_stage_three_options_are_accepted(option, value):
+    selected = set_backend("numpy", **{option: value})
+
+    assert getattr(selected.config, option) == value
+
+
+@pytest.mark.parametrize(
+    "option, value",
+    [
+        ("execution_policy", "eager"),
+        ("execution_policy", None),
+        ("fallback_policy", "numpy"),
+        ("fallback_policy", None),
+    ],
+)
+def test_stage_three_policy_values_are_validated(option, value):
+    with pytest.raises(ValueError, match=option):
         set_backend("numpy", **{option: value})
 
 
@@ -98,9 +116,9 @@ def test_backend_manager_applies_configured_and_legacy_seeds(monkeypatch):
     assert configured_manager.get_backend().random.random_sample() == expected_configured
 
 
-@pytest.mark.parametrize("value", [None, 0, "", True])
-def test_experimental_oe_ir_only_accepts_false_before_stage_three(value):
-    with pytest.raises(ValueError, match="Stage 3"):
+@pytest.mark.parametrize("value", [None, 0, 1, ""])
+def test_experimental_oe_ir_requires_a_boolean(value):
+    with pytest.raises(TypeError, match="boolean"):
         BackendConfig(experimental_oe_ir=value)
 
 
