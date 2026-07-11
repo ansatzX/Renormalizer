@@ -24,6 +24,12 @@ from renormalizer.backend._distributed.sharding import (
     ShardingSpec,
     shard_axis,
 )
+from renormalizer.backend._distributed.solvers import (
+    distributed_norm,
+    distributed_vdot,
+    run_sharded_davidson,
+    run_sharded_krylov,
+)
 from renormalizer.backend.config import DistributedExecutionConfig
 
 
@@ -39,7 +45,11 @@ __all__ = [
     "OperandProvider",
     "OperandRequest",
     "ShardingSpec",
+    "distributed_norm",
+    "distributed_vdot",
     "plan_distributed_execution",
     "run_root_fallback",
+    "run_sharded_davidson",
+    "run_sharded_krylov",
     "shard_axis",
 ]
