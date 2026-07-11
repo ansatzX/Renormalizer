@@ -168,6 +168,22 @@ class CupyBackend(AbstractBackend):
         with self._cupy.cuda.Device(self._device_index):
             self._cupy.get_default_memory_pool().free_all_blocks()
 
+    def create_collective(self, context, *, host, port):
+        if self._device_index != context.local_rank:
+            raise ValueError(
+                "CuPy backend device cuda:{} does not match local_rank {}".format(
+                    self._device_index, context.local_rank
+                )
+            )
+        from renormalizer.backend._distributed.collectives import CupyNcclCollective
+
+        return CupyNcclCollective(
+            context,
+            cupy_module=self._cupy,
+            host=host,
+            port=port,
+        )
+
     def log_memory_usage(self, header=""):
         from renormalizer.utils.utils import sizeof_fmt
 
