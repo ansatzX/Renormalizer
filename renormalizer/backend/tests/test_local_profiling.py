@@ -12,6 +12,7 @@ from renormalizer.backend._gemm.profiling import grouped_gemm_payload, summarize
 from renormalizer.mps.hop_expr import hop_expr
 from renormalizer.mps.matrix import asnumpy
 from renormalizer.utils import profiling
+from renormalizer.utils._profiling.events import validate_source_event
 from renormalizer.utils.log import DEBUG, PROFILING, init_log
 
 
@@ -104,10 +105,76 @@ def test_local_payload_records_planner_fallback_timing_and_bounded_shapes():
     assert payload["actual_steps_truncated"] is False
     assert len(payload["input_shapes"]) == 32
     assert all(len(shape) == 16 for shape in payload["input_shapes"])
+    assert payload["input_shape_ranks"] == [40] * 32
     assert payload["input_shape_count"] == 100
     assert payload["input_shapes_truncated"] is True
     assert len(payload["output_shape"]) == 16
+    assert payload["output_shape_rank"] == 40
     assert payload["output_shape_truncated"] is True
+
+
+def test_local_payload_truncation_flags_are_exact_at_bounds():
+    payload = local_hv_payload(
+        network="mps",
+        center_kind="one_site",
+        input_shapes=tuple([(1,) * 16] * 32),
+        output_shape=(1,) * 16,
+        planner_source="opt_einsum",
+        oe_path_hash="abc123",
+        actual_steps=tuple(["gemm"] * 32),
+        wall_s=0.25,
+        timing_semantics="host_elapsed_synchronous",
+        device_synchronized=True,
+    )
+
+    assert payload["input_shape_ranks"] == [16] * 32
+    assert payload["input_shapes_truncated"] is False
+    assert payload["output_shape_rank"] == 16
+    assert payload["output_shape_truncated"] is False
+    assert payload["actual_steps_truncated"] is False
+
+
+def test_local_payload_rank_only_truncation_is_canonical():
+    payload = local_hv_payload(
+        network="mps",
+        center_kind="one_site",
+        input_shapes=((1,) * 17,),
+        output_shape=(1,),
+        planner_source="opt_einsum",
+        oe_path_hash="abc123",
+        actual_steps=("gemm",),
+        wall_s=0.25,
+        timing_semantics="host_elapsed_synchronous",
+        device_synchronized=True,
+    )
+
+    assert payload["input_shapes"] == [[1] * 16]
+    assert payload["input_shape_ranks"] == [17]
+    validated = validate_source_event({"event": "local_hv_execute", **payload})
+    assert validated["input_shapes_truncated"] is False
+
+
+def test_local_payload_combined_sequence_and_rank_truncation_is_canonical():
+    input_shapes = ((1,) * 17,) + tuple([(1,)] * 32)
+    payload = local_hv_payload(
+        network="mps",
+        center_kind="one_site",
+        input_shapes=input_shapes,
+        output_shape=(1,),
+        planner_source="opt_einsum",
+        oe_path_hash="abc123",
+        actual_steps=("gemm",),
+        wall_s=0.25,
+        timing_semantics="host_elapsed_synchronous",
+        device_synchronized=True,
+    )
+
+    assert payload["input_shape_count"] == 33
+    assert len(payload["input_shapes"]) == 32
+    assert payload["input_shapes"][0] == [1] * 16
+    assert payload["input_shape_ranks"] == [17] + [1] * 31
+    validated = validate_source_event({"event": "local_hv_execute", **payload})
+    assert validated["input_shapes_truncated"] is True
 
 
 @pytest.mark.parametrize(
@@ -271,7 +338,9 @@ def test_enabled_mps_hv_jsonl_records_order_and_bounded_path_evidence(tmp_path):
         assert event["network"] == "mps"
         assert event["center_kind"] == "one_site"
         assert event["input_shapes"] == [[2, 3, 4], [3, 5, 4, 6], [7, 6, 8], [4, 4, 8]]
+        assert event["input_shape_ranks"] == [3, 4, 3, 3]
         assert event["output_shape"] == [2, 5, 7]
+        assert event["output_shape_rank"] == 3
         assert event["requested_policy"] == "legacy_oe"
         assert event["actual_policy"] == "legacy_oe"
         assert event["planner_source"] == "opt_einsum"
@@ -285,6 +354,167 @@ def test_enabled_mps_hv_jsonl_records_order_and_bounded_path_evidence(tmp_path):
         assert event["fallback"] is None
         assert event["fallback_reason"] is None
         assert len(event["input_shapes"]) <= 32
+
+
+def _truncation_payload(*, truncated):
+    width = 17 if truncated else 2
+    count = 33 if truncated else 1
+    step_count = 33 if truncated else 1
+    return local_hv_payload(
+        network="mps",
+        center_kind="one_site",
+        input_shapes=tuple([(1,) * width] * count),
+        output_shape=(1,) * width,
+        planner_source="opt_einsum",
+        oe_path_hash="abc123",
+        actual_steps=tuple(["gemm"] * step_count),
+        wall_s=0.25,
+        timing_semantics="host_elapsed_synchronous",
+        device_synchronized=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "field,truncated,claimed",
+    [
+        ("input_shapes_truncated", False, True),
+        ("input_shapes_truncated", True, False),
+        ("output_shape_truncated", False, True),
+        ("output_shape_truncated", True, False),
+        ("actual_steps_truncated", False, True),
+        ("actual_steps_truncated", True, False),
+    ],
+)
+def test_public_local_record_rejects_false_truncation_claims(
+    tmp_path, field, truncated, claimed
+):
+    init_log(PROFILING)
+    path = tmp_path / "events.jsonl"
+    profiling.register_event_output(path)
+    payload = _truncation_payload(truncated=truncated)
+    payload[field] = claimed
+
+    with pytest.raises(ValueError, match="truncat"):
+        profiling.record("local_hv_execute", **payload)
+
+    profiling.close_event_output()
+    assert path.read_text() == ""
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("input_shape_ranks", []),
+        ("input_shape_ranks", [3]),
+        ("output_shape_rank", 3),
+    ],
+)
+def test_public_local_record_rejects_mismatched_original_rank_evidence(tmp_path, field, value):
+    init_log(PROFILING)
+    path = tmp_path / "events.jsonl"
+    profiling.register_event_output(path)
+    payload = _truncation_payload(truncated=False)
+    payload[field] = value
+
+    with pytest.raises(ValueError, match="rank"):
+        profiling.record("local_hv_execute", **payload)
+
+    profiling.close_event_output()
+    assert path.read_text() == ""
+
+
+@pytest.mark.parametrize("bucket_count,claimed", [(2, True), (33, False)])
+def test_public_grouped_record_rejects_false_bucket_truncation(
+    tmp_path, bucket_count, claimed
+):
+    init_log(PROFILING)
+    path = tmp_path / "events.jsonl"
+    profiling.register_event_output(path)
+    payload = grouped_gemm_payload(
+        operation="gemm",
+        task_count=max(2, bucket_count),
+        shape_buckets={(index + 1, 2, 3): 1 for index in range(bucket_count)},
+        executed_grouped=True,
+    )
+    payload["shape_buckets_truncated"] = claimed
+
+    with pytest.raises(ValueError, match="truncat"):
+        profiling.record("grouped_gemm_execute", **payload)
+
+    profiling.close_event_output()
+    assert path.read_text() == ""
+
+
+def _bounded_sequence_payload(kind, original_count):
+    if kind in {"input_shapes", "actual_steps"}:
+        payload = local_hv_payload(
+            network="mps",
+            center_kind="one_site",
+            input_shapes=tuple([(1, 1)] * (original_count if kind == "input_shapes" else 1)),
+            output_shape=(1, 1),
+            planner_source="opt_einsum",
+            oe_path_hash="abc123",
+            actual_steps=tuple(["gemm"] * (original_count if kind == "actual_steps" else 1)),
+            wall_s=0.25,
+            timing_semantics="host_elapsed_synchronous",
+            device_synchronized=True,
+        )
+        return "local_hv_execute", payload
+    payload = grouped_gemm_payload(
+        operation="gemm",
+        task_count=max(2, original_count),
+        shape_buckets={(index + 1, 2, 3): 1 for index in range(original_count)},
+        executed_grouped=True,
+    )
+    return "grouped_gemm_execute", payload
+
+
+@pytest.mark.parametrize("kind", ["input_shapes", "actual_steps", "shape_buckets"])
+@pytest.mark.parametrize("original_count,retained_count", [(31, 30), (33, 31)])
+def test_public_record_rejects_under_retained_bounded_sequences(
+    tmp_path, kind, original_count, retained_count
+):
+    init_log(PROFILING)
+    path = tmp_path / "events.jsonl"
+    profiling.register_event_output(path)
+    event, payload = _bounded_sequence_payload(kind, original_count)
+    payload[kind] = payload[kind][:retained_count]
+    if kind == "input_shapes":
+        payload["input_shape_ranks"] = payload["input_shape_ranks"][:retained_count]
+        payload["input_shapes_truncated"] = True
+    elif kind == "actual_steps":
+        payload["actual_steps_truncated"] = True
+    else:
+        payload["shape_buckets_truncated"] = True
+
+    with pytest.raises(ValueError, match="retained"):
+        profiling.record(event, **payload)
+
+    profiling.close_event_output()
+    assert path.read_text() == ""
+
+
+@pytest.mark.parametrize("kind", ["input_shapes", "actual_steps", "shape_buckets"])
+@pytest.mark.parametrize("original_count,claimed", [(31, True), (33, False)])
+def test_public_record_rejects_false_truncation_at_count_boundaries(
+    tmp_path, kind, original_count, claimed
+):
+    init_log(PROFILING)
+    path = tmp_path / "events.jsonl"
+    profiling.register_event_output(path)
+    event, payload = _bounded_sequence_payload(kind, original_count)
+    if kind == "input_shapes":
+        payload["input_shapes_truncated"] = claimed
+    elif kind == "actual_steps":
+        payload["actual_steps_truncated"] = claimed
+    else:
+        payload["shape_buckets_truncated"] = claimed
+
+    with pytest.raises(ValueError, match="truncat"):
+        profiling.record(event, **payload)
+
+    profiling.close_event_output()
+    assert path.read_text() == ""
 
 
 def test_disabled_mps_hv_does_not_import_helpers_or_record(monkeypatch):

@@ -114,27 +114,33 @@ def local_hv_payload(
         raise TypeError("device_synchronized must be Python metadata")
     if timing_semantics not in {"host_elapsed_synchronous", "host_elapsed_unsynchronized"}:
         raise ValueError("unsupported timing semantics")
-    if not isinstance(actual_steps, (list, tuple)) or not all(type(step) is str for step in actual_steps):
+    if not isinstance(actual_steps, (list, tuple)) or not all(
+        type(step) is str for step in actual_steps
+    ):
         raise TypeError("actual steps must be Python strings")
     bounded_inputs = _bounded_shapes(input_shapes)
     bounded_output = _bounded_shape(output_shape)
+    input_shape_ranks = [len(shape) for shape in input_shapes[:MAX_SHAPES]]
+    output_shape_rank = len(output_shape)
+    bounded_actual_steps = list(actual_steps[:MAX_ACTUAL_STEPS])
     payload = {
         "network": network,
         "center_kind": center_kind,
         "input_shapes": bounded_inputs,
+        "input_shape_ranks": input_shape_ranks,
         "input_shape_count": len(input_shapes),
-        "input_shapes_truncated": len(input_shapes) > MAX_SHAPES
-        or any(len(shape) > MAX_SHAPE_RANK for shape in input_shapes[:MAX_SHAPES]),
+        "input_shapes_truncated": len(input_shapes) > MAX_SHAPES,
         "output_shape": bounded_output,
-        "output_shape_truncated": len(output_shape) > MAX_SHAPE_RANK,
+        "output_shape_rank": output_shape_rank,
+        "output_shape_truncated": output_shape_rank > len(bounded_output),
         "requested_policy": requested_policy,
         "actual_policy": actual_policy,
         "planner_source": planner_source,
         "oe_path_hash": oe_path_hash,
         "path_override_reason": path_override_reason,
-        "actual_steps": list(actual_steps[:MAX_ACTUAL_STEPS]),
+        "actual_steps": bounded_actual_steps,
         "actual_step_count": len(actual_steps),
-        "actual_steps_truncated": len(actual_steps) > MAX_ACTUAL_STEPS,
+        "actual_steps_truncated": len(actual_steps) > len(bounded_actual_steps),
         "timing_semantics": timing_semantics,
         "device_synchronized": device_synchronized,
         "fallback": actual_policy if fallback_reason is not None else None,
