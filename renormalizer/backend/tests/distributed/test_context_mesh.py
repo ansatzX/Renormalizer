@@ -230,6 +230,16 @@ def test_single_process_collective_has_precise_copy_and_mutation_semantics():
     assert collective.close() is None
 
 
+def test_single_process_inplace_allreduce_reuses_control_storage():
+    collective = SingleProcessCollective()
+    status = np.asarray([1], dtype=np.int32)
+
+    result = collective.allreduce_inplace(status, op="max")
+
+    assert result is status
+    np.testing.assert_array_equal(status, [1])
+
+
 @pytest.mark.parametrize(
     "call, message",
     [

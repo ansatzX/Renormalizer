@@ -312,6 +312,52 @@ def test_fake_collectives_have_explicit_numerical_and_mutation_semantics(collect
     ]
 
 
+def test_inplace_allreduce_reuses_control_array_without_staging_allocation(
+    collective, monkeypatch
+):
+    wrapper, backend = collective
+    source = cupy.ones((1,), dtype=cupy.int32)
+    allocation_calls = []
+    original_empty_like = cupy.empty_like
+    original_ascontiguousarray = cupy.ascontiguousarray
+
+    def recording_empty_like(*args, **kwargs):
+        allocation_calls.append("empty_like")
+        return original_empty_like(*args, **kwargs)
+
+    def recording_ascontiguousarray(*args, **kwargs):
+        allocation_calls.append("ascontiguousarray")
+        return original_ascontiguousarray(*args, **kwargs)
+
+    monkeypatch.setattr(cupy, "empty_like", recording_empty_like)
+    monkeypatch.setattr(cupy, "ascontiguousarray", recording_ascontiguousarray)
+
+    result = wrapper.allreduce_inplace(source, op="max")
+
+    assert result is source
+    assert allocation_calls == []
+    cupy.testing.assert_array_equal(source, cupy.asarray([2], dtype=cupy.int32))
+    assert backend.calls == [("all_reduce", "max", cupy.cuda.Stream.null)]
+
+
+def test_inplace_allreduce_uses_nondefault_stream_and_restores_active_device(
+    collective,
+):
+    wrapper, backend = collective
+    with cupy.cuda.Device(0):
+        stream = cupy.cuda.Stream(non_blocking=True)
+        with stream:
+            source = cupy.ones((1,), dtype=cupy.int32)
+            cupy.cuda.Device(1).use()
+
+            result = wrapper.allreduce_inplace(source, op="max")
+
+            assert int(cupy.cuda.runtime.getDevice()) == 1
+
+    assert result is source
+    assert backend.calls == [("all_reduce", "max", stream)]
+
+
 def test_noncontiguous_arrays_are_staged_without_host_conversion(
     collective, monkeypatch
 ):

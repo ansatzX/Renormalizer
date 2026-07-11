@@ -34,6 +34,9 @@ class Collective(Protocol):
     def allreduce(self, array: Any, *, op: str = "sum") -> Any:
         ...
 
+    def allreduce_inplace(self, array: Any, *, op: str = "sum") -> Any:
+        ...
+
     def reduce_scatter(self, array: Any, *, axis: int, op: str = "sum") -> Any:
         ...
 
@@ -59,6 +62,10 @@ class SingleProcessCollective:
     def allreduce(self, array, *, op="sum"):
         _validate_reduction_op(op)
         return array.copy()
+
+    def allreduce_inplace(self, array, *, op="sum"):
+        _validate_reduction_op(op)
+        return array
 
     def reduce_scatter(self, array, *, axis, op="sum"):
         _normalize_axis(array, axis)
@@ -193,6 +200,17 @@ class CupyNcclCollective:
             output_buffer = cupy.empty_like(input_buffer)
             self._backend.all_reduce(input_buffer, output_buffer, op=op, stream=stream)
         return output_buffer
+
+    def allreduce_inplace(self, array, *, op="sum"):
+        _validate_reduction_op(op)
+        self._validate_array(array, op=op)
+        if not bool(array.flags.c_contiguous):
+            raise ValueError("in-place allreduce requires a C-contiguous array")
+        cupy = self._cupy
+        with cupy.cuda.Device(self._device_index):
+            stream = cupy.cuda.get_current_stream()
+            self._backend.all_reduce(array, array, op=op, stream=stream)
+        return array
 
     def reduce_scatter(self, array, *, axis, op="sum"):
         normalized_axis = _normalize_axis(array, axis)

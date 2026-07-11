@@ -59,3 +59,46 @@ class BackendConfig:
             )
         if type(self.experimental_oe_ir) is not bool:
             raise TypeError("experimental_oe_ir must be a boolean")
+
+
+@dataclass(frozen=True)
+class DistributedExecutionConfig:
+    context: object
+    mesh: object
+    collective: object
+    provider: object
+    residency_policy: str = "device_resident"
+    device_memory_budget_bytes: int | None = None
+    host_memory_budget_bytes: int | None = None
+    prefetch_depth: int = 1
+
+    def __post_init__(self):
+        from renormalizer.backend._distributed.context import DistributedContext
+        from renormalizer.backend._distributed.mesh import DeviceMesh
+
+        if not isinstance(self.context, DistributedContext):
+            raise TypeError("context must be a DistributedContext")
+        if not isinstance(self.mesh, DeviceMesh):
+            raise TypeError("mesh must be a DeviceMesh")
+        if self.residency_policy != "device_resident":
+            raise ValueError(
+                "Stage 4 supports only residency_policy='device_resident'"
+            )
+        if (
+            self.mesh.size != self.context.world_size
+            or self.mesh.rank != self.context.rank
+        ):
+            raise ValueError("mesh rank or size does not match distributed context")
+        if (
+            getattr(self.collective, "size", None) != self.context.world_size
+            or getattr(self.collective, "rank", None) != self.context.rank
+        ):
+            raise ValueError("collective rank or size does not match distributed context")
+        if not callable(getattr(self.provider, "acquire", None)):
+            raise TypeError("provider must implement acquire")
+        for name in ("device_memory_budget_bytes", "host_memory_budget_bytes"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError("{} must be a positive integer or None".format(name))
+        if type(self.prefetch_depth) is not int or self.prefetch_depth <= 0:
+            raise ValueError("prefetch_depth must be a positive integer")
