@@ -85,14 +85,43 @@ def evolve_prop_and_compress_tdrk4(ttns: TTNS, ttno: TTNO, coeff: Union[complex,
 
 
 def evolve_tdvp_ps(ttns: TTNS, ttno: TTNO, coeff: Union[complex, float], tau: float):
-    ttns.check_canonical()
+    execution = ttns.evolve_config.distributed_execution
+    if execution is not None:
+        from renormalizer.tn.distributed import coordinate_ttns_workflow_entry
+
+        coordinate_ttns_workflow_entry(
+            execution,
+            operation="ivp_workflow",
+            node_count=len(ttns.node_list),
+            center_kind="one_site_workflow",
+            solver_controls={
+                "solver": "krylov",
+                "rtol": ttns.evolve_config.ivp_rtol,
+                "atol": ttns.evolve_config.ivp_atol,
+            },
+            selectors={"method": "tdvp_ps"},
+            supported=True,
+            fallback_reason_code="unsupported_ivp_workflow",
+        )
     # second order 1-site projector splitting
     profile_enabled = profiling.enabled()
     if profile_enabled:
         from time import perf_counter
 
         phase_start = perf_counter()
-    ttne = TTNEnviron(ttns, ttno)
+    def prepare_environment():
+        ttns.check_canonical()
+        return TTNEnviron(ttns, ttno)
+
+    if execution is None:
+        ttne = prepare_environment()
+    else:
+        ttne = _synchronize_distributed_state(
+            ttns,
+            "environment",
+            ttns.root,
+            operation=prepare_environment,
+        )
     if profile_enabled:
         _record_phase_summary("environment_construction", "construct", 1, perf_counter() - phase_start)
 
@@ -131,21 +160,37 @@ def _tdvp_ps_forward(ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, coeff: Union[comp
         # no children to evolve
         if (not snode.children) or (ichild == len(snode.children) - 1):
             ms, j = evolve_1site(snode, ttns, ttno, ttne, coeff, tau)
-            snode.tensor = ms.reshape(snode.shape)
             local_steps.append(j)
+            def update_decompose_environment():
+                snode.tensor = ms.reshape(snode.shape)
+                if snode.parent is None:
+                    return None
+                parent_matrix = ttns.decompose_to_parent(snode)
+                ttne.build_children_environ_node(snode, ttns, ttno)
+                return parent_matrix
+
+            ms = _synchronize_distributed_state(
+                ttns,
+                "one_site",
+                snode,
+                operation=update_decompose_environment,
+            )
 
             if snode.parent is None:
                 assert len(stack) == 1
                 stack.pop()
                 continue
-            # decompose, the first index for parent, the second index for child
-            ms = ttns.decompose_to_parent(snode)
-            # update env
-            ttne.build_children_environ_node(snode, ttns, ttno)
             # backward time evolution for snode
             ms_t, j = evolve_0site(ms.T, snode, ttns, ttno, ttne, coeff, -tau)
-            ttns.merge_to_parent(snode, ms_t.reshape(ms.T.shape).T)
             local_steps.append(j)
+            _synchronize_distributed_state(
+                ttns,
+                "zero_site",
+                snode,
+                operation=lambda: ttns.merge_to_parent(
+                    snode, ms_t.reshape(ms.T.shape).T
+                ),
+            )
 
             stack.pop()
             continue
@@ -154,9 +199,15 @@ def _tdvp_ps_forward(ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, coeff: Union[comp
         ichild += 1
         child = snode.children[ichild]
         # cano to child
-        ttns.push_cano_to_child(snode, ichild)
-        # update env
-        ttne.build_parent_environ_node(snode, ichild, ttns, ttno)
+        _synchronize_distributed_state(
+            ttns,
+            "canonical_bond",
+            child,
+            operation=lambda: (
+                ttns.push_cano_to_child(snode, ichild),
+                ttne.build_parent_environ_node(snode, ichild, ttns, ttno),
+            ),
+        )
         stack[-1] = (snode, ichild)
         stack.append((child, -1))
 
@@ -171,26 +222,50 @@ def _tdvp_ps_backward(ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, coeff: Union[com
         snode, ichild = stack[-1]
         if ichild == -1:
             ms, j = evolve_1site(snode, ttns, ttno, ttne, coeff, tau)
-            snode.tensor = ms.reshape(snode.shape)
             local_steps.append(j)
+            _synchronize_distributed_state(
+                ttns,
+                "one_site",
+                snode,
+                operation=lambda: setattr(snode, "tensor", ms.reshape(snode.shape)),
+            )
         if ichild == len(snode.children) - 1:
             if snode is not ttns.root:
-                ttns.push_cano_to_parent(snode)
-                # update env
-                ttne.build_children_environ_node(snode, ttns, ttno)
+                _synchronize_distributed_state(
+                    ttns,
+                    "canonical_bond",
+                    snode,
+                    operation=lambda: (
+                        ttns.push_cano_to_parent(snode),
+                        ttne.build_children_environ_node(snode, ttns, ttno),
+                    ),
+                )
             stack.pop()
             continue
         ichild += 1
         child = snode.children[ichild]
-        # decompose, the first index for child, the second index for parent
-        ms = ttns.decompose_to_child(snode, ichild)
-        # update env
-        ttne.build_parent_environ_node(snode, ichild, ttns, ttno)
+        # decompose, then update the matching environment in the same phase
+        ms = _synchronize_distributed_state(
+            ttns,
+            "canonical_bond",
+            child,
+            operation=lambda: (
+                ttns.decompose_to_child(snode, ichild),
+                ttne.build_parent_environ_node(snode, ichild, ttns, ttno),
+            )[0],
+        )
         # backward time evolution for snode
         shape = ms.shape
         ms, j = evolve_0site(ms, child, ttns, ttno, ttne, coeff, -tau)
-        ttns.merge_to_child(snode, ichild, ms.reshape(shape))
         local_steps.append(j)
+        _synchronize_distributed_state(
+            ttns,
+            "zero_site",
+            child,
+            operation=lambda: ttns.merge_to_child(
+                snode, ichild, ms.reshape(shape)
+            ),
+        )
         stack[-1] = snode, ichild
         stack.append((child, -1))
 
@@ -198,14 +273,43 @@ def _tdvp_ps_backward(ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, coeff: Union[com
 
 
 def evolve_tdvp_ps2(ttns: TTNS, ttno: TTNO, coeff: Union[complex, float], tau: float):
-    ttns.check_canonical()
+    execution = ttns.evolve_config.distributed_execution
+    if execution is not None:
+        from renormalizer.tn.distributed import coordinate_ttns_workflow_entry
+
+        coordinate_ttns_workflow_entry(
+            execution,
+            operation="ivp_workflow",
+            node_count=len(ttns.node_list),
+            center_kind="two_site_workflow",
+            solver_controls={
+                "solver": "krylov",
+                "rtol": ttns.evolve_config.ivp_rtol,
+                "atol": ttns.evolve_config.ivp_atol,
+            },
+            selectors={"method": "tdvp_ps2"},
+            supported=True,
+            fallback_reason_code="unsupported_ivp_workflow",
+        )
     # second order 2-site projector splitting
     profile_enabled = profiling.enabled()
     if profile_enabled:
         from time import perf_counter
 
         phase_start = perf_counter()
-    tte = TTNEnviron(ttns, ttno)
+    def prepare_environment():
+        ttns.check_canonical()
+        return TTNEnviron(ttns, ttno)
+
+    if execution is None:
+        tte = prepare_environment()
+    else:
+        tte = _synchronize_distributed_state(
+            ttns,
+            "environment",
+            ttns.root,
+            operation=prepare_environment,
+        )
     if profile_enabled:
         _record_phase_summary("environment_construction", "construct", 1, perf_counter() - phase_start)
     # in MPS language: left to right sweep
@@ -238,6 +342,20 @@ def _record_phase_summary(phase, operation, operation_count, wall_s):
     profiling.record("phase_summary", **payload)
 
 
+def _synchronize_distributed_state(ttns, center_kind, node, *, operation):
+    execution = ttns.evolve_config.distributed_execution
+    if execution is None:
+        return operation()
+    from renormalizer.tn.distributed import _synchronize_ttns_state
+
+    return _synchronize_ttns_state(
+        execution,
+        ttns,
+        metadata=("krylov", center_kind, ttns.node_idx[node]),
+        operation=operation,
+    )
+
+
 def _tdvp_ps2_recursion_forward(
     snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron, coeff: Union[complex, float], tau: float
 ) -> List[int]:
@@ -249,9 +367,15 @@ def _tdvp_ps2_recursion_forward(
     for ichild, child in enumerate(snode.children):
         if child.children:
             # cano to child
-            ttns.push_cano_to_child(snode, ichild)
-            # update env
-            ttne.update_1bond(child, ttns, ttno)
+            _synchronize_distributed_state(
+                ttns,
+                "canonical_bond",
+                child,
+                operation=lambda: (
+                    ttns.push_cano_to_child(snode, ichild),
+                    ttne.update_1bond(child, ttns, ttno),
+                ),
+            )
             # recursive time evolution
             local_steps_child = _tdvp_ps2_recursion_forward(child, ttns, ttno, ttne, coeff, tau)
             local_steps.extend(local_steps_child)
@@ -260,17 +384,29 @@ def _tdvp_ps2_recursion_forward(
         ms2, j = evolve_2site(child, ttns, ttno, ttne, coeff, tau)
         local_steps.append(j)
         # cano to snode
-        ttns.update_2site(child, ms2, cano_parent=True)
-        # update env
-        ttne.update_2site(child, ttns, ttno)
+        _synchronize_distributed_state(
+            ttns,
+            "two_site",
+            child,
+            operation=lambda: (
+                ttns.update_2site(child, ms2, cano_parent=True),
+                ttne.update_2site(child, ttns, ttno),
+            ),
+        )
         # backward time evolution for snode
         if snode is ttns.root and ichild == len(snode.children) - 1:
             continue
         ms, j = evolve_1site(snode, ttns, ttno, ttne, coeff, -tau)
-        snode.tensor = ms.reshape(snode.shape)
         local_steps.append(j)
-        # update env
-        ttne.update_1site(snode, ttns, ttno)
+        _synchronize_distributed_state(
+            ttns,
+            "one_site",
+            snode,
+            operation=lambda: (
+                setattr(snode, "tensor", ms.reshape(snode.shape)),
+                ttne.update_1site(snode, ttns, ttno),
+            ),
+        )
     return local_steps
 
 
@@ -286,27 +422,47 @@ def _tdvp_ps2_recursion_backward(
         # backward time evolution for snode
         if not (snode is ttns.root and ichild == len(snode.children) - 1):
             ms, j = evolve_1site(snode, ttns, ttno, ttne, coeff, -tau)
-            snode.tensor = ms.reshape(snode.shape)
             local_steps.append(j)
-            # update env
-            ttne.update_1site(snode, ttns, ttno)
+            _synchronize_distributed_state(
+                ttns,
+                "one_site",
+                snode,
+                operation=lambda: (
+                    setattr(snode, "tensor", ms.reshape(snode.shape)),
+                    ttne.update_1site(snode, ttns, ttno),
+                ),
+            )
 
         # forward time evolution for snode + child
         ms2, j = evolve_2site(child, ttns, ttno, ttne, coeff, tau)
         local_steps.append(j)
         # cano to snode
-        ttns.update_2site(child, ms2, cano_parent=not child.children)
-        # update env
-        ttne.update_2site(child, ttns, ttno)
+        _synchronize_distributed_state(
+            ttns,
+            "two_site",
+            child,
+            operation=lambda: (
+                ttns.update_2site(
+                    child, ms2, cano_parent=not child.children
+                ),
+                ttne.update_2site(child, ttns, ttno),
+            ),
+        )
 
         if child.children:
             # recursive time evolution
             local_steps_child = _tdvp_ps2_recursion_backward(child, ttns, ttno, ttne, coeff, tau)
             local_steps.extend(local_steps_child)
             # cano to snode
-            ttns.push_cano_to_parent(child)
-            # update env
-            ttne.update_1bond(child, ttns, ttno)
+            _synchronize_distributed_state(
+                ttns,
+                "canonical_bond",
+                child,
+                operation=lambda: (
+                    ttns.push_cano_to_parent(child),
+                    ttne.update_1bond(child, ttns, ttno),
+                ),
+            )
     return local_steps
 
 
@@ -316,7 +472,25 @@ def evolve_2site(
     # evolve snode and parent
     ms2 = ttns.merge_with_parent(snode)
     hop, _ = hop_expr2(snode, ttns, ttno, ttne)
-    ms2_t, j = expm_krylov(lambda y: hop(y.reshape(ms2.shape)).ravel(), coeff * tau, ms2.ravel())
+    if ttns.evolve_config.distributed_execution is None:
+        ms2_t, j = expm_krylov(lambda y: hop(y.reshape(ms2.shape)).ravel(), coeff * tau, ms2.ravel())
+    else:
+        from renormalizer.tn.distributed import run_ttns_krylov
+
+        node_index = ttns.node_idx[snode]
+        parent_index = ttns.node_idx[snode.parent]
+        ms2_t, j = run_ttns_krylov(
+            hop,
+            distributed_execution=ttns.evolve_config.distributed_execution,
+            center=ms2.ravel(),
+            center_shape=tuple(ms2.shape),
+            node_index=node_index,
+            parent_index=parent_index,
+            child_index=snode.parent.children.index(snode),
+            degree=len(snode.children) + 1,
+            center_kind="two_site",
+            coefficient=coeff * tau,
+        )
     return ms2_t, j
 
 
@@ -325,7 +499,26 @@ def evolve_1site(
 ):
     ms = snode.tensor
     hop = hop_expr1(snode, ttns, ttno, ttne)
-    ms_t, j = expm_krylov(lambda y: hop(y.reshape(ms.shape)).ravel(), coeff * tau, ms.ravel())
+    if ttns.evolve_config.distributed_execution is None:
+        ms_t, j = expm_krylov(lambda y: hop(y.reshape(ms.shape)).ravel(), coeff * tau, ms.ravel())
+    else:
+        from renormalizer.tn.distributed import run_ttns_krylov
+
+        node_index = ttns.node_idx[snode]
+        parent_index = -1 if snode.parent is None else ttns.node_idx[snode.parent]
+        child_index = -1 if snode.parent is None else snode.parent.children.index(snode)
+        ms_t, j = run_ttns_krylov(
+            hop,
+            distributed_execution=ttns.evolve_config.distributed_execution,
+            center=ms.ravel(),
+            center_shape=tuple(ms.shape),
+            node_index=node_index,
+            parent_index=parent_index,
+            child_index=child_index,
+            degree=len(snode.children) + int(snode.parent is not None),
+            center_kind="one_site",
+            coefficient=coeff * tau,
+        )
     return ms_t, j
 
 
@@ -339,7 +532,26 @@ def evolve_0site(
     tau: float,
 ):
     hop = hop_expr0(snode, ttns, ttno, ttne)
-    ms_t, j = expm_krylov(lambda y: hop(y.reshape(ms.shape)).ravel(), coeff * tau, ms.ravel())
+    if ttns.evolve_config.distributed_execution is None:
+        ms_t, j = expm_krylov(lambda y: hop(y.reshape(ms.shape)).ravel(), coeff * tau, ms.ravel())
+    else:
+        from renormalizer.tn.distributed import run_ttns_krylov
+
+        node_index = ttns.node_idx[snode]
+        parent_index = -1 if snode.parent is None else ttns.node_idx[snode.parent]
+        child_index = -1 if snode.parent is None else snode.parent.children.index(snode)
+        ms_t, j = run_ttns_krylov(
+            hop,
+            distributed_execution=ttns.evolve_config.distributed_execution,
+            center=ms.ravel(),
+            center_shape=tuple(ms.shape),
+            node_index=node_index,
+            parent_index=parent_index,
+            child_index=child_index,
+            degree=len(snode.children) + int(snode.parent is not None),
+            center_kind="zero_site",
+            coefficient=coeff * tau,
+        )
     return ms_t, j
 
 

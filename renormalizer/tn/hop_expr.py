@@ -182,9 +182,11 @@ def _contract_expression(args, x_shape, x_indices, y_indices, center_kind):
             "execution_plan_selector",
             "resolved_oe_path",
             "execution_plan",
+            "resolve_execution_artifact",
         ):
             if hasattr(ir_expression, attribute):
                 setattr(policy_expression, attribute, getattr(ir_expression, attribute))
+        policy_expression.legacy_fallback_expression = runtime_fallback
         return policy_expression
     return legacy_expression()
 

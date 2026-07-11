@@ -727,7 +727,14 @@ def _memory_estimates(
     return tuple(estimates)
 
 
-def plan_distributed_execution(execution_plan, *, variable_key, world_size):
+def plan_distributed_execution(
+    execution_plan,
+    *,
+    variable_key,
+    world_size,
+    output_mode=None,
+    input_mode=None,
+):
     if not isinstance(execution_plan, ExecutionPlan):
         raise TypeError("execution_plan must be an ExecutionPlan")
     if type(world_size) is not int or world_size <= 0:
@@ -750,10 +757,18 @@ def plan_distributed_execution(execution_plan, *, variable_key, world_size):
         if mode not in execution_plan.output.spec.modes
         and dimensions[mode] >= world_size
     )
-    if not output_candidates or not input_candidates:
-        raise ValueError("no legal distributed axis pair")
-    output_mode = output_candidates[0]
-    input_mode = input_candidates[0]
+    if (output_mode is None) != (input_mode is None):
+        raise ValueError("output_mode and input_mode must be provided together")
+    if output_mode is None:
+        if not output_candidates or not input_candidates:
+            raise ValueError("no legal distributed axis pair")
+        output_mode = output_candidates[0]
+        input_mode = input_candidates[0]
+    else:
+        if output_mode not in output_candidates:
+            raise ValueError("output_mode is not a legal distributed output mode")
+        if input_mode not in input_candidates:
+            raise ValueError("input_mode is not a legal distributed input mode")
     output_axis = execution_plan.output.spec.modes.index(output_mode)
     input_axis = variable_ref.spec.modes.index(input_mode)
     output_sharding = shard_axis(

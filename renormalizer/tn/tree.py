@@ -1383,24 +1383,93 @@ class TTNS(TTNBase):
         return normalize(self, kind)
 
     def evolve(self, ttno: TTNO, tau: Union[complex, float], normalize: bool = True):
+        distributed_execution = self.evolve_config.distributed_execution
+        if distributed_execution is None:
+            imag_time = np.iscomplex(tau)
+            # trick to avoid complex algebra
+            # exp{coeff * H * tau}
+            # coef and tau are different from MPS implementation
+            if imag_time:
+                coeff = 1
+                tau = tau.imag
+                ttns = self
+            else:
+                coeff = -1j
+                ttns = self.to_complex()
+            method = EVOLVE_METHODS[self.evolve_config.method]
+            new_ttns = method(ttns, ttno, coeff, tau)
+            if normalize:
+                if imag_time:
+                    new_ttns.normalize("mps_and_coeff")
+                else:
+                    new_ttns.normalize("mps_only")
+            return new_ttns
+
+        from renormalizer.backend._distributed.center import (
+            canonicalize_compression_control,
+        )
+        from renormalizer.tn.distributed import (
+            _synchronize_ttns_result,
+            _synchronize_ttns_state,
+            coordinate_ttns_workflow_entry,
+        )
+
+        configured_method = self.evolve_config.method
+        method_name = getattr(configured_method, "name", str(configured_method))
+        supported = (
+            configured_method in {EvolveMethod.tdvp_ps, EvolveMethod.tdvp_ps2}
+            and not self.evolve_config.adaptive
+        )
+        route = coordinate_ttns_workflow_entry(
+            distributed_execution,
+            operation="public_evolve",
+            node_count=len(self.node_list),
+            center_kind="workflow",
+            solver_controls={
+                "adaptive": self.evolve_config.adaptive,
+                "guess_dt": self.evolve_config.guess_dt,
+                "adaptive_rtol": self.evolve_config.adaptive_rtol,
+                "ivp_solver": self.evolve_config.ivp_solver,
+                "ivp_rtol": self.evolve_config.ivp_rtol,
+                "ivp_atol": self.evolve_config.ivp_atol,
+                "tau": tau,
+                "compression": canonicalize_compression_control(
+                    self.compress_config
+                ),
+            },
+            selectors={"method": method_name, "normalize": bool(normalize)},
+            supported=supported,
+            fallback_reason_code="unsupported_public_evolve_workflow",
+        )
+
+        if route == "fallback":
+            raise NotImplementedError(
+                "distributed public TTNS evolution fallback is unavailable because "
+                "complete workflow capacity cannot be proven"
+            )
+
         imag_time = np.iscomplex(tau)
-        # trick to avoid complex algebra
-        # exp{coeff * H * tau}
-        # coef and tau are different from MPS implementation
         if imag_time:
             coeff = 1
             tau = tau.imag
             ttns = self
         else:
             coeff = -1j
-            ttns = self.to_complex()
-        method = EVOLVE_METHODS[self.evolve_config.method]
+            ttns = _synchronize_ttns_result(
+                distributed_execution,
+                self.to_complex,
+                metadata=("public_evolve", "to_complex"),
+            )
+        method = EVOLVE_METHODS[configured_method]
         new_ttns = method(ttns, ttno, coeff, tau)
         if normalize:
-            if imag_time:
-                new_ttns.normalize("mps_and_coeff")
-            else:
-                new_ttns.normalize("mps_only")
+            kind = "mps_and_coeff" if imag_time else "mps_only"
+            _synchronize_ttns_state(
+                distributed_execution,
+                new_ttns,
+                metadata=("public_evolve", "normalization", kind),
+                operation=lambda: new_ttns.normalize(kind),
+            )
         return new_ttns
 
     def metacopy(self):

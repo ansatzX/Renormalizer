@@ -3,6 +3,7 @@
 import itertools
 import string
 import threading
+from dataclasses import dataclass
 from types import MappingProxyType
 
 import numpy as np
@@ -34,6 +35,15 @@ _EXECUTION_PLAN_SELECTOR = "key=(numpy_result_dtype_name, variable_layout_tuple)
 
 class UnsupportedRuntimeDtypeError(NotImplementedError):
     """The runtime result dtype is outside the construction-time plan set."""
+
+
+@dataclass(frozen=True)
+class ResolvedExecutionArtifact:
+    execution_plan: object
+    source_bindings: ExecutionBindings
+    variable_key: str
+    variable_index: int
+    variable_array: object
 
 
 def _ascii_equation(equation):
@@ -256,7 +266,7 @@ def _build_ir_expression(
                 constant_cache[dtype] = cached
         return cached
 
-    def expression(*variable_operands):
+    def prepare(variable_operands):
         if len(variable_operands) != len(variable_indices):
             raise TypeError(
                 "execution IR expression expected {} variable operands, got {}".format(
@@ -311,6 +321,32 @@ def _build_ir_expression(
                 for ref, value in zip(plan.inputs, ordered)
             }
         )
+        return plan, tuple(ordered), bindings, tuple(prepared_variables)
+
+    def resolve_execution_artifact(variable_operand):
+        if len(variable_indices) != 1:
+            raise NotImplementedError(
+                "distributed local H-v requires exactly one variable operand"
+            )
+        plan, _, bindings, prepared_variables = prepare((variable_operand,))
+        variable_index, variable_array = prepared_variables[0]
+        variable_key = plan.inputs[variable_index].key
+        return ResolvedExecutionArtifact(
+            execution_plan=plan,
+            source_bindings=ExecutionBindings(
+                {
+                    key: value
+                    for key, value in bindings.arrays.items()
+                    if key != variable_key
+                }
+            ),
+            variable_key=variable_key,
+            variable_index=variable_index,
+            variable_array=variable_array,
+        )
+
+    def expression(*variable_operands):
+        plan, ordered, bindings, _ = prepare(variable_operands)
         if network is None or not profiling.enabled():
             return selected.execute_plan(plan, bindings)
 
@@ -355,6 +391,7 @@ def _build_ir_expression(
 
     expression.execution_plans = MappingProxyType(dict(variants))
     expression.execution_plan_selector = _EXECUTION_PLAN_SELECTOR
+    expression.resolve_execution_artifact = resolve_execution_artifact
     expression.resolved_oe_path = path_metadata.oe_path
     if len(variants) == 1:
         expression.execution_plan = next(iter(variants.values()))
@@ -388,4 +425,8 @@ def build_experimental_einsum(
     )
 
 
-__all__ = ["UnsupportedRuntimeDtypeError", "build_experimental_einsum"]
+__all__ = [
+    "ResolvedExecutionArtifact",
+    "UnsupportedRuntimeDtypeError",
+    "build_experimental_einsum",
+]

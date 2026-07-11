@@ -290,6 +290,28 @@ class DistributedLocalOperator:
         self._validate_source_arrays()
         self._validate_resident_views()
 
+    @property
+    def solver_input_sharding(self):
+        return self.plan.input_sharding
+
+    @property
+    def solver_output_sharding(self):
+        return self.plan.output_sharding
+
+    @property
+    def solver_dtype(self):
+        variable_ref = next(
+            ref
+            for ref in self.plan.execution_plan.inputs
+            if ref.key == self.plan.variable_key
+        )
+        return np.dtype(variable_ref.spec.dtype)
+
+    def solver_preflight(self):
+        self._preflight_setup()
+        self._preflight_plan_agreement()
+        self._preflight_capacity()
+
     def _validate_source_arrays(self):
         refs = {ref.key: ref for ref in self.plan.execution_plan.inputs}
         for key, array in self.source_bindings.arrays.items():

@@ -292,6 +292,7 @@ class OptimizeConfig:
         # inverse = 1.0 or -1.0
         # -1.0 to get the largest eigenvalue
         self.inverse = 1.0
+        self.distributed_execution = None
 
     def copy(self):
         new = self.__class__.__new__(self.__class__)
@@ -339,6 +340,74 @@ def parse_memory_limit(x) -> float:
         raise ValueError(f"invalid input for memory: {x}")
 
 
+def _bounded_stable_value(value, limit=64):
+    if isinstance(value, Enum):
+        text = "{}.{}".format(type(value).__name__, value.name)
+    elif type(value) in (str, bool, int, float, complex, type(None)):
+        text = repr(value)
+    elif isinstance(value, np.generic):
+        text = repr(value.item())
+    elif isinstance(value, tuple):
+        items = [_bounded_stable_value(item, 24) for item in value[:4]]
+        if len(value) > 4:
+            items.append("...")
+        text = "({}{})".format(
+            ", ".join(items),
+            "," if len(value) == 1 else "",
+        )
+    else:
+        text = "<{}>".format(type(value).__name__)
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def _stable_evolve_field(name, value):
+    if name == "rk_config":
+        return "RungeKutta(method={}, stage={}, order={})".format(
+            _bounded_stable_value(getattr(value, "method", None)),
+            _bounded_stable_value(getattr(value, "stage", None)),
+            _bounded_stable_value(getattr(value, "order", None)),
+        )
+    if name == "taylor_config":
+        return "TaylorExpansion(order={})".format(
+            _bounded_stable_value(getattr(value, "order", None))
+        )
+    return _bounded_stable_value(value)
+
+
+def _distributed_execution_summary(execution):
+    context = getattr(execution, "context", None)
+    mesh = getattr(execution, "mesh", None)
+    fields = (
+        ("rank", getattr(context, "rank", None)),
+        ("local_rank", getattr(context, "local_rank", None)),
+        ("world_size", getattr(context, "world_size", None)),
+        ("local_world_size", getattr(context, "local_world_size", None)),
+        ("mesh_shape", getattr(mesh, "shape", None)),
+        ("mesh_axis_names", getattr(mesh, "axis_names", None)),
+        ("residency_policy", getattr(execution, "residency_policy", None)),
+        (
+            "device_memory_budget_bytes",
+            getattr(execution, "device_memory_budget_bytes", None),
+        ),
+        (
+            "host_memory_budget_bytes",
+            getattr(execution, "host_memory_budget_bytes", None),
+        ),
+        ("prefetch_depth", getattr(execution, "prefetch_depth", None)),
+        ("backend_name", getattr(execution, "backend_name", None)),
+        ("backend_device", getattr(execution, "backend_device", None)),
+        ("backend_precision", getattr(execution, "backend_precision", None)),
+    )
+    return "DistributedExecutionConfig({})".format(
+        ", ".join(
+            "{}={}".format(name, _bounded_stable_value(value))
+            for name, value in fields
+        )
+    )
+
+
 class EvolveConfig:
     def __init__(
         self,
@@ -384,6 +453,7 @@ class EvolveConfig:
         self.force_ovlp: bool = force_ovlp
         # auto switch between mu_vmf and vmf for a higher efficiency
         self.vmf_auto_switch: bool = True
+        self.distributed_execution = None
 
     @property
     def is_tdvp(self):
@@ -408,9 +478,44 @@ class EvolveConfig:
         return new
 
     def __str__(self):
-        attrs = list(self.__dict__.keys())
-        lines = []
-        for attr in attrs:
-            attr_value = getattr(self, attr)
-            lines.append(f"\n{attr}: {attr_value}")
+        if self.distributed_execution is None:
+            attrs = [
+                attr
+                for attr in self.__dict__.keys()
+                if attr != "distributed_execution"
+                or self.distributed_execution is not None
+            ]
+            lines = []
+            for attr in attrs:
+                attr_value = getattr(self, attr)
+                lines.append(f"\n{attr}: {attr_value}")
+            return "".join(lines)
+
+        attrs = [
+            "method",
+            "adaptive",
+            "rk_config",
+            "taylor_config",
+            "guess_dt",
+            "adaptive_rtol",
+            "tdvp_cmf_midpoint",
+            "tdvp_cmf_c_trapz",
+            "reg_epsilon",
+            "ivp_rtol",
+            "ivp_atol",
+            "ivp_solver",
+            "force_ovlp",
+            "vmf_auto_switch",
+        ]
+        lines = [
+            "\n{}: {}".format(
+                attr, _stable_evolve_field(attr, getattr(self, attr, None))
+            )
+            for attr in attrs
+        ]
+        lines.append(
+            "\ndistributed_execution: {}".format(
+                _distributed_execution_summary(self.distributed_execution)
+            )
+        )
         return "".join(lines)

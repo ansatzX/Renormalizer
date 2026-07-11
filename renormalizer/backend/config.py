@@ -71,6 +71,9 @@ class DistributedExecutionConfig:
     device_memory_budget_bytes: int | None = None
     host_memory_budget_bytes: int | None = None
     prefetch_depth: int = 1
+    backend_name: str | None = None
+    backend_device: str | None = None
+    backend_precision: int | None = None
 
     def __post_init__(self):
         from renormalizer.backend._distributed.context import DistributedContext
@@ -102,3 +105,17 @@ class DistributedExecutionConfig:
                 raise ValueError("{} must be a positive integer or None".format(name))
         if type(self.prefetch_depth) is not int or self.prefetch_depth <= 0:
             raise ValueError("prefetch_depth must be a positive integer")
+        backend_metadata = (
+            self.backend_name,
+            self.backend_device,
+            self.backend_precision,
+        )
+        if any(value is not None for value in backend_metadata):
+            if any(value is None for value in backend_metadata):
+                raise ValueError("distributed backend metadata must be complete")
+            if self.backend_name not in {"numpy", "cupy"}:
+                raise ValueError("distributed backend must be NumPy or CuPy")
+            if not isinstance(self.backend_device, str):
+                raise TypeError("distributed backend device must be a string")
+            if self.backend_precision not in {32, 64}:
+                raise ValueError("distributed backend precision must be 32 or 64")

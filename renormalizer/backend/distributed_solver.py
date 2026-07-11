@@ -7,6 +7,10 @@ from renormalizer.backend._distributed.local_operator import (
     DistributedLocalOperator,
     run_root_fallback,
 )
+from renormalizer.backend._distributed.center import (
+    CenterVectorMap,
+    MappedDistributedLocalOperator,
+)
 from renormalizer.backend._distributed.planner import (
     DistributedBlockPlan,
     DistributedMemoryEstimate,
@@ -35,9 +39,11 @@ from renormalizer.backend.config import DistributedExecutionConfig
 
 __all__ = [
     "DeviceResidentProvider",
+    "CenterVectorMap",
     "DistributedBlockPlan",
     "DistributedExecutionConfig",
     "DistributedLocalOperator",
+    "MappedDistributedLocalOperator",
     "DistributedMemoryEstimate",
     "DistributedPlan",
     "DistributedTensor",

@@ -4,8 +4,8 @@ from collections.abc import Mapping
 import importlib
 from numbers import Integral
 import numpy as np
+from typing import Protocol, runtime_checkable
 
-from renormalizer.backend._distributed.local_operator import DistributedLocalOperator
 from renormalizer.backend._distributed.sharding import DistributedTensor
 from renormalizer.lib.krylov.krylov import (
     _lanczos_expm,
@@ -19,6 +19,22 @@ _KRYLOV_KEYS = frozenset({"block_size"})
 _DAVIDSON_KEYS = frozenset(
     {"diagonal", "tol", "max_cycle", "max_space", "lindep", "require_convergence"}
 )
+
+
+@runtime_checkable
+class DistributedSolverOperator(Protocol):
+    backend: object
+    context: object
+    collective: object
+    solver_input_sharding: object
+    solver_output_sharding: object
+    solver_dtype: np.dtype
+
+    def solver_preflight(self) -> None:
+        ...
+
+    def __call__(self, local_vector):
+        ...
 
 
 def _host_scalar(value):
@@ -144,9 +160,9 @@ def _synchronized_controls(parse, operator, collective, solver_name):
 def _vector_contract_error(operator, vector, collective):
     if not isinstance(vector, DistributedTensor):
         return TypeError("vector must be a DistributedTensor")
-    if vector.spec != operator.plan.input_sharding:
+    if vector.spec != operator.solver_input_sharding:
         return ValueError("vector sharding spec does not match operator input")
-    if operator.plan.input_sharding != operator.plan.output_sharding:
+    if operator.solver_input_sharding != operator.solver_output_sharding:
         return ValueError("operator input and output sharding must be equal")
     if len(vector.spec.global_shape) != 1 or vector.spec.axis != 0:
         return NotImplementedError(
@@ -164,25 +180,21 @@ def _vector_contract_error(operator, vector, collective):
         return error
     if not bool(vector.local_array.flags.c_contiguous):
         return ValueError("distributed vector local storage must be C contiguous")
-    variable_ref = next(
-        ref
-        for ref in operator.plan.execution_plan.inputs
-        if ref.key == operator.plan.variable_key
-    )
-    expected_dtype = np.dtype(variable_ref.spec.dtype)
+    expected_dtype = np.dtype(operator.solver_dtype)
     if np.dtype(vector.local_array.dtype) != expected_dtype:
         return ValueError(
             "distributed vector dtype does not match operator input dtype"
         )
-    if np.dtype(operator.plan.execution_plan.output.spec.dtype) != expected_dtype:
-        return ValueError("iterative operator input and output dtype must agree")
     return None
 
 
 def _solver_preflight(operator, vector, collective):
-    if not isinstance(operator, DistributedLocalOperator):
-        raise TypeError("operator must be a DistributedLocalOperator")
-    operator._preflight_setup()
+    preflight = getattr(operator, "solver_preflight", None)
+    if not callable(preflight):
+        raise TypeError("operator must implement the distributed solver protocol")
+    preflight()
+    if not isinstance(operator, DistributedSolverOperator):
+        raise TypeError("operator must implement the distributed solver protocol")
     backend_name = getattr(operator.backend, "name", None)
     if backend_name not in {"numpy", "cupy"}:
         raise NotImplementedError(
@@ -385,6 +397,7 @@ def run_sharded_davidson(operator, vector, *, collective, config):
 
 
 __all__ = [
+    "DistributedSolverOperator",
     "distributed_norm",
     "distributed_vdot",
     "run_sharded_davidson",

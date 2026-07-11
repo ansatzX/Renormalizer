@@ -87,19 +87,62 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
     """
 
     assert mps.optimize_config.method in ["2site", "1site"]
+    distributed_execution = mps.optimize_config.distributed_execution
+    if distributed_execution is not None:
+        from renormalizer.backend._distributed.center import (
+            canonicalize_compression_control,
+        )
+        from renormalizer.mps.distributed import (
+            _mps_ground_mode_supported,
+            coordinate_mps_workflow_entry,
+        )
+
+        effective_procedure = []
+        for compression, percent in mps.optimize_config.procedure:
+            if isinstance(compression, int):
+                compression = CompressConfig(
+                    criteria=CompressCriteria.fixed,
+                    max_bonddim=compression,
+                )
+            effective_procedure.append(
+                {
+                    "compression": canonicalize_compression_control(compression),
+                    "percent": float(percent),
+                }
+            )
+        supported = _mps_ground_mode_supported(
+            algo=mps.optimize_config.algo,
+            nroots=mps.optimize_config.nroots,
+            omega=omega,
+            stacked_mpo=isinstance(mpo, StackedMpo),
+        )
+        coordinate_mps_workflow_entry(
+            distributed_execution,
+            operation="ground_state_workflow",
+            site_count=mps.site_num,
+            center_kind="workflow",
+            solver_controls={
+                "algo": mps.optimize_config.algo,
+                "nroots": mps.optimize_config.nroots,
+                "inverse": mps.optimize_config.inverse,
+                "effective_procedure": effective_procedure,
+                "convergence": {
+                    "rtol": mps.optimize_config.e_rtol,
+                    "atol": mps.optimize_config.e_atol,
+                },
+            },
+            selectors={
+                "method": mps.optimize_config.method,
+                "omega": omega,
+                "stacked_mpo": isinstance(mpo, StackedMpo),
+            },
+            supported=supported,
+            fallback_reason_code="unsupported_ground_state_workflow",
+        )
     logger.info(f"optimization method: {mps.optimize_config.method}")
     logger.info(f"e_rtol: {mps.optimize_config.e_rtol}")
     logger.info(f"e_atol: {mps.optimize_config.e_atol}")
     logger.info(f"procedure: {mps.optimize_config.procedure}")
-
-    # ensure that mps is left or right-canonical
-    # TODO: start from a mix-canonical MPS
-    if mps.is_left_canonical:
-        mps.ensure_right_canonical()
-        env = "R"
-    else:
-        mps.ensure_left_canonical()
-        env = "L"
 
     compress_config_bk = mps.compress_config
 
@@ -109,18 +152,38 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
 
         phase_start = perf_counter()
 
-    # construct the environment matrix
-    if omega is not None:
-        if isinstance(mpo, StackedMpo):
-            raise NotImplementedError("StackedMPO + omega is not implemented yet")
-        identity = Mpo.identity(mpo.model)
-        mpo = mpo.add(identity.scale(-omega))
-        environ = Environ(mps, [mpo, mpo], env)
-    else:
-        if isinstance(mpo, StackedMpo):
-            environ = [Environ(mps, item, env) for item in mpo.mpos]
+    def prepare_environment():
+        # TODO: start from a mix-canonical MPS
+        if mps.is_left_canonical:
+            mps.ensure_right_canonical()
+            env = "R"
         else:
-            environ = Environ(mps, mpo, env)
+            mps.ensure_left_canonical()
+            env = "L"
+        prepared_mpo = mpo
+        if omega is not None:
+            if isinstance(prepared_mpo, StackedMpo):
+                raise NotImplementedError("StackedMPO + omega is not implemented yet")
+            identity = Mpo.identity(prepared_mpo.model)
+            prepared_mpo = prepared_mpo.add(identity.scale(-omega))
+            environ = Environ(mps, [prepared_mpo, prepared_mpo], env)
+        elif isinstance(prepared_mpo, StackedMpo):
+            environ = [Environ(mps, item, env) for item in prepared_mpo.mpos]
+        else:
+            environ = Environ(mps, prepared_mpo, env)
+        return prepared_mpo, environ
+
+    if distributed_execution is None:
+        mpo, environ = prepare_environment()
+    else:
+        from renormalizer.mps.distributed import _synchronize_mps_state
+
+        mpo, environ = _synchronize_mps_state(
+            distributed_execution,
+            mps,
+            metadata=("ground_state", "environment_setup"),
+            operation=prepare_environment,
+        )
     if profile_enabled:
         _record_phase_summary("environment_construction", "construct", perf_counter() - phase_start)
 
@@ -171,12 +234,38 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
     assert res_mps is not None
     # remove the redundant basis near the edge
     # and restore the original compress_config of the input mps
+    def finalize_result(result):
+        return result.normalize("mps_only").ensure_left_canonical().canonicalise()
+
     if mps.optimize_config.nroots == 1:
-        res_mps = res_mps.normalize("mps_only").ensure_left_canonical().canonicalise()
+        if distributed_execution is None:
+            res_mps = finalize_result(res_mps)
+        else:
+            from renormalizer.mps.distributed import _synchronize_mps_state
+
+            res_mps = _synchronize_mps_state(
+                distributed_execution,
+                res_mps,
+                metadata=("ground_state", "result_finalize"),
+                operation=lambda: finalize_result(res_mps),
+            )
         res_mps.compress_config = compress_config_bk
         logger.info(f"{res_mps}")
     else:
-        res_mps = [mp.normalize("mps_only").ensure_left_canonical().canonicalise() for mp in res_mps]
+        if distributed_execution is None:
+            res_mps = [finalize_result(mp) for mp in res_mps]
+        else:
+            from renormalizer.mps.distributed import _synchronize_mps_state
+
+            res_mps = [
+                _synchronize_mps_state(
+                    distributed_execution,
+                    mp,
+                    metadata=("ground_state", "result_finalize", iroot),
+                    operation=lambda mp=mp: finalize_result(mp),
+                )
+                for iroot, mp in enumerate(res_mps)
+            ]
         for res in res_mps:
             res.compress_config = compress_config_bk
         logger.info(f"{res_mps[0]}")
@@ -268,9 +357,48 @@ def single_sweep(
         else:
             cmo = [asxp(mpo[idx]) for idx in cidx]
 
-        use_direct_eigh = np.prod(cshape) < 1000 or mps.optimize_config.algo == "direct"
+        use_direct_eigh = (
+            (
+                mps.optimize_config.distributed_execution is None
+                and np.prod(cshape) < 1000
+            )
+            or mps.optimize_config.algo == "direct"
+        )
         if use_direct_eigh:
-            e, c = eigh_direct(mps, qn_mask, ltensor, rtensor, cmo, omega)
+            distributed_execution = mps.optimize_config.distributed_execution
+            if distributed_execution is None:
+                e, c = eigh_direct(mps, qn_mask, ltensor, rtensor, cmo, omega)
+            else:
+                from renormalizer.mps.distributed import (
+                    run_mps_ground_state_fallback,
+                )
+
+                if method == "1site":
+                    raw_guess = asnumpy(mps[cidx[0]])[qn_mask]
+                else:
+                    raw_guess = asnumpy(
+                        tensordot(mps[cidx[0]], mps[cidx[1]], axes=1)
+                    )[qn_mask]
+                e, c = run_mps_ground_state_fallback(
+                    lambda: eigh_direct(
+                        mps, qn_mask, ltensor, rtensor, cmo, omega
+                    ),
+                    distributed_execution=distributed_execution,
+                    qn_mask=qn_mask,
+                    initial_guesses=[raw_guess] * nroots,
+                    site_indices=tuple(cidx),
+                    center_kind="one_site" if method == "1site" else "two_site",
+                    solver_controls={
+                        "algo": mps.optimize_config.algo,
+                        "nroots": nroots,
+                        "inverse": mps.optimize_config.inverse,
+                    },
+                    selectors={
+                        "method": method,
+                        "omega": omega,
+                        "stacked_mpo": isinstance(mpo, StackedMpo),
+                    },
+                )
         else:
             # the iterative approach
             # generate initial guess
@@ -300,7 +428,56 @@ def single_sweep(
             cguess.extend(
                 [np.random.rand(guess_dim) - 0.5 for i in range(len(cguess), nroots)]
             )
-            e, c = eigh_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega, cguess)
+            distributed_execution = mps.optimize_config.distributed_execution
+            if distributed_execution is None:
+                e, c = eigh_iterative(
+                    mps, qn_mask, ltensor, rtensor, cmo, omega, cguess
+                )
+            else:
+                from renormalizer.mps.distributed import (
+                    _mps_ground_mode_supported,
+                    run_mps_ground_state_fallback,
+                )
+
+                supported = _mps_ground_mode_supported(
+                    algo=mps.optimize_config.algo,
+                    nroots=nroots,
+                    omega=omega,
+                    stacked_mpo=isinstance(mpo, StackedMpo),
+                )
+                if supported:
+                    e, c = eigh_iterative(
+                        mps, qn_mask, ltensor, rtensor, cmo, omega, cguess
+                    )
+                else:
+                    def local_iterative_operation():
+                        hdiag, expr = _prepare_iterative_hamiltonian(
+                            mps, qn_mask, ltensor, rtensor, cmo, omega
+                        )
+                        return _eigh_iterative_local(
+                            mps, qn_mask, hdiag, expr, cguess
+                        )
+
+                    e, c = run_mps_ground_state_fallback(
+                        local_iterative_operation,
+                        distributed_execution=distributed_execution,
+                        qn_mask=qn_mask,
+                        initial_guesses=cguess,
+                        site_indices=tuple(cidx),
+                        center_kind=(
+                            "one_site" if method == "1site" else "two_site"
+                        ),
+                        solver_controls={
+                            "algo": mps.optimize_config.algo,
+                            "nroots": nroots,
+                            "inverse": mps.optimize_config.inverse,
+                        },
+                        selectors={
+                            "method": method,
+                            "omega": omega,
+                            "stacked_mpo": isinstance(mpo, StackedMpo),
+                        },
+                    )
 
         # if multi roots, both davidson and primme return np.ndarray
         if nroots > 1:
@@ -314,19 +491,129 @@ def single_sweep(
         if cidx == last_opt_e_idx:
             if nroots == 1:
                 res_mps = mps.copy()
-                res_mps._update_mps(cstruct, cidx, qnbigl, qnbigr, percent)
+                if mps.optimize_config.distributed_execution is None:
+                    res_mps._update_mps(cstruct, cidx, qnbigl, qnbigr, percent)
+                else:
+                    from renormalizer.mps.distributed import (
+                        _deterministic_mps_update,
+                        _synchronize_mps_state,
+                    )
+
+                    _synchronize_mps_state(
+                        mps.optimize_config.distributed_execution,
+                        res_mps,
+                        metadata=("davidson", tuple(cidx), method, "result_snapshot"),
+                        operation=lambda: _deterministic_mps_update(
+                            res_mps,
+                            cstruct,
+                            cidx,
+                            qnbigl,
+                            qnbigr,
+                            percent,
+                            metadata=(
+                                res_mps.qnidx,
+                                bool(res_mps.to_right),
+                                tuple(cidx),
+                                method,
+                                "result_snapshot",
+                            ),
+                        ),
+                    )
             else:
                 res_mps = [mps.copy() for i in range(len(cstruct))]
                 for iroot in range(len(cstruct)):
-                    res_mps[iroot]._update_mps(
-                        cstruct[iroot], cidx, qnbigl, qnbigr, percent
-                    )
+                    if mps.optimize_config.distributed_execution is None:
+                        res_mps[iroot]._update_mps(
+                            cstruct[iroot], cidx, qnbigl, qnbigr, percent
+                        )
+                    else:
+                        from renormalizer.mps.distributed import (
+                            _deterministic_mps_update,
+                            _synchronize_mps_state,
+                        )
 
-        averaged_ms = mps._update_mps(cstruct, cidx, qnbigl, qnbigr, percent)
-        if mps.compress_config.ofs is not None:
+                        _synchronize_mps_state(
+                            mps.optimize_config.distributed_execution,
+                            res_mps[iroot],
+                            metadata=(
+                                "davidson",
+                                tuple(cidx),
+                                method,
+                                iroot,
+                                "result_snapshot",
+                            ),
+                            operation=lambda iroot=iroot: _deterministic_mps_update(
+                                res_mps[iroot],
+                                cstruct[iroot],
+                                cidx,
+                                qnbigl,
+                                qnbigr,
+                                percent,
+                                metadata=(
+                                    res_mps[iroot].qnidx,
+                                    bool(res_mps[iroot].to_right),
+                                    tuple(cidx),
+                                    method,
+                                    iroot,
+                                    "result_snapshot",
+                                ),
+                            ),
+                        )
+
+        if mps.optimize_config.distributed_execution is None:
+            averaged_ms = mps._update_mps(
+                cstruct, cidx, qnbigl, qnbigr, percent
+            )
+        else:
+            from renormalizer.mps.distributed import (
+                _deterministic_mps_update,
+                _synchronize_mps_state,
+            )
+
+            seed_metadata = (
+                mps.qnidx,
+                bool(mps.to_right),
+                tuple(cidx),
+                method,
+                "active_state",
+            )
+            def update_active_state():
+                result = _deterministic_mps_update(
+                    mps,
+                    cstruct,
+                    cidx,
+                    qnbigl,
+                    qnbigr,
+                    percent,
+                    metadata=seed_metadata,
+                )
+                if mps.compress_config.ofs is not None:
+                    mpo.try_swap_site(mps.model, mps.compress_config.ofs_swap_jw)
+                return result
+
+            averaged_ms = _synchronize_mps_state(
+                mps.optimize_config.distributed_execution,
+                mps,
+                metadata=("davidson", tuple(cidx), method),
+                operation=update_active_state,
+            )
+        if (
+            mps.optimize_config.distributed_execution is None
+            and mps.compress_config.ofs is not None
+        ):
             mpo.try_swap_site(mps.model, mps.compress_config.ofs_swap_jw)
 
-    mps._switch_direction()
+    if mps.optimize_config.distributed_execution is None:
+        mps._switch_direction()
+    else:
+        from renormalizer.mps.distributed import _synchronize_mps_state
+
+        _synchronize_mps_state(
+            mps.optimize_config.distributed_execution,
+            mps,
+            metadata=("davidson", "switch_direction"),
+            operation=mps._switch_direction,
+        )
     return micro_iteration_result, res_mps, mpo
 
 
@@ -509,6 +796,25 @@ def func_sum(funcs):
     return new_func
 
 
+def _prepare_iterative_hamiltonian(
+    mps: Mps,
+    qn_mask: np.ndarray,
+    ltensor: Union[xp.ndarray, List[xp.ndarray]],
+    rtensor: Union[xp.ndarray, List[xp.ndarray]],
+    cmo: List[xp.ndarray],
+    omega: float,
+):
+    if isinstance(ltensor, list):
+        assert isinstance(rtensor, list)
+        assert len(ltensor) == len(rtensor)
+        ham = [get_ham_iterative(mps, qn_mask, ltensor_item, rtensor_item, cmo_item, omega) for ltensor_item, rtensor_item, cmo_item in zip(ltensor, rtensor, cmo)]
+        hdiag = sum([hdiag_item for hdiag_item, expr_item in ham])
+        expr = func_sum([expr_item for hdiag_item, expr_item in ham])
+    else:
+        hdiag, expr = get_ham_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega)
+    return hdiag, expr
+
+
 def eigh_iterative(
     mps: Mps,
     qn_mask: np.ndarray,
@@ -520,14 +826,86 @@ def eigh_iterative(
 ):
     # iterative algorithm
     inverse = mps.optimize_config.inverse
-    if isinstance(ltensor, list):
-        assert isinstance(rtensor, list)
-        assert len(ltensor) == len(rtensor)
-        ham = [get_ham_iterative(mps, qn_mask, ltensor_item, rtensor_item, cmo_item, omega) for ltensor_item, rtensor_item, cmo_item in zip(ltensor, rtensor, cmo)]
-        hdiag = sum([hdiag_item for hdiag_item, expr_item in ham])
-        expr = func_sum([expr_item for hdiag_item, expr_item in ham])
-    else:
-        hdiag, expr = get_ham_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega)
+    hdiag, expr = _prepare_iterative_hamiltonian(
+        mps, qn_mask, ltensor, rtensor, cmo, omega
+    )
+
+    distributed_execution = mps.optimize_config.distributed_execution
+    if distributed_execution is not None:
+        from renormalizer.mps.distributed import (
+            _mps_ground_mode_supported,
+            run_mps_davidson,
+            run_mps_ground_state_fallback,
+        )
+
+        center_index = int(mps.qnidx)
+        if mps.optimize_config.method == "1site":
+            site_indices = (center_index,)
+            center_kind = "one_site"
+        elif mps.to_right:
+            site_indices = (center_index, center_index + 1)
+            center_kind = "two_site"
+        else:
+            site_indices = (center_index - 1, center_index)
+            center_kind = "two_site"
+        supported = _mps_ground_mode_supported(
+            algo=mps.optimize_config.algo,
+            nroots=mps.optimize_config.nroots,
+            omega=omega,
+            stacked_mpo=isinstance(ltensor, list),
+        )
+        if not supported:
+            return run_mps_ground_state_fallback(
+                lambda: _eigh_iterative_local(
+                    mps, qn_mask, hdiag, expr, cguess
+                ),
+                distributed_execution=distributed_execution,
+                qn_mask=qn_mask,
+                initial_guesses=cguess,
+                site_indices=site_indices,
+                center_kind=center_kind,
+                solver_controls={
+                    "algo": mps.optimize_config.algo,
+                    "nroots": mps.optimize_config.nroots,
+                    "inverse": inverse,
+                },
+                selectors={
+                    "method": mps.optimize_config.method,
+                    "omega": omega,
+                    "stacked_mpo": isinstance(ltensor, list),
+                },
+            )
+        e, c, _ = run_mps_davidson(
+            expr,
+            distributed_execution=distributed_execution,
+            qn_mask=qn_mask,
+            initial_guess=cguess[0],
+            diagonal=hdiag,
+            site_indices=site_indices,
+            center_kind=center_kind,
+            coefficient=inverse,
+            solver_config={
+                "tol": 1e-12,
+                "max_cycle": 100,
+                "max_space": 12,
+                "lindep": 1e-14,
+                "require_convergence": False,
+            },
+            decision_selectors={
+                "algo": mps.optimize_config.algo,
+                "nroots": mps.optimize_config.nroots,
+                "omega": omega,
+                "stacked_mpo": isinstance(ltensor, list),
+                "method": mps.optimize_config.method,
+            },
+        )
+        return e, sign_fix(c, 1)
+
+    return _eigh_iterative_local(mps, qn_mask, hdiag, expr, cguess)
+
+
+def _eigh_iterative_local(mps, qn_mask, hdiag, expr, cguess):
+    inverse = mps.optimize_config.inverse
 
     count = 0
 

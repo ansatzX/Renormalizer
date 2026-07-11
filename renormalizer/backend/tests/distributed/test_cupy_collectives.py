@@ -1,7 +1,9 @@
 import gc
 import os
+from types import SimpleNamespace
 import weakref
 
+import numpy as np
 import pytest
 
 from renormalizer.backend._distributed.context import DistributedContext
@@ -284,6 +286,152 @@ def test_runtime_close_retries_without_marking_runtime_closed():
     assert runtime._closed is True
     assert collective.live is False
     assert collective.close_calls == 2
+
+
+def test_runtime_execution_config_is_a_borrowed_frozen_view():
+    from dataclasses import FrozenInstanceError
+
+    from renormalizer.backend._distributed.collectives import SingleProcessCollective
+    from renormalizer.backend._distributed.context import DistributedRendezvous
+    from renormalizer.backend._distributed.mesh import DeviceMesh
+    from renormalizer.backend._distributed.providers import DeviceResidentProvider
+    from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
+
+    context = DistributedContext(0, 0, 1, 1)
+    collective = SingleProcessCollective()
+    runtime = CupyDistributedRuntime(
+        backend=object(),
+        context=context,
+        rendezvous=DistributedRendezvous("127.0.0.1", 23456),
+        mesh=DeviceMesh((1,), ("rank",), 0),
+        collective=collective,
+    )
+
+    config = runtime.execution_config(
+        device_memory_budget_bytes=1024,
+        host_memory_budget_bytes=2048,
+        prefetch_depth=2,
+    )
+
+    assert config.context is context
+    assert config.mesh is runtime.mesh
+    assert config.collective is collective
+    assert isinstance(config.provider, DeviceResidentProvider)
+    assert config.device_memory_budget_bytes == 1024
+    assert config.host_memory_budget_bytes == 2048
+    assert config.prefetch_depth == 2
+    with pytest.raises(FrozenInstanceError):
+        config.prefetch_depth = 3
+
+    runtime.close()
+    with pytest.raises(RuntimeError, match="distributed runtime is closed"):
+        runtime.execution_config()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", "numpy"),
+        ("device", "cuda:1"),
+        ("precision", 32),
+    ],
+)
+def test_runtime_execution_config_synchronizes_active_backend_mismatch(
+    field, value, monkeypatch
+):
+    import renormalizer.backend.distributed_runtime as runtime_module
+    from renormalizer.backend._distributed.context import DistributedRendezvous
+    from renormalizer.backend._distributed.mesh import DeviceMesh
+
+    class Collective:
+        rank = 0
+        size = 2
+
+        def __init__(self):
+            self.trace = []
+
+        def allreduce(self, array, *, op="sum"):
+            self.trace.append((op, np.asarray(array).dtype.str, np.asarray(array).size))
+            return np.array(array, copy=True)
+
+    expected = SimpleNamespace(
+        name="cupy",
+        device="cuda:0",
+        config=SimpleNamespace(precision=64),
+        array_namespace=np,
+        asarray=np.asarray,
+    )
+    active = SimpleNamespace(
+        name="cupy",
+        device="cuda:0",
+        config=SimpleNamespace(precision=64),
+    )
+    if field == "precision":
+        active.config.precision = value
+    else:
+        setattr(active, field, value)
+    monkeypatch.setattr("renormalizer.cons.get_backend", lambda: active)
+    collective = Collective()
+    context = DistributedContext(0, 0, 2, 2)
+    runtime = runtime_module.CupyDistributedRuntime(
+        backend=expected,
+        context=context,
+        rendezvous=DistributedRendezvous("127.0.0.1", 23456),
+        mesh=DeviceMesh((2,), ("rank",), 0),
+        collective=collective,
+    )
+
+    with pytest.raises(RuntimeError, match="distributed runtime backend validation failed"):
+        runtime.execution_config()
+
+    assert collective.trace == [
+        ("max", np.dtype(np.int32).str, 1),
+        ("min", np.dtype(np.uint64).str, 4),
+        ("max", np.dtype(np.uint64).str, 4),
+    ]
+
+
+def test_runtime_backend_digest_normalizes_valid_rank_local_devices(monkeypatch):
+    import renormalizer.backend.distributed_runtime as runtime_module
+    from renormalizer.backend._distributed.context import DistributedRendezvous
+    from renormalizer.backend._distributed.mesh import DeviceMesh
+
+    def digest_for_rank(rank):
+        class Collective:
+            size = 2
+
+            def __init__(self):
+                self.rank = rank
+                self.digest = None
+
+            def allreduce(self, value, *, op="sum"):
+                value = np.asarray(value)
+                if op == "min" and value.dtype == np.uint64:
+                    self.digest = np.array(value, copy=True)
+                return np.array(value, copy=True)
+
+        selected = SimpleNamespace(
+            name="cupy",
+            device="cuda:{}".format(rank),
+            config=SimpleNamespace(precision=64),
+            array_namespace=np,
+            asarray=np.asarray,
+        )
+        monkeypatch.setattr("renormalizer.cons.get_backend", lambda: selected)
+        collective = Collective()
+        context = DistributedContext(rank, rank, 2, 2)
+        runtime = runtime_module.CupyDistributedRuntime(
+            backend=selected,
+            context=context,
+            rendezvous=DistributedRendezvous("127.0.0.1", 23456),
+            mesh=DeviceMesh((2,), ("rank",), rank),
+            collective=collective,
+        )
+        config = runtime.execution_config()
+        assert config.backend_device == "cuda:{}".format(rank)
+        return collective.digest
+
+    np.testing.assert_array_equal(digest_for_rank(0), digest_for_rank(1))
 
 
 def test_fake_collectives_have_explicit_numerical_and_mutation_semantics(collective):

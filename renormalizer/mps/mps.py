@@ -43,6 +43,58 @@ from renormalizer.utils.utils import calc_vn_entropy, calc_vn_entropy_dm
 logger = logging.getLogger(__name__)
 
 
+def _run_distributed_ivp_fallback(
+    execution,
+    hop,
+    shape,
+    center,
+    denominator,
+    interval,
+    site_indices,
+    center_kind,
+    evolve_config,
+):
+    from renormalizer.mps.distributed import run_mps_ivp_fallback
+
+    def operation():
+        sol = solve_ivp(
+            lambda t, y: hop(y.reshape(shape)).ravel() / denominator,
+            interval,
+            center,
+            method=evolve_config.ivp_solver,
+            rtol=evolve_config.ivp_rtol,
+            atol=evolve_config.ivp_atol,
+        )
+        return sol.y, sol.nfev
+
+    return run_mps_ivp_fallback(
+        operation,
+        distributed_execution=execution,
+        center=center,
+        center_shape=tuple(shape),
+        site_indices=tuple(site_indices),
+        center_kind=center_kind,
+        solver=evolve_config.ivp_solver,
+        solver_controls={
+            "rtol": evolve_config.ivp_rtol,
+            "atol": evolve_config.ivp_atol,
+            "interval": tuple(interval),
+            "denominator": denominator,
+        },
+    )
+
+
+def _run_synchronized_mps_update(execution, state, operation, metadata):
+    from renormalizer.mps.distributed import _synchronize_mps_state
+
+    return _synchronize_mps_state(
+        execution,
+        state,
+        operation=operation,
+        metadata=metadata,
+    )
+
+
 def adaptive_tdvp(fun):
     # evolve t/2 (twice) and t to obtain the O(dt^3) error term in 2nd-order Trotter decomposition
     # J. Chem. Phys. 146, 174107 (2017)
@@ -655,8 +707,7 @@ class Mps(MatrixProduct):
 
 
     def evolve(self, mpo, evolve_dt, normalize=True) -> "Mps":
-
-        method = {
+        methods = {
             EvolveMethod.prop_and_compress: self._evolve_prop_and_compress,
             EvolveMethod.prop_and_compress_tdrk4: self._evolve_prop_and_compress_tdrk4,
             EvolveMethod.prop_and_compress_tdrk: self._evolve_prop_and_compress_tdrk,
@@ -665,13 +716,70 @@ class Mps(MatrixProduct):
             EvolveMethod.tdvp_mu_cmf: self._evolve_tdvp_mu_cmf,
             EvolveMethod.tdvp_ps: self._evolve_tdvp_ps,
             EvolveMethod.tdvp_ps2: self._evolve_tdvp_ps2
-        }[self.evolve_config.method]
+        }
+        distributed_execution = self.evolve_config.distributed_execution
+        if distributed_execution is None:
+            method = methods[self.evolve_config.method]
+            new_mps = method(mpo, evolve_dt)
+            if normalize:
+                if np.iscomplex(evolve_dt):
+                    new_mps.normalize("mps_and_coeff")
+                else:
+                    new_mps.normalize("mps_only")
+            return new_mps
+
+        from renormalizer.backend._distributed.center import (
+            canonicalize_compression_control,
+        )
+        from renormalizer.mps.distributed import (
+            _synchronize_mps_state,
+            coordinate_mps_workflow_entry,
+        )
+
+        configured_method = self.evolve_config.method
+        method_name = getattr(configured_method, "name", str(configured_method))
+        supported = (
+            configured_method in {EvolveMethod.tdvp_ps, EvolveMethod.tdvp_ps2}
+            and not self.evolve_config.adaptive
+        )
+        route = coordinate_mps_workflow_entry(
+            distributed_execution,
+            operation="public_evolve",
+            site_count=self.site_num,
+            center_kind="workflow",
+            solver_controls={
+                "adaptive": self.evolve_config.adaptive,
+                "guess_dt": self.evolve_config.guess_dt,
+                "adaptive_rtol": self.evolve_config.adaptive_rtol,
+                "ivp_solver": self.evolve_config.ivp_solver,
+                "ivp_rtol": self.evolve_config.ivp_rtol,
+                "ivp_atol": self.evolve_config.ivp_atol,
+                "evolve_dt": evolve_dt,
+                "compression": canonicalize_compression_control(
+                    self.compress_config
+                ),
+            },
+            selectors={"method": method_name, "normalize": bool(normalize)},
+            supported=supported,
+            fallback_reason_code="unsupported_public_evolve_workflow",
+        )
+
+        if route == "fallback":
+            raise NotImplementedError(
+                "distributed public MPS evolution fallback is unavailable because "
+                "complete workflow capacity cannot be proven"
+            )
+
+        method = methods[configured_method]
         new_mps = method(mpo, evolve_dt)
         if normalize:
-            if np.iscomplex(evolve_dt):
-                new_mps.normalize("mps_and_coeff")
-            else:
-                new_mps.normalize("mps_only")
+            kind = "mps_and_coeff" if np.iscomplex(evolve_dt) else "mps_only"
+            _synchronize_mps_state(
+                distributed_execution,
+                new_mps,
+                metadata=("public_evolve", "normalization", kind),
+                operation=lambda: new_mps.normalize(kind),
+            )
         return new_mps
     
     def _evolve_prop_and_compress_tdrk4(self, mpo, evolve_dt) -> "Mps":
@@ -1282,6 +1390,24 @@ class Mps(MatrixProduct):
         # PhysRevB.94.165116
         # TDVP projector splitting
         # one-site
+        distributed_execution = self.evolve_config.distributed_execution
+        if distributed_execution is not None:
+            from renormalizer.mps.distributed import coordinate_mps_workflow_entry
+
+            coordinate_mps_workflow_entry(
+                distributed_execution,
+                operation="ivp_workflow",
+                site_count=self.site_num,
+                center_kind="one_site_workflow",
+                solver_controls={
+                    "solver": self.evolve_config.ivp_solver,
+                    "rtol": self.evolve_config.ivp_rtol,
+                    "atol": self.evolve_config.ivp_atol,
+                },
+                selectors={"method": "tdvp_ps"},
+                supported=self.evolve_config.ivp_solver == "krylov",
+                fallback_reason_code="unsupported_ivp_workflow",
+            )
         if np.iscomplex(evolve_dt):
             mps = self.copy()
             if self.evolve_config.ivp_solver != "krylov":
@@ -1310,105 +1436,270 @@ class Mps(MatrixProduct):
                 hop = hop_expr(l_array, r_array, [asxp(mpo[imps].array)], shape)
 
                 if self.evolve_config.ivp_solver == "krylov":
-                    mps_t, j = expm_krylov(
-                        lambda y: hop(y.reshape(shape)).ravel(),
-                        -1j * evolve_dt / 2, mps[imps].ravel().array
-                    )
+                    if self.evolve_config.distributed_execution is None:
+                        mps_t, j = expm_krylov(
+                            lambda y: hop(y.reshape(shape)).ravel(),
+                            -1j * evolve_dt / 2, mps[imps].ravel().array
+                        )
+                    else:
+                        from renormalizer.mps.distributed import run_mps_krylov
+
+                        mps_t, j = run_mps_krylov(
+                            hop,
+                            distributed_execution=self.evolve_config.distributed_execution,
+                            center=mps[imps].ravel().array,
+                            center_shape=tuple(shape),
+                            site_indices=(imps,),
+                            center_kind="one_site",
+                            coefficient=-1j * evolve_dt / 2,
+                        )
                 else:
-                    sol = solve_ivp(
-                        lambda t, y: hop(y.reshape(shape)).ravel() / coef,
-                        (0, evolve_dt/2),
-                        mps[imps].ravel().array,
-                        method=self.evolve_config.ivp_solver,
-                        rtol=self.evolve_config.ivp_rtol,
-                        atol=self.evolve_config.ivp_atol,
-                    )
-                    mps_t, j = sol.y, sol.nfev
+                    if self.evolve_config.distributed_execution is None:
+                        sol = solve_ivp(
+                            lambda t, y: hop(y.reshape(shape)).ravel() / coef,
+                            (0, evolve_dt/2),
+                            mps[imps].ravel().array,
+                            method=self.evolve_config.ivp_solver,
+                            rtol=self.evolve_config.ivp_rtol,
+                            atol=self.evolve_config.ivp_atol,
+                        )
+                        mps_t, j = sol.y, sol.nfev
+                    else:
+                        mps_t, j = _run_distributed_ivp_fallback(
+                            self.evolve_config.distributed_execution,
+                            hop,
+                            shape,
+                            mps[imps].ravel().array,
+                            coef,
+                            (0, evolve_dt / 2),
+                            (imps,),
+                            "one_site",
+                            self.evolve_config,
+                        )
 
                 local_steps.append(j)
-                mps_t = mps_t.reshape(shape)
+                if distributed_execution is None:
+                    mps_t = mps_t.reshape(shape)
+                    qnbigl, qnbigr, _ = mps._get_big_qn([imps])
+                    u, qnlset, v, qnrset = svd_qn.svd_qn(
+                        asnumpy(mps_t),
+                        qnbigl,
+                        qnbigr,
+                        mps.qntot,
+                        QR=True,
+                        system=system,
+                        full_matrices=False,
+                    )
+                    vt = v.T
+                else:
+                    def decompose_update_environment():
+                        local_mps_t = mps_t.reshape(shape)
+                        qnbigl, qnbigr, _ = mps._get_big_qn([imps])
+                        u, qnlset, v, qnrset = svd_qn.svd_qn(
+                            asnumpy(local_mps_t),
+                            qnbigl,
+                            qnbigr,
+                            mps.qntot,
+                            QR=True,
+                            system=system,
+                            full_matrices=False,
+                        )
+                        vt = v.T
+                        updated_l = None
+                        updated_r = None
+                        if not mps.to_right and imps != 0:
+                            mps[imps] = vt.reshape([-1] + shape[1:])
+                            mps.qn[imps] = qnrset
+                            mps.qnidx = imps - 1
+                            updated_r = environ.GetLR(
+                                "R", imps, mps, mpo, itensor=r_array, method="System"
+                            )
+                        elif mps.to_right and imps != len(mps) - 1:
+                            mps[imps] = u.reshape(shape[:-1] + [-1])
+                            mps.qn[imps + 1] = qnlset
+                            mps.qnidx = imps + 1
+                            updated_l = environ.GetLR(
+                                "L", imps, mps, mpo, itensor=l_array, method="System"
+                            )
+                        else:
+                            mps[imps] = local_mps_t
+                        return u, vt, updated_l, updated_r
 
-                qnbigl, qnbigr, _ = mps._get_big_qn([imps])
-                u, qnlset, v, qnrset = svd_qn.svd_qn(
-                    asnumpy(mps_t),
-                    qnbigl,
-                    qnbigr,
-                    mps.qntot,
-                    QR=True,
-                    system=system,
-                    full_matrices=False,
-                )
-                vt = v.T
+                    u, vt, updated_l, updated_r = _run_synchronized_mps_update(
+                        distributed_execution,
+                        mps,
+                        decompose_update_environment,
+                        (self.evolve_config.ivp_solver, "one_site_transition", imps),
+                    )
+                    if updated_l is not None:
+                        l_array = updated_l
+                    if updated_r is not None:
+                        r_array = updated_r
 
                 if not mps.to_right and imps != 0:
-                    mps[imps] = vt.reshape([-1] + shape[1:])
-                    mps.qn[imps] = qnrset
-                    mps.qnidx = imps-1
-
-                    r_array = environ.GetLR(
-                        "R", imps, mps, mpo, itensor=r_array, method="System"
-                    )
+                    if distributed_execution is None:
+                        mps[imps] = vt.reshape([-1] + shape[1:])
+                        mps.qn[imps] = qnrset
+                        mps.qnidx = imps-1
+                        r_array = environ.GetLR(
+                            "R", imps, mps, mpo, itensor=r_array, method="System"
+                        )
 
                     # reverse update u site
                     shape_u = u.shape
                     hop_u = hop_expr(l_array, r_array, [], shape_u)
                     if self.evolve_config.ivp_solver == "krylov":
-                        mps_t, j = expm_krylov(
-                            lambda y: hop_u(y.reshape(shape_u)).ravel(),
-                            1j * evolve_dt / 2, u.ravel()
-                        )
+                        if self.evolve_config.distributed_execution is None:
+                            mps_t, j = expm_krylov(
+                                lambda y: hop_u(y.reshape(shape_u)).ravel(),
+                                1j * evolve_dt / 2, u.ravel()
+                            )
+                        else:
+                            from renormalizer.mps.distributed import run_mps_krylov
+
+                            mps_t, j = run_mps_krylov(
+                                hop_u,
+                                distributed_execution=self.evolve_config.distributed_execution,
+                                center=u.ravel(),
+                                center_shape=tuple(shape_u),
+                                site_indices=(imps - 1, imps),
+                                center_kind="zero_site",
+                                coefficient=1j * evolve_dt / 2,
+                            )
                     else:
-                        sol = solve_ivp(
-                            lambda t, y: hop_u(y.reshape(shape_u)).ravel() / -coef,
-                            (0, evolve_dt/2),
-                            u.ravel(),
-                            method=self.evolve_config.ivp_solver,
-                            rtol=self.evolve_config.ivp_rtol,
-                            atol=self.evolve_config.ivp_atol,
-                        )
-                        mps_t, j = sol.y, sol.nfev
+                        if self.evolve_config.distributed_execution is None:
+                            sol = solve_ivp(
+                                lambda t, y: hop_u(y.reshape(shape_u)).ravel() / -coef,
+                                (0, evolve_dt/2),
+                                u.ravel(),
+                                method=self.evolve_config.ivp_solver,
+                                rtol=self.evolve_config.ivp_rtol,
+                                atol=self.evolve_config.ivp_atol,
+                            )
+                            mps_t, j = sol.y, sol.nfev
+                        else:
+                            mps_t, j = _run_distributed_ivp_fallback(
+                                self.evolve_config.distributed_execution,
+                                hop_u,
+                                shape_u,
+                                u.ravel(),
+                                -coef,
+                                (0, evolve_dt / 2),
+                                (imps - 1, imps),
+                                "zero_site",
+                                self.evolve_config,
+                            )
 
                     local_steps.append(j)
                     mps_t = mps_t.reshape(shape_u)
 
-                    mps[imps - 1] = tensordot(mps[imps - 1].array, mps_t, axes=(-1, 0),)
+                    if self.evolve_config.distributed_execution is None:
+                        mps[imps - 1] = tensordot(
+                            mps[imps - 1].array, mps_t, axes=(-1, 0),
+                        )
+                    else:
+                        _run_synchronized_mps_update(
+                            self.evolve_config.distributed_execution,
+                            mps,
+                            lambda: mps.__setitem__(
+                                imps - 1,
+                                tensordot(
+                                    mps[imps - 1].array,
+                                    mps_t,
+                                    axes=(-1, 0),
+                                ),
+                            ),
+                            ("krylov", "zero_site", imps - 1, imps),
+                        )
 
                 elif mps.to_right and imps != len(mps) - 1:
-                    mps[imps] = u.reshape(shape[:-1] + [-1])
-                    mps.qn[imps + 1] = qnlset
-                    mps.qnidx = imps+1
-
-                    l_array = environ.GetLR(
-                        "L", imps, mps, mpo, itensor=l_array, method="System"
-                    )
+                    if distributed_execution is None:
+                        mps[imps] = u.reshape(shape[:-1] + [-1])
+                        mps.qn[imps + 1] = qnlset
+                        mps.qnidx = imps+1
+                        l_array = environ.GetLR(
+                            "L", imps, mps, mpo, itensor=l_array, method="System"
+                        )
 
                     # reverse update svt site
                     shape_svt = vt.shape
                     hop_svt = hop_expr(l_array, r_array, [], shape_svt)
                     if self.evolve_config.ivp_solver == "krylov":
-                        mps_t, j = expm_krylov(
-                            lambda y: hop_svt(y.reshape(shape_svt)).ravel(),
-                            1j * evolve_dt / 2, vt.ravel()
-                        )
+                        if self.evolve_config.distributed_execution is None:
+                            mps_t, j = expm_krylov(
+                                lambda y: hop_svt(y.reshape(shape_svt)).ravel(),
+                                1j * evolve_dt / 2, vt.ravel()
+                            )
+                        else:
+                            from renormalizer.mps.distributed import run_mps_krylov
+
+                            mps_t, j = run_mps_krylov(
+                                hop_svt,
+                                distributed_execution=self.evolve_config.distributed_execution,
+                                center=vt.ravel(),
+                                center_shape=tuple(shape_svt),
+                                site_indices=(imps, imps + 1),
+                                center_kind="zero_site",
+                                coefficient=1j * evolve_dt / 2,
+                            )
                     else:
-                        sol = solve_ivp(
-                            lambda t, y: hop_svt(y.reshape(shape_svt)).ravel() / -coef,
-                            (0, evolve_dt/2),
-                            vt.ravel(),
-                            method=self.evolve_config.ivp_solver,
-                            rtol=self.evolve_config.ivp_rtol,
-                            atol=self.evolve_config.ivp_atol,
-                        )
-                        mps_t, j = sol.y, sol.nfev
+                        if self.evolve_config.distributed_execution is None:
+                            sol = solve_ivp(
+                                lambda t, y: hop_svt(y.reshape(shape_svt)).ravel() / -coef,
+                                (0, evolve_dt/2),
+                                vt.ravel(),
+                                method=self.evolve_config.ivp_solver,
+                                rtol=self.evolve_config.ivp_rtol,
+                                atol=self.evolve_config.ivp_atol,
+                            )
+                            mps_t, j = sol.y, sol.nfev
+                        else:
+                            mps_t, j = _run_distributed_ivp_fallback(
+                                self.evolve_config.distributed_execution,
+                                hop_svt,
+                                shape_svt,
+                                vt.ravel(),
+                                -coef,
+                                (0, evolve_dt / 2),
+                                (imps, imps + 1),
+                                "zero_site",
+                                self.evolve_config,
+                            )
 
                     local_steps.append(j)
                     mps_t = mps_t.reshape(shape_svt)
 
-                    mps[imps + 1] = tensordot(mps_t, mps[imps + 1].array, axes=(1, 0),)
+                    if self.evolve_config.distributed_execution is None:
+                        mps[imps + 1] = tensordot(
+                            mps_t, mps[imps + 1].array, axes=(1, 0),
+                        )
+                    else:
+                        _run_synchronized_mps_update(
+                            self.evolve_config.distributed_execution,
+                            mps,
+                            lambda: mps.__setitem__(
+                                imps + 1,
+                                tensordot(
+                                    mps_t,
+                                    mps[imps + 1].array,
+                                    axes=(1, 0),
+                                ),
+                            ),
+                            ("krylov", "zero_site", imps, imps + 1),
+                        )
 
                 else:
-                    mps[imps] = mps_t
-            mps._switch_direction()
+                    if distributed_execution is None:
+                        mps[imps] = mps_t
+            if distributed_execution is None:
+                mps._switch_direction()
+            else:
+                _run_synchronized_mps_update(
+                    distributed_execution,
+                    mps,
+                    mps._switch_direction,
+                    (self.evolve_config.ivp_solver, "switch_direction", i),
+                )
 
         steps_stat = stats.describe(local_steps)
         logger.debug(f"TDVP-PS Krylov space: {steps_stat}")
@@ -1421,6 +1712,24 @@ class Mps(MatrixProduct):
         # PhysRevB.94.165116
         # TDVP projector splitting
         # two-site
+        distributed_execution = self.evolve_config.distributed_execution
+        if distributed_execution is not None:
+            from renormalizer.mps.distributed import coordinate_mps_workflow_entry
+
+            coordinate_mps_workflow_entry(
+                distributed_execution,
+                operation="ivp_workflow",
+                site_count=self.site_num,
+                center_kind="two_site_workflow",
+                solver_controls={
+                    "solver": self.evolve_config.ivp_solver,
+                    "rtol": self.evolve_config.ivp_rtol,
+                    "atol": self.evolve_config.ivp_atol,
+                },
+                selectors={"method": "tdvp_ps2"},
+                supported=self.evolve_config.ivp_solver == "krylov",
+                fallback_reason_code="unsupported_ivp_workflow",
+            )
         if np.iscomplex(evolve_dt):
             mps = self.copy()
             if self.evolve_config.ivp_solver != "krylov":
@@ -1460,37 +1769,116 @@ class Mps(MatrixProduct):
                 hop = hop_expr(l_array, r_array, [mpo[cidx0], mpo[cidx1]], ms2.shape)
                 
                 if self.evolve_config.ivp_solver == "krylov":
-                    mps_t, j = expm_krylov(
-                        lambda y: hop(y.reshape(ms2.shape)).ravel(),
-                        -1j * evolve_dt / 2,
-                        ms2.ravel()
-                    )
+                    if self.evolve_config.distributed_execution is None:
+                        mps_t, j = expm_krylov(
+                            lambda y: hop(y.reshape(ms2.shape)).ravel(),
+                            -1j * evolve_dt / 2,
+                            ms2.ravel()
+                        )
+                    else:
+                        from renormalizer.mps.distributed import run_mps_krylov
+
+                        mps_t, j = run_mps_krylov(
+                            hop,
+                            distributed_execution=self.evolve_config.distributed_execution,
+                            center=ms2.ravel(),
+                            center_shape=tuple(ms2.shape),
+                            site_indices=(cidx0, cidx1),
+                            center_kind="two_site",
+                            coefficient=-1j * evolve_dt / 2,
+                        )
                 else:
-                    sol = solve_ivp(
-                        lambda t, y: hop(y.reshape(ms2.shape)).ravel() / coef,
-                        (0, evolve_dt/2),
-                        ms2.ravel(),
-                        method=self.evolve_config.ivp_solver,
-                        rtol=self.evolve_config.ivp_rtol,
-                        atol=self.evolve_config.ivp_atol,
-                    )
-                    mps_t, j = sol.y, sol.nfev
+                    if self.evolve_config.distributed_execution is None:
+                        sol = solve_ivp(
+                            lambda t, y: hop(y.reshape(ms2.shape)).ravel() / coef,
+                            (0, evolve_dt/2),
+                            ms2.ravel(),
+                            method=self.evolve_config.ivp_solver,
+                            rtol=self.evolve_config.ivp_rtol,
+                            atol=self.evolve_config.ivp_atol,
+                        )
+                        mps_t, j = sol.y, sol.nfev
+                    else:
+                        mps_t, j = _run_distributed_ivp_fallback(
+                            self.evolve_config.distributed_execution,
+                            hop,
+                            ms2.shape,
+                            ms2.ravel(),
+                            coef,
+                            (0, evolve_dt / 2),
+                            (cidx0, cidx1),
+                            "two_site",
+                            self.evolve_config,
+                        )
                     
                 local_steps.append(j)
 
-                mps_t = mps_t.reshape(ms2.shape)
-                qnbigl, qnbigr, _ = mps._get_big_qn([cidx0, cidx1])
-                mps._update_mps(mps_t, [cidx0, cidx1], qnbigl, qnbigr)
-                if mps.compress_config.ofs is not None:
-                    mpo.try_swap_site(mps.model, mps.compress_config.ofs_swap_jw)
+                if distributed_execution is None:
+                    mps_t = mps_t.reshape(ms2.shape)
+                    qnbigl, qnbigr, _ = mps._get_big_qn([cidx0, cidx1])
+                    mps._update_mps(mps_t, [cidx0, cidx1], qnbigl, qnbigr)
+                    if mps.compress_config.ofs is not None:
+                        mpo.try_swap_site(mps.model, mps.compress_config.ofs_swap_jw)
+                else:
+                    def update_two_site_environment():
+                        local_mps_t = mps_t.reshape(ms2.shape)
+                        qnbigl, qnbigr, _ = mps._get_big_qn([cidx0, cidx1])
+                        mps._update_mps(
+                            local_mps_t, [cidx0, cidx1], qnbigl, qnbigr
+                        )
+                        if mps.compress_config.ofs is not None:
+                            mpo.try_swap_site(
+                                mps.model, mps.compress_config.ofs_swap_jw
+                            )
+                        if imps == last_idx:
+                            return None, None
+                        if mps.to_right:
+                            return (
+                                environ.GetLR(
+                                    "L",
+                                    lidx + 1,
+                                    mps,
+                                    mpo,
+                                    itensor=l_array,
+                                    method="System",
+                                ),
+                                None,
+                            )
+                        return (
+                            None,
+                            environ.GetLR(
+                                "R",
+                                ridx - 1,
+                                mps,
+                                mpo,
+                                itensor=r_array,
+                                method="System",
+                            ),
+                        )
+
+                    updated_l, updated_r = _run_synchronized_mps_update(
+                        distributed_execution,
+                        mps,
+                        update_two_site_environment,
+                        (
+                            self.evolve_config.ivp_solver,
+                            "two_site_transition",
+                            cidx0,
+                            cidx1,
+                        ),
+                    )
+                    if updated_l is not None:
+                        l_array = updated_l
+                    if updated_r is not None:
+                        r_array = updated_r
                 if imps == last_idx:
                     continue
 
-                if mps.to_right:
+                if distributed_execution is None and mps.to_right:
                     l_array = environ.GetLR(
                         "L", lidx + 1, mps, mpo, itensor=l_array, method="System"
                     )
-                else:
+                elif distributed_execution is None:
                     r_array = environ.GetLR(
                         "R", ridx - 1, mps, mpo, itensor=r_array, method="System"
                     )
@@ -1501,27 +1889,73 @@ class Mps(MatrixProduct):
                 
 
                 if self.evolve_config.ivp_solver == "krylov":
-                    mps_t, j = expm_krylov(
-                        lambda y: hop(y.reshape(ms1.shape)).ravel(),
-                        1j * evolve_dt / 2, ms1.ravel()
-                    )
+                    if self.evolve_config.distributed_execution is None:
+                        mps_t, j = expm_krylov(
+                            lambda y: hop(y.reshape(ms1.shape)).ravel(),
+                            1j * evolve_dt / 2, ms1.ravel()
+                        )
+                    else:
+                        from renormalizer.mps.distributed import run_mps_krylov
+
+                        mps_t, j = run_mps_krylov(
+                            hop,
+                            distributed_execution=self.evolve_config.distributed_execution,
+                            center=ms1.ravel(),
+                            center_shape=tuple(ms1.shape),
+                            site_indices=(cidx2,),
+                            center_kind="one_site",
+                            coefficient=1j * evolve_dt / 2,
+                        )
                 else:
-                    sol = solve_ivp(
-                        lambda t, y: hop(y.reshape(ms1.shape)).ravel() / -coef,
-                        (0, evolve_dt/2),
-                        ms1.ravel(),
-                        method=self.evolve_config.ivp_solver,
-                        rtol=self.evolve_config.ivp_rtol,
-                        atol=self.evolve_config.ivp_atol,
-                    )
-                    mps_t, j = sol.y, sol.nfev
+                    if self.evolve_config.distributed_execution is None:
+                        sol = solve_ivp(
+                            lambda t, y: hop(y.reshape(ms1.shape)).ravel() / -coef,
+                            (0, evolve_dt/2),
+                            ms1.ravel(),
+                            method=self.evolve_config.ivp_solver,
+                            rtol=self.evolve_config.ivp_rtol,
+                            atol=self.evolve_config.ivp_atol,
+                        )
+                        mps_t, j = sol.y, sol.nfev
+                    else:
+                        mps_t, j = _run_distributed_ivp_fallback(
+                            self.evolve_config.distributed_execution,
+                            hop,
+                            ms1.shape,
+                            ms1.ravel(),
+                            -coef,
+                            (0, evolve_dt / 2),
+                            (cidx2,),
+                            "one_site",
+                            self.evolve_config,
+                        )
 
                 local_steps.append(j)
                 mps_t = mps_t.reshape(ms1.shape)
-                mps[cidx2] = mps_t
-                mps._push_cano(cidx2)
+                if self.evolve_config.distributed_execution is None:
+                    mps[cidx2] = mps_t
+                    mps._push_cano(cidx2)
+                else:
+                    def update_reverse_site():
+                        mps[cidx2] = mps_t
+                        mps._push_cano(cidx2)
 
-            mps._switch_direction()
+                    _run_synchronized_mps_update(
+                        self.evolve_config.distributed_execution,
+                        mps,
+                        update_reverse_site,
+                        ("krylov", "one_site", cidx2),
+                    )
+
+            if distributed_execution is None:
+                mps._switch_direction()
+            else:
+                _run_synchronized_mps_update(
+                    distributed_execution,
+                    mps,
+                    mps._switch_direction,
+                    (self.evolve_config.ivp_solver, "switch_direction", i),
+                )
 
         steps_stat = stats.describe(local_steps)
         logger.debug(f"TDVP-PS Krylov space: {steps_stat}")

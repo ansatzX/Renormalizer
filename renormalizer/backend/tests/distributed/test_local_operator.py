@@ -308,6 +308,43 @@ def test_planner_rewrites_every_affected_spec_and_preserves_oe_path_order():
             assert dimensions["c"] == 1
 
 
+def test_planner_accepts_explicit_compatible_center_modes():
+    plan = lower_einsum_path("ab,bc->ac", ((8, 8), (8, 8)), dtype="float64")
+    default = plan_distributed_execution(
+        plan, variable_key="input_1", world_size=4
+    )
+
+    explicit = plan_distributed_execution(
+        plan,
+        variable_key="input_1",
+        world_size=4,
+        output_mode="a",
+        input_mode="b",
+    )
+
+    assert explicit.output_mode == "a"
+    assert explicit.input_mode == "b"
+    assert explicit.output_sharding == explicit.input_sharding
+    assert explicit == default
+
+
+def test_planner_rejects_partial_or_illegal_explicit_modes_without_reselection():
+    plan = lower_einsum_path("ab,bc->ac", ((8, 8), (8, 8)), dtype="float64")
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        plan_distributed_execution(
+            plan, variable_key="input_1", world_size=4, output_mode="a"
+        )
+    with pytest.raises(ValueError, match="legal distributed output mode"):
+        plan_distributed_execution(
+            plan,
+            variable_key="input_1",
+            world_size=4,
+            output_mode="c",
+            input_mode="b",
+        )
+
+
 def test_planner_packs_strided_resident_slices_before_matmul():
     plan = lower_einsum_path("ab,b->a", ((10, 7), (7,)), dtype="float64")
 

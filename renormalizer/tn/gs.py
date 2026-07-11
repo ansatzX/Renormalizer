@@ -19,12 +19,56 @@ logger = logging.getLogger(__name__)
 def optimize_ttns(ttns: TTNS, ttno: TTNO, procedure=None):
     if procedure is None:
         procedure = ttns.optimize_config.procedure
+    distributed_execution = ttns.optimize_config.distributed_execution
+    if distributed_execution is not None:
+        from renormalizer.backend._distributed.center import (
+            canonicalize_compression_control,
+        )
+        from renormalizer.tn.distributed import coordinate_ttns_workflow_entry
+
+        effective_procedure = [
+            {
+                "compression": canonicalize_compression_control(compression),
+                "percent": float(percent),
+            }
+            for compression, percent in procedure
+        ]
+        supported = (
+            ttns.optimize_config.algo == "davidson"
+            and ttns.optimize_config.nroots == 1
+        )
+        coordinate_ttns_workflow_entry(
+            distributed_execution,
+            operation="ground_state_workflow",
+            node_count=len(ttns.node_list),
+            center_kind="two_site_workflow",
+            solver_controls={
+                "algo": ttns.optimize_config.algo,
+                "nroots": ttns.optimize_config.nroots,
+                "effective_procedure": effective_procedure,
+                "convergence": {
+                    "rtol": ttns.optimize_config.e_rtol,
+                    "atol": ttns.optimize_config.e_atol,
+                },
+            },
+            selectors={"ground_state_topology": "existing_two_site"},
+            supported=supported,
+            fallback_reason_code="unsupported_ground_state_workflow",
+        )
     profile_enabled = profiling.enabled()
     if profile_enabled:
         from time import perf_counter
 
         phase_start = perf_counter()
-    ttne = TTNEnviron(ttns, ttno)
+    if distributed_execution is None:
+        ttne = TTNEnviron(ttns, ttno)
+    else:
+        ttne = _synchronize_distributed_state(
+            ttns,
+            ttns.root,
+            "environment_setup",
+            operation=lambda: TTNEnviron(ttns, ttno),
+        )
     if profile_enabled:
         _record_phase_summary("environment_construction", "construct", perf_counter() - phase_start)
     e_list = []
@@ -39,6 +83,13 @@ def optimize_ttns(ttns: TTNS, ttno: TTNO, procedure=None):
             )
         logger.info(f"Micro e: {micro_e}")
         e_list.append(micro_e[-1])
+    if distributed_execution is not None:
+        _synchronize_distributed_state(
+            ttns,
+            ttns.root,
+            "final_normalization",
+            operation=lambda: ttns.normalize("ttns_only"),
+        )
     return e_list
 
 
@@ -67,9 +118,17 @@ def optimize_recursion(
             e, c = optimize_2site(child, ttns, ttno, ttne)
             micro_e.append(e)
             # cano to child
-            ttns.update_2site(child, c, m, percent, cano_parent=False)
-            # update env
-            ttne.update_2site(child, ttns, ttno)
+            _synchronize_distributed_state(
+                ttns,
+                child,
+                "to_child",
+                operation=lambda: (
+                    ttns.update_2site(
+                        child, c, m, percent, cano_parent=False
+                    ),
+                    ttne.update_2site(child, ttns, ttno),
+                ),
+            )
             # recursive optimization
             micro_e_child = optimize_recursion(child, ttns, ttno, ttne, m)
             micro_e.extend(micro_e_child)
@@ -78,16 +137,81 @@ def optimize_recursion(
         e, c = optimize_2site(child, ttns, ttno, ttne)
         micro_e.append(e)
         # cano to snode
-        ttns.update_2site(child, c, m, percent, cano_parent=True)
-        # update env
-        ttne.update_2site(child, ttns, ttno)
+        _synchronize_distributed_state(
+            ttns,
+            child,
+            "to_parent",
+            operation=lambda: (
+                ttns.update_2site(
+                    child, c, m, percent, cano_parent=True
+                ),
+                ttne.update_2site(child, ttns, ttno),
+            ),
+        )
     return micro_e
+
+
+def _synchronize_distributed_state(ttns, node, direction, *, operation):
+    execution = ttns.optimize_config.distributed_execution
+    if execution is None:
+        return operation()
+    from renormalizer.tn.distributed import _synchronize_ttns_state
+
+    return _synchronize_ttns_state(
+        execution,
+        ttns,
+        metadata=("davidson", ttns.node_idx[node], direction),
+        operation=operation,
+    )
 
 
 def optimize_2site(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnviron):
     cguess = ttns.merge_with_parent(snode)
     qn_mask = ttns.get_qnmask(snode, include_parent=True)
     cguess = cguess[qn_mask].ravel()
+    distributed_execution = ttns.optimize_config.distributed_execution
+    if distributed_execution is not None and (
+        ttns.optimize_config.nroots != 1
+        or ttns.optimize_config.algo != "davidson"
+    ):
+        from renormalizer.tn.distributed import run_ttns_ground_state_fallback
+
+        node_index = ttns.node_idx[snode]
+
+        def local_ground_operation():
+            local_expr, local_hdiag = hop_expr2(snode, ttns, ttno, ttne)
+            local_hdiag = local_hdiag[qn_mask].ravel()
+
+            def local_hop(x):
+                cstruct = vec2tensor(x, qn_mask)
+                ret = local_expr(asxp(cstruct))[qn_mask].ravel()
+                return asnumpy(ret)
+
+            return eigh_iterative(
+                local_hop,
+                local_hdiag,
+                cguess,
+                ttns.optimize_config.algo,
+            )
+
+        energy, vector = run_ttns_ground_state_fallback(
+            local_ground_operation,
+            distributed_execution=distributed_execution,
+            qn_mask=qn_mask,
+            initial_guess=cguess,
+            node_index=node_index,
+            parent_index=ttns.node_idx[snode.parent],
+            child_index=snode.parent.children.index(snode),
+            degree=len(snode.children) + 1,
+            center_kind="two_site",
+            solver_controls={
+                "algo": ttns.optimize_config.algo,
+                "nroots": ttns.optimize_config.nroots,
+            },
+            selectors={"ground_state_topology": "existing_two_site"},
+        )
+        return energy, vec2tensor(vector, qn_mask)
+
     expr, hdiag = hop_expr2(snode, ttns, ttno, ttne)
     hdiag = hdiag[qn_mask].ravel()
 
@@ -95,6 +219,36 @@ def optimize_2site(snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, ttne: TTNEnvir
         cstruct = vec2tensor(x, qn_mask)
         ret = expr(asxp(cstruct))[qn_mask].ravel()
         return asnumpy(ret)
+
+    if distributed_execution is not None:
+        from renormalizer.tn.distributed import run_ttns_davidson
+
+        node_index = ttns.node_idx[snode]
+        energy, center, _ = run_ttns_davidson(
+            expr,
+            distributed_execution=distributed_execution,
+            qn_mask=qn_mask,
+            initial_guess=cguess,
+            diagonal=hdiag,
+            node_index=node_index,
+            parent_index=ttns.node_idx[snode.parent],
+            child_index=snode.parent.children.index(snode),
+            degree=len(snode.children) + 1,
+            center_kind="two_site",
+            solver_config={
+                "tol": 1e-7,
+                "max_cycle": 100,
+                "max_space": 24,
+                "lindep": 1e-14,
+                "require_convergence": False,
+            },
+            decision_selectors={
+                "algo": ttns.optimize_config.algo,
+                "nroots": ttns.optimize_config.nroots,
+                "ground_state_topology": "existing_two_site",
+            },
+        )
+        return energy, center
 
     assert ttns.optimize_config.nroots == 1
     algo: str = ttns.optimize_config.algo

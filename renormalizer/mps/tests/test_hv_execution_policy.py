@@ -298,6 +298,44 @@ def test_execution_ir_promotes_real_mpo_with_complex_environment_and_center():
     np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11)
 
 
+@pytest.mark.parametrize("layout", ["C", "F", "strided"])
+def test_execution_ir_resolves_dtype_correct_artifact_without_executing(layout, monkeypatch):
+    rng = np.random.default_rng(571)
+    left = rng.normal(size=(2, 3, 4))
+    mpo = rng.normal(size=(3, 5, 4, 6))
+    right = rng.normal(size=(7, 6, 8))
+    base = rng.normal(size=(4, 4, 16)) + 1j * rng.normal(size=(4, 4, 16))
+    if layout == "C":
+        center = np.array(base[..., :8], order="C", copy=True)
+    elif layout == "F":
+        center = np.array(base[..., :8], order="F", copy=True)
+    else:
+        center = base[..., ::2]
+    selected = set_backend(
+        "numpy", execution_policy="execution_ir", fallback_policy="legacy_oe"
+    )
+    hop = mps_hop_module.hop_expr(left, right, [mpo], center.shape)
+    execute_calls = []
+    monkeypatch.setattr(
+        selected,
+        "execute_plan",
+        lambda *_args, **_kwargs: execute_calls.append(1),
+    )
+
+    artifact = hop.resolve_execution_artifact(center)
+
+    assert execute_calls == []
+    assert artifact.variable_index == 3
+    assert artifact.variable_key not in artifact.source_bindings.arrays
+    assert artifact.variable_array is center
+    assert artifact.execution_plan.inputs[artifact.variable_index].key == artifact.variable_key
+    assert all(
+        np.dtype(array.dtype) == np.dtype("complex128")
+        for array in artifact.source_bindings.arrays.values()
+    )
+    assert hop.legacy_fallback_expression is not None
+
+
 @pytest.mark.parametrize(
     ("constant_dtype", "center_dtype", "result_dtype"),
     [

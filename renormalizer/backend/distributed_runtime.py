@@ -5,15 +5,23 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 import os
+
+import numpy as np
 
 from renormalizer.backend._distributed.context import (
     DistributedContext,
     DistributedRendezvous,
 )
+from renormalizer.backend._distributed.center import (
+    normalize_distributed_backend_metadata,
+)
 from renormalizer.backend._distributed.mesh import DeviceMesh
-from renormalizer.backend.config import BackendConfig
+from renormalizer.backend._distributed.providers import DeviceResidentProvider
+from renormalizer.backend.config import BackendConfig, DistributedExecutionConfig
 from renormalizer.backend.factory import create_backend
 
 
@@ -40,6 +48,108 @@ class CupyDistributedRuntime:
 
     def barrier(self):
         return self.collective.barrier()
+
+    def execution_config(
+        self,
+        *,
+        device_memory_budget_bytes=None,
+        host_memory_budget_bytes=None,
+        prefetch_depth=1,
+    ):
+        if self._closed:
+            raise RuntimeError("distributed runtime is closed")
+        backend_metadata = self._synchronize_active_backend()
+        return DistributedExecutionConfig(
+            context=self.context,
+            mesh=self.mesh,
+            collective=self.collective,
+            provider=DeviceResidentProvider(),
+            device_memory_budget_bytes=device_memory_budget_bytes,
+            host_memory_budget_bytes=host_memory_budget_bytes,
+            prefetch_depth=prefetch_depth,
+            backend_name=backend_metadata[0] if backend_metadata is not None else None,
+            backend_device=backend_metadata[1] if backend_metadata is not None else None,
+            backend_precision=backend_metadata[2] if backend_metadata is not None else None,
+        )
+
+    def _synchronize_active_backend(self):
+        expected_name = getattr(self.backend, "name", None)
+        expected_device = getattr(self.backend, "device", None)
+        expected_config = getattr(self.backend, "config", None)
+        expected_precision = getattr(expected_config, "precision", None)
+        if None in (expected_name, expected_device, expected_precision):
+            return None
+
+        from renormalizer.cons import get_backend
+
+        local_error = None
+        active_metadata = (None, None, None)
+        try:
+            active = get_backend()
+            active_metadata = (
+                str(active.name),
+                str(active.device),
+                int(active.config.precision),
+            )
+            expected = (
+                str(expected_name),
+                str(expected_device),
+                int(expected_precision),
+            )
+            context_expected = (
+                "cupy",
+                "cuda:{}".format(self.local_rank),
+                int(expected_precision),
+            )
+            if expected != context_expected or active_metadata != expected:
+                raise ValueError(
+                    "active backend name/device/precision does not match runtime"
+                )
+        except BaseException as error:
+            local_error = error
+
+        status = self.backend.asarray(
+            [int(local_error is not None)], dtype=np.int32
+        )
+        failed = self.collective.allreduce(status, op="max")
+        digest_payload = {
+            "active": normalize_distributed_backend_metadata(
+                active_metadata, local_rank=self.local_rank
+            ),
+            "expected": normalize_distributed_backend_metadata(
+                (expected_name, expected_device, expected_precision),
+                local_rank=self.local_rank,
+            ),
+            "local_error": None if local_error is None else type(local_error).__name__,
+        }
+        encoded = json.dumps(
+            digest_payload, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+        hexdigest = hashlib.sha256(encoded).hexdigest()
+        words = np.asarray(
+            [
+                int(hexdigest[index : index + 16], 16)
+                for index in range(0, 64, 16)
+            ],
+            dtype=np.uint64,
+        )
+        control = self.backend.asarray(words, dtype=np.uint64)
+        minimum = self.collective.allreduce(control, op="min")
+        maximum = self.collective.allreduce(control, op="max")
+        host = lambda value: np.asarray(
+            value.get() if callable(getattr(value, "get", None)) else value
+        )
+        if not np.array_equal(host(minimum), host(maximum)):
+            raise RuntimeError("distributed runtime backend metadata disagreement")
+        if int(host(failed).reshape(-1)[0]):
+            raise RuntimeError(
+                "distributed runtime backend validation failed"
+            ) from local_error
+        return (
+            str(expected_name),
+            str(expected_device),
+            int(expected_precision),
+        )
 
     def close(self):
         if self._closed:

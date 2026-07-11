@@ -79,9 +79,11 @@ def _build_hop(equation, constants, cshape, center_kind):
             "execution_plan_selector",
             "resolved_oe_path",
             "execution_plan",
+            "resolve_execution_artifact",
         ):
             if hasattr(ir_hop, attribute):
                 setattr(policy_hop, attribute, getattr(ir_hop, attribute))
+        policy_hop.legacy_fallback_expression = runtime_fallback
         return policy_hop
     return _legacy_hop(equation, constants, cshape, center_kind)
 
