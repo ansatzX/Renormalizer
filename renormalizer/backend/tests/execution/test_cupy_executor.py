@@ -9,6 +9,8 @@ from renormalizer.backend._execution.model import (
     BufferRef,
     ExecutionBindings,
     ExecutionPlan,
+    GroupedMatmulStep,
+    MatmulStep,
     ReductionStep,
     TensorSpec,
     TransformStep,
@@ -560,3 +562,48 @@ def test_cupy_stream_none_uses_selected_device_and_preserves_ambient_context(
         np.testing.assert_allclose(cp.asnumpy(actual), arrays["left"] @ arrays["right"])
     finally:
         cp.cuda.Device(original_device).use()
+
+
+def test_cupy_grouped_ir_executes_on_selected_stream_without_sync(
+    cupy_backend, monkeypatch
+):
+    cp = cupy_backend._cupy
+    refs = (
+        _ref("input_0", (2, 3), ("a", "b")),
+        _ref("input_1", (3, 4), ("b", "c")),
+        _ref("input_2", (2, 3), ("d", "e")),
+        _ref("input_3", (3, 4), ("e", "f")),
+    )
+    outputs = (
+        _ref("output", (2, 4), ("a", "c")),
+        _ref("other", (2, 4), ("d", "f")),
+    )
+    grouped = GroupedMatmulStep(
+        (
+            MatmulStep(refs[0], refs[1], outputs[0], ("b",)),
+            MatmulStep(refs[2], refs[3], outputs[1], ("e",)),
+        )
+    )
+    plan = _specialized_plan(refs, outputs[0], (grouped,))
+    host = {
+        ref.key: np.arange(np.prod(ref.spec.shape), dtype=np.float64).reshape(ref.spec.shape)
+        for ref in refs
+    }
+    bindings = ExecutionBindings(
+        {key: cupy_backend.asarray(value) for key, value in host.items()}
+    )
+    stream = cp.cuda.Stream(non_blocking=True)
+    observed = []
+    original_batched = cupy_backend.batched_matmul
+
+    def batched(a, b, *, stream=None, workspace=None):
+        observed.append((cp.cuda.runtime.getDevice(), cp.cuda.get_current_stream().ptr))
+        return original_batched(a, b, stream=stream, workspace=workspace)
+
+    monkeypatch.setattr(cupy_backend, "batched_matmul", batched)
+    monkeypatch.setattr(cupy_backend, "sync", lambda: pytest.fail("IR synchronized"))
+
+    actual = execute_plan(cupy_backend, plan, bindings, stream=stream)
+
+    assert actual.device.id == 0
+    assert observed == [(0, stream.ptr)]

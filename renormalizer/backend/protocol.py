@@ -15,6 +15,8 @@ class BackendProtocol(Protocol):
     opt_einsum_name: str
     supports_gpu: bool
     supports_execution_ir: bool
+    supports_batched_matmul: bool
+    supports_grouped_gemm: bool
 
     @property
     def real_dtype(self) -> Any: ...
@@ -55,6 +57,20 @@ class BackendProtocol(Protocol):
 
     def matmul(
         self, a: Any, b: Any, *, stream: Any = None, workspace: Any = None
+    ) -> Any: ...
+
+    def batched_matmul(
+        self, a: Any, b: Any, *, stream: Any = None, workspace: Any = None
+    ) -> Any: ...
+
+    def grouped_gemm(
+        self,
+        descriptors: Any,
+        tensors: Any,
+        *,
+        stream: Any = None,
+        workspace: Any = None,
+        policy: str = "direct",
     ) -> Any: ...
 
     def execute_plan(

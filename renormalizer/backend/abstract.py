@@ -61,6 +61,8 @@ class AbstractBackend:
     supports_sparse = False
     supports_functional_update = True
     supports_execution_ir = False
+    supports_batched_matmul = False
+    supports_grouped_gemm = False
     host_array_types = (np.ndarray,)
     device_array_types = ()
 
@@ -196,6 +198,18 @@ class AbstractBackend:
         if stream is not None:
             raise ValueError("backend {!r} does not accept a stream".format(self.name))
         return self.array_namespace.matmul(a, b)
+
+    def batched_matmul(self, a, b, *, stream=None, workspace=None):
+        raise NotImplementedError(
+            "backend {!r} does not support batched matmul".format(self.name)
+        )
+
+    def grouped_gemm(
+        self, descriptors, tensors, *, stream=None, workspace=None, policy="direct"
+    ):
+        raise NotImplementedError(
+            "backend {!r} does not support grouped GEMM".format(self.name)
+        )
 
     def execute_plan(self, plan, bindings, *, stream=None, workspace=None):
         if not self.supports_execution_ir:

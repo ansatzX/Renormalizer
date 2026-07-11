@@ -17,6 +17,8 @@ class NumpyBackend(AbstractBackend):
     memory_errors = (MemoryError,)
     opt_einsum_name = "numpy"
     supports_execution_ir = True
+    supports_batched_matmul = True
+    supports_grouped_gemm = True
 
     def array(self, *args, **kwargs):
         if kwargs.get("copy", True) is None:
@@ -49,6 +51,25 @@ class NumpyBackend(AbstractBackend):
         if stream is not None:
             raise ValueError("NumPy execution does not accept a stream")
         return np.matmul(a, b)
+
+    def batched_matmul(self, a, b, *, stream=None, workspace=None):
+        if stream is not None:
+            raise ValueError("NumPy execution does not accept a stream")
+        return np.matmul(a, b)
+
+    def grouped_gemm(
+        self, descriptors, tensors, *, stream=None, workspace=None, policy="direct"
+    ):
+        from renormalizer.backend._gemm.executor import execute_grouped_gemm
+
+        return execute_grouped_gemm(
+            self,
+            descriptors,
+            tensors,
+            stream=stream,
+            workspace=workspace,
+            policy=policy,
+        )
 
     def _validate_execution_array(self, value):
         if not isinstance(value, np.ndarray):

@@ -127,6 +127,13 @@ def _product(values):
 
 
 def _execute_matmul(backend, step, buffers, workspace):
+    left, right = _matmul_views(backend, step, buffers)
+    value = backend.matmul(left, right, workspace=workspace)
+    value = _reshape_view(backend, value, step.output.spec.shape)
+    _store_output(backend, buffers, step.output, value)
+
+
+def _matmul_views(backend, step, buffers):
     batch_count = len(step.batch_modes) if isinstance(step, BatchedMatmulStep) else 0
     contracted_count = len(step.contracted_modes)
     left_shape = step.left.spec.shape
@@ -145,9 +152,59 @@ def _execute_matmul(backend, step, buffers, workspace):
         buffers[step.right.key],
         batch_shape + (_product(contracted_shape), _product(right_free_shape)),
     )
-    value = backend.matmul(left, right, workspace=workspace)
-    value = _reshape_view(backend, value, step.output.spec.shape)
-    _store_output(backend, buffers, step.output, value)
+    return left, right
+
+
+def _execute_grouped_matmul(backend, step, buffers, workspace):
+    from renormalizer.backend._gemm.descriptors import MatmulDesc
+    from renormalizer.backend._gemm.executor import execute_grouped_gemm
+
+    descriptors = []
+    matrices = {}
+    prepared = []
+    for index, operation in enumerate(step.operations):
+        left, right = _matmul_views(backend, operation, buffers)
+        a_key = "grouped_a_{}".format(index)
+        b_key = "grouped_b_{}".format(index)
+        c_key = "grouped_c_{}".format(index)
+        matrices[a_key] = left
+        matrices[b_key] = right
+        descriptors.append(
+            MatmulDesc(
+                a_key,
+                b_key,
+                c_key,
+                left.shape[0],
+                right.shape[1],
+                left.shape[1],
+            )
+        )
+        prepared.append(operation)
+
+    matrix_outputs = execute_grouped_gemm(
+        backend,
+        tuple(descriptors),
+        matrices,
+        workspace=workspace,
+        policy="execution_ir",
+    )
+    outputs = []
+    for operation, matrix in zip(prepared, matrix_outputs):
+        if operation.output.key in buffers:
+            raise ValueError(
+                "plan attempted to replace declared buffer {!r}".format(
+                    operation.output.key
+                )
+            )
+        value = _reshape_view(backend, matrix, operation.output.spec.shape)
+        _validate_array(
+            backend,
+            value,
+            operation.output,
+            "step output {!r}".format(operation.output.key),
+        )
+        outputs.append((operation.output.key, value))
+    buffers.update(outputs)
 
 
 def execute_plan(backend, plan, bindings, *, stream=None, workspace=None):
@@ -175,9 +232,6 @@ def execute_plan(backend, plan, bindings, *, stream=None, workspace=None):
                 plan.workspace_bytes, capacity
             )
         )
-    if any(isinstance(step, GroupedMatmulStep) for step in plan.steps):
-        raise NotImplementedError("GroupedMatmulStep execution is deferred to Task 11")
-
     buffers = dict(bindings.arrays)
     with backend._execution_context(stream):
         for step in plan.steps:
@@ -187,6 +241,8 @@ def execute_plan(backend, plan, bindings, *, stream=None, workspace=None):
                 _execute_reduction(backend, step, buffers)
             elif isinstance(step, (MatmulStep, BatchedMatmulStep)):
                 _execute_matmul(backend, step, buffers, workspace)
+            elif isinstance(step, GroupedMatmulStep):
+                _execute_grouped_matmul(backend, step, buffers, workspace)
             else:
                 raise TypeError("unsupported execution step type")
     return buffers[plan.output.key]

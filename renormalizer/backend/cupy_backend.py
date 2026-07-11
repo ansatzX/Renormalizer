@@ -29,6 +29,8 @@ class CupyBackend(AbstractBackend):
     opt_einsum_name = "cupy"
     supports_gpu = True
     supports_execution_ir = True
+    supports_batched_matmul = True
+    supports_grouped_gemm = True
     host_array_types = (np.ndarray,)
 
     def __init__(self, config):
@@ -101,6 +103,24 @@ class CupyBackend(AbstractBackend):
     def matmul(self, a, b, *, stream=None, workspace=None):
         with self._execution_context(stream):
             return self._cupy.matmul(a, b)
+
+    def batched_matmul(self, a, b, *, stream=None, workspace=None):
+        with self._execution_context(stream):
+            return self._cupy.matmul(a, b)
+
+    def grouped_gemm(
+        self, descriptors, tensors, *, stream=None, workspace=None, policy="direct"
+    ):
+        from renormalizer.backend._gemm.executor import execute_grouped_gemm
+
+        return execute_grouped_gemm(
+            self,
+            descriptors,
+            tensors,
+            stream=stream,
+            workspace=workspace,
+            policy=policy,
+        )
 
     def _validate_execution_stream(self, stream):
         if stream is None:

@@ -560,14 +560,170 @@ def test_binding_keys_and_stream_are_validated_before_execution(monkeypatch):
     assert calls == []
 
 
-def test_grouped_matmul_is_rejected_before_partial_execution(monkeypatch):
+def _grouped_plan(shapes):
+    refs = []
+    outputs = []
+    operations = []
+    arrays = {}
+    rng = np.random.default_rng(71)
+    for index, (m, n, k) in enumerate(shapes):
+        left_mode, contracted_mode, right_mode = "abcdefghi"[3 * index:3 * index + 3]
+        left = _ref(f"input_{2 * index}", (m, k), (left_mode, contracted_mode))
+        right = _ref(
+            f"input_{2 * index + 1}", (k, n), (contracted_mode, right_mode)
+        )
+        output_key = "output" if index == 0 else f"other_{index}"
+        output = _ref(output_key, (m, n), (left_mode, right_mode))
+        refs.extend((left, right))
+        outputs.append(output)
+        operations.append(MatmulStep(left, right, output, (contracted_mode,)))
+        arrays[left.key] = rng.normal(size=(m, k))
+        arrays[right.key] = rng.normal(size=(k, n))
+    grouped = GroupedMatmulStep(tuple(operations))
+    return (
+        _specialized_plan(tuple(refs), outputs[0], (grouped,)),
+        ExecutionBindings(arrays),
+        tuple(operations),
+    )
+
+
+def test_grouped_matmul_same_shape_executes_one_batched_primitive(monkeypatch):
+    plan, bindings, operations = _grouped_plan(((2, 4, 3), (2, 4, 3)))
+    backend = _numpy_backend()
+    calls = {"scalar": 0, "batched": 0, "stack": 0}
+    original_batched = backend.batched_matmul
+    original_stack = backend.stack
+
+    monkeypatch.setattr(
+        backend,
+        "matmul",
+        lambda *args, **kwargs: pytest.fail("same-shape group used scalar matmul"),
+    )
+
+    def batched(*args, **kwargs):
+        calls["batched"] += 1
+        return original_batched(*args, **kwargs)
+
+    def stack(*args, **kwargs):
+        calls["stack"] += 1
+        return original_stack(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "batched_matmul", batched)
+    monkeypatch.setattr(backend, "stack", stack)
+
+    actual = execute_plan(backend, plan, bindings)
+
+    first = operations[0]
+    expected = bindings.arrays[first.left.key] @ bindings.arrays[first.right.key]
+    np.testing.assert_allclose(actual, expected)
+    assert calls == {"scalar": 0, "batched": 1, "stack": 2}
+
+
+def test_grouped_matmul_ragged_buckets_use_one_scalar_and_one_batched(monkeypatch):
+    plan, bindings, operations = _grouped_plan(
+        ((2, 4, 3), (5, 2, 3), (2, 4, 3))
+    )
+    backend = _numpy_backend()
+    calls = {"scalar": 0, "batched": 0}
+    original_scalar = backend.matmul
+    original_batched = backend.batched_matmul
+
+    def scalar(*args, **kwargs):
+        calls["scalar"] += 1
+        return original_scalar(*args, **kwargs)
+
+    def batched(*args, **kwargs):
+        calls["batched"] += 1
+        return original_batched(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "matmul", scalar)
+    monkeypatch.setattr(backend, "batched_matmul", batched)
+
+    actual = execute_plan(backend, plan, bindings)
+
+    first = operations[0]
+    np.testing.assert_allclose(
+        actual, bindings.arrays[first.left.key] @ bindings.arrays[first.right.key]
+    )
+    assert calls == {"scalar": 1, "batched": 1}
+
+
+def test_grouped_workspace_counts_outputs_and_only_nonsingleton_packs():
+    plan, _, operations = _grouped_plan(((2, 4, 3), (5, 2, 3), (2, 4, 3)))
+    output_bytes = sum(operation.output.spec.nbytes for operation in operations)
+    pair_pack_bytes = 2 * (2 * 3 + 3 * 4) * np.dtype("float64").itemsize
+
+    assert plan.workspace_bytes == output_bytes + pair_pack_bytes
+
+
+def test_grouped_workspace_preflight_runs_before_any_primitive(monkeypatch):
+    plan, bindings, _ = _grouped_plan(((2, 4, 3), (2, 4, 3)))
+    backend = _numpy_backend()
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("primitive ran before grouped workspace preflight")
+
+    for name in ("reshape", "stack", "matmul", "batched_matmul"):
+        monkeypatch.setattr(backend, name, fail)
+
+    with pytest.raises(ValueError, match="workspace capacity"):
+        execute_plan(backend, plan, bindings, workspace=plan.workspace_bytes - 1)
+    assert calls == []
+
+
+def test_grouped_matmul_validates_all_views_before_compute(monkeypatch):
+    refs = (
+        _ref("input_0", (2, 2, 3), ("a", "b", "c")),
+        _ref("input_1", (3, 4), ("c", "d")),
+        _ref("input_2", (2, 2, 3), ("e", "f", "g")),
+        _ref("input_3", (3, 4), ("g", "h")),
+    )
+    outputs = (
+        _ref("output", (2, 2, 4), ("a", "b", "d")),
+        _ref("other", (2, 2, 4), ("e", "f", "h")),
+    )
+    grouped = GroupedMatmulStep(
+        (
+            MatmulStep(refs[0], refs[1], outputs[0], ("c",)),
+            MatmulStep(refs[2], refs[3], outputs[1], ("g",)),
+        )
+    )
+    plan = _specialized_plan(refs, outputs[0], (grouped,))
+    bindings = ExecutionBindings(
+        {ref.key: np.zeros(ref.spec.shape, dtype=np.float64) for ref in refs}
+    )
+    backend = _numpy_backend()
+    original_reshape = backend.reshape
+    reshape_calls = []
+    compute_calls = []
+
+    def bad_second_reshape(value, shape):
+        reshape_calls.append(value)
+        if len(reshape_calls) == 2:
+            return np.array(original_reshape(value, shape), copy=True)
+        return original_reshape(value, shape)
+
+    monkeypatch.setattr(backend, "reshape", bad_second_reshape)
+    monkeypatch.setattr(backend, "matmul", lambda *args, **kwargs: compute_calls.append("scalar"))
+    monkeypatch.setattr(
+        backend, "batched_matmul", lambda *args, **kwargs: compute_calls.append("batched")
+    )
+
+    with pytest.raises(ValueError, match="reshape unexpectedly copied"):
+        execute_plan(backend, plan, bindings)
+    assert compute_calls == []
+
+
+def test_grouped_matmul_shape_mismatch_is_atomic(monkeypatch):
     refs = (
         _ref("input_0", (2, 3), ("a", "b")),
         _ref("input_1", (3, 4), ("b", "c")),
-        _ref("input_2", (5, 6), ("d", "e")),
-        _ref("input_3", (6, 7), ("e", "f")),
+        _ref("input_2", (2, 3), ("d", "e")),
+        _ref("input_3", (3, 4), ("e", "f")),
     )
-    outputs = (_ref("output", (2, 4), ("a", "c")), _ref("other", (5, 7), ("d", "f")))
+    outputs = (_ref("output", (2, 4), ("a", "c")), _ref("other", (2, 4), ("d", "f")))
     grouped = GroupedMatmulStep(
         (
             MatmulStep(refs[0], refs[1], outputs[0], ("b",)),
@@ -577,14 +733,21 @@ def test_grouped_matmul_is_rejected_before_partial_execution(monkeypatch):
     plan = _specialized_plan(refs, outputs[0], (grouped,))
     backend = _numpy_backend()
     calls = []
-    monkeypatch.setattr(backend, "matmul", lambda *args, **kwargs: calls.append(True))
+    original_batched = backend.batched_matmul
+
+    def bad_batched(*args, **kwargs):
+        calls.append(True)
+        result = original_batched(*args, **kwargs)
+        return result[:, :, :-1]
+
+    monkeypatch.setattr(backend, "batched_matmul", bad_batched)
     bindings = ExecutionBindings(
         {ref.key: np.zeros(ref.spec.shape, dtype=ref.spec.dtype) for ref in refs}
     )
 
-    with pytest.raises(NotImplementedError, match="GroupedMatmulStep"):
+    with pytest.raises(ValueError, match="shape"):
         execute_plan(backend, plan, bindings)
-    assert calls == []
+    assert calls == [True]
 
 
 def test_backend_api_shape_and_unsupported_backends():
