@@ -87,7 +87,7 @@ def test_backend_roundtrip_and_tensordot(name):
     assert selected.to_numpy(None) is None
     assert selected.to_host(None) is None
     assert selected.current_device() == ("cuda:0" if name == "cupy" else "cpu")
-    assert selected.supports_execution_ir is False
+    assert selected.supports_execution_ir is (name in {"numpy", "cupy"})
     np.testing.assert_array_equal(selected.to_numpy(value), source)
     np.testing.assert_allclose(
         selected.to_numpy(result),

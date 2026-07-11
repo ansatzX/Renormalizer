@@ -15,6 +15,7 @@ from renormalizer.backend._execution.model import (
     TransformStep,
 )
 from renormalizer.backend._execution.planner import _array_layout, _plan_hash
+from renormalizer.backend._execution.workspace import workspace_bytes_for_steps
 
 
 def _ref(key, shape=(2, 3), modes=("a", "b"), dtype="float64", layout="C"):
@@ -290,6 +291,62 @@ def test_batched_matmul_requires_complete_ordered_mode_metadata():
         BatchedMatmulStep(left, right, output, ("x",), ("c", "b"))
     with pytest.raises(ValueError, match="batch modes"):
         BatchedMatmulStep(left, right, output, (), ("b", "c"))
+
+
+@pytest.mark.parametrize("step_kind", ["matmul", "batched"])
+@pytest.mark.parametrize("role", ["left", "right", "output"])
+@pytest.mark.parametrize("layout", ["F", "strided"])
+def test_pair_step_requires_c_layout_for_every_physical_buffer(
+    step_kind, role, layout
+):
+    if step_kind == "matmul":
+        left, right, output = _matmul_refs()
+
+        def make_step(refs):
+            return MatmulStep(*refs, ("b",))
+    else:
+        left = _ref("left", (5, 2, 3), ("x", "a", "b"))
+        right = _ref("right", (5, 3, 4), ("x", "b", "c"))
+        output = _ref("output", (5, 2, 4), ("x", "a", "c"))
+
+        def make_step(refs):
+            return BatchedMatmulStep(*refs, ("x",), ("b",))
+    refs = {"left": left, "right": right, "output": output}
+    changed = refs[role]
+    refs[role] = _ref(
+        changed.key,
+        changed.spec.shape,
+        changed.spec.modes,
+        changed.spec.dtype,
+        layout,
+    )
+
+    with pytest.raises(ValueError, match="pair step buffers must use C layout"):
+        make_step((refs["left"], refs["right"], refs["output"]))
+
+
+def test_specialized_pair_plan_accepts_explicit_transform_to_c():
+    source_left = _ref("input_0", layout="F")
+    packed_left = _ref("packed_left")
+    right = _ref("input_1", (3, 4), ("b", "c"))
+    output = _ref("output", (2, 4), ("a", "c"))
+    steps = (
+        TransformStep(source_left, packed_left, (0, 1), True),
+        MatmulStep(packed_left, right, output, ("b",)),
+    )
+    plan = ExecutionPlan(**_with_plan_hash(dict(
+        operation="einsum",
+        inputs=(source_left, right),
+        output=output,
+        steps=steps,
+        workspace_bytes=workspace_bytes_for_steps(steps, output.key),
+        planner_source="specialized",
+        oe_path=((0, 1),),
+        override_reason="explicitly pack F input to canonical C",
+    )))
+
+    assert plan.steps == steps
+    assert packed_left.spec.layout == "C"
 
 
 def test_step_metadata_keeps_valid_zero_sized_and_scalar_shapes():

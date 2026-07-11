@@ -4,6 +4,7 @@
 """CuPy backend adapter with lazy package loading and indexed CUDA devices."""
 
 import logging
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -27,6 +28,7 @@ class CupyBackend(AbstractBackend):
     name = "cupy"
     opt_einsum_name = "cupy"
     supports_gpu = True
+    supports_execution_ir = True
     host_array_types = (np.ndarray,)
 
     def __init__(self, config):
@@ -96,8 +98,48 @@ class CupyBackend(AbstractBackend):
     def transpose(self, value, axes=None):
         return self._on_device(self._cupy.transpose, value, axes=axes)
 
-    def matmul(self, a, b, *args, **kwargs):
-        return self._on_device(self._cupy.matmul, a, b, *args, **kwargs)
+    def matmul(self, a, b, *, stream=None, workspace=None):
+        with self._execution_context(stream):
+            return self._cupy.matmul(a, b)
+
+    def _validate_execution_stream(self, stream):
+        if stream is None:
+            return
+        if not isinstance(stream, self._cupy.cuda.Stream):
+            raise TypeError("CuPy execution stream must be a cupy.cuda.Stream")
+        if stream.device_id not in {-1, self._device_index}:
+            raise ValueError("CuPy stream must belong to the selected CUDA device")
+
+    @contextmanager
+    def _execution_context(self, stream):
+        self._validate_execution_stream(stream)
+        with self._cupy.cuda.Device(self._device_index):
+            if stream is None:
+                yield
+            else:
+                with stream:
+                    yield
+
+    def _validate_execution_array(self, value):
+        if not isinstance(value, self._cupy.ndarray):
+            raise TypeError("CuPy execution binding must be a CuPy device array")
+        if value.device.id != self._device_index:
+            raise ValueError("CuPy execution binding is not on the selected CUDA device")
+
+    def _is_exact_execution_reshape(self, left, right):
+        if (
+            left.dtype != right.dtype
+            or left.size != right.size
+            or left.nbytes != right.nbytes
+            or not left.flags.c_contiguous
+            or not right.flags.c_contiguous
+            or any(stride == 0 for stride in right.strides)
+            or left.data.mem is not right.data.mem
+        ):
+            return False
+        if left.size == 0:
+            return True
+        return left.data.ptr == right.data.ptr
 
     def sync(self):
         self._cupy.cuda.Device(self._device_index).synchronize()

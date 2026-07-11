@@ -16,6 +16,7 @@ class NumpyBackend(AbstractBackend):
     device_array_types = ()
     memory_errors = (MemoryError,)
     opt_einsum_name = "numpy"
+    supports_execution_ir = True
 
     def array(self, *args, **kwargs):
         if kwargs.get("copy", True) is None:
@@ -43,3 +44,12 @@ class NumpyBackend(AbstractBackend):
         if value is None:
             return None
         return np.asarray(value, dtype=dtype)
+
+    def matmul(self, a, b, *, stream=None, workspace=None):
+        if stream is not None:
+            raise ValueError("NumPy execution does not accept a stream")
+        return np.matmul(a, b)
+
+    def _validate_execution_array(self, value):
+        if not isinstance(value, np.ndarray):
+            raise TypeError("NumPy execution binding must be a NumPy host array")

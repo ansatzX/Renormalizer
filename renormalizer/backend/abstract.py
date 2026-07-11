@@ -4,6 +4,7 @@
 """Shared behavior for selectable numerical backends."""
 
 import functools
+from contextlib import nullcontext
 from types import ModuleType
 from typing import Any
 
@@ -188,8 +189,65 @@ class AbstractBackend:
     def transpose(self, value, axes=None):
         return self.array_namespace.transpose(value, axes=axes)
 
-    def matmul(self, a, b, *args, **kwargs):
-        return self.array_namespace.matmul(a, b, *args, **kwargs)
+    def reshape(self, value, shape):
+        return self.array_namespace.reshape(value, shape)
+
+    def matmul(self, a, b, *, stream=None, workspace=None):
+        if stream is not None:
+            raise ValueError("backend {!r} does not accept a stream".format(self.name))
+        return self.array_namespace.matmul(a, b)
+
+    def execute_plan(self, plan, bindings, *, stream=None, workspace=None):
+        if not self.supports_execution_ir:
+            raise NotImplementedError(
+                "backend {!r} does not support execution IR".format(self.name)
+            )
+        from renormalizer.backend._execution.executor import execute_plan
+
+        return execute_plan(
+            self, plan, bindings, stream=stream, workspace=workspace
+        )
+
+    def _validate_execution_stream(self, stream):
+        if stream is not None:
+            raise ValueError("backend {!r} does not accept a stream".format(self.name))
+
+    def _execution_context(self, stream):
+        self._validate_execution_stream(stream)
+        return nullcontext()
+
+    def _validate_execution_array(self, value):
+        if not isinstance(value, self.ndarray):
+            raise TypeError("execution binding must be a backend array")
+
+    def _is_exact_execution_reshape(self, left, right):
+        if (
+            left.dtype != right.dtype
+            or left.size != right.size
+            or left.nbytes != right.nbytes
+            or not left.flags.c_contiguous
+            or not right.flags.c_contiguous
+            or any(stride == 0 for stride in right.strides)
+        ):
+            return False
+
+        def root_base(value):
+            seen = set()
+            while getattr(value, "base", None) is not None:
+                if id(value) in seen:
+                    break
+                seen.add(id(value))
+                value = value.base
+            return value
+
+        if root_base(left) is not root_base(right):
+            return False
+        if left.size == 0:
+            return True
+        return (
+            left.__array_interface__["data"][0]
+            == right.__array_interface__["data"][0]
+        )
 
     def is_array(self, value: Any) -> bool:
         return isinstance(value, self.ndarray)
