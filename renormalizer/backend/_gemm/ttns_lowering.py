@@ -14,6 +14,7 @@ def build_ttns_ir_hop(equation, constants, center_shape, center_kind):
         center_kind=center_kind,
         optimize="optimal",
         lowerer=lower_einsum_path,
+        local_hv_contract=True,
     )
 
 

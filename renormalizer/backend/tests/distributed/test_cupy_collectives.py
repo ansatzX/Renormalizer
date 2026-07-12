@@ -427,7 +427,10 @@ def test_runtime_backend_digest_normalizes_valid_rank_local_devices(monkeypatch)
             mesh=DeviceMesh((2,), ("rank",), rank),
             collective=collective,
         )
-        config = runtime.execution_config()
+        config = runtime.execution_config(
+            device_memory_budget_bytes=1024,
+            host_memory_budget_bytes=2048,
+        )
         assert config.backend_device == "cuda:{}".format(rank)
         return collective.digest
 

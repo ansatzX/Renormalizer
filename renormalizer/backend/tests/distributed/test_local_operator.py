@@ -865,8 +865,8 @@ def test_local_operator_matches_full_hv_with_ordered_uneven_broadcasts():
         assert counters["broadcast_calls"] == 4
         assert counters["allgather_calls"] == 0
         assert counters["execution_calls"] == 4
-        assert counters["allreduce_calls"] == 10
-        assert collective.allreduce_calls == 10
+        assert counters["allreduce_calls"] == 12
+        assert collective.allreduce_calls == 12
         assert collective.inplace_allreduce_calls == 4
 
     np.testing.assert_allclose(np.concatenate(local_results), matrix @ vector)
@@ -904,8 +904,8 @@ def test_operator_reuses_preallocated_receive_output_and_status_storage():
     assert host_execution_status.dtype == np.dtype(np.int32)
     assert first is output_storage
     assert second is output_storage
-    assert counters["allreduce_calls"] == 16
-    assert collective.allreduce_calls == 16
+    assert counters["allreduce_calls"] == 18
+    assert collective.allreduce_calls == 18
     assert collective.inplace_allreduce_calls == 8
 
 
@@ -939,6 +939,67 @@ def test_numpy_execution_status_copies_into_one_persistent_host_array(monkeypatc
     assert len(destinations) == 4
     assert all(destination is host_status for destination in destinations)
     assert collective.inplace_allreduce_calls == 4
+
+
+def test_host_execution_status_survives_first_hv_through_projected_solver_work(
+    monkeypatch,
+):
+    import renormalizer.backend._distributed.solvers as solvers
+    from renormalizer.backend._distributed.residency import (
+        _RANK_COMPONENT_NAMES,
+        _rank_peaks,
+    )
+    from renormalizer.backend._distributed.sharding import DistributedTensor
+
+    matrix = np.arange(25.0, dtype=np.float64).reshape(5, 5) / 11
+    vector = np.arange(5.0, dtype=np.float64) + 1
+    plan = lower_einsum_path("ab,b->a", (matrix.shape, vector.shape))
+    distributed = plan_distributed_execution(
+        plan, variable_key="input_1", world_size=2
+    )
+    source_shards = tuple(
+        vector[local_slice]
+        for local_slice in distributed.input_sharding.local_slices
+    )
+    operator, collective, _ = _make_numpy_operator(
+        distributed, matrix, 0, source_shards
+    )
+
+    operator(source_shards[0])
+    host_status = operator._host_execution_status
+    host_status_ref = weakref.ref(host_status)
+    projected_statuses = []
+    original_projected = solvers._projected_exponential_coefficients
+
+    def recording_projected(*args, **kwargs):
+        assert host_status_ref() is operator._host_execution_status
+        projected_statuses.append(host_status_ref())
+        return original_projected(*args, **kwargs)
+
+    monkeypatch.setattr(
+        solvers, "_projected_exponential_coefficients", recording_projected
+    )
+    solvers.run_sharded_krylov(
+        operator,
+        DistributedTensor(
+            distributed.input_sharding, 0, source_shards[0].copy()
+        ),
+        -0.1j,
+        collective=collective,
+        config={"block_size": 2, "max_krylov_vectors": 1},
+    )
+
+    assert projected_statuses == [host_status]
+    assert host_status_ref() is host_status
+    assert host_status.nbytes == np.dtype(np.int32).itemsize
+
+    components = {name: 0 for name in _RANK_COMPONENT_NAMES}
+    components.update(
+        task14_host_control_bytes=64,
+        task14_persistent_execution_status_host_bytes=host_status.nbytes,
+        solver_host_peak_bytes=100,
+    )
+    assert _rank_peaks(components)["host_peak_bytes"] == 104
 
 
 def test_cupy_execution_status_uses_asnumpy_out_without_new_host_array(monkeypatch):
@@ -1102,7 +1163,7 @@ def test_execute_baseexception_is_synchronized_before_next_source_broadcast():
 
     assert isinstance(caught.value.__cause__, _InjectedBaseException)
     assert collective.broadcast_calls == [(0, (3,))]
-    assert counters["allreduce_calls"] == 7
+    assert counters["allreduce_calls"] == 9
     assert counters["allgather_calls"] == 0
 
 
@@ -1131,7 +1192,7 @@ def test_accumulation_baseexception_is_synchronized_before_next_broadcast():
 
     assert isinstance(caught.value.__cause__, _InjectedBaseException)
     assert collective.broadcast_calls == [(0, (3,))]
-    assert counters["allreduce_calls"] == 7
+    assert counters["allreduce_calls"] == 9
     assert operator._active_contribution is None
 
 
@@ -1301,7 +1362,7 @@ def test_local_vector_preflight_fails_before_first_data_path_collective():
 
     assert collective.broadcast_calls == []
     assert collective.allgather_calls == 0
-    assert collective.allreduce_calls == 4
+    assert collective.allreduce_calls == 6
 
 
 def test_plan_hash_disagreement_fails_before_first_data_path_collective():
@@ -1338,7 +1399,7 @@ def test_plan_hash_disagreement_fails_before_first_data_path_collective():
 
     assert collective.broadcast_calls == []
     assert collective.allgather_calls == 0
-    assert collective.allreduce_calls == 3
+    assert collective.allreduce_calls == 5
 
 
 def test_rank_local_resident_setup_failure_is_synchronized_before_broadcast():
@@ -1742,7 +1803,7 @@ def test_private_counter_sink_seeds_valid_values_and_preserves_metadata():
 
     assert counters == {
         "broadcast_calls": 7,
-        "allreduce_calls": 15,
+        "allreduce_calls": 17,
         "allgather_calls": 11,
         "execution_calls": 15,
         "metadata": metadata,
@@ -1784,7 +1845,7 @@ def test_external_known_counter_mutation_never_becomes_arithmetic(counter_key):
 
     expected_counters = {
         "broadcast_calls": 4,
-        "allreduce_calls": 12,
+        "allreduce_calls": 14,
         "allgather_calls": 0,
         "execution_calls": 4,
     }
@@ -1792,7 +1853,7 @@ def test_external_known_counter_mutation_never_becomes_arithmetic(counter_key):
     assert all(counters[key] == value for key, value in expected_counters.items())
     assert counters["metadata"] is metadata
     assert collective.inplace_allreduce_calls == 4
-    assert collective.allreduce_calls == 12
+    assert collective.allreduce_calls == 14
     assert len(collective.broadcast_calls) == 4
     np.testing.assert_allclose(
         result,
@@ -1832,7 +1893,7 @@ def test_provider_acquire_failure_is_synchronized_before_broadcast():
         operator(source_shards[0])
 
     assert collective.broadcast_calls == []
-    assert collective.allreduce_calls == 6
+    assert collective.allreduce_calls == 8
 
 
 class _RecordingAcquireProvider(DeviceResidentProvider):
@@ -1901,7 +1962,7 @@ def test_provider_baseexception_closes_already_entered_contexts():
 def test_resource_status_allreduce_failure_closes_all_provider_contexts():
     class FailingStatusCollective(_ReplayBroadcastCollective):
         def allreduce(self, array, *, op="sum"):
-            if self.allreduce_calls == 5:
+            if self.allreduce_calls == 7:
                 raise RuntimeError("injected resource status failure")
             return super().allreduce(array, op=op)
 
@@ -1926,7 +1987,7 @@ def test_resource_status_conversion_failure_closes_all_provider_contexts():
     class InvalidStatusCollective(_ReplayBroadcastCollective):
         def allreduce(self, array, *, op="sum"):
             result = super().allreduce(array, op=op)
-            if self.allreduce_calls == 6:
+            if self.allreduce_calls == 8:
                 return object()
             return result
 
@@ -1972,8 +2033,8 @@ def test_capacity_failure_is_synchronized_before_allocation_or_broadcast():
         operator(source_shards[0])
 
     assert collective.broadcast_calls == []
-    assert collective.allreduce_calls == 5
-    assert counters["allreduce_calls"] == 5
+    assert collective.allreduce_calls == 7
+    assert counters["allreduce_calls"] == 7
     assert operator._receive_storage is None
     assert operator._output_accumulator is None
 
@@ -2008,8 +2069,8 @@ def test_preflight_control_peak_is_enforced_by_tight_budgets(
         operator(source_shards[0])
 
     assert collective.broadcast_calls == []
-    assert collective.allreduce_calls == 5
-    assert counters["allreduce_calls"] == 5
+    assert collective.allreduce_calls == 7
+    assert counters["allreduce_calls"] == 7
     assert operator._receive_storage is None
 
 
@@ -2046,8 +2107,8 @@ def test_rank_local_allocation_failure_is_synchronized_before_broadcast():
         operator(source_shards[0])
 
     assert collective.broadcast_calls == []
-    assert collective.allreduce_calls == 6
-    assert counters["allreduce_calls"] == 6
+    assert collective.allreduce_calls == 8
+    assert counters["allreduce_calls"] == 8
 
 
 def test_operator_rejects_a_complete_resident_variable_replica():

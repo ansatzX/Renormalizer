@@ -21,6 +21,8 @@ class OperandRequest:
     source_rank: int
     broadcast_variable: object
     operand_slices: object
+    residency_request: object = None
+    residency_plan: object = None
 
     def __post_init__(self):
         if not isinstance(self.execution_plan, ExecutionPlan):
@@ -44,14 +46,69 @@ class OperandRequest:
             raise ValueError("request context does not match distributed plan")
         if self.source_rank < 0 or self.source_rank >= self.context.world_size:
             raise ValueError("source_rank is out of range for request context")
-        block = self.distributed_plan.block_plan(
-            self.context.rank, self.source_rank
-        )
+        block = self.distributed_plan.block_plan(self.context.rank, self.source_rank)
         if self.execution_plan != block.execution_plan:
             raise ValueError("request execution_plan does not match rank/source block")
         if copied != dict(block.operand_slices):
             raise ValueError("request operand_slices do not match rank/source block")
+        if self.residency_plan is None:
+            if self.residency_request is not None:
+                raise ValueError(
+                    "residency_request requires an authorized residency plan"
+                )
+        else:
+            from renormalizer.backend._distributed.residency import (
+                ResidencyPlan,
+                ResidencyRequest,
+            )
+
+            if not isinstance(self.residency_plan, ResidencyPlan):
+                raise TypeError("residency_plan must be a ResidencyPlan or None")
+            if not isinstance(self.residency_request, ResidencyRequest):
+                raise TypeError(
+                    "residency_request must be a ResidencyRequest with a plan"
+                )
+            if self.residency_plan.world_size != self.context.world_size:
+                raise ValueError("residency plan world size does not match request")
+            if (
+                self.residency_plan.placement_hash
+                != self.distributed_plan.placement_hash
+            ):
+                raise ValueError("residency plan placement does not match request")
+            if self.residency_request.distributed_plan != self.distributed_plan:
+                raise ValueError(
+                    "residency request distributed plan does not match operand request"
+                )
+            self.residency_plan.validate_request(self.residency_request)
         object.__setattr__(self, "operand_slices", MappingProxyType(copied))
+
+
+def active_working_set_policy_error(
+    residency_policy,
+    backend,
+    distributed_plan=None,
+):
+    """Return the closed-world active-policy error without invoking user code."""
+    if residency_policy != "active_working_set":
+        return None
+    config = getattr(backend, "config", None)
+    execution_policy = getattr(config, "execution_policy", None)
+    fallback_policy = getattr(config, "fallback_policy", None)
+    message = (
+        "active_working_set requires a complete local-H-v execution contract "
+        "under execution_ir with fallback_policy='error'"
+    )
+    if execution_policy != "execution_ir" or fallback_policy != "error":
+        return ValueError(message)
+    if not isinstance(distributed_plan, DistributedPlan):
+        return NotImplementedError(message)
+    source = distributed_plan.execution_plan
+    if source.execution_contract is None or any(
+        block.execution_plan.execution_contract is None
+        for block in distributed_plan.block_plans
+    ):
+        return NotImplementedError(message)
+    return None
 
 
 class OperandLease(Protocol):
@@ -65,6 +122,17 @@ class OperandLease(Protocol):
 
 
 class OperandProvider(Protocol):
+    def validate_setup(
+        self,
+        distributed_plan: DistributedPlan,
+        source_bindings: ExecutionBindings,
+        context: DistributedContext,
+    ) -> None:
+        ...
+
+    def validate_request(self, request: OperandRequest, residency_plan=None) -> None:
+        ...
+
     def acquire(self, request: OperandRequest) -> ContextManager[OperandLease]:
         ...
 
@@ -119,6 +187,39 @@ class _DeviceResidentLease:
 
 class DeviceResidentProvider:
     """Lease existing backend arrays and their slices without transfer or copy."""
+
+    residency_policy = "device_resident"
+
+    @staticmethod
+    def validate_setup(distributed_plan, source_bindings, context):
+        if not isinstance(distributed_plan, DistributedPlan):
+            raise TypeError("distributed_plan must be a DistributedPlan")
+        if not isinstance(source_bindings, ExecutionBindings):
+            raise TypeError("source_bindings must be ExecutionBindings")
+        if not isinstance(context, DistributedContext):
+            raise TypeError("context must be a DistributedContext")
+        if context.world_size != distributed_plan.world_size:
+            raise ValueError("provider context does not match distributed plan")
+        variable_key = distributed_plan.variable_key
+        expected_refs = {
+            ref.key: ref
+            for ref in distributed_plan.execution_plan.inputs
+            if ref.key != variable_key
+        }
+        if set(source_bindings.arrays) != set(expected_refs):
+            raise ValueError("resident source binding coverage is incomplete")
+        kinds = set()
+        for key, ref in expected_refs.items():
+            array = source_bindings.arrays[key]
+            kinds.add(_validate_resident_array(array, context))
+            if tuple(array.shape) != ref.spec.shape:
+                raise ValueError("resident source shape does not match execution plan")
+            if np.dtype(array.dtype).name != ref.spec.dtype:
+                raise ValueError("resident source dtype does not match execution plan")
+            if not _layout_matches(array, ref.spec.layout):
+                raise ValueError("resident source layout does not match execution plan")
+        if len(kinds) > 1:
+            raise ValueError("resident operands must use one array backend")
 
     @staticmethod
     def _build_bindings(request, *, require_variable):
@@ -177,13 +278,21 @@ class DeviceResidentProvider:
                 )
         return ExecutionBindings(arrays)
 
-    def validate_resident(self, request):
+    def validate_request(self, request, residency_plan=None):
+        if not isinstance(request, OperandRequest):
+            raise TypeError("request must be an OperandRequest")
+        if residency_plan is not None and residency_plan is not request.residency_plan:
+            raise ValueError("request residency plan identity does not match")
         self._build_bindings(request, require_variable=False)
+
+    def validate_resident(self, request):
+        self.validate_request(request, request.residency_plan)
 
     @contextmanager
     def acquire(self, request):
         if not isinstance(request, OperandRequest):
             raise TypeError("request must be an OperandRequest")
+        self.validate_request(request, request.residency_plan)
         bindings = self._build_bindings(request, require_variable=True)
         bindings.validate_for(request.execution_plan)
         lease = _DeviceResidentLease(bindings)
@@ -194,6 +303,7 @@ class DeviceResidentProvider:
 
 
 __all__ = [
+    "active_working_set_policy_error",
     "DeviceResidentProvider",
     "OperandLease",
     "OperandProvider",

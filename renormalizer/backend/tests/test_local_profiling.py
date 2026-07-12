@@ -712,6 +712,7 @@ def test_ttns_optimization_timer_has_truthful_phase_label(tmp_path, monkeypatch)
 
     class OptimizeConfig:
         procedure = [(4, 0.1), (4, 0.0)]
+        distributed_execution = None
 
     class FakeTTNS:
         optimize_config = OptimizeConfig()
@@ -839,6 +840,7 @@ def test_tdvp_whole_sweep_timer_has_truthful_phase_label(tmp_path, monkeypatch):
 
     class FakeTTNS:
         root = object()
+        evolve_config = type("EvolveConfig", (), {"distributed_execution": None})()
 
         def check_canonical(self):
             return None

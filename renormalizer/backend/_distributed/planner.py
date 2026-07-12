@@ -21,6 +21,7 @@ from renormalizer.backend._execution.model import (
     _contiguous_strides,
     _plan_hash,
     _transform_view_layout,
+    bind_local_hv_execution_contract,
 )
 from renormalizer.backend._execution.workspace import workspace_bytes_for_steps
 
@@ -119,9 +120,7 @@ class DistributedMemoryEstimate:
             raise TypeError("memory estimate fields must be integers")
         if any(getattr(self, name) < 0 for name in names):
             raise ValueError("memory estimate fields must be non-negative")
-        resident_device_bytes = (
-            self.resident_static_bytes + self.local_input_bytes
-        )
+        resident_device_bytes = self.resident_static_bytes + self.local_input_bytes
         preflight_device_peak = resident_device_bytes + max(
             self.preflight_hash_device_bytes,
             self.preflight_status_device_bytes,
@@ -197,6 +196,46 @@ class DistributedPlan:
             raise ValueError("distributed plan must contain every rank/source block")
         if any(not isinstance(block, DistributedBlockPlan) for block in blocks):
             raise TypeError("block_plans must contain DistributedBlockPlan metadata")
+        source_contract = self.execution_plan.execution_contract
+        block_contracts = tuple(
+            block.execution_plan.execution_contract for block in blocks
+        )
+        if source_contract is None:
+            if any(contract is not None for contract in block_contracts):
+                raise ValueError(
+                    "distributed block execution contracts require a source contract"
+                )
+        else:
+            if source_contract.variable_key != self.variable_key:
+                raise ValueError(
+                    "distributed variable_key must match the execution contract"
+                )
+            source_identity = (
+                source_contract.network,
+                source_contract.center_kind,
+                source_contract.equation,
+                source_contract.input_modes,
+                source_contract.output_modes,
+                source_contract.variable_index,
+                source_contract.variable_key,
+            )
+            for contract in block_contracts:
+                if (
+                    contract is None
+                    or (
+                        contract.network,
+                        contract.center_kind,
+                        contract.equation,
+                        contract.input_modes,
+                        contract.output_modes,
+                        contract.variable_index,
+                        contract.variable_key,
+                    )
+                    != source_identity
+                ):
+                    raise ValueError(
+                        "distributed block execution contract does not match the source"
+                    )
         expected = tuple(
             (rank, source) for rank in range(size) for source in range(size)
         )
@@ -316,8 +355,10 @@ def _rewrite_block(
             selected[ref.spec.modes.index(input_mode)] = input_slice
         selected = tuple(selected)
         local_shape = tuple(dimensions[mode] for mode in ref.spec.modes)
-        layout = "C" if ref.key == variable_key else _slice_layout(
-            ref.spec, selected, local_shape
+        layout = (
+            "C"
+            if ref.key == variable_key
+            else _slice_layout(ref.spec, selected, local_shape)
         )
         rewritten = BufferRef(
             ref.key,
@@ -366,9 +407,7 @@ def _rewrite_block(
                 operation.contracted_modes,
             )
         else:
-            rewritten = MatmulStep(
-                left, right, output, operation.contracted_modes
-            )
+            rewritten = MatmulStep(left, right, output, operation.contracted_modes)
         current[operation.output.key] = output
         return rewritten
 
@@ -388,9 +427,7 @@ def _rewrite_block(
             steps.append(rewritten)
         elif isinstance(step, ReductionStep):
             input_ref = current[step.input.key]
-            output_ref = BufferRef(
-                step.output.key, _new_spec(step.output, dimensions)
-            )
+            output_ref = BufferRef(step.output.key, _new_spec(step.output, dimensions))
             rewritten = ReductionStep(input_ref, output_ref, step.reduced_modes)
             current[step.output.key] = output_ref
             steps.append(rewritten)
@@ -420,8 +457,10 @@ def _rewrite_block(
         if ref.key not in input_by_key:
             selected = operand_slices[ref.key]
             local_shape = tuple(dimensions[mode] for mode in ref.spec.modes)
-            layout = "C" if ref.key == variable_key else _slice_layout(
-                ref.spec, selected, local_shape
+            layout = (
+                "C"
+                if ref.key == variable_key
+                else _slice_layout(ref.spec, selected, local_shape)
             )
             input_by_key[ref.key] = BufferRef(
                 ref.key, TensorSpec(local_shape, ref.spec.dtype, layout, ref.spec.modes)
@@ -451,6 +490,15 @@ def _rewrite_block(
         override_reason=plan.override_reason,
         plan_hash=plan_hash,
     )
+    if plan.execution_contract is not None:
+        contract = plan.execution_contract
+        rewritten_plan = bind_local_hv_execution_contract(
+            rewritten_plan,
+            network=contract.network,
+            center_kind=contract.center_kind,
+            equation=contract.equation,
+            variable_index=contract.variable_index,
+        )
     return DistributedBlockPlan(
         rank=rank,
         source_rank=source_rank,
@@ -501,9 +549,7 @@ def _placement_hash(
                 "output_contribution_bytes": estimate.output_contribution_bytes,
                 "control_status_bytes": estimate.control_status_bytes,
                 "host_control_status_bytes": estimate.host_control_status_bytes,
-                "preflight_hash_device_bytes": (
-                    estimate.preflight_hash_device_bytes
-                ),
+                "preflight_hash_device_bytes": (estimate.preflight_hash_device_bytes),
                 "preflight_hash_host_bytes": estimate.preflight_hash_host_bytes,
                 "preflight_status_device_bytes": (
                     estimate.preflight_status_device_bytes
@@ -574,9 +620,7 @@ def _execution_memory_profile(execution_plan):
             if step.copy:
                 retain((step.output,), step.output.spec.nbytes)
             else:
-                buffer_allocations[step.output.key] = buffer_allocations[
-                    step.input.key
-                ]
+                buffer_allocations[step.output.key] = buffer_allocations[step.input.key]
             continue
         if isinstance(step, (ReductionStep, MatmulStep, BatchedMatmulStep)):
             retain((step.output,), step.output.spec.nbytes)
@@ -593,10 +637,7 @@ def _execution_memory_profile(execution_plan):
                 result_bytes = m * n * itemsize
                 peak_bytes = max(
                     peak_bytes,
-                    retained_bytes
-                    + left_pack_bytes
-                    + right_pack_bytes
-                    + result_bytes,
+                    retained_bytes + left_pack_bytes + right_pack_bytes + result_bytes,
                 )
                 retain((operations[0].output,), result_bytes)
                 continue
@@ -623,10 +664,7 @@ def _execution_memory_profile(execution_plan):
             # Result views retain C; Python keeps current A/B locals after the bucket.
             peak_bytes = max(
                 peak_bytes,
-                retained_bytes
-                + left_pack_bytes
-                + right_pack_bytes
-                + result_bytes,
+                retained_bytes + left_pack_bytes + right_pack_bytes + result_bytes,
             )
             retain(
                 tuple(operation.output for operation in operations),
@@ -650,9 +688,7 @@ def _memory_estimates(
     input_sharding,
     blocks,
 ):
-    variable_ref = next(
-        ref for ref in execution_plan.inputs if ref.key == variable_key
-    )
+    variable_ref = next(ref for ref in execution_plan.inputs if ref.key == variable_key)
     resident_static_bytes = sum(
         ref.spec.nbytes for ref in execution_plan.inputs if ref.key != variable_key
     )
@@ -684,9 +720,7 @@ def _memory_estimates(
         output_contribution_bytes = max(
             profile.contribution_retained_bytes for profile in execution_profiles
         )
-        execution_peak_bytes = max(
-            profile.peak_bytes for profile in execution_profiles
-        )
+        execution_peak_bytes = max(profile.peak_bytes for profile in execution_profiles)
         workspace_bytes = execution_peak_bytes - output_contribution_bytes
         resident_device_bytes = resident_static_bytes + local_input_bytes
         preflight_device_peak = resident_device_bytes + max(

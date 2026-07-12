@@ -74,6 +74,8 @@ class DistributedExecutionConfig:
     backend_name: str | None = None
     backend_device: str | None = None
     backend_precision: int | None = None
+    device_budget_resolution: object = None
+    host_budget_resolution: object = None
 
     def __post_init__(self):
         from renormalizer.backend._distributed.context import DistributedContext
@@ -83,10 +85,8 @@ class DistributedExecutionConfig:
             raise TypeError("context must be a DistributedContext")
         if not isinstance(self.mesh, DeviceMesh):
             raise TypeError("mesh must be a DeviceMesh")
-        if self.residency_policy != "device_resident":
-            raise ValueError(
-                "Stage 4 supports only residency_policy='device_resident'"
-            )
+        if self.residency_policy not in {"device_resident", "active_working_set"}:
+            raise ValueError("unsupported distributed residency_policy")
         if (
             self.mesh.size != self.context.world_size
             or self.mesh.rank != self.context.rank
@@ -99,6 +99,19 @@ class DistributedExecutionConfig:
             raise ValueError("collective rank or size does not match distributed context")
         if not callable(getattr(self.provider, "acquire", None)):
             raise TypeError("provider must implement acquire")
+        provider_policy = getattr(self.provider, "residency_policy", None)
+        if self.residency_policy == "active_working_set" and (
+            provider_policy != "active_working_set"
+        ):
+            raise ValueError(
+                "provider policy mismatch; DeviceResidentProvider supports only "
+                "residency_policy='device_resident'"
+            )
+        if (
+            self.residency_policy == "device_resident"
+            and provider_policy not in {None, "device_resident"}
+        ):
+            raise ValueError("provider policy does not match residency_policy")
         for name in ("device_memory_budget_bytes", "host_memory_budget_bytes"):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value <= 0):
@@ -119,3 +132,65 @@ class DistributedExecutionConfig:
                 raise TypeError("distributed backend device must be a string")
             if self.backend_precision not in {32, 64}:
                 raise ValueError("distributed backend precision must be 32 or 64")
+        from renormalizer.backend._distributed.residency import (
+            MemoryBudgetResolution,
+        )
+
+        for requested_name, resolution_name, resource in (
+            (
+                "device_memory_budget_bytes",
+                "device_budget_resolution",
+                "device",
+            ),
+            (
+                "host_memory_budget_bytes",
+                "host_budget_resolution",
+                "host",
+            ),
+        ):
+            requested = getattr(self, requested_name)
+            resolution = getattr(self, resolution_name)
+            if resolution is None:
+                continue
+            if not isinstance(resolution, MemoryBudgetResolution):
+                raise TypeError(
+                    "{} must be a MemoryBudgetResolution or None".format(
+                        resolution_name
+                    )
+                )
+            if resolution.requested_bytes != requested:
+                raise ValueError("budget resolution does not match requested bytes")
+            if resolution.resource != resource:
+                raise ValueError(
+                    "{} budget resolution has the wrong resource".format(resource)
+                )
+
+    @property
+    def resolved_device_memory_budget_bytes(self):
+        resolution = self.device_budget_resolution
+        return None if resolution is None else resolution.resolved_bytes
+
+    @property
+    def resolved_host_memory_budget_bytes(self):
+        resolution = self.host_budget_resolution
+        return None if resolution is None else resolution.resolved_bytes
+
+    @property
+    def device_memory_budget_source(self):
+        resolution = self.device_budget_resolution
+        return None if resolution is None else resolution.source
+
+    @property
+    def host_memory_budget_source(self):
+        resolution = self.host_budget_resolution
+        return None if resolution is None else resolution.source
+
+    @property
+    def device_available_snapshot_bytes(self):
+        resolution = self.device_budget_resolution
+        return None if resolution is None else resolution.available_snapshot_bytes
+
+    @property
+    def host_available_snapshot_bytes(self):
+        resolution = self.host_budget_resolution
+        return None if resolution is None else resolution.available_snapshot_bytes

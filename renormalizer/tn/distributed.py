@@ -14,7 +14,9 @@ from renormalizer.backend._distributed.center import (
     copy_backend_metadata as _copy_metadata,
     coordinate_adapter_decision,
     host_array as _host_array,
+    krylov_root_fallback_memory_profile,
     measured_execution as _measured_execution,
+    preflight_root_fallback_capacity,
     record_phase_summary,
     record_fallback_solve,
     record_distributed_solve,
@@ -169,19 +171,53 @@ def run_ttns_krylov(
         if counters is None:
             counters = {}
         counters.setdefault("allgather_calls", 0)
+        def profile_fallback():
+            unknown = set(options) - {"block_size", "max_krylov_vectors"}
+            if unknown:
+                raise ValueError(
+                    "unknown Krylov config keys: {}".format(
+                        ", ".join(sorted(map(str, unknown)))
+                    )
+                )
+            memory_profile = krylov_root_fallback_memory_profile(
+                vector_bytes=int(full_center.nbytes),
+                vector_count=int(full_center.size),
+                dtype=np.dtype(full_center.dtype),
+                coefficient=coefficient,
+                block_size=options.get("block_size", 50),
+                max_krylov_vectors=options.get("max_krylov_vectors"),
+            )
+            return (
+                getattr(hop, "legacy_fallback_expression", hop),
+                memory_profile,
+            )
+
+        legacy_hop, memory_profile = run_synchronized_setup_phase(
+            distributed_execution,
+            profile_fallback,
+            "ttns Krylov fallback profile",
+            counters=counters,
+        )
+        capacity_approval = preflight_root_fallback_capacity(
+            distributed_execution,
+            selected,
+            device_bytes=memory_profile.device_peak_bytes,
+            host_bytes=memory_profile.host_peak_bytes,
+            counters=counters,
+        )
+
         def allocate_fallback():
             metadata = selected.array_namespace.zeros(1, dtype=np.int64)
             receive = selected.array_namespace.empty(
-                int(np.prod(descriptor.center_shape)), dtype=full_center.dtype
+                int(np.prod(descriptor.center_shape)),
+                dtype=np.dtype(memory_profile.result_dtype),
             )
             return (
                 metadata,
                 receive,
-                getattr(hop, "legacy_fallback_expression", hop),
-                options.get("block_size", 50),
             )
 
-        metadata, receive, legacy_hop, block_size = (
+        metadata, receive = (
             run_synchronized_setup_phase(
                 distributed_execution,
                 allocate_fallback,
@@ -196,20 +232,21 @@ def run_ttns_krylov(
                 ).ravel(),
                 coefficient,
                 full_center.ravel(),
-                block_size=block_size,
+                block_size=memory_profile.block_size,
+                max_krylov_vectors=memory_profile.max_krylov_vectors,
             )
             metadata[0] = iterations
             return result
 
-        basis_bytes = receive.nbytes * (int(block_size) + 2)
         result = run_ttns_root_fallback(
             operation,
             distributed_execution,
             receive,
             metadata_buffers=(metadata,),
-            estimated_device_bytes=basis_bytes,
-            estimated_host_bytes=basis_bytes,
+            estimated_device_bytes=memory_profile.device_peak_bytes,
+            estimated_host_bytes=memory_profile.host_peak_bytes,
             counters=counters,
+            capacity_approval=capacity_approval,
         )
         iterations = int(_host_array(metadata)[0])
         state_collective_start = collective_elapsed(
@@ -676,11 +713,29 @@ def run_ttns_ground_state_fallback(
         raise NotImplementedError(
             "TTNS ground-state fallback is limited to the existing two-site workflow"
         )
+    def profile_fallback():
+        allowed_count = int(np.count_nonzero(mask))
+        dtype = np.dtype(initial_guess.dtype)
+        estimated_bytes = allowed_count * dtype.itemsize * 6
+        return allowed_count, dtype, estimated_bytes
+
+    allowed_count, dtype, estimated_bytes = run_synchronized_setup_phase(
+        distributed_execution,
+        profile_fallback,
+        "ttns ground-state fallback profile",
+        counters=counters,
+    )
+    capacity_approval = preflight_root_fallback_capacity(
+        distributed_execution,
+        selected,
+        device_bytes=estimated_bytes,
+        host_bytes=estimated_bytes,
+        counters=counters,
+    )
+
     def allocate():
         namespace = selected.array_namespace
-        receive = namespace.empty(
-            int(np.count_nonzero(mask)), dtype=np.dtype(initial_guess.dtype)
-        )
+        receive = namespace.empty(allowed_count, dtype=dtype)
         energy_buffer = namespace.zeros(1, dtype=np.float64)
         return namespace, receive, energy_buffer
 
@@ -706,9 +761,10 @@ def run_ttns_ground_state_fallback(
         distributed_execution,
         receive,
         metadata_buffers=(energy_buffer,),
-        estimated_device_bytes=receive.nbytes * 6,
-        estimated_host_bytes=receive.nbytes * 6,
+        estimated_device_bytes=estimated_bytes,
+        estimated_host_bytes=estimated_bytes,
         counters=counters,
+        capacity_approval=capacity_approval,
     )
     record_fallback_solve(
         distributed_execution,

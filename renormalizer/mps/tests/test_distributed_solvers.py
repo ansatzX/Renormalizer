@@ -1178,6 +1178,8 @@ def test_mps_root_fallback_emits_synchronized_telemetry(monkeypatch):
     assert summary["allgather_calls"] == 0
     assert summary["broadcast_calls"] == 2
     assert summary["allreduce_calls"] == 18
+    assert summary["capacity_proven"] is False
+    assert summary["capacity_reason"] == "unbounded_device_resident_root_fallback"
     assert summary["compute_s"] > 0.0
     fallback_phase = next(
         event
@@ -1188,6 +1190,70 @@ def test_mps_root_fallback_emits_synchronized_telemetry(monkeypatch):
     assert fallback_phase["network"] == "mps"
     assert fallback_phase["operation"] == "root_solver_and_broadcast"
     assert fallback_phase["wall_s"] > 0.0
+
+
+def test_mps_krylov_root_fallback_enforces_maximum_vector_count():
+    matrix = np.diag(np.arange(1.0, 7.0))
+    matrix += np.diag(np.full(5, -0.3), 1)
+    matrix += np.diag(np.full(5, -0.3), -1)
+    center = np.arange(1.0, 7.0)
+    set_backend(
+        "numpy", execution_policy="execution_ir", fallback_policy="legacy_oe"
+    )
+
+    actual, iterations = run_mps_krylov(
+        lambda value: matrix @ value,
+        distributed_execution=_execution_config(),
+        center=center,
+        center_shape=center.shape,
+        site_indices=(1,),
+        center_kind="one_site",
+        coefficient=-0.02,
+        solver_config={"block_size": 2, "max_krylov_vectors": 2},
+    )
+    expected, expected_iterations = expm_krylov(
+        matrix.dot,
+        -0.02,
+        center,
+        block_size=2,
+        max_krylov_vectors=2,
+    )
+
+    assert iterations == expected_iterations == 2
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_mps_root_fallback_preserves_promoted_krylov_and_davidson_results():
+    matrix = np.diag(np.asarray([1.0, 2.0], dtype=np.float32))
+    center = np.asarray([1.0, 0.0], dtype=np.float32)
+    mask = np.ones(2, dtype=bool)
+    set_backend(
+        "numpy", execution_policy="execution_ir", fallback_policy="legacy_oe"
+    )
+
+    krylov, _ = run_mps_krylov(
+        lambda value: matrix @ value,
+        distributed_execution=_execution_config(),
+        center=center,
+        center_shape=center.shape,
+        site_indices=(1,),
+        center_kind="one_site",
+        coefficient=-0.125j,
+        solver_config={"block_size": 2, "max_krylov_vectors": 2},
+    )
+    _, davidson, _ = run_mps_davidson(
+        lambda value: matrix @ value,
+        distributed_execution=_execution_config(),
+        qn_mask=mask,
+        initial_guess=center,
+        diagonal=np.diag(matrix).copy(),
+        site_indices=(1, 2),
+        center_kind="two_site",
+        solver_config={"max_cycle": 2, "max_space": 2},
+    )
+
+    assert krylov.dtype == np.dtype("complex128")
+    assert davidson.dtype == np.dtype("float64")
 
 
 def test_mps_error_policy_rejects_unsupported_hop_before_local_hv():

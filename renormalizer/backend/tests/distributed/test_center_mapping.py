@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+import weakref
 
 import numpy as np
 import pytest
@@ -7,8 +8,10 @@ import pytest
 from renormalizer.backend._distributed.center import (
     CenterVectorMap,
     MeasuredCollective,
+    QnMaskIdentity,
     MappedDistributedLocalOperator,
     _adapter_decision_digest,
+    center_materialization_memory_profile,
     coordinate_adapter_decision,
     run_synchronized_state_update,
     validate_distributed_backend,
@@ -135,6 +138,16 @@ def test_adapter_backend_digest_normalizes_valid_rank_local_devices():
     np.testing.assert_array_equal(digest_for_rank(0), digest_for_rank(1))
 
 
+def test_wave9_oversized_qn_shape_product_fails_without_array_allocation():
+    oversized_shape = (1 << 62, 4)
+    sharding = shard_axis(oversized_shape, 0, 1)
+
+    with pytest.raises(OverflowError, match="int64|range"):
+        QnMaskIdentity(oversized_shape, (1,), "0" * 64)
+    with pytest.raises(OverflowError, match="int64|range"):
+        CenterVectorMap(sharding, sharding)
+
+
 def _mapped_matrix_operator(matrix, mask=None):
     backend = _numpy_backend()
     source = lower_einsum_path(
@@ -168,8 +181,7 @@ def test_dense_center_map_round_trips_uneven_shards_without_allgather():
     center = np.arange(15, dtype=np.float64).reshape(5, 3)
 
     local = tuple(
-        vector_map.extract_local(center, rank, _numpy_backend())
-        for rank in range(2)
+        vector_map.extract_local(center, rank, _numpy_backend()) for rank in range(2)
     )
 
     assert vector_map.rank_counts == (9, 6)
@@ -197,8 +209,7 @@ def test_qn_center_map_uses_rank_major_dense_slab_order_and_baseline_pack():
     center = np.arange(12, dtype=np.float64).reshape(3, 4)
 
     local = tuple(
-        vector_map.extract_local(center, rank, _numpy_backend())
-        for rank in range(2)
+        vector_map.extract_local(center, rank, _numpy_backend()) for rank in range(2)
     )
 
     np.testing.assert_array_equal(local[0], [0, 5, 8, 9])
@@ -361,7 +372,9 @@ def test_adapter_decision_synchronizes_unsupported_fallback_and_error():
     ]
 
     error_collective = _TraceCollective()
-    with pytest.raises(NotImplementedError, match="distributed adapter decision failed"):
+    with pytest.raises(
+        NotImplementedError, match="distributed adapter decision failed"
+    ):
         coordinate_adapter_decision(
             _execution(error_collective),
             _numpy_backend(),
@@ -451,7 +464,9 @@ def test_center_materialization_synchronizes_root_source_staging_before_broadcas
     class FailingBackend:
         array_namespace = FailingNamespace()
 
-    with pytest.raises(RuntimeError, match="center materialization source staging failed"):
+    with pytest.raises(
+        RuntimeError, match="center materialization source staging failed"
+    ):
         vector_map.materialize(
             np.ones(4, dtype=np.float64), collective, FailingBackend()
         )
@@ -462,7 +477,9 @@ def test_center_materialization_synchronizes_root_source_staging_before_broadcas
     ]
 
 
-def test_center_materialization_synchronizes_each_unpack_before_next_source(monkeypatch):
+def test_center_materialization_synchronizes_each_unpack_before_next_source(
+    monkeypatch,
+):
     dense = shard_axis((4, 2), axis=0, parts=2)
     vector_map = CenterVectorMap(dense, dense)
     collective = _TraceCollective()
@@ -485,6 +502,46 @@ def test_center_materialization_synchronizes_each_unpack_before_next_source(monk
         ("broadcast", 0, 4),
         ("allreduce", "max", 1),
     ]
+
+
+def test_center_materialization_profile_bounds_retained_status_result(monkeypatch):
+    import renormalizer.backend._distributed.center as center
+
+    class TrackedArray(np.ndarray):
+        pass
+
+    refs = []
+    peak_bytes = 0
+
+    def track(value, dtype=None):
+        nonlocal peak_bytes
+        array = np.array(value, dtype=dtype, copy=True).view(TrackedArray)
+        refs.append(weakref.ref(array))
+        peak_bytes = max(
+            peak_bytes,
+            sum(live.nbytes for ref in refs for live in (ref(),) if live is not None),
+        )
+        return array
+
+    class Collective(_TraceCollective):
+        def allreduce(self, value, *, op="sum"):
+            self.trace.append(("allreduce", op, int(np.asarray(value).size)))
+            return track(value)
+
+    dense = shard_axis((8,), axis=0, parts=2)
+    vector_map = CenterVectorMap(dense, dense)
+    collective = Collective()
+    monkeypatch.setattr(
+        center,
+        "_control_array",
+        lambda _collective, values, dtype: track(values, dtype),
+    )
+
+    vector_map.materialize(np.ones(4, dtype=np.float64), collective, _numpy_backend())
+    profile = center_materialization_memory_profile(vector_map, np.dtype("float64"))
+
+    assert peak_bytes == 3 * np.dtype(np.int32).itemsize
+    assert profile.control_device_bytes == (peak_bytes, peak_bytes)
 
 
 def test_state_update_failure_stops_before_digest_collectives():

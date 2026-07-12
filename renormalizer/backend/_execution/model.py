@@ -13,6 +13,8 @@ from renormalizer.backend._execution.workspace import workspace_bytes_for_steps
 
 
 _LAYOUTS = frozenset({"C", "F", "strided"})
+_LOCAL_HV_NETWORKS = frozenset({"mps", "ttns"})
+_LOCAL_HV_CENTER_KINDS = frozenset({"zero_site", "one_site", "two_site"})
 
 
 def _as_tuple(value, name):
@@ -38,9 +40,83 @@ def _normalize_dtype(dtype):
         normalized = np.dtype(dtype)
     except (TypeError, ValueError) as error:
         raise ValueError("unsupported dtype: {!r}".format(dtype)) from error
-    if normalized.hasobject or normalized.fields is not None or normalized.kind not in "biufc":
+    if (
+        normalized.hasobject
+        or normalized.fields is not None
+        or normalized.kind not in "biufc"
+    ):
         raise ValueError("unsupported dtype: {!r}".format(dtype))
     return normalized.name
+
+
+def _normalize_local_hv_equation(equation):
+    if not isinstance(equation, str):
+        raise TypeError("local H-v equation must be a string")
+    normalized = "".join(equation.split())
+    if normalized.count("->") != 1 or "..." in normalized:
+        raise ValueError("local H-v equation must be explicit without ellipses")
+    input_text, output_text = normalized.split("->")
+    input_parts = tuple(input_text.split(","))
+    if not input_parts or any(not part for part in input_parts):
+        raise ValueError("local H-v equation inputs must not be empty")
+    input_modes = tuple(
+        _validate_modes(tuple(part), allow_empty=False) for part in input_parts
+    )
+    output_modes = _validate_modes(tuple(output_text), allow_empty=False)
+    if not set(output_modes) <= {mode for modes in input_modes for mode in modes}:
+        raise ValueError("local H-v output modes must occur in the inputs")
+    return normalized, input_modes, output_modes
+
+
+def _require_sha256(value, name):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("{} must be a canonical SHA-256 digest".format(name))
+
+
+@dataclass(frozen=True)
+class LocalHvExecutionContract:
+    network: str
+    center_kind: str
+    equation: str
+    input_modes: tuple[tuple[str, ...], ...]
+    output_modes: tuple[str, ...]
+    variable_index: int
+    variable_key: str
+    source_plan_hash: str
+
+    def __post_init__(self):
+        if self.network not in _LOCAL_HV_NETWORKS:
+            raise ValueError("local H-v network must be 'mps' or 'ttns'")
+        if self.center_kind not in _LOCAL_HV_CENTER_KINDS:
+            raise ValueError("local H-v center kind is unsupported")
+        equation, equation_inputs, equation_output = _normalize_local_hv_equation(
+            self.equation
+        )
+        if self.equation != equation:
+            raise ValueError("local H-v equation must be canonical")
+        try:
+            input_modes = tuple(
+                _validate_modes(modes, allow_empty=False) for modes in self.input_modes
+            )
+        except TypeError as error:
+            raise TypeError("local H-v input modes must be iterable") from error
+        output_modes = _validate_modes(self.output_modes, allow_empty=False)
+        if input_modes != equation_inputs:
+            raise ValueError("local H-v input modes do not match the equation")
+        if output_modes != equation_output:
+            raise ValueError("local H-v output modes do not match the equation")
+        if type(self.variable_index) is not int or self.variable_index < 0:
+            raise ValueError("local H-v variable index must be non-negative")
+        if not isinstance(self.variable_key, str) or not self.variable_key:
+            raise ValueError("local H-v variable key must be a non-empty string")
+        _require_sha256(self.source_plan_hash, "local H-v source plan hash")
+        object.__setattr__(self, "input_modes", input_modes)
+        object.__setattr__(self, "output_modes", output_modes)
 
 
 @dataclass(frozen=True)
@@ -52,7 +128,10 @@ class TensorSpec:
 
     def __post_init__(self):
         shape = _as_tuple(self.shape, "shape")
-        if any(isinstance(dim, bool) or not isinstance(dim, (int, np.integer)) for dim in shape):
+        if any(
+            isinstance(dim, bool) or not isinstance(dim, (int, np.integer))
+            for dim in shape
+        ):
             raise TypeError("shape dimensions must be integers")
         shape = tuple(int(dim) for dim in shape)
         if any(dim < 0 for dim in shape):
@@ -136,7 +215,9 @@ class TransformStep:
     copy: bool
 
     def __post_init__(self):
-        if not isinstance(self.input, BufferRef) or not isinstance(self.output, BufferRef):
+        if not isinstance(self.input, BufferRef) or not isinstance(
+            self.output, BufferRef
+        ):
             raise TypeError("transform buffers must be BufferRef instances")
         axes = _as_tuple(self.axes, "transform axes")
         rank = len(self.input.spec.shape)
@@ -148,9 +229,13 @@ class TransformStep:
             raise TypeError("transform copy must be a boolean")
         if self.output.spec.dtype != self.input.spec.dtype:
             raise ValueError("transform output dtype must match input dtype")
-        if self.output.spec.shape != tuple(self.input.spec.shape[axis] for axis in axes):
+        if self.output.spec.shape != tuple(
+            self.input.spec.shape[axis] for axis in axes
+        ):
             raise ValueError("transform output shape does not match axes")
-        if self.output.spec.modes != tuple(self.input.spec.modes[axis] for axis in axes):
+        if self.output.spec.modes != tuple(
+            self.input.spec.modes[axis] for axis in axes
+        ):
             raise ValueError("transform output modes do not match axes")
         if self.copy:
             if self.output.spec.layout not in {"C", "F"}:
@@ -199,14 +284,18 @@ def _validate_pair_step(left, right, output, contracted_modes, batch_modes=()):
         if mode in shared_modes and mode not in output_mode_set
     )
     if contracted_modes != expected_contracted:
-        raise ValueError("contracted modes must list all shared non-output modes in left-input order")
+        raise ValueError(
+            "contracted modes must list all shared non-output modes in left-input order"
+        )
     expected_batch = tuple(mode for mode in output.spec.modes if mode in shared_modes)
     if batch_modes != expected_batch:
-        raise ValueError("batch modes must list all shared output modes in output order")
+        raise ValueError(
+            "batch modes must list all shared output modes in output order"
+        )
 
-    expected_output_modes = (
-        set(left.spec.modes) | set(right.spec.modes)
-    ) - set(expected_contracted)
+    expected_output_modes = (set(left.spec.modes) | set(right.spec.modes)) - set(
+        expected_contracted
+    )
     if output_mode_set != expected_output_modes:
         raise ValueError("output modes do not match pair contraction modes")
     dimensions = {**left_dimensions, **right_dimensions}
@@ -262,7 +351,9 @@ class BatchedMatmulStep:
             if mode in self.left.spec.modes and mode in self.right.spec.modes
         )
         if batch != shared_output:
-            raise ValueError("batch modes must list all shared output modes in output order")
+            raise ValueError(
+                "batch modes must list all shared output modes in output order"
+            )
         object.__setattr__(self, "contracted_modes", contracted)
         object.__setattr__(self, "batch_modes", batch)
 
@@ -305,7 +396,9 @@ class ReductionStep:
     reduced_modes: tuple[str, ...]
 
     def __post_init__(self):
-        if not isinstance(self.input, BufferRef) or not isinstance(self.output, BufferRef):
+        if not isinstance(self.input, BufferRef) or not isinstance(
+            self.output, BufferRef
+        ):
             raise TypeError("reduction buffers must be BufferRef instances")
         reduced = _validate_modes(self.reduced_modes, allow_empty=False)
         if not set(reduced) <= set(self.input.spec.modes):
@@ -320,7 +413,9 @@ class ReductionStep:
         if self.output.spec.modes != tuple(mode for mode, _ in remaining):
             raise ValueError("reduction output modes do not match reduced modes")
         if self.output.spec.shape != tuple(dim for _, dim in remaining):
-            raise ValueError("reduction output shape does not match unreduced dimensions")
+            raise ValueError(
+                "reduction output shape does not match unreduced dimensions"
+            )
         object.__setattr__(self, "reduced_modes", reduced)
 
     @property
@@ -328,7 +423,9 @@ class ReductionStep:
         return (self.output,)
 
 
-Step = TransformStep | MatmulStep | BatchedMatmulStep | GroupedMatmulStep | ReductionStep
+Step = (
+    TransformStep | MatmulStep | BatchedMatmulStep | GroupedMatmulStep | ReductionStep
+)
 
 
 def _hash_value(value):
@@ -354,6 +451,7 @@ def _plan_hash(
     planner_source,
     oe_path,
     override_reason,
+    execution_contract=None,
 ):
     payload = {
         "operation": operation,
@@ -365,7 +463,11 @@ def _plan_hash(
         "oe_path": _hash_value(oe_path),
         "override_reason": override_reason,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if execution_contract is not None:
+        payload["execution_contract"] = _hash_value(execution_contract)
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
@@ -387,7 +489,9 @@ def _validate_step_graph(inputs, steps, output):
         for operation in _step_operations(step):
             for ref in _operation_inputs(operation):
                 if ref.key not in available:
-                    raise ValueError("plan step references unknown buffer {!r}".format(ref.key))
+                    raise ValueError(
+                        "plan step references unknown buffer {!r}".format(ref.key)
+                    )
                 if available[ref.key] != ref:
                     raise ValueError("plan step buffer specification is inconsistent")
             if operation.output.key in available or operation.output.key in {
@@ -409,7 +513,9 @@ def _normalize_oe_path(oe_path, input_count):
     for indices in oe_path:
         if len(indices) != 2 or len(set(indices)) != 2:
             raise ValueError("OE path must contain pair contractions")
-        if any(isinstance(index, bool) or not isinstance(index, int) for index in indices):
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) for index in indices
+        ):
             raise TypeError("OE path indices must be integers")
         if any(index < 0 or index >= active for index in indices):
             raise ValueError("OE path index is out of range")
@@ -447,7 +553,9 @@ def _validate_oe_path_dependencies(inputs, steps, oe_path, output):
                 ) from error
             path_pair = oe_path[path_index]
             if set(dependency_indices) != set(path_pair):
-                raise ValueError("OE path pair selection does not match step dependencies")
+                raise ValueError(
+                    "OE path pair selection does not match step dependencies"
+                )
             for operand_index in sorted(path_pair, reverse=True):
                 active.pop(operand_index)
             active.append(operation.output.key)
@@ -467,6 +575,7 @@ class ExecutionPlan:
     oe_path: tuple[tuple[int, ...], ...]
     override_reason: str | None
     plan_hash: str
+    execution_contract: LocalHvExecutionContract | None = None
 
     def __post_init__(self):
         inputs = _as_tuple(self.inputs, "plan inputs")
@@ -480,11 +589,19 @@ class ExecutionPlan:
             raise ValueError("plan inputs contain duplicate buffer keys")
         if not isinstance(self.output, BufferRef):
             raise TypeError("plan output must be a BufferRef")
-        allowed_steps = (TransformStep, MatmulStep, BatchedMatmulStep, GroupedMatmulStep, ReductionStep)
+        allowed_steps = (
+            TransformStep,
+            MatmulStep,
+            BatchedMatmulStep,
+            GroupedMatmulStep,
+            ReductionStep,
+        )
         if not steps or any(not isinstance(step, allowed_steps) for step in steps):
             raise TypeError("plan step metadata has an unsupported type")
         _validate_step_graph(inputs, steps, self.output)
-        if isinstance(self.workspace_bytes, bool) or not isinstance(self.workspace_bytes, int):
+        if isinstance(self.workspace_bytes, bool) or not isinstance(
+            self.workspace_bytes, int
+        ):
             raise TypeError("workspace bytes must be an integer")
         if self.workspace_bytes < 0:
             raise ValueError("workspace bytes must be non-negative")
@@ -496,20 +613,62 @@ class ExecutionPlan:
         if self.planner_source not in {"opt_einsum", "specialized"}:
             raise ValueError("unsupported planner source")
         if self.planner_source == "specialized" and (
-            not isinstance(self.override_reason, str) or not self.override_reason.strip()
+            not isinstance(self.override_reason, str)
+            or not self.override_reason.strip()
         ):
-            raise ValueError("specialized plans require a non-empty string override reason")
+            raise ValueError(
+                "specialized plans require a non-empty string override reason"
+            )
         if self.planner_source == "opt_einsum" and self.override_reason is not None:
             raise ValueError("opt_einsum plans must not record an override reason")
         oe_path = _normalize_oe_path(self.oe_path, len(inputs))
         if self.planner_source == "opt_einsum":
             _validate_oe_path_dependencies(inputs, steps, oe_path, self.output)
+        execution_contract = self.execution_contract
+        if execution_contract is not None:
+            if not isinstance(execution_contract, LocalHvExecutionContract):
+                raise TypeError(
+                    "execution_contract must be LocalHvExecutionContract or None"
+                )
+            if execution_contract.input_modes != tuple(
+                ref.spec.modes for ref in inputs
+            ):
+                raise ValueError(
+                    "local H-v execution contract input modes do not match the plan"
+                )
+            if execution_contract.output_modes != self.output.spec.modes:
+                raise ValueError(
+                    "local H-v execution contract output modes do not match the plan"
+                )
+            if execution_contract.variable_index >= len(inputs) or (
+                inputs[execution_contract.variable_index].key
+                != execution_contract.variable_key
+            ):
+                raise ValueError(
+                    "local H-v execution contract variable does not match the plan"
+                )
+            source_plan_hash = _plan_hash(
+                self.operation,
+                inputs,
+                self.output,
+                steps,
+                self.workspace_bytes,
+                self.planner_source,
+                oe_path,
+                self.override_reason,
+            )
+            if execution_contract.source_plan_hash != source_plan_hash:
+                raise ValueError(
+                    "local H-v execution contract source plan hash does not match"
+                )
         if not isinstance(self.plan_hash, str) or len(self.plan_hash) != 64:
             raise ValueError("plan hash must be a 64-character hexadecimal digest")
         try:
             int(self.plan_hash, 16)
         except ValueError as error:
-            raise ValueError("plan hash must be a 64-character hexadecimal digest") from error
+            raise ValueError(
+                "plan hash must be a 64-character hexadecimal digest"
+            ) from error
         expected_hash = _plan_hash(
             self.operation,
             inputs,
@@ -519,12 +678,47 @@ class ExecutionPlan:
             self.planner_source,
             oe_path,
             self.override_reason,
+            execution_contract,
         )
         if self.plan_hash != expected_hash:
             raise ValueError("plan hash does not match canonical metadata")
         object.__setattr__(self, "inputs", inputs)
         object.__setattr__(self, "steps", steps)
         object.__setattr__(self, "oe_path", oe_path)
+
+
+def bind_local_hv_execution_contract(
+    plan, *, network, center_kind, equation, variable_index
+):
+    if not isinstance(plan, ExecutionPlan):
+        raise TypeError("plan must be an ExecutionPlan")
+    if plan.execution_contract is not None:
+        raise ValueError("plan already has a local H-v execution contract")
+    normalized, input_modes, output_modes = _normalize_local_hv_equation(equation)
+    if type(variable_index) is not int or not 0 <= variable_index < len(plan.inputs):
+        raise ValueError("local H-v variable index is out of range")
+    contract = LocalHvExecutionContract(
+        network=network,
+        center_kind=center_kind,
+        equation=normalized,
+        input_modes=input_modes,
+        output_modes=output_modes,
+        variable_index=variable_index,
+        variable_key=plan.inputs[variable_index].key,
+        source_plan_hash=plan.plan_hash,
+    )
+    plan_hash = _plan_hash(
+        plan.operation,
+        plan.inputs,
+        plan.output,
+        plan.steps,
+        plan.workspace_bytes,
+        plan.planner_source,
+        plan.oe_path,
+        plan.override_reason,
+        contract,
+    )
+    return dataclasses.replace(plan, execution_contract=contract, plan_hash=plan_hash)
 
 
 @dataclass(frozen=True)
@@ -549,9 +743,13 @@ class ExecutionBindings:
         missing = sorted(expected - actual)
         unexpected = sorted(actual - expected)
         if missing:
-            raise ValueError("missing execution binding keys: {}".format(", ".join(missing)))
+            raise ValueError(
+                "missing execution binding keys: {}".format(", ".join(missing))
+            )
         if unexpected:
-            raise ValueError("unexpected execution binding keys: {}".format(", ".join(unexpected)))
+            raise ValueError(
+                "unexpected execution binding keys: {}".format(", ".join(unexpected))
+            )
 
 
 __all__ = [
@@ -560,8 +758,10 @@ __all__ = [
     "ExecutionBindings",
     "ExecutionPlan",
     "GroupedMatmulStep",
+    "LocalHvExecutionContract",
     "MatmulStep",
     "ReductionStep",
     "TensorSpec",
     "TransformStep",
+    "bind_local_hv_execution_contract",
 ]

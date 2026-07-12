@@ -62,6 +62,7 @@ def _lanczos_expm(
     block_size,
     vector_ops,
     global_size,
+    max_vectors=None,
 ):
     """Generic Lanczos recurrence over vectors managed by ``vector_ops``."""
     if not np.iscomplex(dt):
@@ -77,11 +78,18 @@ def _lanczos_expm(
     basis = [vstart]
     res = None
 
-    for j in range(global_size):
+    if max_vectors is None:
+        iteration_limit = global_size
+    else:
+        if type(max_vectors) is not int or max_vectors <= 0:
+            raise ValueError("max_vectors must be a positive integer or None")
+        iteration_limit = min(global_size, max_vectors)
+
+    for j in range(iteration_limit):
         w = vector_ops.copy(Afunc(basis[j]))
         alpha[j] = vector_ops.vdot(w, basis[j]).real
 
-        if j == global_size - 1:
+        if j == iteration_limit - 1:
             return (
                 vector_ops.projected_exponential(
                     alpha[: j + 1], beta[:j], basis[: j + 1], nrmv, dt
@@ -113,7 +121,14 @@ def _lanczos_expm(
         basis.append(vector_ops.copy(w / beta[j]))
 
 
-def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
+def expm_krylov(
+    Afunc,
+    dt,
+    vstart: xp.ndarray,
+    block_size=50,
+    *,
+    max_krylov_vectors=None,
+):
     """
     Compute Krylov subspace approximation of the matrix exponential
     applied to input vector: `expm(dt*A)*v`.
@@ -123,11 +138,15 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
         On Krylov subspace approximations to the matrix exponential operator
         SIAM J. Numer. Anal. 34, 1911 (1997)
     """
-    return _lanczos_expm(
-        Afunc,
-        dt,
-        vstart,
-        block_size=block_size,
-        vector_ops=_LocalLanczosVectorOps(),
-        global_size=int(np.prod(vstart.shape)),
-    )
+    recurrence_kwargs = {
+        "block_size": block_size,
+        "vector_ops": _LocalLanczosVectorOps(),
+        "global_size": int(np.prod(vstart.shape)),
+    }
+    if max_krylov_vectors is not None:
+        if type(max_krylov_vectors) is not int or max_krylov_vectors <= 0:
+            raise ValueError(
+                "max_krylov_vectors must be a positive integer or None"
+            )
+        recurrence_kwargs["max_vectors"] = max_krylov_vectors
+    return _lanczos_expm(Afunc, dt, vstart, **recurrence_kwargs)

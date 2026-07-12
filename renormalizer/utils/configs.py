@@ -392,8 +392,32 @@ def _distributed_execution_summary(execution):
             getattr(execution, "device_memory_budget_bytes", None),
         ),
         (
+            "device_memory_budget_source",
+            getattr(execution, "device_memory_budget_source", None),
+        ),
+        (
+            "resolved_device_memory_budget_bytes",
+            getattr(execution, "resolved_device_memory_budget_bytes", None),
+        ),
+        (
+            "device_available_snapshot_bytes",
+            getattr(execution, "device_available_snapshot_bytes", None),
+        ),
+        (
             "host_memory_budget_bytes",
             getattr(execution, "host_memory_budget_bytes", None),
+        ),
+        (
+            "host_memory_budget_source",
+            getattr(execution, "host_memory_budget_source", None),
+        ),
+        (
+            "resolved_host_memory_budget_bytes",
+            getattr(execution, "resolved_host_memory_budget_bytes", None),
+        ),
+        (
+            "host_available_snapshot_bytes",
+            getattr(execution, "host_available_snapshot_bytes", None),
         ),
         ("prefetch_depth", getattr(execution, "prefetch_depth", None)),
         ("backend_name", getattr(execution, "backend_name", None)),

@@ -1020,6 +1020,79 @@ def test_ttns_unsupported_hop_uses_synchronized_root_fallback():
     assert counters["root_operation_count"] == 1
 
 
+def test_ttns_krylov_root_fallback_enforces_maximum_vector_count():
+    matrix = np.diag(np.arange(1.0, 7.0))
+    matrix += np.diag(np.full(5, -0.3), 1)
+    matrix += np.diag(np.full(5, -0.3), -1)
+    center = np.arange(1.0, 7.0)
+    set_backend(
+        "numpy", execution_policy="execution_ir", fallback_policy="legacy_oe"
+    )
+
+    actual, iterations = run_ttns_krylov(
+        lambda value: matrix @ value,
+        distributed_execution=_execution_config(),
+        center=center,
+        center_shape=center.shape,
+        node_index=2,
+        parent_index=1,
+        child_index=0,
+        degree=1,
+        center_kind="one_site",
+        coefficient=-0.02,
+        solver_config={"block_size": 2, "max_krylov_vectors": 2},
+    )
+    expected, expected_iterations = expm_krylov(
+        matrix.dot,
+        -0.02,
+        center,
+        block_size=2,
+        max_krylov_vectors=2,
+    )
+
+    assert iterations == expected_iterations == 2
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_ttns_root_fallback_preserves_promoted_krylov_and_davidson_results():
+    matrix = np.diag(np.asarray([1.0, 2.0], dtype=np.float32))
+    center = np.asarray([1.0, 0.0], dtype=np.float32)
+    mask = np.ones(2, dtype=bool)
+    set_backend(
+        "numpy", execution_policy="execution_ir", fallback_policy="legacy_oe"
+    )
+
+    krylov, _ = run_ttns_krylov(
+        lambda value: matrix @ value,
+        distributed_execution=_execution_config(),
+        center=center,
+        center_shape=center.shape,
+        node_index=2,
+        parent_index=1,
+        child_index=0,
+        degree=1,
+        center_kind="one_site",
+        coefficient=-0.125j,
+        solver_config={"block_size": 2, "max_krylov_vectors": 2},
+    )
+    _, davidson, _ = run_ttns_davidson(
+        lambda value: matrix @ value,
+        distributed_execution=_execution_config(),
+        qn_mask=mask,
+        initial_guess=center,
+        diagonal=np.diag(matrix).copy(),
+        node_index=2,
+        parent_index=1,
+        child_index=0,
+        degree=1,
+        center_kind="two_site",
+        solver_config={"max_cycle": 2, "max_space": 2},
+    )
+
+    assert krylov.dtype == np.dtype("complex128")
+    assert davidson.dtype == np.dtype("float64")
+
+
 def test_ttns_unsupported_davidson_uses_synchronized_root_fallback():
     rng = np.random.default_rng(1612)
     matrix = rng.normal(size=(6, 6))

@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import numpy as np
 import pytest
@@ -9,6 +9,7 @@ from renormalizer.backend._execution.model import (
     ExecutionBindings,
     ExecutionPlan,
     GroupedMatmulStep,
+    LocalHvExecutionContract,
     MatmulStep,
     ReductionStep,
     TensorSpec,
@@ -41,8 +42,37 @@ def _with_plan_hash(values):
         values["planner_source"],
         values["oe_path"],
         values["override_reason"],
+        values.get("execution_contract"),
     )
     return values
+
+
+def _contract_plan(contract=None):
+    left, right, output = _matmul_refs()
+    values = _with_plan_hash(
+        dict(
+            operation="einsum",
+            inputs=(left, right),
+            output=output,
+            steps=(MatmulStep(left, right, output, ("b",)),),
+            workspace_bytes=0,
+            planner_source="opt_einsum",
+            oe_path=((0, 1),),
+            override_reason=None,
+        )
+    )
+    if contract is None:
+        contract = LocalHvExecutionContract(
+            network="mps",
+            center_kind="one_site",
+            equation="ab,bc->ac",
+            input_modes=(("a", "b"), ("b", "c")),
+            output_modes=("a", "c"),
+            variable_index=1,
+            variable_key="input_1",
+            source_plan_hash=values["plan_hash"],
+        )
+    return ExecutionPlan(**_with_plan_hash({**values, "execution_contract": contract}))
 
 
 def test_tensor_spec_is_immutable():
@@ -134,7 +164,7 @@ def test_transform_step_rejects_untrusted_output_metadata(output, message):
 )
 def test_transform_layout_matches_real_numpy_transpose(shape, order, axes):
     array = np.empty(shape, order=order)
-    modes = tuple("abcdef"[:len(shape)])
+    modes = tuple("abcdef"[: len(shape)])
     transposed = array.transpose(axes)
     source = _ref("source", shape, modes, layout=_array_layout(array))
     output = _ref(
@@ -144,9 +174,9 @@ def test_transform_layout_matches_real_numpy_transpose(shape, order, axes):
         layout=_array_layout(transposed),
     )
 
-    assert TransformStep(source, output, axes, False).output.spec.layout == _array_layout(
-        transposed
-    )
+    assert TransformStep(
+        source, output, axes, False
+    ).output.spec.layout == _array_layout(transposed)
 
 
 @pytest.mark.parametrize(
@@ -163,7 +193,7 @@ def test_transform_layout_matches_real_numpy_transpose(shape, order, axes):
 def test_transform_layout_is_conservative_without_input_strides(
     shape, input_layout, axes, expected_layout
 ):
-    modes = tuple("abcdef"[:len(shape)])
+    modes = tuple("abcdef"[: len(shape)])
     source = _ref("source", shape, modes, layout=input_layout)
     output = _ref(
         "output",
@@ -172,7 +202,9 @@ def test_transform_layout_is_conservative_without_input_strides(
         layout=expected_layout,
     )
 
-    assert TransformStep(source, output, axes, False).output.spec.layout == expected_layout
+    assert (
+        TransformStep(source, output, axes, False).output.spec.layout == expected_layout
+    )
 
 
 @pytest.mark.parametrize(
@@ -187,7 +219,7 @@ def test_transform_layout_is_conservative_without_input_strides(
 def test_transform_layout_rejects_noncanonical_classification(
     shape, layout, axes, wrong_layout
 ):
-    modes = tuple("abcdef"[:len(shape)])
+    modes = tuple("abcdef"[: len(shape)])
     source = _ref("source", shape, modes, layout=layout)
     output = _ref(
         "output",
@@ -208,7 +240,9 @@ def test_transform_layout_accepts_materialized_contiguous_copy(
     source = _ref("source", (2, 3), ("a", "b"), layout=input_layout)
     output = _ref("output", (3, 2), ("b", "a"), layout=output_layout)
 
-    assert TransformStep(source, output, (1, 0), True).output.spec.layout == output_layout
+    assert (
+        TransformStep(source, output, (1, 0), True).output.spec.layout == output_layout
+    )
 
 
 def test_transform_layout_rejects_materialized_strided_copy():
@@ -296,14 +330,13 @@ def test_batched_matmul_requires_complete_ordered_mode_metadata():
 @pytest.mark.parametrize("step_kind", ["matmul", "batched"])
 @pytest.mark.parametrize("role", ["left", "right", "output"])
 @pytest.mark.parametrize("layout", ["F", "strided"])
-def test_pair_step_requires_c_layout_for_every_physical_buffer(
-    step_kind, role, layout
-):
+def test_pair_step_requires_c_layout_for_every_physical_buffer(step_kind, role, layout):
     if step_kind == "matmul":
         left, right, output = _matmul_refs()
 
         def make_step(refs):
             return MatmulStep(*refs, ("b",))
+
     else:
         left = _ref("left", (5, 2, 3), ("x", "a", "b"))
         right = _ref("right", (5, 3, 4), ("x", "b", "c"))
@@ -311,6 +344,7 @@ def test_pair_step_requires_c_layout_for_every_physical_buffer(
 
         def make_step(refs):
             return BatchedMatmulStep(*refs, ("x",), ("b",))
+
     refs = {"left": left, "right": right, "output": output}
     changed = refs[role]
     refs[role] = _ref(
@@ -334,19 +368,50 @@ def test_specialized_pair_plan_accepts_explicit_transform_to_c():
         TransformStep(source_left, packed_left, (0, 1), True),
         MatmulStep(packed_left, right, output, ("b",)),
     )
-    plan = ExecutionPlan(**_with_plan_hash(dict(
-        operation="einsum",
-        inputs=(source_left, right),
-        output=output,
-        steps=steps,
-        workspace_bytes=workspace_bytes_for_steps(steps, output.key),
-        planner_source="specialized",
-        oe_path=((0, 1),),
-        override_reason="explicitly pack F input to canonical C",
-    )))
+    plan = ExecutionPlan(
+        **_with_plan_hash(
+            dict(
+                operation="einsum",
+                inputs=(source_left, right),
+                output=output,
+                steps=steps,
+                workspace_bytes=workspace_bytes_for_steps(steps, output.key),
+                planner_source="specialized",
+                oe_path=((0, 1),),
+                override_reason="explicitly pack F input to canonical C",
+            )
+        )
+    )
 
     assert plan.steps == steps
     assert packed_left.spec.layout == "C"
+
+
+def test_wave9_local_hv_execution_contract_validates_complete_structure():
+    plan = _contract_plan()
+
+    assert plan.execution_contract.variable_key == "input_1"
+    assert plan.execution_contract.source_plan_hash != plan.plan_hash
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"network": "generic"}, "network"),
+        ({"center_kind": "edge"}, "center kind"),
+        ({"equation": "ab, bc -> ac"}, "canonical"),
+        ({"input_modes": (("a", "b"), ("b", "d"))}, "input modes"),
+        ({"output_modes": ("c", "a")}, "output modes"),
+        ({"variable_index": 0}, "variable"),
+        ({"variable_key": "input_0"}, "variable"),
+        ({"source_plan_hash": "0" * 64}, "source plan hash"),
+    ],
+)
+def test_wave9_local_hv_execution_contract_rejects_structural_forgery(changes, message):
+    baseline = _contract_plan().execution_contract
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        _contract_plan(replace(baseline, **changes))
 
 
 def test_step_metadata_keeps_valid_zero_sized_and_scalar_shapes():
@@ -405,16 +470,20 @@ def test_execution_bindings_copy_and_validate_keys():
     source = {"input_0": object(), "input_1": object()}
     bindings = ExecutionBindings(source)
     left, right, output = _matmul_refs()
-    plan = ExecutionPlan(**_with_plan_hash(dict(
-        operation="einsum",
-        inputs=(left, right),
-        output=output,
-        steps=(MatmulStep(left, right, output, ("b",)),),
-        workspace_bytes=0,
-        planner_source="opt_einsum",
-        oe_path=((0, 1),),
-        override_reason=None,
-    )))
+    plan = ExecutionPlan(
+        **_with_plan_hash(
+            dict(
+                operation="einsum",
+                inputs=(left, right),
+                output=output,
+                steps=(MatmulStep(left, right, output, ("b",)),),
+                workspace_bytes=0,
+                planner_source="opt_einsum",
+                oe_path=((0, 1),),
+                override_reason=None,
+            )
+        )
+    )
 
     source.clear()
     assert tuple(bindings.arrays) == ("input_0", "input_1")
@@ -432,16 +501,18 @@ def test_execution_bindings_copy_and_validate_keys():
 
 def test_execution_plan_rejects_invalid_trust_metadata():
     left, right, output = _matmul_refs()
-    values = _with_plan_hash(dict(
-        operation="einsum",
-        inputs=(left, right),
-        output=output,
-        steps=(MatmulStep(left, right, output, ("b",)),),
-        workspace_bytes=0,
-        planner_source="opt_einsum",
-        oe_path=((0, 1),),
-        override_reason=None,
-    ))
+    values = _with_plan_hash(
+        dict(
+            operation="einsum",
+            inputs=(left, right),
+            output=output,
+            steps=(MatmulStep(left, right, output, ("b",)),),
+            workspace_bytes=0,
+            planner_source="opt_einsum",
+            oe_path=((0, 1),),
+            override_reason=None,
+        )
+    )
 
     with pytest.raises(ValueError, match="workspace"):
         ExecutionPlan(**{**values, "workspace_bytes": -1})

@@ -15,7 +15,9 @@ from renormalizer.backend._distributed.center import (
     copy_backend_metadata as _copy_metadata,
     coordinate_adapter_decision,
     host_array as _host_array,
+    krylov_root_fallback_memory_profile,
     measured_execution as _measured_execution,
+    preflight_root_fallback_capacity,
     record_phase_summary,
     record_fallback_solve,
     record_distributed_solve,
@@ -141,6 +143,7 @@ def run_mps_root_fallback(
     estimated_device_bytes,
     estimated_host_bytes,
     counters=None,
+    capacity_approval=None,
 ):
     selected = _validate_execution(distributed_execution)
     if counters is None:
@@ -154,6 +157,7 @@ def run_mps_root_fallback(
         estimated_device_bytes=estimated_device_bytes,
         estimated_host_bytes=estimated_host_bytes,
         counters=counters,
+        capacity_approval=capacity_approval,
     )
     record_phase_summary(
         "mps",
@@ -206,14 +210,32 @@ def run_mps_ivp_fallback(
     )
     if route != "fallback":
         raise RuntimeError("unsupported IVP decision did not select fallback")
+    def profile_fallback():
+        flat_center = selected.reshape(center, (-1,))
+        estimated_bytes = int(flat_center.size) * np.dtype(flat_center.dtype).itemsize * 4
+        return flat_center, estimated_bytes
+
+    flat_center, estimated_bytes = run_synchronized_setup_phase(
+        distributed_execution,
+        profile_fallback,
+        "mps IVP fallback profile",
+        counters=counters,
+    )
+    capacity_approval = preflight_root_fallback_capacity(
+        distributed_execution,
+        selected,
+        device_bytes=estimated_bytes,
+        host_bytes=estimated_bytes,
+        counters=counters,
+    )
+
     def allocate():
         namespace = selected.array_namespace
-        flat_center = selected.reshape(center, (-1,))
         receive = namespace.empty(flat_center.shape, dtype=flat_center.dtype)
         metadata = namespace.zeros(1, dtype=np.int64)
-        return namespace, flat_center, receive, metadata
+        return namespace, receive, metadata
 
-    namespace, flat_center, receive, metadata = run_synchronized_setup_phase(
+    namespace, receive, metadata = run_synchronized_setup_phase(
         distributed_execution,
         allocate,
         "mps IVP center allocation",
@@ -233,9 +255,10 @@ def run_mps_ivp_fallback(
         distributed_execution,
         receive,
         metadata_buffers=(metadata,),
-        estimated_device_bytes=receive.nbytes * 4,
-        estimated_host_bytes=receive.nbytes * 4,
+        estimated_device_bytes=estimated_bytes,
+        estimated_host_bytes=estimated_bytes,
         counters=counters,
+        capacity_approval=capacity_approval,
     )
     evaluations = int(_host_array(metadata).reshape(-1)[0])
     record_fallback_solve(
@@ -301,15 +324,34 @@ def run_mps_ground_state_fallback(
     )
     if route != "fallback":
         raise RuntimeError("unsupported ground-state decision did not select fallback")
-    def allocate():
+    def profile_fallback():
         allowed_count = int(np.count_nonzero(mask))
         dtype = _result_dtype(*initial_guesses)
+        receive_bytes = allowed_count * nroots * np.dtype(dtype).itemsize
+        return allowed_count, dtype, receive_bytes
+
+    allowed_count, dtype, estimated_bytes = run_synchronized_setup_phase(
+        distributed_execution,
+        profile_fallback,
+        "mps ground-state fallback profile",
+        counters=counters,
+    )
+    estimated_bytes *= 6
+    capacity_approval = preflight_root_fallback_capacity(
+        distributed_execution,
+        selected,
+        device_bytes=estimated_bytes,
+        host_bytes=estimated_bytes,
+        counters=counters,
+    )
+
+    def allocate():
         namespace = selected.array_namespace
         receive = namespace.empty(allowed_count * nroots, dtype=dtype)
         energies = namespace.zeros(nroots, dtype=np.float64)
-        return allowed_count, dtype, namespace, receive, energies
+        return namespace, receive, energies
 
-    allowed_count, dtype, namespace, receive, energies = (
+    namespace, receive, energies = (
         run_synchronized_setup_phase(
             distributed_execution,
             allocate,
@@ -337,9 +379,10 @@ def run_mps_ground_state_fallback(
         distributed_execution,
         receive,
         metadata_buffers=(energies,),
-        estimated_device_bytes=receive.nbytes * 6,
-        estimated_host_bytes=receive.nbytes * 6,
+        estimated_device_bytes=estimated_bytes,
+        estimated_host_bytes=estimated_bytes,
         counters=counters,
+        capacity_approval=capacity_approval,
     )
     host_result = _host_array(result)
     host_energies = _host_array(energies)
@@ -449,19 +492,53 @@ def run_mps_krylov(
         if counters is None:
             counters = {}
         counters.setdefault("allgather_calls", 0)
+        def profile_fallback():
+            unknown = set(options) - {"block_size", "max_krylov_vectors"}
+            if unknown:
+                raise ValueError(
+                    "unknown Krylov config keys: {}".format(
+                        ", ".join(sorted(map(str, unknown)))
+                    )
+                )
+            memory_profile = krylov_root_fallback_memory_profile(
+                vector_bytes=int(full_center.nbytes),
+                vector_count=int(full_center.size),
+                dtype=np.dtype(full_center.dtype),
+                coefficient=coefficient,
+                block_size=options.get("block_size", 50),
+                max_krylov_vectors=options.get("max_krylov_vectors"),
+            )
+            return (
+                getattr(hop, "legacy_fallback_expression", hop),
+                memory_profile,
+            )
+
+        legacy_hop, memory_profile = run_synchronized_setup_phase(
+            distributed_execution,
+            profile_fallback,
+            "mps Krylov fallback profile",
+            counters=counters,
+        )
+        capacity_approval = preflight_root_fallback_capacity(
+            distributed_execution,
+            selected,
+            device_bytes=memory_profile.device_peak_bytes,
+            host_bytes=memory_profile.host_peak_bytes,
+            counters=counters,
+        )
+
         def allocate_fallback():
             metadata = selected.array_namespace.zeros(1, dtype=np.int64)
             receive = selected.array_namespace.empty(
-                int(np.prod(descriptor.center_shape)), dtype=full_center.dtype
+                int(np.prod(descriptor.center_shape)),
+                dtype=np.dtype(memory_profile.result_dtype),
             )
             return (
                 metadata,
                 receive,
-                getattr(hop, "legacy_fallback_expression", hop),
-                options.get("block_size", 50),
             )
 
-        metadata, receive, legacy_hop, block_size = (
+        metadata, receive = (
             run_synchronized_setup_phase(
                 distributed_execution,
                 allocate_fallback,
@@ -476,20 +553,21 @@ def run_mps_krylov(
                 ).ravel(),
                 coefficient,
                 full_center.ravel(),
-                block_size=block_size,
+                block_size=memory_profile.block_size,
+                max_krylov_vectors=memory_profile.max_krylov_vectors,
             )
             metadata[0] = iterations
             return result
 
-        basis_bytes = receive.nbytes * (int(block_size) + 2)
         result = run_mps_root_fallback(
             operation,
             distributed_execution,
             receive,
             metadata_buffers=(metadata,),
-            estimated_device_bytes=basis_bytes,
-            estimated_host_bytes=basis_bytes,
+            estimated_device_bytes=memory_profile.device_peak_bytes,
+            estimated_host_bytes=memory_profile.host_peak_bytes,
             counters=counters,
+            capacity_approval=capacity_approval,
         )
         iterations = int(_host_array(metadata)[0])
         state_collective_start = collective_elapsed(

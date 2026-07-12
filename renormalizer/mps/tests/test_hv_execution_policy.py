@@ -111,7 +111,10 @@ def _run_case(case, policy):
     _, equation, left, right, mpos, center, two_layer = case
     set_backend("numpy", execution_policy=policy)
     hop = mps_hop_module.hop_expr(
-        left.copy(), right.copy(), [mpo.copy() for mpo in mpos], center.shape,
+        left.copy(),
+        right.copy(),
+        [mpo.copy() for mpo in mpos],
+        center.shape,
         twolayer=two_layer,
     )
     actual = asnumpy(hop(center.copy()))
@@ -299,7 +302,9 @@ def test_execution_ir_promotes_real_mpo_with_complex_environment_and_center():
 
 
 @pytest.mark.parametrize("layout", ["C", "F", "strided"])
-def test_execution_ir_resolves_dtype_correct_artifact_without_executing(layout, monkeypatch):
+def test_execution_ir_resolves_dtype_correct_artifact_without_executing(
+    layout, monkeypatch
+):
     rng = np.random.default_rng(571)
     left = rng.normal(size=(2, 3, 4))
     mpo = rng.normal(size=(3, 5, 4, 6))
@@ -328,12 +333,36 @@ def test_execution_ir_resolves_dtype_correct_artifact_without_executing(layout, 
     assert artifact.variable_index == 3
     assert artifact.variable_key not in artifact.source_bindings.arrays
     assert artifact.variable_array is center
-    assert artifact.execution_plan.inputs[artifact.variable_index].key == artifact.variable_key
+    assert (
+        artifact.execution_plan.inputs[artifact.variable_index].key
+        == artifact.variable_key
+    )
     assert all(
         np.dtype(array.dtype) == np.dtype("complex128")
         for array in artifact.source_bindings.arrays.values()
     )
     assert hop.legacy_fallback_expression is not None
+
+
+def test_wave9_mps_builder_binds_structural_local_hv_execution_contract():
+    case = _mps_cases()[1]
+    _, equation, left, right, mpos, center, _ = case
+    set_backend("numpy", execution_policy="execution_ir", fallback_policy="error")
+
+    artifact = mps_hop_module.hop_expr(
+        left, right, list(mpos), center.shape
+    ).resolve_execution_artifact(center)
+    plan = artifact.execution_plan
+    contract = plan.execution_contract
+
+    assert contract.network == "mps"
+    assert contract.center_kind == "one_site"
+    assert contract.equation == "abc,bdef,gfh,ceh->adg"
+    assert contract.input_modes == tuple(ref.spec.modes for ref in plan.inputs)
+    assert contract.output_modes == plan.output.spec.modes
+    assert contract.variable_index == artifact.variable_index == 3
+    assert contract.variable_key == artifact.variable_key
+    assert contract.source_plan_hash != plan.plan_hash
 
 
 @pytest.mark.parametrize(
@@ -541,12 +570,8 @@ def test_unsupported_runtime_dtype_uses_explicit_legacy_fallback(monkeypatch):
         oe_wrap_module.oe, "contract_expression", recording_contract_expression
     )
     monkeypatch.setattr(planner.oe, "contract_path", recording_contract_path)
-    monkeypatch.setattr(
-        oe_contract_module, "contract_path", recording_contract_path
-    )
-    set_backend(
-        "numpy", execution_policy="execution_ir", fallback_policy="legacy_oe"
-    )
+    monkeypatch.setattr(oe_contract_module, "contract_path", recording_contract_path)
+    set_backend("numpy", execution_policy="execution_ir", fallback_policy="legacy_oe")
     monkeypatch.setattr(profiling, "enabled", lambda: True)
     monkeypatch.setattr(
         profiling,
@@ -681,9 +706,7 @@ def test_experimental_layout_cartesian_is_bounded_at_construction():
 def test_generic_runtime_dtype_fallback_reason_is_exact_and_reuses_oe(monkeypatch):
     constant = np.arange(6.0).reshape(2, 3)
     variable = np.arange(12.0, dtype=np.longdouble).reshape(3, 4)
-    lowerer = importlib.import_module(
-        "renormalizer.backend._gemm.experimental_einsum"
-    )
+    lowerer = importlib.import_module("renormalizer.backend._gemm.experimental_einsum")
     planner_calls = []
     legacy_builds = []
     path_calls = []
@@ -711,9 +734,7 @@ def test_generic_runtime_dtype_fallback_reason_is_exact_and_reuses_oe(monkeypatc
         oe_wrap_module.oe, "contract_expression", recording_contract_expression
     )
     monkeypatch.setattr(planner.oe, "contract_path", recording_contract_path)
-    monkeypatch.setattr(
-        oe_contract_module, "contract_path", recording_contract_path
-    )
+    monkeypatch.setattr(oe_contract_module, "contract_path", recording_contract_path)
     set_backend(
         "numpy",
         execution_policy="execution_ir",
@@ -772,9 +793,7 @@ def test_generic_two_variable_fallback_profiles_all_operand_shapes(monkeypatch):
     left = np.arange(6.0, dtype=np.longdouble).reshape(2, 3)
     constant = np.arange(12.0).reshape(3, 4)
     right = np.arange(20.0, dtype=np.longdouble).reshape(4, 5)
-    lowerer = importlib.import_module(
-        "renormalizer.backend._gemm.experimental_einsum"
-    )
+    lowerer = importlib.import_module("renormalizer.backend._gemm.experimental_einsum")
     planner = importlib.import_module("renormalizer.backend._execution.planner")
     oe_contract_module = importlib.import_module("opt_einsum.contract")
     planner_calls = []
@@ -799,9 +818,7 @@ def test_generic_two_variable_fallback_profiles_all_operand_shapes(monkeypatch):
 
     monkeypatch.setattr(lowerer, "lower_einsum_path", recording_lower)
     monkeypatch.setattr(planner.oe, "contract_path", recording_contract_path)
-    monkeypatch.setattr(
-        oe_contract_module, "contract_path", recording_contract_path
-    )
+    monkeypatch.setattr(oe_contract_module, "contract_path", recording_contract_path)
     monkeypatch.setattr(
         oe_wrap_module.oe, "contract_expression", recording_contract_expression
     )
@@ -1041,7 +1058,10 @@ def test_cupy_constant_dtype_copies_are_lazy_cached_and_device_resident(monkeypa
     original_array = selected.array
 
     def recording_array(value, *args, **kwargs):
-        if kwargs.get("dtype") is not None and np.dtype(kwargs["dtype"]).name == "complex128":
+        if (
+            kwargs.get("dtype") is not None
+            and np.dtype(kwargs["dtype"]).name == "complex128"
+        ):
             complex_copies.append((value, kwargs.get("order"), kwargs.get("copy")))
         return original_array(value, *args, **kwargs)
 

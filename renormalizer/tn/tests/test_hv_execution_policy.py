@@ -69,7 +69,8 @@ def test_ttns_default_policy_does_not_select_ir(monkeypatch):
     expr, args, center = _build_interleaved("legacy_oe")
 
     np.testing.assert_allclose(
-        expr(center), np.einsum("abc,bdef,lfk,cek->adl", args[0], args[2], args[4], center)
+        expr(center),
+        np.einsum("abc,bdef,lfk,cek->adl", args[0], args[2], args[4], center),
     )
 
 
@@ -92,9 +93,7 @@ def test_ttns_strict_policy_propagates_lowering_error(monkeypatch):
 def test_ttns_explicit_fallback_records_requested_and_actual_policy(monkeypatch):
     args, center, input_indices, output_indices = _interleaved_case()
     events = []
-    set_backend(
-        "numpy", execution_policy="execution_ir", fallback_policy="legacy_oe"
-    )
+    set_backend("numpy", execution_policy="execution_ir", fallback_policy="legacy_oe")
     monkeypatch.setattr(
         ttns_hop_module,
         "build_ttns_ir_hop",
@@ -162,6 +161,23 @@ def test_ttns_plan_is_reused_and_ir_telemetry_is_truthful(monkeypatch):
     np.testing.assert_allclose(second, expected * 2)
 
 
+def test_wave9_ttns_builder_binds_structural_local_hv_execution_contract():
+    expression, _, center = _build_interleaved("execution_ir")
+
+    artifact = expression.resolve_execution_artifact(center)
+    plan = artifact.execution_plan
+    contract = plan.execution_contract
+
+    assert contract.network == "ttns"
+    assert contract.center_kind == "one_site"
+    assert contract.equation == "abc,bdef,gfh,ceh->adg"
+    assert contract.input_modes == tuple(ref.spec.modes for ref in plan.inputs)
+    assert contract.output_modes == plan.output.spec.modes
+    assert contract.variable_index == artifact.variable_index == 3
+    assert contract.variable_key == artifact.variable_key
+    assert contract.source_plan_hash != plan.plan_hash
+
+
 def test_ttns_runtime_dtype_fallback_reason_is_exact_and_reuses_oe(monkeypatch):
     args, center, input_indices, output_indices = _interleaved_case()
     center = center.astype(np.longdouble)
@@ -193,12 +209,8 @@ def test_ttns_runtime_dtype_fallback_reason_is_exact_and_reuses_oe(monkeypatch):
         oe_wrap_module.oe, "contract_expression", recording_contract_expression
     )
     monkeypatch.setattr(planner.oe, "contract_path", recording_contract_path)
-    monkeypatch.setattr(
-        oe_contract_module, "contract_path", recording_contract_path
-    )
-    set_backend(
-        "numpy", execution_policy="execution_ir", fallback_policy="legacy_oe"
-    )
+    monkeypatch.setattr(oe_contract_module, "contract_path", recording_contract_path)
+    set_backend("numpy", execution_policy="execution_ir", fallback_policy="legacy_oe")
     monkeypatch.setattr(profiling, "enabled", lambda: True)
     monkeypatch.setattr(
         profiling,
@@ -219,9 +231,7 @@ def test_ttns_runtime_dtype_fallback_reason_is_exact_and_reuses_oe(monkeypatch):
     first = expression(center)
     second = expression(center * 2)
 
-    expected = np.einsum(
-        "abc,bdef,lfk,cek->adl", args[0], args[2], args[4], center
-    )
+    expected = np.einsum("abc,bdef,lfk,cek->adl", args[0], args[2], args[4], center)
     reason = (
         "UnsupportedRuntimeDtypeError: execution IR runtime result dtype 'float128' "
         "with layouts ('C',) has no configured variant; available variants: "
@@ -248,7 +258,9 @@ def test_ttns_runtime_dtype_fallback_reason_is_exact_and_reuses_oe(monkeypatch):
 def test_ttns_hdiag_data_path_is_unchanged_by_execution_policy(monkeypatch):
     sentinel_expr = object()
     sentinel_diag = np.arange(4.0)
-    monkeypatch.setattr(ttns_hop_module, "_contract_expression", lambda *args: sentinel_expr)
+    monkeypatch.setattr(
+        ttns_hop_module, "_contract_expression", lambda *args: sentinel_expr
+    )
     monkeypatch.setattr(ttns_hop_module, "_get_hdiag", lambda *args: sentinel_diag)
 
     class Node:
@@ -313,9 +325,7 @@ def test_ttns_zero_one_two_site_and_hdiag_match_legacy_numerically():
     )
     zero_center = np.random.default_rng(71).normal(size=zero_shape)
     parent_axis = child.parent.children.index(child)
-    two_center = np.tensordot(
-        child.tensor, child.parent.tensor, axes=(-1, parent_axis)
-    )
+    two_center = np.tensordot(child.tensor, child.parent.tensor, axes=(-1, parent_axis))
 
     def evaluate(policy):
         set_backend("numpy", execution_policy=policy)
@@ -324,14 +334,9 @@ def test_ttns_zero_one_two_site_and_hdiag_match_legacy_numerically():
             child, ttns, ttno, ttne, return_hdiag=True
         )
         one = one_expr(child.tensor)
-        two_expr, two_hdiag = ttns_hop_module.hop_expr2(
-            child, ttns, ttno, ttne
-        )
+        two_expr, two_hdiag = ttns_hop_module.hop_expr2(child, ttns, ttno, ttne)
         two = two_expr(two_center)
-        return tuple(
-            asnumpy(value)
-            for value in (zero, one, one_hdiag, two, two_hdiag)
-        )
+        return tuple(asnumpy(value) for value in (zero, one, one_hdiag, two, two_hdiag))
 
     legacy = evaluate("legacy_oe")
     execution_ir = evaluate("execution_ir")

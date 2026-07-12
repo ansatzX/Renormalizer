@@ -9,7 +9,10 @@ import numpy as np
 
 from renormalizer.backend._distributed.context import DistributedContext
 from renormalizer.backend._distributed.planner import DistributedPlan
-from renormalizer.backend._distributed.providers import OperandRequest
+from renormalizer.backend._distributed.providers import (
+    OperandRequest,
+    active_working_set_policy_error,
+)
 from renormalizer.backend._execution.model import ExecutionBindings
 
 
@@ -112,9 +115,7 @@ def _fallback_fingerprint(metadata):
 def _fallback_fingerprint_agrees(collective, metadata):
     if collective.size == 1:
         return True
-    fingerprint = _control_array(
-        collective, _fallback_fingerprint(metadata), np.uint64
-    )
+    fingerprint = _control_array(collective, _fallback_fingerprint(metadata), np.uint64)
     minimum = collective.allreduce(fingerprint, op="min")
     maximum = collective.allreduce(fingerprint, op="max")
     local = _array_to_numpy(fingerprint)
@@ -209,6 +210,9 @@ class DistributedLocalOperator:
     source_bindings: ExecutionBindings
     device_memory_budget_bytes: int | None = None
     host_memory_budget_bytes: int | None = None
+    residency_request: object = None
+    residency_plan: object = None
+    mesh: object = None
 
     def __post_init__(self):
         if not callable(getattr(self.collective, "allreduce", None)):
@@ -217,9 +221,7 @@ class DistributedLocalOperator:
             self.context, self.plan, self.collective
         )
         self._counter_error = _counter_validation_error(self.counters)
-        self._counter_target = (
-            self.counters if self._counter_error is None else None
-        )
+        self._counter_target = self.counters if self._counter_error is None else None
         self._counters = {key: 0 for key in _COUNTER_KEYS}
         if type(self.counters) is dict:
             for key in _COUNTER_KEYS:
@@ -271,24 +273,74 @@ class DistributedLocalOperator:
             raise ValueError("collective rank or size does not match context")
         if not callable(getattr(self.provider, "acquire", None)):
             raise TypeError("provider must implement acquire")
+        if not callable(getattr(self.provider, "validate_setup", None)):
+            raise TypeError("provider must implement validate_setup")
+        if not callable(getattr(self.provider, "validate_request", None)):
+            raise TypeError("provider must implement validate_request")
         if not callable(getattr(self.collective, "allreduce_inplace", None)):
             raise TypeError("collective must implement in-place allreduce")
         for name in ("device_memory_budget_bytes", "host_memory_budget_bytes"):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value < 0):
-                raise ValueError("{} must be a non-negative integer or None".format(name))
+                raise ValueError(
+                    "{} must be a non-negative integer or None".format(name)
+                )
         if self.plan.variable_key in self.source_bindings.arrays:
             raise ValueError(
                 "resident source bindings must not contain the variable input"
             )
-        expected_keys = {
-            ref.key for ref in self.plan.execution_plan.inputs
-        } - {self.plan.variable_key}
+        expected_keys = {ref.key for ref in self.plan.execution_plan.inputs} - {
+            self.plan.variable_key
+        }
         actual_keys = set(self.source_bindings.arrays)
         if actual_keys != expected_keys:
-            raise ValueError("resident source binding coverage is incomplete")
-        self._validate_source_arrays()
-        self._validate_resident_views()
+            raise ValueError("source binding coverage is incomplete")
+        provider_policy = getattr(self.provider, "residency_policy", None)
+        if provider_policy == "active_working_set" and (
+            self.residency_plan is None or self.residency_request is None
+        ):
+            raise ValueError(
+                "active_working_set requires a resolved residency plan and request"
+            )
+        if provider_policy != "active_working_set" and (
+            self.residency_plan is not None or self.residency_request is not None
+        ):
+            raise ValueError(
+                "residency metadata requires active_working_set provider policy"
+            )
+        policy_error = active_working_set_policy_error(
+            provider_policy, self.backend, self.plan
+        )
+        if policy_error is not None:
+            raise policy_error
+        if self.residency_plan is not None:
+            from renormalizer.backend._distributed.residency import (
+                ResidencyPlan,
+                ResidencyRequest,
+            )
+
+            if not isinstance(self.residency_plan, ResidencyPlan):
+                raise TypeError("residency_plan must be a ResidencyPlan or None")
+            if not isinstance(self.residency_request, ResidencyRequest):
+                raise TypeError(
+                    "residency_request must be a ResidencyRequest with a plan"
+                )
+            if (
+                self.residency_plan.world_size != self.plan.world_size
+                or self.residency_plan.placement_hash != self.plan.placement_hash
+            ):
+                raise ValueError("residency plan does not match distributed plan")
+            if self.residency_request.distributed_plan != self.plan:
+                raise ValueError("residency request does not match distributed plan")
+            if self.residency_request.backend_name != self.backend.name:
+                raise ValueError("residency request backend does not match operator")
+            self.residency_plan.validate_capacity()
+            self.residency_plan.runtime_identity.validate_runtime(
+                self.context, self.mesh, self.backend
+            )
+            self.residency_plan.validate_request(self.residency_request)
+        self.provider.validate_setup(self.plan, self.source_bindings, self.context)
+        self._validate_provider_requests()
 
     @property
     def solver_input_sharding(self):
@@ -312,35 +364,21 @@ class DistributedLocalOperator:
         self._preflight_plan_agreement()
         self._preflight_capacity()
 
-    def _validate_source_arrays(self):
-        refs = {ref.key: ref for ref in self.plan.execution_plan.inputs}
-        for key, array in self.source_bindings.arrays.items():
-            ref = refs[key]
-            self.backend._validate_execution_array(array)
-            if tuple(array.shape) != ref.spec.shape:
-                raise ValueError("resident source shape does not match execution plan")
-            if np.dtype(array.dtype).name != ref.spec.dtype:
-                raise ValueError("resident source dtype does not match execution plan")
-
-    def _validate_resident_views(self):
-        validator = getattr(self.provider, "validate_resident", None)
-        if validator is None:
-            raise NotImplementedError(
-                "Stage 4 operand providers must support deterministic resident preflight"
-            )
+    def _validate_provider_requests(self):
         for source_rank in range(self.plan.world_size):
             block = self.plan.block_plan(self.context.rank, source_rank)
-            validator(
-                OperandRequest(
-                    execution_plan=block.execution_plan,
-                    source_bindings=self.source_bindings,
-                    distributed_plan=self.plan,
-                    context=self.context,
-                    source_rank=source_rank,
-                    broadcast_variable=None,
-                    operand_slices=block.operand_slices,
-                )
+            request = OperandRequest(
+                execution_plan=block.execution_plan,
+                source_bindings=self.source_bindings,
+                distributed_plan=self.plan,
+                context=self.context,
+                source_rank=source_rank,
+                broadcast_variable=None,
+                operand_slices=block.operand_slices,
+                residency_request=self.residency_request,
+                residency_plan=self.residency_plan,
             )
+            self.provider.validate_request(request, self.residency_plan)
 
     def _local_vector_error(self, local_vector):
         try:
@@ -384,9 +422,7 @@ class DistributedLocalOperator:
             return local_code
         status = _control_array(self.collective, [local_code], np.int32)
         synchronized = self.collective.allreduce(status, op="max")
-        self._increment_counter(
-            "allreduce_calls", mirror=mirror_counters
-        )
+        self._increment_counter("allreduce_calls", mirror=mirror_counters)
         return _array_scalar(synchronized)
 
     def _preflight_setup(self):
@@ -420,37 +456,136 @@ class DistributedLocalOperator:
         if self._plan_preflight_complete or self.context.world_size == 1:
             self._plan_preflight_complete = True
             return
+        policy = getattr(self.provider, "residency_policy", None)
+        local_policy = _control_array(
+            self.collective,
+            [
+                int(policy == "active_working_set"),
+                int(self.residency_plan is not None),
+            ],
+            np.int32,
+        )
+        policy_minimum = self.collective.allreduce(local_policy, op="min")
+        policy_maximum = self.collective.allreduce(local_policy, op="max")
+        self._increment_counter("allreduce_calls", amount=2)
+        policy_minimum_values = _array_to_numpy(policy_minimum)
+        policy_maximum_values = _array_to_numpy(policy_maximum)
+        if policy_minimum_values[0] != policy_maximum_values[0]:
+            raise ValueError("distributed residency policy disagreement")
+        if policy_minimum_values[1] != policy_maximum_values[1]:
+            raise ValueError("distributed residency plan presence disagreement")
+
         chunks = [
             int(self.plan.placement_hash[index : index + 16], 16)
             for index in range(0, 64, 16)
         ]
+        if self.residency_plan is not None:
+            chunks.extend(
+                int(self.residency_plan.plan_hash[index : index + 16], 16)
+                for index in range(0, 64, 16)
+            )
         local_hash = _control_array(self.collective, chunks, np.uint64)
         minimum = self.collective.allreduce(local_hash, op="min")
         maximum = self.collective.allreduce(local_hash, op="max")
         self._increment_counter("allreduce_calls", amount=2)
         local_values = _array_to_numpy(local_hash)
+        minimum_values = _array_to_numpy(minimum)
+        maximum_values = _array_to_numpy(maximum)
         if not (
-            np.array_equal(_array_to_numpy(minimum), local_values)
-            and np.array_equal(_array_to_numpy(maximum), local_values)
+            np.array_equal(minimum_values[:4], local_values[:4])
+            and np.array_equal(maximum_values[:4], local_values[:4])
         ):
             raise ValueError("distributed placement hash disagreement")
+        if self.residency_plan is not None and not (
+            np.array_equal(minimum_values[4:], local_values[4:])
+            and np.array_equal(maximum_values[4:], local_values[4:])
+        ):
+            raise ValueError("distributed residency hash disagreement")
+        if self.residency_plan is not None:
+            del (
+                local_policy,
+                policy_minimum,
+                policy_maximum,
+                policy_minimum_values,
+                policy_maximum_values,
+                local_hash,
+                minimum,
+                maximum,
+                local_values,
+                minimum_values,
+                maximum_values,
+            )
+            requirements = (
+                *self.residency_plan.device_peak_bytes,
+                *self.residency_plan.host_peak_bytes,
+                self.residency_plan.host_required_bytes,
+            )
+            budgets = (
+                self.residency_plan.device_budget.resolved_bytes,
+                self.residency_plan.host_budget.resolved_bytes,
+            )
+            control = _control_array(
+                self.collective, (*requirements, *budgets), np.int64
+            )
+            minimum = self.collective.allreduce(control, op="min")
+            maximum = self.collective.allreduce(control, op="max")
+            self._increment_counter("allreduce_calls", amount=2)
+            local_values = _array_to_numpy(control)
+            minimum_values = _array_to_numpy(minimum)
+            maximum_values = _array_to_numpy(maximum)
+            requirement_count = len(requirements)
+            if not (
+                np.array_equal(
+                    minimum_values[:requirement_count],
+                    local_values[:requirement_count],
+                )
+                and np.array_equal(
+                    maximum_values[:requirement_count],
+                    local_values[:requirement_count],
+                )
+            ):
+                raise ValueError("distributed residency requirement disagreement")
+            if not (
+                np.array_equal(
+                    minimum_values[requirement_count:],
+                    local_values[requirement_count:],
+                )
+                and np.array_equal(
+                    maximum_values[requirement_count:],
+                    local_values[requirement_count:],
+                )
+            ):
+                raise ValueError("distributed residency budget disagreement")
         self._plan_preflight_complete = True
 
     def _preflight_capacity(self):
         if self._capacity_preflight_complete:
             return
-        estimate = self.plan.memory_estimates[self.context.rank]
         local_code = 0
-        if (
-            self.device_memory_budget_bytes is not None
-            and estimate.device_bytes > self.device_memory_budget_bytes
-        ):
-            local_code = 1
-        elif (
-            self.host_memory_budget_bytes is not None
-            and estimate.host_bytes > self.host_memory_budget_bytes
-        ):
-            local_code = 2
+        if self.residency_plan is not None:
+            if (
+                self.residency_plan.backend_name == "cupy"
+                and self.residency_plan.device_peak_bytes[self.context.rank]
+                > self.residency_plan.device_budget.resolved_bytes
+            ):
+                local_code = 1
+            elif (
+                self.residency_plan.host_required_bytes
+                > self.residency_plan.host_budget.resolved_bytes
+            ):
+                local_code = 2
+        else:
+            estimate = self.plan.memory_estimates[self.context.rank]
+            if (
+                self.device_memory_budget_bytes is not None
+                and estimate.device_bytes > self.device_memory_budget_bytes
+            ):
+                local_code = 1
+            elif (
+                self.host_memory_budget_bytes is not None
+                and estimate.host_bytes > self.host_memory_budget_bytes
+            ):
+                local_code = 2
         if self._allreduce_status(local_code):
             raise ValueError("distributed capacity preflight failed")
         self._capacity_preflight_complete = True
@@ -530,12 +665,8 @@ class DistributedLocalOperator:
                     dtype=np.dtype(self.plan.execution_plan.output.spec.dtype),
                     order="C",
                 )
-                execution_status = self.backend.empty(
-                    (1,), dtype=np.int32, order="C"
-                )
-                host_execution_status = np.empty(
-                    (1,), dtype=np.int32, order="C"
-                )
+                execution_status = self.backend.empty((1,), dtype=np.int32, order="C")
+                host_execution_status = np.empty((1,), dtype=np.int32, order="C")
             output_accumulator.fill(0)
             for source_rank in range(self.plan.world_size):
                 block = self.plan.block_plan(self.context.rank, source_rank)
@@ -554,6 +685,8 @@ class DistributedLocalOperator:
                     source_rank=source_rank,
                     broadcast_variable=broadcast_variable,
                     operand_slices=block.operand_slices,
+                    residency_request=self.residency_request,
+                    residency_plan=self.residency_plan,
                 )
                 leases.append(stack.enter_context(self.provider.acquire(request)))
         except BaseException as error:
@@ -573,7 +706,9 @@ class DistributedLocalOperator:
             stack.close()
             self._discard_execution_resources()
             if local_error is not None:
-                raise ValueError("distributed resource preflight failed") from local_error
+                raise ValueError(
+                    "distributed resource preflight failed"
+                ) from local_error
             raise ValueError("distributed resource preflight failed")
         self._receive_storage = receive_storage
         self._output_accumulator = output_accumulator

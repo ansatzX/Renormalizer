@@ -8,7 +8,10 @@ from types import MappingProxyType
 
 import numpy as np
 
-from renormalizer.backend._execution.model import ExecutionBindings
+from renormalizer.backend._execution.model import (
+    ExecutionBindings,
+    bind_local_hv_execution_contract,
+)
 from renormalizer.backend._execution.planner import (
     _resolve_einsum_path,
     lower_einsum_path,
@@ -108,9 +111,7 @@ def _unsupported_variant(dtype, layouts, variants):
     )
     return UnsupportedRuntimeDtypeError(
         "execution IR runtime result dtype {!r} with layouts {!r} has no "
-        "configured variant; available variants: {}".format(
-            dtype, layouts, available
-        )
+        "configured variant; available variants: {}".format(dtype, layouts, available)
     )
 
 
@@ -123,6 +124,7 @@ def _build_ir_expression(
     center_kind,
     optimize,
     lowerer,
+    local_hv_contract=False,
 ):
     selected = backend.current
     if not selected.supports_execution_ir:
@@ -138,10 +140,7 @@ def _build_ir_expression(
     ):
         raise NotImplementedError("execution IR received invalid constant operands")
     constant_set = set(constant_indices)
-    raw_constants = {
-        index: operand_specs[index]
-        for index in constant_indices
-    }
+    raw_constants = {index: operand_specs[index] for index in constant_indices}
     if not raw_constants:
         raise NotImplementedError(
             "experimental execution IR requires at least one constant operand to fix dtype"
@@ -151,15 +150,19 @@ def _build_ir_expression(
         for value in raw_constants.values()
     ):
         raise NotImplementedError("execution IR constants must be backend arrays")
-    raw_constant_dtypes = tuple(
-        value.dtype for value in raw_constants.values()
-    )
+    raw_constant_dtypes = tuple(value.dtype for value in raw_constants.values())
     variable_shapes = {}
     variable_indices = []
     for index, spec in enumerate(operand_specs):
         if index not in constant_set:
             variable_shapes[index] = _normalize_shape(spec, index)
             variable_indices.append(index)
+    if type(local_hv_contract) is not bool:
+        raise TypeError("local_hv_contract must be a boolean")
+    if local_hv_contract and len(variable_indices) != 1:
+        raise NotImplementedError(
+            "local H-v execution contracts require exactly one variable operand"
+        )
 
     candidate_variable_dtypes = (
         _SUPPORTED_DTYPES
@@ -198,9 +201,7 @@ def _build_ir_expression(
         for index in range(len(operand_specs))
     )
     try:
-        path_metadata = _resolve_einsum_path(
-            equation, shapes, optimize=optimize
-        )
+        path_metadata = _resolve_einsum_path(equation, shapes, optimize=optimize)
     except (TypeError, ValueError) as error:
         raise NotImplementedError(
             "execution IR could not resolve the opt_einsum path: {}".format(error)
@@ -235,10 +236,16 @@ def _build_ir_expression(
                 )
             except (TypeError, ValueError) as error:
                 raise NotImplementedError(
-                    "execution IR could not lower the opt_einsum path: {}".format(
-                        error
-                    )
+                    "execution IR could not lower the opt_einsum path: {}".format(error)
                 ) from error
+            if local_hv_contract:
+                plan = bind_local_hv_execution_contract(
+                    plan,
+                    network=network,
+                    center_kind=center_kind,
+                    equation=equation,
+                    variable_index=variable_indices[0],
+                )
             variants[(dtype, variable_layouts)] = plan
 
     constant_cache = {}
@@ -316,10 +323,7 @@ def _build_ir_expression(
         for index, value in prepared_variables:
             ordered[index] = value
         bindings = ExecutionBindings(
-            {
-                ref.key: value
-                for ref, value in zip(plan.inputs, ordered)
-            }
+            {ref.key: value for ref, value in zip(plan.inputs, ordered)}
         )
         return plan, tuple(ordered), bindings, tuple(prepared_variables)
 
@@ -368,17 +372,14 @@ def _build_ir_expression(
             network=network,
             center_kind=center_kind,
             input_shapes=tuple(
-                tuple(int(dimension) for dimension in value.shape)
-                for value in ordered
+                tuple(int(dimension) for dimension in value.shape) for value in ordered
             ),
             output_shape=tuple(int(dimension) for dimension in result.shape),
             requested_policy="execution_ir",
             actual_policy="execution_ir",
             planner_source=plan.planner_source,
             oe_path_hash=oe_path_identity(plan.oe_path),
-            actual_steps=tuple(
-                _STEP_NAMES[type(step).__name__] for step in plan.steps
-            ),
+            actual_steps=tuple(_STEP_NAMES[type(step).__name__] for step in plan.steps),
             wall_s=wall_s,
             path_override_reason=plan.override_reason,
             fallback_reason=None,
