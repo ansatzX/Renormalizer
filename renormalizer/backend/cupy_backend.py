@@ -101,16 +101,19 @@ class CupyBackend(AbstractBackend):
         return self._on_device(self._cupy.transpose, value, axes=axes)
 
     def matmul(self, a, b, *, stream=None, workspace=None):
+        self._require_execution_usable()
         with self._execution_context(stream):
             return self._cupy.matmul(a, b)
 
     def batched_matmul(self, a, b, *, stream=None, workspace=None):
+        self._require_execution_usable()
         with self._execution_context(stream):
             return self._cupy.matmul(a, b)
 
     def grouped_gemm(
         self, descriptors, tensors, *, stream=None, workspace=None, policy="direct"
     ):
+        self._require_execution_usable()
         from renormalizer.backend._gemm.executor import execute_grouped_gemm
 
         return execute_grouped_gemm(
@@ -132,6 +135,7 @@ class CupyBackend(AbstractBackend):
 
     @contextmanager
     def _execution_context(self, stream):
+        self._require_execution_usable()
         self._validate_execution_stream(stream)
         with self._cupy.cuda.Device(self._device_index):
             if stream is None:
@@ -140,11 +144,33 @@ class CupyBackend(AbstractBackend):
                 with stream:
                     yield
 
+    def _synchronize_execution_stream(self, stream):
+        self._validate_execution_stream(stream)
+        with self._cupy.cuda.Device(self._device_index):
+            selected = (
+                self._cupy.cuda.get_current_stream() if stream is None else stream
+            )
+            selected.synchronize()
+
+    def _is_exact_execution_destination(self, expected, result):
+        if (
+            expected.shape != result.shape
+            or expected.dtype != result.dtype
+            or expected.strides != result.strides
+            or expected.data.mem is not result.data.mem
+        ):
+            return False
+        if expected.size == 0:
+            return True
+        return expected.data.ptr == result.data.ptr
+
     def _validate_execution_array(self, value):
         if not isinstance(value, self._cupy.ndarray):
             raise TypeError("CuPy execution binding must be a CuPy device array")
         if value.device.id != self._device_index:
-            raise ValueError("CuPy execution binding is not on the selected CUDA device")
+            raise ValueError(
+                "CuPy execution binding is not on the selected CUDA device"
+            )
 
     def _is_exact_execution_reshape(self, left, right):
         if (

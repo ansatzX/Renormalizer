@@ -3,15 +3,17 @@
 
 """Explicit lifecycle for launcher-configured CuPy distributed execution."""
 
-from contextlib import contextmanager
-from dataclasses import dataclass, field
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
 import os
+import uuid
 
 import numpy as np
 
+from renormalizer.backend._distributed.async_owner import RuntimeTerminalQuarantine
 from renormalizer.backend._distributed.context import (
     DistributedContext,
     DistributedRendezvous,
@@ -21,7 +23,13 @@ from renormalizer.backend._distributed.center import (
 )
 from renormalizer.backend._distributed.mesh import DeviceMesh
 from renormalizer.backend._distributed.providers import DeviceResidentProvider
-from renormalizer.backend._distributed.residency import MemoryBudgetResolution
+from renormalizer.backend._distributed.residency import (
+    MemoryBudgetResolution,
+    ResidencyPlan,
+    ResidencyPreflightReceipt,
+    ResidencyRequest,
+    budget_resolution_hash,
+)
 from renormalizer.backend.config import BackendConfig, DistributedExecutionConfig
 from renormalizer.backend.factory import create_backend
 
@@ -63,6 +71,15 @@ class CupyDistributedRuntime:
     _closed: bool = False
     _auto_device_budget: object = field(default=None, init=False, repr=False)
     _auto_host_budget: object = field(default=None, init=False, repr=False)
+    _runtime_id: str = field(
+        default_factory=lambda: uuid.uuid4().hex, init=False, repr=False
+    )
+    _issued_receipts: dict = field(default_factory=dict, init=False, repr=False)
+    _active_provider: object = field(default=None, init=False, repr=False)
+    _terminal_quarantine: RuntimeTerminalQuarantine = field(
+        default_factory=RuntimeTerminalQuarantine, init=False, repr=False
+    )
+    _terminal_error: object = field(default=None, init=False, repr=False)
 
     @property
     def rank(self):
@@ -76,7 +93,101 @@ class CupyDistributedRuntime:
     def world_size(self):
         return self.context.world_size
 
+    @property
+    def terminal_poisoned(self):
+        return self._terminal_error is not None
+
+    def _require_usable(self):
+        if self._closed:
+            raise RuntimeError("distributed runtime is closed")
+        backend_error = getattr(self.backend, "_execution_terminal_error", None)
+        if self._terminal_error is None and backend_error is not None:
+            self._terminal_error = backend_error
+        if self._terminal_error is not None:
+            raise RuntimeError(
+                "distributed runtime is terminal-poisoned"
+            ) from self._terminal_error
+
+    def _accept_async_quarantine(self, owner, primary=None):
+        error = owner.error if primary is None else primary
+        self._terminal_quarantine.retain(owner, error)
+        if self._terminal_error is None:
+            self._terminal_error = error
+        backend = self.backend
+        if getattr(backend, "_execution_terminal_error", None) is None:
+            backend._execution_terminal_error = error
+
+    def _arm_communicator_fatal(self):
+        install = getattr(self.collective, "_install_fatal_handler", None)
+        if not callable(install):
+            raise RuntimeError("collective does not provide fatal observation")
+        install(self._enter_communicator_fatal)
+
+    @contextmanager
+    def _communicator_fatal_reservation(self, primary):
+        if not isinstance(primary, BaseException):
+            raise TypeError("communicator fatal failure must be an exception")
+        reserve = getattr(self.collective, "_communicator_fatal_reservation", None)
+        boundary = reserve(primary) if callable(reserve) else nullcontext(None)
+        with boundary as reservation:
+            if reservation is not None:
+                primary = reservation.primary
+            yield primary, reservation
+
+    def _enter_communicator_fatal(self, primary, owner=None):
+        if not isinstance(primary, BaseException):
+            raise TypeError("communicator fatal failure must be an exception")
+        provider = self._active_provider
+        lease = None if provider is None else provider._active_lease
+        if owner is None and lease is not None:
+            owner = lease._active_operator_owner
+            if owner is None:
+                status_workspace = lease._status_workspace
+                if status_workspace is not None:
+                    owner = status_workspace.borrower
+        call = None if owner is None else getattr(owner, "_operator_call", None)
+        if self._terminal_error is not None:
+            primary = self._terminal_error
+        elif call is not None and call.primary_error is not None:
+            primary = call.primary_error
+        try:
+            with self._communicator_fatal_reservation(primary) as (
+                primary,
+                reservation,
+            ):
+                if reservation is not None and not reservation.started:
+                    return primary
+                if self._terminal_error is None:
+                    self._terminal_error = primary
+                primary = self._terminal_error
+                if owner is not None:
+                    if owner.state not in {"detached", "quarantined"}:
+                        owner.force_quarantine(primary)
+                    if owner.state == "quarantined":
+                        self._terminal_quarantine.retain(owner, primary)
+                self._terminal_quarantine.retain_error(primary)
+                if provider is not None:
+                    if provider._terminal_error is None:
+                        provider._terminal_error = primary
+                    if lease is not None and lease._poisoned_error is None:
+                        lease._poisoned_error = primary
+                backend = self.backend
+                if getattr(backend, "_execution_terminal_error", None) is None:
+                    backend._execution_terminal_error = primary
+                publish = getattr(self.collective, "_publish_communicator_fatal", None)
+                if not callable(publish):
+                    raise RuntimeError("collective does not provide fatal publication")
+                publish(primary)
+        except BaseException as error:
+            if owner is not None:
+                owner._remember_secondary(error)
+            if error is not primary:
+                raise primary
+            raise
+        return primary
+
     def barrier(self):
+        self._require_usable()
         return self.collective.barrier()
 
     def execution_config(
@@ -87,28 +198,308 @@ class CupyDistributedRuntime:
         host_memory_budget_bytes=None,
         prefetch_depth=1,
     ):
-        if self._closed:
-            raise RuntimeError("distributed runtime is closed")
+        self._require_usable()
         backend_metadata = self._synchronize_active_backend()
-        device_resolution = self._resolve_budget(
-            "device", device_memory_budget_bytes
-        )
+        device_resolution = self._resolve_budget("device", device_memory_budget_bytes)
         host_resolution = self._resolve_budget("host", host_memory_budget_bytes)
+        if residency_policy == "active_working_set":
+            config = getattr(self.backend, "config", None)
+            if (
+                getattr(config, "execution_policy", None) != "execution_ir"
+                or getattr(config, "fallback_policy", None) != "error"
+            ):
+                raise ValueError(
+                    "active_working_set requires execution_ir with fallback_policy='error'"
+                )
+            from renormalizer.backend._distributed.providers import (
+                ActiveWorkingSetProvider,
+            )
+
+            if self._active_provider is None:
+                self._active_provider = ActiveWorkingSetProvider(
+                    self,
+                    device_budget_resolution=device_resolution,
+                    host_budget_resolution=host_resolution,
+                    prefetch_depth=prefetch_depth,
+                )
+            elif not self._active_provider.matches_config(
+                device_resolution, host_resolution, prefetch_depth
+            ):
+                raise ValueError(
+                    "active provider already has different frozen budget metadata"
+                )
+            provider = self._active_provider
+        else:
+            provider = DeviceResidentProvider()
         return DistributedExecutionConfig(
             context=self.context,
             mesh=self.mesh,
             collective=self.collective,
-            provider=DeviceResidentProvider(),
+            provider=provider,
             residency_policy=residency_policy,
             device_memory_budget_bytes=device_memory_budget_bytes,
             host_memory_budget_bytes=host_memory_budget_bytes,
             prefetch_depth=prefetch_depth,
             backend_name=backend_metadata[0] if backend_metadata is not None else None,
-            backend_device=backend_metadata[1] if backend_metadata is not None else None,
-            backend_precision=backend_metadata[2] if backend_metadata is not None else None,
+            backend_device=backend_metadata[1]
+            if backend_metadata is not None
+            else None,
+            backend_precision=backend_metadata[2]
+            if backend_metadata is not None
+            else None,
             device_budget_resolution=device_resolution,
             host_budget_resolution=host_resolution,
         )
+
+    def preflight_residency(self, request, plan):
+        """Run the fixed Stage 5 agreement schedule without creating resources."""
+        self._require_usable()
+        local_error = None
+        try:
+            if not isinstance(request, ResidencyRequest):
+                raise TypeError("request must be a ResidencyRequest")
+            if not isinstance(plan, ResidencyPlan):
+                raise TypeError("plan must be a ResidencyPlan")
+            plan.validate_request(request)
+            plan.validate_capacity()
+            plan.runtime_identity.validate_runtime(
+                self.context, self.mesh, self.backend
+            )
+            config = getattr(self.backend, "config", None)
+            if (
+                getattr(config, "execution_policy", None) != "execution_ir"
+                or getattr(config, "fallback_policy", None) != "error"
+            ):
+                raise ValueError(
+                    "active_working_set requires execution_ir with fallback_policy='error'"
+                )
+            if (
+                self._active_provider is not None
+                and not self._active_provider.matches_config(
+                    request.device_budget,
+                    request.host_budget,
+                    request.prefetch_depth,
+                )
+            ):
+                raise ValueError("residency request budgets do not match the runtime")
+        except BaseException as error:
+            local_error = error
+
+        world_size = self.world_size
+        if world_size == 1:
+            if local_error is not None:
+                raise ValueError(
+                    "active residency preflight validation failed"
+                ) from local_error
+            device_budget_hash = budget_resolution_hash(request.device_budget)
+            host_budget_hash = budget_resolution_hash(request.host_budget)
+            receipt = ResidencyPreflightReceipt.create(
+                runtime_id=self._runtime_id,
+                rank=self.rank,
+                local_device=str(self.backend.current_device()),
+                request_hash=request.request_hash,
+                plan_hash=plan.plan_hash,
+                device_budget_hash=device_budget_hash,
+                host_budget_hash=host_budget_hash,
+            )
+            self._issued_receipts.clear()
+            self._issued_receipts[id(receipt)] = receipt
+            return receipt
+
+        status = self._control_array([int(local_error is not None)], np.int32)
+        failed = int(
+            self._host_control(self.collective.allreduce(status, op="max")).reshape(-1)[
+                0
+            ]
+        )
+        del status
+
+        policy = self._control_array(
+            [
+                1,
+                int(
+                    getattr(
+                        getattr(self.backend, "config", None), "execution_policy", None
+                    )
+                    == "execution_ir"
+                ),
+                int(
+                    getattr(
+                        getattr(self.backend, "config", None), "fallback_policy", None
+                    )
+                    == "error"
+                ),
+                world_size,
+                self.context.local_world_size,
+            ],
+            np.int32,
+        )
+        policy_minimum = self._host_control(self.collective.allreduce(policy, op="min"))
+        policy_maximum = self._host_control(self.collective.allreduce(policy, op="max"))
+        policy_disagreement = not np.array_equal(policy_minimum, policy_maximum)
+        del policy, policy_minimum, policy_maximum
+
+        hashes = (
+            request.request_hash if isinstance(request, ResidencyRequest) else "0" * 64,
+            plan.plan_hash if isinstance(plan, ResidencyPlan) else "0" * 64,
+            (
+                budget_resolution_hash(request.device_budget)
+                if isinstance(request, ResidencyRequest)
+                else "0" * 64
+            ),
+            (
+                budget_resolution_hash(request.host_budget)
+                if isinstance(request, ResidencyRequest)
+                else "0" * 64
+            ),
+        )
+        hash_control = self._control_array(
+            [
+                int(value[index : index + 16], 16)
+                for value in hashes
+                for index in range(0, 64, 16)
+            ],
+            np.uint64,
+        )
+        hash_minimum = self._host_control(
+            self.collective.allreduce(hash_control, op="min")
+        )
+        hash_maximum = self._host_control(
+            self.collective.allreduce(hash_control, op="max")
+        )
+        local_hashes = self._host_control(hash_control).reshape(4, 4)
+        minimum_hashes = np.asarray(hash_minimum).reshape(4, 4)
+        maximum_hashes = np.asarray(hash_maximum).reshape(4, 4)
+        hash_disagreements = tuple(
+            not (
+                np.array_equal(minimum_hashes[index], local_hashes[index])
+                and np.array_equal(maximum_hashes[index], local_hashes[index])
+            )
+            for index in range(4)
+        )
+        del hash_control, hash_minimum, hash_maximum
+        del local_hashes, minimum_hashes, maximum_hashes
+
+        if isinstance(plan, ResidencyPlan):
+            requirement_values = (
+                *plan.device_peak_bytes,
+                *plan.host_peak_bytes,
+                plan.host_required_bytes,
+                plan.device_budget.resolved_bytes,
+                plan.host_budget.resolved_bytes,
+            )
+        else:
+            requirement_values = (0,) * (2 * world_size + 3)
+        requirements = self._control_array(requirement_values, np.int64)
+        requirement_minimum = self._host_control(
+            self.collective.allreduce(requirements, op="min")
+        )
+        requirement_maximum = self._host_control(
+            self.collective.allreduce(requirements, op="max")
+        )
+        local_requirements = self._host_control(requirements)
+        requirement_count = 2 * world_size + 1
+        requirement_disagreement = not (
+            np.array_equal(
+                np.asarray(requirement_minimum)[:requirement_count],
+                local_requirements[:requirement_count],
+            )
+            and np.array_equal(
+                np.asarray(requirement_maximum)[:requirement_count],
+                local_requirements[:requirement_count],
+            )
+        )
+        budget_disagreement = not (
+            np.array_equal(
+                np.asarray(requirement_minimum)[requirement_count:],
+                local_requirements[requirement_count:],
+            )
+            and np.array_equal(
+                np.asarray(requirement_maximum)[requirement_count:],
+                local_requirements[requirement_count:],
+            )
+        )
+        del requirements, requirement_minimum, requirement_maximum, local_requirements
+
+        capacity_code = 0
+        if isinstance(plan, ResidencyPlan):
+            if (
+                plan.backend_name == "cupy"
+                and plan.device_peak_bytes[self.rank]
+                > plan.device_budget.resolved_bytes
+            ):
+                capacity_code = 1
+            elif plan.host_required_bytes > plan.host_budget.resolved_bytes:
+                capacity_code = 2
+        capacity = self._control_array([capacity_code], np.int32)
+        capacity_failed = int(
+            self._host_control(self.collective.allreduce(capacity, op="max")).reshape(
+                -1
+            )[0]
+        )
+        del capacity
+
+        if policy_disagreement:
+            raise ValueError("active residency policy disagreement")
+        labels = ("request hash", "plan hash", "device budget", "host budget")
+        for index, label in enumerate(labels):
+            if hash_disagreements[index]:
+                raise ValueError("{} disagreement".format(label))
+        if requirement_disagreement:
+            raise ValueError("requirement disagreement")
+        if budget_disagreement:
+            raise ValueError("budget disagreement")
+        if failed:
+            raise ValueError(
+                "active residency preflight validation failed"
+            ) from local_error
+        if capacity_failed:
+            raise ValueError("active residency capacity preflight failed")
+
+        receipt = ResidencyPreflightReceipt.create(
+            runtime_id=self._runtime_id,
+            rank=self.rank,
+            local_device=str(self.backend.current_device()),
+            request_hash=request.request_hash,
+            plan_hash=plan.plan_hash,
+            device_budget_hash=hashes[2],
+            host_budget_hash=hashes[3],
+        )
+        self._issued_receipts.clear()
+        self._issued_receipts[id(receipt)] = receipt
+        return receipt
+
+    def consume_residency_receipt(self, receipt, request, plan):
+        self._require_usable()
+        if not isinstance(receipt, ResidencyPreflightReceipt):
+            raise TypeError("receipt must be a ResidencyPreflightReceipt")
+        issued = self._issued_receipts.pop(id(receipt), None)
+        if issued is not receipt:
+            raise ValueError(
+                "residency preflight receipt was not issued by this runtime"
+            )
+        expected = (
+            self._runtime_id,
+            self.rank,
+            str(self.backend.current_device()),
+            request.request_hash,
+            plan.plan_hash,
+            budget_resolution_hash(request.device_budget),
+            budget_resolution_hash(request.host_budget),
+        )
+        actual = (
+            receipt.runtime_id,
+            receipt.rank,
+            receipt.local_device,
+            receipt.request_hash,
+            receipt.plan_hash,
+            receipt.device_budget_hash,
+            receipt.host_budget_hash,
+        )
+        if actual != expected:
+            raise ValueError(
+                "residency preflight receipt does not match the runtime tuple"
+            )
 
     def _control_array(self, values, dtype):
         converter = getattr(self.backend, "asarray", None)
@@ -127,9 +518,7 @@ class CupyDistributedRuntime:
         local_error = None
         encoded = 0
         try:
-            if requested is not None and (
-                type(requested) is not int or requested <= 0
-            ):
+            if requested is not None and (type(requested) is not int or requested <= 0):
                 raise ValueError(
                     "{}_memory_budget_bytes must be a positive integer or None".format(
                         resource
@@ -150,9 +539,9 @@ class CupyDistributedRuntime:
             return
         status = self._control_array([int(local_error is not None)], np.int32)
         failed = int(
-            self._host_control(
-                self.collective.allreduce(status, op="max")
-            ).reshape(-1)[0]
+            self._host_control(self.collective.allreduce(status, op="max")).reshape(-1)[
+                0
+            ]
         )
         control = self._control_array([encoded], np.int64)
         minimum = self._host_control(
@@ -166,9 +555,7 @@ class CupyDistributedRuntime:
                 "{} memory budget request validation failed".format(resource)
             ) from local_error
         if int(minimum) != int(maximum):
-            raise RuntimeError(
-                "{} memory budget request disagreement".format(resource)
-            )
+            raise RuntimeError("{} memory budget request disagreement".format(resource))
 
     def _auto_available_snapshot(self, resource):
         cached_name = "_auto_{}_budget".format(resource)
@@ -195,9 +582,9 @@ class CupyDistributedRuntime:
         else:
             status = self._control_array([int(local_error is not None)], np.int32)
             failed = int(
-                self._host_control(
-                    self.collective.allreduce(status, op="max")
-                ).reshape(-1)[0]
+                self._host_control(self.collective.allreduce(status, op="max")).reshape(
+                    -1
+                )[0]
             )
         if failed:
             raise RuntimeError(
@@ -276,9 +663,7 @@ class CupyDistributedRuntime:
         except BaseException as error:
             local_error = error
 
-        status = self.backend.asarray(
-            [int(local_error is not None)], dtype=np.int32
-        )
+        status = self.backend.asarray([int(local_error is not None)], dtype=np.int32)
         failed = self.collective.allreduce(status, op="max")
         digest_payload = {
             "active": normalize_distributed_backend_metadata(
@@ -295,10 +680,7 @@ class CupyDistributedRuntime:
         ).encode("ascii")
         hexdigest = hashlib.sha256(encoded).hexdigest()
         words = np.asarray(
-            [
-                int(hexdigest[index : index + 16], 16)
-                for index in range(0, 64, 16)
-            ],
+            [int(hexdigest[index : index + 16], 16) for index in range(0, 64, 16)],
             dtype=np.uint64,
         )
         control = self.backend.asarray(words, dtype=np.uint64)
@@ -322,16 +704,67 @@ class CupyDistributedRuntime:
     def close(self):
         if self._closed:
             return
-        self.collective.close()
-        self._closed = True
+        error = self._terminal_error
+        if error is None:
+            error = getattr(self.backend, "_execution_terminal_error", None)
+        provider = self._active_provider
+        collective = self.collective
+        if provider is not None:
+            try:
+                provider.close()
+            except BaseException as caught:
+                if error is None:
+                    error = caught
+        try:
+            if collective is not None:
+                collective.close()
+        except BaseException as caught:
+            if error is None:
+                error = caught
+        finally:
+            if self._terminal_error is not None:
+                error = self._terminal_error
+            self._issued_receipts.clear()
+            self._active_provider = None
+            self.collective = None
+            self._closed = True
+            if self._terminal_error is None:
+                self._terminal_error = error
+        if error is not None:
+            raise error
+
+    def resource_state(self):
+        if self._active_provider is None:
+            state = {
+                "active_leases": 0,
+                "cache_bytes": 0,
+                "cache_refs": 0,
+                "pinned_bytes": 0,
+                "stream_count": 0,
+                "event_count": 0,
+            }
+        else:
+            state = self._active_provider.runtime_resource_state()
+        if self._terminal_quarantine.poisoned:
+            retained = self._terminal_quarantine.retained_resource_state()
+            for key in ("cache_bytes", "pinned_bytes", "stream_count", "event_count"):
+                state[key] = max(state[key], retained[key])
+            state.update(self._terminal_quarantine.resource_state())
+        return state
 
     def __enter__(self):
-        if self._closed:
-            raise RuntimeError("distributed runtime is closed")
+        self._require_usable()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        if exc_value is None:
+            self.close()
+        else:
+            try:
+                self.close()
+            except BaseException:
+                pass
+        return False
 
 
 def _validate_expected_world_size(expected_world_size, actual_world_size):
@@ -350,6 +783,9 @@ def _validate_expected_world_size(expected_world_size, actual_world_size):
 def create_cupy_distributed_runtime(
     *,
     precision=64,
+    execution_policy="legacy_oe",
+    fallback_policy="error",
+    experimental_oe_ir=False,
     expected_world_size=None,
     mesh_shape=None,
     axis_names=None,
@@ -371,7 +807,11 @@ def create_cupy_distributed_runtime(
     backend = create_backend(
         "cupy",
         config=BackendConfig(
-            device="cuda:{}".format(context.local_rank), precision=precision
+            device="cuda:{}".format(context.local_rank),
+            precision=precision,
+            execution_policy=execution_policy,
+            fallback_policy=fallback_policy,
+            experimental_oe_ir=experimental_oe_ir,
         ),
     )
     collective = backend.create_collective(
@@ -391,5 +831,47 @@ def cupy_distributed_runtime(**kwargs):
     runtime = create_cupy_distributed_runtime(**kwargs)
     try:
         yield runtime
-    finally:
+    except BaseException:
+        try:
+            runtime.close()
+        except BaseException:
+            pass
+        raise
+    else:
         runtime.close()
+
+
+@contextmanager
+def active_working_set_execution(distributed_execution, request, plan, store):
+    """Borrow an active config with one receipt-bound outer working-set lease."""
+    if not isinstance(distributed_execution, DistributedExecutionConfig):
+        raise TypeError("distributed_execution must be a DistributedExecutionConfig")
+    if distributed_execution.residency_policy != "active_working_set":
+        raise ValueError(
+            "active working-set execution requires active residency policy"
+        )
+    factory = distributed_execution.provider
+    if getattr(factory, "provider_role", None) != "factory":
+        raise ValueError("active working-set execution requires a factory provider")
+    runtime = getattr(factory, "runtime", None)
+    if runtime is None or runtime._closed:
+        raise RuntimeError("active provider runtime is unavailable")
+    runtime._require_usable()
+    receipt = runtime.preflight_residency(request, plan)
+    working_set = factory.open_working_set(request, plan, store, receipt)
+    try:
+        yield replace(
+            distributed_execution,
+            provider=working_set,
+            residency_request=request,
+            residency_plan=plan,
+            residency_receipt=receipt,
+        )
+    except BaseException:
+        try:
+            working_set.close()
+        except BaseException:
+            pass
+        raise
+    else:
+        working_set.close()

@@ -1386,6 +1386,13 @@ def validate_distributed_backend(distributed_execution, selected, *, network):
             )
         if not selected.supports_execution_ir:
             raise NotImplementedError("distributed execution requires execution IR")
+        if distributed_execution.residency_policy == "active_working_set" and (
+            selected.config.execution_policy != "execution_ir"
+            or selected.config.fallback_policy != "error"
+        ):
+            raise ValueError(
+                "active_working_set requires execution_ir with fallback_policy='error'"
+            )
         if expected[0] is not None and actual != expected:
             raise ValueError(
                 "active backend name/device/precision does not match runtime"
@@ -2119,6 +2126,9 @@ def build_mapped_local_operator(
             host_memory_budget_bytes=_resolved_execution_budget(
                 distributed_execution, "host"
             ),
+            residency_request=distributed_execution.residency_request,
+            residency_plan=distributed_execution.residency_plan,
+            residency_receipt=distributed_execution.residency_receipt,
         )
         return (
             MappedDistributedLocalOperator(local_operator, vector_map),

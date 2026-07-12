@@ -400,14 +400,14 @@ def test_cupy_exact_reshape_identity_accepts_empty_view(
     cp = cupy_backend._cupy
     arrays = {"left": np.empty((2, 0)), "right": np.empty((0, 3))}
     plan, bindings, _ = _device_plan(cupy_backend, "ab,bc->ac", arrays)
-    original_matmul = cupy_backend.matmul
+    original_matmul = cupy_backend._execution_matmul_into
     matmul_calls = []
 
-    def recording_matmul(a, b, *, stream=None, workspace=None):
+    def recording_matmul(a, b, destination, *, workspace=None):
         matmul_calls.append((a, b))
-        return original_matmul(a, b, stream=stream, workspace=workspace)
+        return original_matmul(a, b, destination, workspace=workspace)
 
-    monkeypatch.setattr(cupy_backend, "matmul", recording_matmul)
+    monkeypatch.setattr(cupy_backend, "_execution_matmul_into", recording_matmul)
 
     actual = execute_plan(cupy_backend, plan, bindings)
 
@@ -594,13 +594,13 @@ def test_cupy_grouped_ir_executes_on_selected_stream_without_sync(
     )
     stream = cp.cuda.Stream(non_blocking=True)
     observed = []
-    original_batched = cupy_backend.batched_matmul
+    original_batched = cupy_backend._execution_batched_matmul_into
 
-    def batched(a, b, *, stream=None, workspace=None):
+    def batched(a, b, destination, *, workspace=None):
         observed.append((cp.cuda.runtime.getDevice(), cp.cuda.get_current_stream().ptr))
-        return original_batched(a, b, stream=stream, workspace=workspace)
+        return original_batched(a, b, destination, workspace=workspace)
 
-    monkeypatch.setattr(cupy_backend, "batched_matmul", batched)
+    monkeypatch.setattr(cupy_backend, "_execution_batched_matmul_into", batched)
     monkeypatch.setattr(cupy_backend, "sync", lambda: pytest.fail("IR synchronized"))
 
     actual = execute_plan(cupy_backend, plan, bindings, stream=stream)

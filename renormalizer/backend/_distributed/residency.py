@@ -17,6 +17,7 @@ from renormalizer.backend._distributed.solvers import (
     canonical_solver_memory_profile,
     krylov_coefficient_payload,
 )
+from renormalizer.backend._distributed.transfer import TransferProfile
 
 
 _NUMERIC_DTYPE_KINDS = frozenset({"b", "i", "u", "f", "c"})
@@ -223,6 +224,8 @@ class HostTensorStore:
         self._entries = {}
         self._generations = {}
         self._current_bytes = 0
+        self._namespace_revision = 0
+        self._reservations = {}
         self._closed = False
         self._lock = threading.RLock()
 
@@ -252,8 +255,19 @@ class HostTensorStore:
     def snapshot(self):
         with self._lock:
             self._require_open()
-            refs = tuple(self._entries[key].ref for key in sorted(self._entries))
-            return HostTensorStoreSnapshot(self._store_id, refs)
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self):
+        refs = tuple(self._entries[key].ref for key in sorted(self._entries))
+        return HostTensorStoreSnapshot(
+            self._store_id,
+            refs,
+            namespace_revision=self._namespace_revision,
+        )
+
+    def _require_unreserved_namespace(self):
+        if self._reservations:
+            raise HostTensorError("host tensor store is reserved by an active lease")
 
     def _require_open(self):
         if self._closed:
@@ -286,6 +300,7 @@ class HostTensorStore:
         _validate_key(key)
         with self._lock:
             self._require_open()
+            self._require_unreserved_namespace()
             if key in self._entries:
                 raise KeyError("host tensor key already exists: {!r}".format(key))
             metadata = _canonical_array_metadata(value)
@@ -297,6 +312,7 @@ class HostTensorStore:
             self._current_bytes = _checked_memory_sum(
                 (self._current_bytes, ref.nbytes), "host tensor store bytes"
             )
+            self._namespace_revision += 1
             return ref
 
     def ref(self, key):
@@ -338,6 +354,91 @@ class HostTensorStore:
                 snapshot = snapshot.copy(order="C")
             return snapshot
 
+    def copy_into(self, ref, destination, local_slice=None):
+        """Copy one exact retained value directly into caller-owned host storage."""
+        if type(destination) is not np.ndarray:
+            raise TypeError("destination must be a NumPy ndarray")
+        with self._lock:
+            self._require_open()
+            entry = self._validated_entry(ref)
+            canonical_slice = _canonical_read_slice(local_slice, entry.ref.shape)
+            source = (
+                entry.array if canonical_slice is None else entry.array[canonical_slice]
+            )
+            if tuple(destination.shape) != tuple(source.shape):
+                raise ValueError(
+                    "destination shape does not match the requested tensor"
+                )
+            if destination.dtype != source.dtype:
+                raise ValueError(
+                    "destination dtype does not match the requested tensor"
+                )
+            if int(destination.nbytes) != int(source.nbytes):
+                raise ValueError("destination nbytes do not match the requested tensor")
+            if not destination.flags.writeable:
+                raise ValueError("destination must be writable")
+            np.copyto(destination, source, casting="no")
+
+    def reserve(self, snapshot, *, dirty_ref):
+        if not isinstance(snapshot, HostTensorStoreSnapshot):
+            raise TypeError("snapshot must be a HostTensorStoreSnapshot")
+        if not isinstance(dirty_ref, HostTensorRef):
+            raise TypeError("dirty_ref must be a HostTensorRef")
+        with self._lock:
+            self._require_open()
+            self._require_unreserved_namespace()
+            if snapshot != self._snapshot_locked():
+                raise HostTensorError(
+                    "host tensor store does not match the complete snapshot"
+                )
+            self._validated_entry(dirty_ref)
+            if dirty_ref not in snapshot.refs:
+                raise HostTensorError(
+                    "authorized dirty ref is outside the complete snapshot"
+                )
+            reservation = _HostTensorReservation(self, snapshot, dirty_ref)
+            self._reservations[id(reservation)] = reservation
+            return reservation
+
+    def _release_reservation(self, reservation):
+        with self._lock:
+            self._reservations.pop(id(reservation), None)
+
+    def _commit_reservation(self, reservation, ref, value):
+        with self._lock:
+            self._require_open()
+            retained = self._reservations.get(id(reservation))
+            if retained is not reservation:
+                raise HostTensorError("host tensor reservation is closed")
+            if reservation._committed:
+                raise HostTensorError("host tensor reservation already committed")
+            if self._snapshot_locked() != reservation._snapshot:
+                raise HostTensorError(
+                    "host tensor store changed outside its complete snapshot"
+                )
+            if ref != reservation._dirty_ref:
+                raise HostTensorError(
+                    "host tensor ref is not owned by this reservation"
+                )
+            current = self._validated_entry(ref)
+            metadata = _canonical_array_metadata(value)
+            self._check_budget(self._current_bytes, metadata[2])
+            array = _canonical_copy(value, metadata)
+            updated = self._make_ref(
+                ref.key,
+                current.ref.version + 1,
+                current.ref.generation,
+                array,
+            )
+            self._entries[ref.key] = _HostTensorEntry(updated, array)
+            self._current_bytes = _checked_memory_sum(
+                (self._current_bytes - current.ref.nbytes, updated.nbytes),
+                "host tensor store bytes",
+            )
+            self._namespace_revision += 1
+            reservation._promote(updated, self._snapshot_locked())
+            return updated
+
     def validate(self, ref):
         """Validate identity and integrity metadata without copying tensor values."""
         with self._lock:
@@ -349,6 +450,7 @@ class HostTensorStore:
         _validate_expected_version(expected_version)
         with self._lock:
             self._require_open()
+            self._require_unreserved_namespace()
             try:
                 current = self._entries[key]
             except KeyError:
@@ -373,6 +475,7 @@ class HostTensorStore:
                 (self._current_bytes - current.ref.nbytes, ref.nbytes),
                 "host tensor store bytes",
             )
+            self._namespace_revision += 1
             return ref
 
     def remove(self, key, *, expected_version):
@@ -380,6 +483,7 @@ class HostTensorStore:
         _validate_expected_version(expected_version)
         with self._lock:
             self._require_open()
+            self._require_unreserved_namespace()
             try:
                 current = self._entries[key]
             except KeyError:
@@ -393,12 +497,15 @@ class HostTensorStore:
             del self._entries[key]
             self._current_bytes -= current.ref.nbytes
             self._generations[key] = current.ref.generation + 1
+            self._namespace_revision += 1
             return current.ref
 
     def close(self):
         with self._lock:
             if self._closed:
                 return
+            if self._reservations:
+                raise HostTensorError("host tensor store has active reservations")
             self._entries.clear()
             self._current_bytes = 0
             self._closed = True
@@ -409,7 +516,72 @@ class HostTensorStore:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        if exc_value is None:
+            self.close()
+        else:
+            try:
+                self.close()
+            except BaseException:
+                pass
+        return False
+
+
+class _HostTensorReservation:
+    def __init__(self, store, snapshot, dirty_ref):
+        self._store = store
+        self._snapshot = snapshot
+        self._dirty_ref = dirty_ref
+        self._committed = False
+        self._closed = False
+
+    @property
+    def refs(self):
+        if self._closed:
+            return ()
+        return self._snapshot.refs
+
+    @property
+    def snapshot(self):
+        if self._closed:
+            raise HostTensorError("host tensor reservation is closed")
+        return self._snapshot
+
+    def _promote(self, updated, snapshot):
+        self._dirty_ref = updated
+        self._snapshot = snapshot
+        self._committed = True
+
+    def commit(self, ref, value):
+        if self._closed:
+            raise HostTensorError("host tensor reservation is closed")
+        return self._store._commit_reservation(self, ref, value)
+
+    def close(self):
+        if self._closed:
+            return
+        store = self._store
+        try:
+            store._release_reservation(self)
+        finally:
+            self._store = None
+            self._snapshot = None
+            self._dirty_ref = None
+            self._closed = True
+
+    def __enter__(self):
+        if self._closed:
+            raise HostTensorError("host tensor reservation is closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_value is None:
+            self.close()
+        else:
+            try:
+                self.close()
+            except BaseException:
+                pass
+        return False
 
 
 def _require_sha256(value, name):
@@ -456,6 +628,7 @@ def _store_snapshot_payload(snapshot):
     return {
         "store_id": snapshot.store_id,
         "refs": [_ref_payload(ref) for ref in snapshot.refs],
+        "namespace_revision": snapshot.namespace_revision,
         "current_bytes": snapshot.current_bytes,
     }
 
@@ -500,11 +673,14 @@ def _metadata_nbytes(shape, dtype, name):
 class HostTensorStoreSnapshot:
     store_id: str
     refs: tuple[HostTensorRef, ...]
+    namespace_revision: int = 0
     current_bytes: int = field(init=False)
 
     def __post_init__(self):
         if not isinstance(self.store_id, str) or not self.store_id:
             raise ValueError("snapshot store_id must be a non-empty string")
+        if type(self.namespace_revision) is not int or self.namespace_revision < 0:
+            raise ValueError("snapshot namespace_revision must be non-negative")
         try:
             refs = tuple(self.refs)
         except TypeError as error:
@@ -607,6 +783,81 @@ class MemoryBudgetResolution:
                         self.resource
                     )
                 )
+
+
+def budget_resolution_hash(value):
+    value = _bound_budget_resolution(value, value.resource)
+    return _sha256(_budget_payload(value))
+
+
+@dataclass(frozen=True)
+class ResidencyPreflightReceipt:
+    runtime_id: str
+    rank: int
+    local_device: str
+    request_hash: str
+    plan_hash: str
+    device_budget_hash: str
+    host_budget_hash: str
+    receipt_hash: str
+
+    def __post_init__(self):
+        if not isinstance(self.runtime_id, str) or not self.runtime_id:
+            raise ValueError("receipt runtime_id must be a non-empty string")
+        if type(self.rank) is not int or self.rank < 0:
+            raise ValueError("receipt rank must be a non-negative integer")
+        if not isinstance(self.local_device, str) or not self.local_device:
+            raise ValueError("receipt local_device must be a non-empty string")
+        for name in (
+            "request_hash",
+            "plan_hash",
+            "device_budget_hash",
+            "host_budget_hash",
+            "receipt_hash",
+        ):
+            _require_sha256(getattr(self, name), name)
+        if self.receipt_hash != _sha256(_receipt_payload(self)):
+            raise ValueError("receipt_hash does not match canonical preflight metadata")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        runtime_id,
+        rank,
+        local_device,
+        request_hash,
+        plan_hash,
+        device_budget_hash,
+        host_budget_hash,
+    ):
+        fields = {
+            "runtime_id": runtime_id,
+            "rank": rank,
+            "local_device": local_device,
+            "request_hash": request_hash,
+            "plan_hash": plan_hash,
+            "device_budget_hash": device_budget_hash,
+            "host_budget_hash": host_budget_hash,
+        }
+        provisional = object.__new__(cls)
+        for name, value in fields.items():
+            object.__setattr__(provisional, name, value)
+        fields["receipt_hash"] = _sha256(_receipt_payload(provisional))
+        return cls(**fields)
+
+
+def _receipt_payload(value):
+    return {
+        "schema": "renormalizer.residency.receipt.v1",
+        "runtime_id": value.runtime_id,
+        "rank": value.rank,
+        "local_device": value.local_device,
+        "request_hash": value.request_hash,
+        "plan_hash": value.plan_hash,
+        "device_budget_hash": value.device_budget_hash,
+        "host_budget_hash": value.host_budget_hash,
+    }
 
 
 @dataclass(frozen=True)
@@ -980,6 +1231,45 @@ def _solver_payload(value):
     }
 
 
+def _derive_transfer_profile(
+    distributed_plan,
+    host_refs,
+    future_plans,
+    dirty_writeback_bytes,
+    world_size,
+):
+    refs = dict(host_refs)
+    variable_key = distributed_plan.variable_key
+    current = [0] * world_size
+    for block in distributed_plan.block_plans:
+        block_refs = {ref.key: ref for ref in block.execution_plan.inputs}
+        for key in block.operand_slices:
+            if key == variable_key:
+                continue
+            if key not in refs or key not in block_refs:
+                raise ValueError("transfer profile current placement is incomplete")
+            current[block.rank] = max(current[block.rank], block_refs[key].spec.nbytes)
+
+    future = [0] * world_size
+    for plan in future_plans:
+        for placement in plan.local_slices:
+            if placement.rank >= world_size:
+                raise ValueError("future transfer rank exceeds world_size")
+            future[placement.rank] = max(future[placement.rank], placement.nbytes)
+    return TransferProfile.build(current, future, dirty_writeback_bytes)
+
+
+def _transfer_profile_payload(value):
+    return {
+        "lanes": value.lanes,
+        "rank_staging_bytes": list(value.rank_staging_bytes),
+        "current_h2d_bytes": list(value.current_h2d_bytes),
+        "future_h2d_bytes": list(value.future_h2d_bytes),
+        "dirty_d2h_bytes": list(value.dirty_d2h_bytes),
+        "profile_hash": value.profile_hash,
+    }
+
+
 def _sha256(payload):
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=True, separators=(",", ":")
@@ -996,7 +1286,7 @@ class ResidencyRequest:
     backend_name: str
     store_bytes: tuple[int, ...] | None
     external_host_bytes: tuple[int, ...]
-    transfer_staging_host_bytes: tuple[int, ...]
+    transfer_staging_host_bytes: tuple[int, ...] | None
     dirty_writeback_bytes: tuple[int, ...] | None
     solver_input_sharding: ShardingSpec
     solver_output_sharding: ShardingSpec
@@ -1017,6 +1307,7 @@ class ResidencyRequest:
     transactional_store_bytes: tuple[int, ...] = field(init=False)
     complete_input_center_bytes: int = field(init=False)
     complete_diagonal_center_bytes: int = field(init=False)
+    transfer_profile: TransferProfile = field(init=False)
     request_hash: str = field(init=False)
 
     def __post_init__(self):
@@ -1171,11 +1462,7 @@ class ResidencyRequest:
         )
 
         rank_fields = {}
-        for name in (
-            "external_host_bytes",
-            "transfer_staging_host_bytes",
-            "mapped_local_counts",
-        ):
+        for name in ("external_host_bytes", "mapped_local_counts"):
             rank_fields[name] = _validate_nonnegative_rank_values(
                 getattr(self, name), name, self.world_size
             )
@@ -1381,6 +1668,24 @@ class ResidencyRequest:
             raise ValueError(
                 "store snapshot does not cover current and future host refs"
             )
+        transfer_profile = _derive_transfer_profile(
+            self.distributed_plan,
+            refs,
+            futures,
+            derived_dirty_bytes,
+            self.world_size,
+        )
+        if self.transfer_staging_host_bytes is not None:
+            supplied_staging = _validate_nonnegative_rank_values(
+                self.transfer_staging_host_bytes,
+                "transfer_staging_host_bytes",
+                self.world_size,
+            )
+            if supplied_staging != transfer_profile.rank_staging_bytes:
+                raise ValueError(
+                    "transfer staging bytes do not match the canonical profile"
+                )
+        rank_fields["transfer_staging_host_bytes"] = transfer_profile.rank_staging_bytes
         if not isinstance(self.device_budget, MemoryBudgetResolution) or not isinstance(
             self.host_budget, MemoryBudgetResolution
         ):
@@ -1430,6 +1735,7 @@ class ResidencyRequest:
         object.__setattr__(self, "device_budget", device_budget)
         object.__setattr__(self, "host_budget", host_budget)
         object.__setattr__(self, "runtime_identity", runtime_identity)
+        object.__setattr__(self, "transfer_profile", transfer_profile)
         object.__setattr__(self, "request_hash", _sha256(_request_payload(self)))
 
 
@@ -1448,6 +1754,7 @@ def _request_payload(request):
         ],
         "external_host_bytes": list(request.external_host_bytes),
         "transfer_staging_host_bytes": list(request.transfer_staging_host_bytes),
+        "transfer_profile": _transfer_profile_payload(request.transfer_profile),
         "dirty_writeback_bytes": list(request.dirty_writeback_bytes),
         "writeback_allocations": [
             [_allocation_payload(value) for value in allocations]
@@ -1942,6 +2249,7 @@ class ResidencyPlan:
     solver_kind: str
     device_budget: MemoryBudgetResolution
     host_budget: MemoryBudgetResolution
+    transfer_profile: TransferProfile
     plan_hash: str
     current_refs: tuple[HostTensorRef, ...] = ()
     future_plans: tuple[FutureResidencyPlan, ...] = ()
@@ -2014,6 +2322,14 @@ class ResidencyPlan:
             raise TypeError("plan budgets must use MemoryBudgetResolution")
         device_budget = _bound_budget_resolution(self.device_budget, "device")
         host_budget = _bound_budget_resolution(self.host_budget, "host")
+        if not isinstance(self.transfer_profile, TransferProfile):
+            raise TypeError("plan transfer_profile must be a TransferProfile")
+        if len(self.transfer_profile.rank_staging_bytes) != self.world_size:
+            raise ValueError("plan transfer profile world size is inconsistent")
+        if self.transfer_profile.rank_staging_bytes != tuple(
+            estimate.transfer_staging_host_bytes for estimate in estimates
+        ):
+            raise ValueError("plan transfer profile does not match rank estimates")
         runtime_identity = self.runtime_identity
         if runtime_identity is None:
             runtime_identity = ResidencyRuntimeIdentity.one_node(
@@ -2092,26 +2408,11 @@ class ResidencyPlan:
     def validate_request(self, request):
         if not isinstance(request, ResidencyRequest):
             raise TypeError("request must be a ResidencyRequest")
-        retained = (
-            request.world_size == self.world_size
-            and request.backend_name == self.backend_name
-            and request.distributed_plan.execution_plan.plan_hash
-            == self.source_plan_hash
-            and request.distributed_plan.placement_hash == self.placement_hash
-            and request.solver_profile.solver_kind == self.solver_kind
-            and request.solver_profile.coefficient_identity
-            == self.krylov_coefficient_identity
-            and request.qn_mask_identity == self.qn_mask_identity
-            and request.device_budget == self.device_budget
-            and request.host_budget == self.host_budget
-            and request.runtime_identity == self.runtime_identity
-            and request.prefetch_depth == self.prefetch_depth
-            and tuple(value.plan_hash for value in request.future_plans)
-            == self.future_plan_hashes
-            and tuple(ref for _, ref in request.host_refs) == self.current_refs
-        )
-        if request.request_hash != self.request_hash or not retained:
-            raise ValueError("residency request hash does not match authorized request")
+        regenerated = ResidencyPlanner().plan(request)
+        if self != regenerated:
+            raise ValueError(
+                "residency request hash or deterministic residency plan does not match"
+            )
 
     def metadata(self):
         version_payload = [
@@ -2137,6 +2438,7 @@ class ResidencyPlan:
             "qn_mask_identity": _qn_mask_payload(self.qn_mask_identity),
             "device_budget": _budget_payload(self.device_budget),
             "host_budget": _budget_payload(self.host_budget),
+            "transfer_profile": _transfer_profile_payload(self.transfer_profile),
             "runtime_identity": _runtime_identity_payload(self.runtime_identity),
             "device_peak_bytes": list(self.device_peak_bytes),
             "host_peak_bytes": list(self.host_peak_bytes),
@@ -2256,6 +2558,7 @@ def _plan_payload(plan):
         "qn_mask_identity": _qn_mask_payload(plan.qn_mask_identity),
         "device_budget": _budget_payload(plan.device_budget),
         "host_budget": _budget_payload(plan.host_budget),
+        "transfer_profile": _transfer_profile_payload(plan.transfer_profile),
         "runtime_identity": _runtime_identity_payload(plan.runtime_identity),
         "current_refs": [_ref_payload(ref) for ref in plan.current_refs],
         "future_plans": [_future_plan_payload(value) for value in plan.future_plans],
@@ -2568,6 +2871,7 @@ class ResidencyPlanner:
             "qn_mask_identity": request.qn_mask_identity,
             "device_budget": request.device_budget,
             "host_budget": request.host_budget,
+            "transfer_profile": request.transfer_profile,
             "runtime_identity": request.runtime_identity,
             "current_refs": tuple(ref for _, ref in request.host_refs),
             "future_plans": request.future_plans,
@@ -2598,9 +2902,12 @@ __all__ = [
     "ResidencyBudgetError",
     "ResidencyPlan",
     "ResidencyPlanner",
+    "ResidencyPreflightReceipt",
     "ResidencyRequest",
     "ResidencyRuntimeIdentity",
     "SliceRange",
     "StaleHostTensorRefError",
     "TensorPlacement",
+    "TransferProfile",
+    "budget_resolution_hash",
 ]

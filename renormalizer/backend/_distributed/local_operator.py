@@ -1,6 +1,6 @@
 """Ordered source-broadcast execution for output-sharded local H-v."""
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 import hashlib
 import json
@@ -14,6 +14,7 @@ from renormalizer.backend._distributed.providers import (
     active_working_set_policy_error,
 )
 from renormalizer.backend._execution.model import ExecutionBindings
+from renormalizer.backend._execution.executor import _exact_reshape_view
 
 
 _PREFLIGHT_ERRORS = {
@@ -212,6 +213,7 @@ class DistributedLocalOperator:
     host_memory_budget_bytes: int | None = None
     residency_request: object = None
     residency_plan: object = None
+    residency_receipt: object = None
     mesh: object = None
 
     def __post_init__(self):
@@ -241,6 +243,8 @@ class DistributedLocalOperator:
         self._execution_status = None
         self._host_execution_status = None
         self._active_contribution = None
+        self._active_allocation_scope = None
+        self._resource_allocation_preflight_complete = False
 
     def _validate_setup(self):
         if not isinstance(self.plan, DistributedPlan):
@@ -296,6 +300,9 @@ class DistributedLocalOperator:
         if actual_keys != expected_keys:
             raise ValueError("source binding coverage is incomplete")
         provider_policy = getattr(self.provider, "residency_policy", None)
+        provider_role = getattr(self.provider, "provider_role", None)
+        if provider_role == "factory":
+            raise ValueError("factory provider cannot execute operand blocks")
         if provider_policy == "active_working_set" and (
             self.residency_plan is None or self.residency_request is None
         ):
@@ -303,7 +310,9 @@ class DistributedLocalOperator:
                 "active_working_set requires a resolved residency plan and request"
             )
         if provider_policy != "active_working_set" and (
-            self.residency_plan is not None or self.residency_request is not None
+            self.residency_plan is not None
+            or self.residency_request is not None
+            or self.residency_receipt is not None
         ):
             raise ValueError(
                 "residency metadata requires active_working_set provider policy"
@@ -339,6 +348,23 @@ class DistributedLocalOperator:
                 self.context, self.mesh, self.backend
             )
             self.residency_plan.validate_request(self.residency_request)
+            if provider_role == "working_set":
+                from renormalizer.backend._distributed.residency import (
+                    ResidencyPreflightReceipt,
+                )
+
+                if not isinstance(self.residency_receipt, ResidencyPreflightReceipt):
+                    raise TypeError("working-set provider requires a preflight receipt")
+                if (
+                    getattr(self.provider, "request", None)
+                    is not self.residency_request
+                    or getattr(self.provider, "plan", None) is not self.residency_plan
+                    or getattr(self.provider, "receipt", None)
+                    is not self.residency_receipt
+                ):
+                    raise ValueError(
+                        "working-set provider metadata does not match operator"
+                    )
         self.provider.validate_setup(self.plan, self.source_bindings, self.context)
         self._validate_provider_requests()
 
@@ -360,6 +386,15 @@ class DistributedLocalOperator:
         return np.dtype(variable_ref.spec.dtype)
 
     def solver_preflight(self):
+        if callable(getattr(self.provider, "_operator_call", None)):
+            if (
+                self.residency_receipt is None
+                or self.provider.request is not self.residency_request
+                or self.provider.plan is not self.residency_plan
+                or self.provider.receipt is not self.residency_receipt
+            ):
+                raise ValueError("working-set receipt metadata does not match operator")
+            return
         self._preflight_setup()
         self._preflight_plan_agreement()
         self._preflight_capacity()
@@ -600,9 +635,7 @@ class DistributedLocalOperator:
     def _receive_view(self, storage, shape):
         elements = self._shape_elements(shape)
         prefix = storage[:elements]
-        view = self.backend.reshape(prefix, shape)
-        if not self.backend._is_exact_execution_reshape(prefix, view):
-            raise ValueError("reusable receive reshape unexpectedly copied data")
+        view = _exact_reshape_view(self.backend, prefix, shape)
         if not bool(view.flags.c_contiguous):
             raise ValueError("reusable receive view must be C contiguous")
         return view
@@ -612,10 +645,14 @@ class DistributedLocalOperator:
         self._output_accumulator = None
         self._execution_status = None
         self._host_execution_status = None
+        self._resource_allocation_preflight_complete = False
 
     def _copy_execution_status_to_host(self):
-        status = self._execution_status
-        host_status = self._host_execution_status
+        return self._copy_status_to_host(
+            self._execution_status, self._host_execution_status
+        )
+
+    def _copy_status_to_host(self, status, host_status):
         if self.backend.name == "cupy":
             cupy = self.backend._cupy
             with cupy.cuda.Device(self.backend._device_index):
@@ -626,55 +663,154 @@ class DistributedLocalOperator:
             np.copyto(host_status, status, casting="no")
         return int(host_status[0])
 
-    def _allreduce_execution_status(self, local_error):
+    def _allreduce_active_status(self, call, local_error):
+        runtime = self.provider._provider.runtime
+        terminal = runtime._terminal_error or getattr(
+            self.collective, "_fatal_error", None
+        )
+        if terminal is not None:
+            primary = call.mark_communicator_fatal(terminal)
+            self.provider._enter_communicator_fatal(primary, call.owner)
+            raise primary
+        status = call.status_workspace.device_status
+        host_status = call.status_workspace.host_status
+        try:
+            status.fill(1 if local_error is not None else 0)
+            synchronized = self.collective.allreduce_inplace(status, op="max")
+            self._increment_counter("allreduce_calls")
+            if synchronized is not status:
+                raise RuntimeError(
+                    "in-place allreduce replaced execution status storage"
+                )
+            terminal = runtime._terminal_error or getattr(
+                self.collective, "_fatal_error", None
+            )
+            if terminal is not None:
+                primary = call.mark_communicator_fatal(terminal)
+                self.provider._enter_communicator_fatal(primary, call.owner)
+                raise primary
+            result = self._copy_status_to_host(status, host_status)
+            terminal = runtime._terminal_error or getattr(
+                self.collective, "_fatal_error", None
+            )
+            if terminal is not None:
+                primary = call.mark_communicator_fatal(terminal)
+                self.provider._enter_communicator_fatal(primary, call.owner)
+                raise primary
+            return result
+        except BaseException as error:
+            fatal_error = getattr(self.collective, "_fatal_error", None)
+            if fatal_error is not None and error.__cause__ is fatal_error:
+                error = fatal_error
+            primary = call.record_primary(error)
+            if primary is not error:
+                call.record_secondary(error)
+            call.mark_communicator_fatal(primary)
+            self.provider._enter_communicator_fatal(primary, call.owner)
+            if primary is error:
+                raise
+            raise primary
+
+    def _allreduce_execution_status(self, local_error, *, synchronize=True):
         status = self._execution_status
         status.fill(1 if local_error is not None else 0)
-        synchronized = self.collective.allreduce_inplace(status, op="max")
-        self._increment_counter("allreduce_calls")
-        if synchronized is not status:
-            raise RuntimeError("in-place allreduce replaced execution status storage")
+        if synchronize:
+            synchronized = self.collective.allreduce_inplace(status, op="max")
+            self._increment_counter("allreduce_calls")
+            if synchronized is not status:
+                raise RuntimeError(
+                    "in-place allreduce replaced execution status storage"
+                )
         return self._copy_execution_status_to_host()
 
-    @staticmethod
-    def _accumulate_contribution(output, contribution):
-        output += contribution
+    def _accumulate_contribution(self, output, contribution):
+        if self._active_allocation_scope is None:
+            output += contribution
+            return
+        self._active_allocation_scope.add_into(output, contribution, output)
 
-    def _prepare_call_bindings(self, local_vector):
-        new_resources = self._receive_storage is None
-        receive_storage = self._receive_storage
-        output_accumulator = self._output_accumulator
-        execution_status = self._execution_status
-        host_execution_status = self._host_execution_status
+    def _ensure_resident_call_resources(self, allocation_scope=None):
+        resources = (
+            self._receive_storage,
+            self._output_accumulator,
+            self._execution_status,
+            self._host_execution_status,
+        )
+        if all(resource is not None for resource in resources):
+            return
+        if any(resource is not None for resource in resources):
+            self._discard_execution_resources()
+        variable_ref = next(
+            ref
+            for ref in self.plan.execution_plan.inputs
+            if ref.key == self.plan.variable_key
+        )
+        self._execution_status = self.backend.empty((1,), dtype=np.int32, order="C")
+        if allocation_scope is not None:
+            allocation_scope.capture(self._execution_status)
+        self._host_execution_status = np.empty((1,), dtype=np.int32, order="C")
+        if allocation_scope is not None:
+            allocation_scope.capture(self._host_execution_status)
+        self._receive_storage = self.backend.empty(
+            (self.plan.input_sharding.max_local_elements,),
+            dtype=np.dtype(variable_ref.spec.dtype),
+            order="C",
+        )
+        if allocation_scope is not None:
+            allocation_scope.capture(self._receive_storage)
+        self._output_accumulator = self.backend.empty(
+            self.plan.output_sharding.local_shape(self.context.rank),
+            dtype=np.dtype(self.plan.execution_plan.output.spec.dtype),
+            order="C",
+        )
+        if allocation_scope is not None:
+            allocation_scope.capture(self._output_accumulator)
+
+    def _discard_active_call_resources(self):
+        self._receive_storage = None
+        self._output_accumulator = None
+
+    def _ensure_call_resources(self, allocation_scope):
+        resources = (self._receive_storage, self._output_accumulator)
+        if all(resource is not None for resource in resources):
+            for resource in resources:
+                allocation_scope.capture(resource)
+            return
+        if any(resource is not None for resource in resources):
+            self._discard_active_call_resources()
+        variable_ref = next(
+            ref
+            for ref in self.plan.execution_plan.inputs
+            if ref.key == self.plan.variable_key
+        )
+        self._receive_storage = self.backend.empty(
+            (self.plan.input_sharding.max_local_elements,),
+            dtype=np.dtype(variable_ref.spec.dtype),
+            order="C",
+        )
+        allocation_scope.capture(self._receive_storage)
+        self._output_accumulator = self.backend.empty(
+            self.plan.output_sharding.local_shape(self.context.rank),
+            dtype=np.dtype(self.plan.execution_plan.output.spec.dtype),
+            order="C",
+        )
+        allocation_scope.capture(self._output_accumulator)
+
+    def _prepare_call_bindings(self, local_vector, call=None):
         stack = ExitStack()
+        if call is not None:
+            call.owner.capture_resources(stack)
         leases = []
         local_error = None
         try:
-            variable_ref = next(
-                ref
-                for ref in self.plan.execution_plan.inputs
-                if ref.key == self.plan.variable_key
-            )
-            if new_resources:
-                receive_storage = self.backend.empty(
-                    (self.plan.input_sharding.max_local_elements,),
-                    dtype=np.dtype(variable_ref.spec.dtype),
-                    order="C",
-                )
-                output_accumulator = self.backend.empty(
-                    self.plan.output_sharding.local_shape(self.context.rank),
-                    dtype=np.dtype(self.plan.execution_plan.output.spec.dtype),
-                    order="C",
-                )
-                execution_status = self.backend.empty((1,), dtype=np.int32, order="C")
-                host_execution_status = np.empty((1,), dtype=np.int32, order="C")
-            output_accumulator.fill(0)
+            self._output_accumulator.fill(0)
             for source_rank in range(self.plan.world_size):
                 block = self.plan.block_plan(self.context.rank, source_rank)
                 if source_rank == self.context.rank:
                     broadcast_variable = local_vector
                 else:
                     broadcast_variable = self._receive_view(
-                        receive_storage,
+                        self._receive_storage,
                         self.plan.input_sharding.local_shape(source_rank),
                     )
                 request = OperandRequest(
@@ -691,68 +827,297 @@ class DistributedLocalOperator:
                 leases.append(stack.enter_context(self.provider.acquire(request)))
         except BaseException as error:
             local_error = error
+            if call is not None:
+                call.record_primary(error)
+
+        if call is not None and (
+            call.owner.quarantined
+            or self.provider._provider._terminal_error is not None
+            or self.provider._provider.runtime._terminal_error is not None
+            or getattr(self.collective, "_fatal_error", None) is not None
+        ):
+            primary = call.mark_communicator_fatal(
+                call.primary_error
+                or local_error
+                or self.provider._provider.runtime._terminal_error
+                or getattr(self.collective, "_fatal_error", None)
+            )
+            self.provider._enter_communicator_fatal(primary, call.owner)
+            raise primary
 
         try:
-            error_code = self._allreduce_status(1 if local_error is not None else 0)
+            error_code = (
+                self._allreduce_execution_status(
+                    local_error, synchronize=self.context.world_size > 1
+                )
+                if call is None
+                else self._allreduce_active_status(call, local_error)
+            )
         except BaseException as status_error:
+            if call is not None:
+                call.record_primary(status_error)
             try:
                 stack.close()
             except BaseException as cleanup_error:
-                self._discard_execution_resources()
-                raise status_error from cleanup_error
-            self._discard_execution_resources()
+                if call is not None:
+                    call.record_secondary(cleanup_error)
             raise
         if error_code:
-            stack.close()
-            self._discard_execution_resources()
+            try:
+                stack.close()
+            except BaseException as cleanup_error:
+                if call is not None:
+                    if call.primary_error is None:
+                        call.record_primary(cleanup_error)
+                    else:
+                        call.record_secondary(cleanup_error)
+                    raise call.primary_error
+                raise
             if local_error is not None:
                 raise ValueError(
                     "distributed resource preflight failed"
                 ) from local_error
             raise ValueError("distributed resource preflight failed")
-        self._receive_storage = receive_storage
-        self._output_accumulator = output_accumulator
-        self._execution_status = execution_status
-        self._host_execution_status = host_execution_status
         return stack, tuple(leases)
 
-    def __call__(self, local_vector):
+    def _active_call_ready_error(self, local_vector):
+        if self._setup_error is not None:
+            return self._setup_error
+        try:
+            if (
+                self.provider.request is not self.residency_request
+                or self.provider.plan is not self.residency_plan
+                or self.provider.receipt is not self.residency_receipt
+            ):
+                raise ValueError("working-set receipt metadata does not match operator")
+            self.residency_plan.validate_capacity()
+            rank = self.context.rank
+            if (
+                self.residency_plan.device_peak_bytes[rank]
+                > self.residency_plan.device_budget.resolved_bytes
+                or self.residency_plan.host_required_bytes
+                > self.residency_plan.host_budget.resolved_bytes
+            ):
+                raise ValueError("working-set capacity does not match operator")
+            local_code = self._local_vector_error(local_vector)
+            if local_code:
+                raise ValueError(
+                    "local vector preflight failed: {}".format(
+                        _PREFLIGHT_ERRORS.get(local_code, "unknown")
+                    )
+                )
+            from renormalizer.backend._distributed.async_owner import allocation_record
+
+            allocation_record(local_vector)
+        except BaseException as error:
+            return error
+        return None
+
+    def _call_active(self, local_vector, operator_call):
+        try:
+            with operator_call(local_vector) as call:
+                self._active_allocation_scope = call.scope
+                ready_error = (
+                    call.entry_error
+                    if call.entry_error is not None
+                    else self._active_call_ready_error(local_vector)
+                )
+                if ready_error is not None:
+                    call.record_primary(ready_error)
+                if self._allreduce_active_status(call, ready_error):
+                    if call.entry_error is not None:
+                        raise call.entry_error
+                    if ready_error is not None:
+                        raise ValueError(
+                            "distributed call-ready preflight failed"
+                        ) from ready_error
+                    raise ValueError("distributed call-ready preflight failed")
+
+                allocation_error = None
+                try:
+                    call.owner.capture_arrays(local_vector)
+                    self._ensure_call_resources(call.scope)
+                except BaseException as error:
+                    allocation_error = error
+                    call.record_primary(error)
+                if self._allreduce_active_status(call, allocation_error):
+                    if allocation_error is not None:
+                        raise ValueError(
+                            "distributed call-storage preflight failed"
+                        ) from allocation_error
+                    raise ValueError("distributed call-storage preflight failed")
+
+                stack, leases = self._prepare_call_bindings(local_vector, call)
+                local_output = self._output_accumulator
+                with stack:
+                    for source_rank, lease in enumerate(leases):
+                        block = self.plan.block_plan(self.context.rank, source_rank)
+                        broadcast_variable = lease.bindings.arrays[
+                            self.plan.variable_key
+                        ]
+                        admission = getattr(
+                            self.collective, "_active_broadcast_admission", None
+                        )
+                        boundary = (
+                            nullcontext(
+                                (
+                                    self.collective.broadcast,
+                                    self.collective._agree_active_broadcast,
+                                )
+                            )
+                            if admission is None
+                            else admission()
+                        )
+                        with boundary as (broadcast, agree):
+                            broadcast_error = None
+                            try:
+                                broadcast(broadcast_variable, root=source_rank)
+                            except BaseException as error:
+                                broadcast_error = error
+                                primary = call.mark_communicator_fatal(error)
+                                if call.owner.state not in {
+                                    "detached",
+                                    "quarantined",
+                                }:
+                                    call.owner.force_quarantine(primary)
+                                self.provider._enter_communicator_fatal(
+                                    primary, call.owner
+                                )
+                            try:
+                                agree(broadcast_error is not None)
+                            except BaseException as error:
+                                fatal_error = getattr(
+                                    self.collective, "_fatal_error", None
+                                )
+                                if (
+                                    fatal_error is not None
+                                    and error.__cause__ is fatal_error
+                                ):
+                                    error = fatal_error
+                                if broadcast_error is None:
+                                    primary = call.mark_communicator_fatal(error)
+                                    self.provider._enter_communicator_fatal(
+                                        primary, call.owner
+                                    )
+                                else:
+                                    primary = call.primary_error
+                                    call.record_secondary(error)
+                                raise primary
+                            if broadcast_error is not None:
+                                raise call.primary_error
+                        self._increment_counter("broadcast_calls")
+                        local_error = None
+                        contribution = None
+                        try:
+                            contribution = self.backend._execute_plan_with_scope(
+                                block.execution_plan,
+                                lease.bindings,
+                                workspace=block.execution_plan.workspace_bytes,
+                                allocation_scope=call.scope,
+                            )
+                            self._increment_counter("execution_calls")
+                            self._active_contribution = contribution
+                            self._accumulate_contribution(local_output, contribution)
+                        except BaseException as error:
+                            local_error = error
+                            call.record_primary(error)
+                        finally:
+                            self._active_contribution = None
+                            contribution = None
+                        failed = self._allreduce_active_status(call, local_error)
+                        if failed:
+                            if local_error is not None:
+                                raise RuntimeError(
+                                    "distributed block execution failed"
+                                ) from local_error
+                            raise RuntimeError("distributed block execution failed")
+                return local_output
+        except BaseException:
+            self._discard_active_call_resources()
+            raise
+        finally:
+            self._active_allocation_scope = None
+
+    def _call_device_resident(self, local_vector):
         self._preflight_setup()
         self._preflight_plan_agreement()
         self._preflight_local_vector(local_vector)
         self._preflight_capacity()
-        stack, leases = self._prepare_call_bindings(local_vector)
-        local_output = self._output_accumulator
-        with stack:
-            for source_rank, lease in enumerate(leases):
-                block = self.plan.block_plan(self.context.rank, source_rank)
-                broadcast_variable = lease.bindings.arrays[self.plan.variable_key]
-                self.collective.broadcast(broadcast_variable, root=source_rank)
-                self._increment_counter("broadcast_calls")
-                local_error = None
-                contribution = None
+        try:
+            with nullcontext(None) as allocation_scope:
+                self._active_allocation_scope = allocation_scope
+                allocation_error = None
                 try:
-                    contribution = self.backend.execute_plan(
-                        block.execution_plan,
-                        lease.bindings,
-                        workspace=block.execution_plan.workspace_bytes,
-                    )
-                    self._increment_counter("execution_calls")
-                    self._active_contribution = contribution
-                    self._accumulate_contribution(local_output, contribution)
+                    self._ensure_resident_call_resources(allocation_scope)
                 except BaseException as error:
-                    local_error = error
-                finally:
-                    self._active_contribution = None
-                    contribution = None
-                failed = self._allreduce_execution_status(local_error)
-                if failed:
-                    if local_error is not None:
-                        raise RuntimeError(
-                            "distributed block execution failed"
-                        ) from local_error
-                    raise RuntimeError("distributed block execution failed")
-        return local_output
+                    allocation_error = error
+                if not self._resource_allocation_preflight_complete:
+                    if (
+                        self._execution_status is None
+                        or self._host_execution_status is None
+                    ):
+                        if allocation_scope is not None:
+                            raise ValueError(
+                                "distributed resource preflight failed"
+                            ) from allocation_error
+                        error_code = self._allreduce_status(1)
+                    else:
+                        error_code = self._allreduce_execution_status(
+                            allocation_error,
+                            synchronize=self.context.world_size > 1,
+                        )
+                    if error_code:
+                        if allocation_error is not None:
+                            raise ValueError(
+                                "distributed resource preflight failed"
+                            ) from allocation_error
+                        raise ValueError("distributed resource preflight failed")
+                    self._resource_allocation_preflight_complete = True
+                stack, leases = self._prepare_call_bindings(local_vector)
+                local_output = self._output_accumulator
+                with stack:
+                    for source_rank, lease in enumerate(leases):
+                        block = self.plan.block_plan(self.context.rank, source_rank)
+                        broadcast_variable = lease.bindings.arrays[
+                            self.plan.variable_key
+                        ]
+                        self.collective.broadcast(broadcast_variable, root=source_rank)
+                        self._increment_counter("broadcast_calls")
+                        local_error = None
+                        contribution = None
+                        try:
+                            contribution = self.backend.execute_plan(
+                                block.execution_plan,
+                                lease.bindings,
+                                workspace=block.execution_plan.workspace_bytes,
+                            )
+                            self._increment_counter("execution_calls")
+                            self._active_contribution = contribution
+                            self._accumulate_contribution(local_output, contribution)
+                        except BaseException as error:
+                            local_error = error
+                        finally:
+                            self._active_contribution = None
+                            contribution = None
+                        failed = self._allreduce_execution_status(local_error)
+                        if failed:
+                            if local_error is not None:
+                                raise RuntimeError(
+                                    "distributed block execution failed"
+                                ) from local_error
+                            raise RuntimeError("distributed block execution failed")
+                return local_output
+        except BaseException:
+            self._discard_execution_resources()
+            raise
+        finally:
+            self._active_allocation_scope = None
+
+    def __call__(self, local_vector):
+        operator_call = getattr(self.provider, "_operator_call", None)
+        if callable(operator_call):
+            return self._call_active(local_vector, operator_call)
+        return self._call_device_resident(local_vector)
 
 
 __all__ = ["DistributedLocalOperator", "run_root_fallback"]

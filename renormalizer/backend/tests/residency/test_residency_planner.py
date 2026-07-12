@@ -30,6 +30,7 @@ from renormalizer.backend._distributed.solvers import (
     build_davidson_memory_profile,
     build_krylov_memory_profile,
 )
+from renormalizer.backend._distributed.transfer import TransferProfile
 from renormalizer.backend._distributed.sharding import shard_axis
 from renormalizer.backend._execution.planner import lower_einsum_path
 
@@ -76,7 +77,7 @@ def _request(
         backend_name=backend_name,
         store_bytes=None,
         external_host_bytes=(11, 13),
-        transfer_staging_host_bytes=(17, 19),
+        transfer_staging_host_bytes=None,
         dirty_writeback_bytes=None,
         solver_input_sharding=distributed.input_sharding,
         solver_output_sharding=distributed.input_sharding,
@@ -399,6 +400,27 @@ def test_request_and_plan_are_canonical_immutable_and_hash_stable():
         first_plan.prefetch_depth = 2
 
 
+def test_transfer_profile_is_canonical_derived_and_bound_to_request_and_plan():
+    request, _ = _request()
+    plan = ResidencyPlanner().plan(request)
+
+    assert isinstance(request.transfer_profile, TransferProfile)
+    assert request.transfer_profile.lanes == 1
+    assert request.transfer_profile.current_h2d_bytes == (128, 128)
+    assert request.transfer_profile.future_h2d_bytes == (0, 0)
+    assert request.transfer_profile.dirty_d2h_bytes == (64, 64)
+    assert request.transfer_profile.rank_staging_bytes == (128, 128)
+    assert request.transfer_staging_host_bytes == (128, 128)
+    assert plan.transfer_profile == request.transfer_profile
+
+    with pytest.raises(ValueError, match="transfer staging.*canonical profile"):
+        replace(request, transfer_staging_host_bytes=(127, 128))
+
+    replay = replace(request, transfer_staging_host_bytes=None)
+    assert replay.transfer_profile == request.transfer_profile
+    assert replay.request_hash == request.request_hash
+
+
 def test_wave8_plan_binds_complete_request_and_rejects_solver_replay():
     request, store = _request()
     changed_profile = build_krylov_memory_profile(
@@ -420,6 +442,35 @@ def test_wave8_plan_binds_complete_request_and_rejects_solver_replay():
     assert request.request_hash != changed.request_hash
     assert plan.request_hash == request.request_hash
     assert _plan_payload(plan)["request_hash"] == request.request_hash
+
+
+def test_validate_request_rejects_rehashed_internally_consistent_lower_peaks():
+    request, store = _request()
+    try:
+        plan = ResidencyPlanner().plan(request)
+        original = plan.rank_estimates[0]
+        components = {name: getattr(original, name) for name in _RANK_COMPONENT_NAMES}
+        components["current_static_bytes"] -= np.dtype(np.float64).itemsize
+        forged_estimate = replace(
+            original,
+            **components,
+            **_rank_peaks(components),
+        )
+        estimates = (forged_estimate,) + plan.rank_estimates[1:]
+        device_peaks = tuple(value.device_peak_bytes for value in estimates)
+        host_peaks = tuple(value.host_peak_bytes for value in estimates)
+        forged = _rehash_plan(
+            plan,
+            rank_estimates=estimates,
+            device_peak_bytes=device_peaks,
+            host_peak_bytes=host_peaks,
+            host_required_bytes=sum(host_peaks),
+        )
+
+        with pytest.raises(ValueError, match="deterministic residency plan"):
+            forged.validate_request(request)
+    finally:
+        store.close()
 
 
 def test_future_placement_prefetch_deduplicates_current_and_cross_plan_identity():
@@ -507,11 +558,21 @@ def test_retained_future_placements_drive_replica_prediction_and_plan_hash():
     )
 
     replicated_plan = ResidencyPlanner().plan(
-        replace(request, future_plans=(replicated,))
+        replace(
+            request,
+            future_plans=(replicated,),
+            transfer_staging_host_bytes=None,
+        )
     )
-    partial_plan = ResidencyPlanner().plan(replace(request, future_plans=(partial,)))
+    partial_plan = ResidencyPlanner().plan(
+        replace(request, future_plans=(partial,), transfer_staging_host_bytes=None)
+    )
     overlap_plan = ResidencyPlanner().plan(
-        replace(request, future_plans=(overlapping_partial,))
+        replace(
+            request,
+            future_plans=(overlapping_partial,),
+            transfer_staging_host_bytes=None,
+        )
     )
 
     assert replicated_plan.future_plans == (replicated,)
@@ -912,7 +973,7 @@ def _wave6_request(kind):
         backend_name="cupy",
         store_bytes=None,
         external_host_bytes=(0, 0),
-        transfer_staging_host_bytes=(0, 0),
+        transfer_staging_host_bytes=None,
         dirty_writeback_bytes=None,
         solver_input_sharding=solver_sharding,
         solver_output_sharding=solver_sharding,

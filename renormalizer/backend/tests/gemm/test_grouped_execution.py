@@ -102,14 +102,14 @@ def test_complex_c_pair_conjugates_packs_in_place_at_exact_capacity(monkeypatch)
         )
     inputs = {key: value.copy() for key, value in tensors.items()}
     required = 2 * (m * k + k * n) * np.dtype("complex128").itemsize
-    original_conj = backend.conj
+    original_conj = backend._execution_conjugate_into
     conjugations = []
 
-    def recording_conj(value, *, out=None):
-        conjugations.append((value, out))
-        return original_conj(value, out=out)
+    def recording_conj(value, destination):
+        conjugations.append((value, destination))
+        return original_conj(value, destination)
 
-    monkeypatch.setattr(backend, "conj", recording_conj)
+    monkeypatch.setattr(backend, "_execution_conjugate_into", recording_conj)
 
     outputs = backend.grouped_gemm(
         descriptors, tensors, workspace=required
@@ -140,11 +140,16 @@ def test_complex_c_singleton_capacity_counts_both_conjugate_temporaries(
     }
     required = (m * k + k * n) * np.dtype("complex128").itemsize
     calls = []
-    original_conj = backend.conj
-    original_matmul = backend.matmul
-    monkeypatch.setattr(backend, "conj", lambda *args, **kwargs: calls.append("conj"))
+    original_conj = backend._execution_conjugate_into
+    original_matmul = backend._execution_matmul_into
     monkeypatch.setattr(
-        backend, "matmul", lambda *args, **kwargs: calls.append("matmul")
+        backend,
+        "_execution_conjugate_into",
+        lambda *args, **kwargs: calls.append("conj"),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_execution_matmul_into", lambda *args, **kwargs: calls.append("matmul"),
     )
 
     with pytest.raises(ValueError, match="workspace capacity"):
@@ -153,8 +158,8 @@ def test_complex_c_singleton_capacity_counts_both_conjugate_temporaries(
         )
     assert calls == []
 
-    monkeypatch.setattr(backend, "conj", original_conj)
-    monkeypatch.setattr(backend, "matmul", original_matmul)
+    monkeypatch.setattr(backend, "_execution_conjugate_into", original_conj)
+    monkeypatch.setattr(backend, "_execution_matmul_into", original_matmul)
     (output,) = backend.grouped_gemm(
         (descriptor,), tensors, workspace=required
     )
@@ -177,33 +182,33 @@ def test_ragged_singleton_and_pair_use_exact_scalar_and_batched_dispatch(monkeyp
         "a2": rng.normal(size=(2, 3)),
         "b2": rng.normal(size=(3, 4)),
     }
-    original_matmul = backend.matmul
-    original_batched = backend.batched_matmul
-    original_stack = backend.stack
-    calls = {"matmul": 0, "batched": 0, "stack": 0}
+    original_matmul = backend._execution_matmul_into
+    original_batched = backend._execution_batched_matmul_into
+    original_copy = backend._execution_copy_into
+    calls = {"matmul": 0, "batched": 0, "copy": 0}
     packs = []
 
-    def matmul(a, b, *, stream=None, workspace=None):
+    def matmul(a, b, destination, *, workspace=None):
         calls["matmul"] += 1
-        return original_matmul(a, b, stream=stream, workspace=workspace)
+        return original_matmul(a, b, destination, workspace=workspace)
 
-    def batched(a, b, *, stream=None, workspace=None):
+    def batched(a, b, destination, *, workspace=None):
         calls["batched"] += 1
-        result = original_batched(a, b, stream=stream, workspace=workspace)
-        packs.append(result)
+        result = original_batched(a, b, destination, workspace=workspace)
+        packs.append(destination)
         return result
 
-    def stack(values, axis=0):
-        calls["stack"] += 1
-        return original_stack(values, axis=axis)
+    def copy(source, destination):
+        calls["copy"] += 1
+        return original_copy(source, destination)
 
-    monkeypatch.setattr(backend, "matmul", matmul)
-    monkeypatch.setattr(backend, "batched_matmul", batched)
-    monkeypatch.setattr(backend, "stack", stack)
+    monkeypatch.setattr(backend, "_execution_matmul_into", matmul)
+    monkeypatch.setattr(backend, "_execution_batched_matmul_into", batched)
+    monkeypatch.setattr(backend, "_execution_copy_into", copy)
 
     outputs = backend.grouped_gemm(descriptors, tensors)
 
-    assert calls == {"matmul": 1, "batched": 1, "stack": 2}
+    assert calls == {"matmul": 1, "batched": 1, "copy": 4}
     assert np.shares_memory(outputs[0], packs[0])
     assert np.shares_memory(outputs[2], packs[0])
     for descriptor, output in zip(descriptors, outputs):
@@ -222,10 +227,10 @@ def test_same_shape_pair_never_uses_scalar_matmul(monkeypatch):
         MatmulDesc("a", "b1", "c1", 2, 4, 3),
     )
     calls = []
-    original_batched = backend.batched_matmul
+    original_batched = backend._execution_batched_matmul_into
     monkeypatch.setattr(
         backend,
-        "matmul",
+        "_execution_matmul_into",
         lambda *args, **kwargs: pytest.fail("same-shape pair used scalar matmul"),
     )
 
@@ -233,7 +238,7 @@ def test_same_shape_pair_never_uses_scalar_matmul(monkeypatch):
         calls.append(True)
         return original_batched(*args, **kwargs)
 
-    monkeypatch.setattr(backend, "batched_matmul", batched)
+    monkeypatch.setattr(backend, "_execution_batched_matmul_into", batched)
 
     outputs = backend.grouped_gemm(descriptors, tensors)
 
@@ -274,16 +279,16 @@ def test_same_shape_different_dtypes_remain_separate_singleton_buckets(monkeypat
         "b1": np.eye(2, dtype=np.float64),
     }
     scalar_calls = []
-    original_scalar = backend.matmul
+    original_scalar = backend._execution_matmul_into
 
     def scalar(*args, **kwargs):
         scalar_calls.append(True)
         return original_scalar(*args, **kwargs)
 
-    monkeypatch.setattr(backend, "matmul", scalar)
+    monkeypatch.setattr(backend, "_execution_matmul_into", scalar)
     monkeypatch.setattr(
         backend,
-        "batched_matmul",
+        "_execution_batched_matmul_into",
         lambda *args, **kwargs: pytest.fail("different dtypes were batched together"),
     )
 
@@ -310,11 +315,11 @@ def test_malformed_batched_result_is_not_published(monkeypatch):
     }
     monkeypatch.setattr(
         backend,
-        "batched_matmul",
+        "_execution_batched_matmul_into",
         lambda *args, **kwargs: np.zeros((2, 2, 3)),
     )
 
-    with pytest.raises(ValueError, match="batched.*shape"):
+    with pytest.raises(ValueError, match="published destination"):
         backend.grouped_gemm(descriptors, tensors)
     assert "c0" not in tensors and "c1" not in tensors
 
@@ -415,16 +420,16 @@ def test_compute_failure_does_not_publish_any_outputs(monkeypatch):
         "b2": np.zeros((3, 4)),
     }
     scalar_calls = []
-    original_matmul = backend.matmul
+    original_matmul = backend._execution_matmul_into
 
     def scalar(*args, **kwargs):
         scalar_calls.append(True)
         return original_matmul(*args, **kwargs)
 
-    monkeypatch.setattr(backend, "matmul", scalar)
+    monkeypatch.setattr(backend, "_execution_matmul_into", scalar)
     monkeypatch.setattr(
         backend,
-        "batched_matmul",
+        "_execution_batched_matmul_into",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("forced failure")),
     )
 
@@ -432,6 +437,28 @@ def test_compute_failure_does_not_publish_any_outputs(monkeypatch):
         backend.grouped_gemm(descriptors, tensors)
     assert scalar_calls == [True]
     assert not ({"c0", "c1", "c2"} & set(tensors))
+
+
+def test_scalar_output_overlap_is_rejected_before_destination_launch(monkeypatch):
+    backend = _numpy_backend()
+    descriptor = MatmulDesc("a", "b", "c", 2, 2, 2)
+    tensors = {
+        "a": np.arange(4.0).reshape(2, 2),
+        "b": np.arange(4.0, 8.0).reshape(2, 2),
+    }
+    snapshot = tensors["a"].copy()
+    launches = []
+    monkeypatch.setattr(backend, "empty", lambda *args, **kwargs: tensors["a"])
+    monkeypatch.setattr(
+        backend,
+        "_execution_matmul_into",
+        lambda *args, **kwargs: launches.append(True),
+    )
+
+    with pytest.raises(ValueError, match="overlap"):
+        backend.grouped_gemm((descriptor,), tensors)
+    assert launches == []
+    np.testing.assert_array_equal(tensors["a"], snapshot)
 
 
 @pytest.mark.parametrize("alias_key", ["a0", "c0"])
@@ -459,17 +486,17 @@ def test_scalar_alias_is_rejected_without_external_mutation(
 
     monkeypatch.setattr(
         backend,
-        "matmul",
-        lambda left, right, **kwargs: tensors[alias_key],
+        "_execution_matmul_into",
+        lambda left, right, destination, **kwargs: tensors[alias_key],
     )
 
     def fail_later(*args, **kwargs):
         later_calls.append(True)
         raise RuntimeError("later bucket failed")
 
-    monkeypatch.setattr(backend, "batched_matmul", fail_later)
+    monkeypatch.setattr(backend, "_execution_batched_matmul_into", fail_later)
 
-    with pytest.raises(ValueError, match="scalar matmul result.*overlap"):
+    with pytest.raises(ValueError, match="published destination"):
         backend.grouped_gemm(descriptors, tensors)
     assert later_calls == []
     assert tensors.keys() == original_entries.keys()
@@ -503,7 +530,7 @@ def test_batched_input_view_alias_is_rejected_without_external_mutation(
 
     monkeypatch.setattr(
         backend,
-        "batched_matmul",
+        "_execution_batched_matmul_into",
         lambda *args, **kwargs: tensors["a0"].reshape(2, 2, 2),
     )
 
@@ -511,9 +538,9 @@ def test_batched_input_view_alias_is_rejected_without_external_mutation(
         later_calls.append(True)
         raise RuntimeError("later bucket failed")
 
-    monkeypatch.setattr(backend, "matmul", fail_later)
+    monkeypatch.setattr(backend, "_execution_matmul_into", fail_later)
 
-    with pytest.raises(ValueError, match="batched matmul result.*overlap"):
+    with pytest.raises(ValueError, match="published destination"):
         backend.grouped_gemm(descriptors, tensors)
     assert later_calls == []
     assert tensors.keys() == original_entries.keys()
@@ -718,14 +745,14 @@ def test_cupy_complex_c_pair_conjugates_packs_in_place_at_exact_capacity(
     }
     inputs = {key: value.copy() for key, value in tensors.items()}
     required = 2 * (m * k + k * n) * np.dtype("complex128").itemsize
-    original_conj = backend.conj
+    original_conj = backend._execution_conjugate_into
     conjugations = []
 
-    def recording_conj(value, *, out=None):
-        conjugations.append((value, out))
-        return original_conj(value, out=out)
+    def recording_conj(value, destination):
+        conjugations.append((value, destination))
+        return original_conj(value, destination)
 
-    monkeypatch.setattr(backend, "conj", recording_conj)
+    monkeypatch.setattr(backend, "_execution_conjugate_into", recording_conj)
 
     outputs = backend.grouped_gemm(
         descriptors, tensors, workspace=required
@@ -754,13 +781,13 @@ def test_cupy_complex_c_singleton_exact_capacity_and_numerics(monkeypatch):
     }
     required = (m * k + k * n) * np.dtype("complex128").itemsize
     calls = []
-    original_matmul = backend.matmul
+    original_matmul = backend._execution_matmul_into
 
     def recording_matmul(*args, **kwargs):
         calls.append(True)
         return original_matmul(*args, **kwargs)
 
-    monkeypatch.setattr(backend, "matmul", recording_matmul)
+    monkeypatch.setattr(backend, "_execution_matmul_into", recording_matmul)
 
     with pytest.raises(ValueError, match="workspace capacity"):
         backend.grouped_gemm(
@@ -798,13 +825,13 @@ def test_cupy_grouped_gemm_uses_selected_device_stream_without_sync_or_host_tran
     monkeypatch.setattr(backend, "to_numpy", lambda value: pytest.fail("host transfer"))
     observed = []
     events = []
-    original_batched = backend.batched_matmul
+    original_batched = backend._execution_batched_matmul_into
 
-    def batched(a, b, *, stream=None, workspace=None):
+    def batched(a, b, destination, *, workspace=None):
         observed.append((cp.cuda.runtime.getDevice(), cp.cuda.get_current_stream().ptr))
-        return original_batched(a, b, stream=stream, workspace=workspace)
+        return original_batched(a, b, destination, workspace=workspace)
 
-    monkeypatch.setattr(backend, "batched_matmul", batched)
+    monkeypatch.setattr(backend, "_execution_batched_matmul_into", batched)
     monkeypatch.setattr(profiling, "enabled", lambda: True)
     monkeypatch.setattr(
         profiling, "record", lambda event, **payload: events.append(payload)

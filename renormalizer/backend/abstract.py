@@ -5,6 +5,7 @@
 
 import functools
 from contextlib import nullcontext
+from contextvars import ContextVar
 from types import ModuleType
 from typing import Any
 
@@ -12,6 +13,11 @@ import numpy as np
 
 from renormalizer.backend.config import BackendConfig
 from renormalizer.backend.transforms import UnavailableTransforms
+
+
+_EXECUTION_ALLOCATION_SCOPE = ContextVar(
+    "renormalizer_execution_allocation_scope", default=None
+)
 
 
 class _DeviceBoundNamespace:
@@ -30,6 +36,7 @@ class _DeviceBoundNamespace:
         if isinstance(value, ModuleType):
             result = type(self)(value, self._on_device)
         elif callable(value) and not isinstance(value, type):
+
             def device_bound_call(*args, **kwargs):
                 return self._on_device(value, *args, **kwargs)
 
@@ -69,6 +76,8 @@ class AbstractBackend:
     def __init__(self, config: BackendConfig):
         self.config = config
         self.device = config.device
+        self._execution_terminal_error = None
+        self._execution_terminal_quarantine = None
         self.first_mp = False
         self.transforms = UnavailableTransforms(self.name)
         self._real_dtype = None
@@ -212,15 +221,37 @@ class AbstractBackend:
         )
 
     def execute_plan(self, plan, bindings, *, stream=None, workspace=None):
+        self._require_execution_usable()
         if not self.supports_execution_ir:
             raise NotImplementedError(
                 "backend {!r} does not support execution IR".format(self.name)
             )
         from renormalizer.backend._execution.executor import execute_plan
 
-        return execute_plan(
-            self, plan, bindings, stream=stream, workspace=workspace
+        scope_binding = _EXECUTION_ALLOCATION_SCOPE.get()
+        allocation_scope = (
+            scope_binding[1]
+            if scope_binding is not None and scope_binding[0] is self
+            else None
         )
+        return execute_plan(
+            self,
+            plan,
+            bindings,
+            stream=stream,
+            workspace=workspace,
+            _allocation_scope=allocation_scope,
+        )
+
+    def _execute_plan_with_scope(
+        self, plan, bindings, *, stream=None, workspace=None, allocation_scope
+    ):
+        self._require_execution_usable()
+        token = _EXECUTION_ALLOCATION_SCOPE.set((self, allocation_scope))
+        try:
+            return self.execute_plan(plan, bindings, stream=stream, workspace=workspace)
+        finally:
+            _EXECUTION_ALLOCATION_SCOPE.reset(token)
 
     def _validate_execution_stream(self, stream):
         if stream is not None:
@@ -229,6 +260,65 @@ class AbstractBackend:
     def _execution_context(self, stream):
         self._validate_execution_stream(stream)
         return nullcontext()
+
+    def _require_execution_usable(self):
+        terminal_error = self.__dict__.get("_execution_terminal_error")
+        if terminal_error is not None:
+            raise RuntimeError("backend execution is terminal-poisoned") from (
+                terminal_error
+            )
+
+    def _synchronize_execution_stream(self, stream):
+        self._validate_execution_stream(stream)
+
+    def _execution_copy_into(self, source, destination):
+        self.array_namespace.copyto(destination, source, casting="no")
+
+    def _execution_sum_into(self, source, destination, *, axis, dtype):
+        return self.array_namespace.sum(source, out=destination, axis=axis, dtype=dtype)
+
+    def _execution_conjugate_into(self, source, destination):
+        return self.array_namespace.conjugate(source, out=destination)
+
+    def _execution_multiply_into(self, left, right, destination):
+        return self.array_namespace.multiply(left, right, out=destination)
+
+    def _execution_add_into(self, left, right, destination):
+        return self.array_namespace.add(left, right, out=destination)
+
+    def _execution_matmul_into(self, left, right, destination, *, workspace=None):
+        return self.array_namespace.matmul(left, right, out=destination)
+
+    def _execution_batched_matmul_into(
+        self, left, right, destination, *, workspace=None
+    ):
+        return self.array_namespace.matmul(left, right, out=destination)
+
+    def _is_exact_execution_destination(self, expected, result):
+        if (
+            expected.shape != result.shape
+            or expected.dtype != result.dtype
+            or expected.strides != result.strides
+        ):
+            return False
+
+        def root_base(value):
+            seen = set()
+            while getattr(value, "base", None) is not None:
+                if id(value) in seen:
+                    break
+                seen.add(id(value))
+                value = value.base
+            return value
+
+        if root_base(expected) is not root_base(result):
+            return False
+        if expected.size == 0:
+            return True
+        return (
+            expected.__array_interface__["data"][0]
+            == result.__array_interface__["data"][0]
+        )
 
     def _validate_execution_array(self, value):
         if not isinstance(value, self.ndarray):
@@ -259,8 +349,7 @@ class AbstractBackend:
         if left.size == 0:
             return True
         return (
-            left.__array_interface__["data"][0]
-            == right.__array_interface__["data"][0]
+            left.__array_interface__["data"][0] == right.__array_interface__["data"][0]
         )
 
     def is_array(self, value: Any) -> bool:

@@ -42,7 +42,9 @@ class BackendConfig:
     def __post_init__(self):
         object.__setattr__(self, "device", _normalize_device(self.device))
         if self.precision not in {32, 64}:
-            raise ValueError("unsupported backend precision: {!r}".format(self.precision))
+            raise ValueError(
+                "unsupported backend precision: {!r}".format(self.precision)
+            )
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("backend seed must be an integer or None")
         if self.execution_policy not in _EXECUTION_POLICIES:
@@ -76,6 +78,9 @@ class DistributedExecutionConfig:
     backend_precision: int | None = None
     device_budget_resolution: object = None
     host_budget_resolution: object = None
+    residency_request: object = None
+    residency_plan: object = None
+    residency_receipt: object = None
 
     def __post_init__(self):
         from renormalizer.backend._distributed.context import DistributedContext
@@ -96,21 +101,25 @@ class DistributedExecutionConfig:
             getattr(self.collective, "size", None) != self.context.world_size
             or getattr(self.collective, "rank", None) != self.context.rank
         ):
-            raise ValueError("collective rank or size does not match distributed context")
+            raise ValueError(
+                "collective rank or size does not match distributed context"
+            )
         if not callable(getattr(self.provider, "acquire", None)):
             raise TypeError("provider must implement acquire")
         provider_policy = getattr(self.provider, "residency_policy", None)
-        if self.residency_policy == "active_working_set" and (
-            provider_policy != "active_working_set"
+        provider_role = getattr(self.provider, "provider_role", None)
+        if (
+            self.residency_policy == "active_working_set"
+            and provider_policy != "active_working_set"
         ):
             raise ValueError(
                 "provider policy mismatch; DeviceResidentProvider supports only "
                 "residency_policy='device_resident'"
             )
-        if (
-            self.residency_policy == "device_resident"
-            and provider_policy not in {None, "device_resident"}
-        ):
+        if self.residency_policy == "device_resident" and provider_policy not in {
+            None,
+            "device_resident",
+        }:
             raise ValueError("provider policy does not match residency_policy")
         for name in ("device_memory_budget_bytes", "host_memory_budget_bytes"):
             value = getattr(self, name)
@@ -164,6 +173,56 @@ class DistributedExecutionConfig:
                 raise ValueError(
                     "{} budget resolution has the wrong resource".format(resource)
                 )
+
+        residency_metadata = (
+            self.residency_request,
+            self.residency_plan,
+            self.residency_receipt,
+        )
+        if self.residency_policy == "device_resident":
+            if provider_role not in {None, "resident"}:
+                raise ValueError("device-resident provider role is invalid")
+            if any(value is not None for value in residency_metadata):
+                raise ValueError("residency metadata requires active_working_set")
+            return
+
+        if self.device_budget_resolution is None or self.host_budget_resolution is None:
+            raise ValueError(
+                "active_working_set requires resolved device and host budgets"
+            )
+        if provider_role == "factory":
+            if not callable(getattr(self.provider, "open_working_set", None)):
+                raise TypeError("factory provider must implement open_working_set")
+            if any(value is not None for value in residency_metadata):
+                raise ValueError("factory config must not retain lease metadata")
+            return
+        if provider_role != "working_set":
+            raise ValueError("active provider role must be 'factory' or 'working_set'")
+
+        from renormalizer.backend._distributed.residency import (
+            ResidencyPlan,
+            ResidencyPreflightReceipt,
+            ResidencyRequest,
+        )
+
+        if not isinstance(self.residency_request, ResidencyRequest):
+            raise TypeError("working-set config requires a ResidencyRequest")
+        if not isinstance(self.residency_plan, ResidencyPlan):
+            raise TypeError("working-set config requires a ResidencyPlan")
+        if not isinstance(self.residency_receipt, ResidencyPreflightReceipt):
+            raise TypeError("working-set config requires a ResidencyPreflightReceipt")
+        if (
+            getattr(self.provider, "request", None) is not self.residency_request
+            or getattr(self.provider, "plan", None) is not self.residency_plan
+            or getattr(self.provider, "receipt", None) is not self.residency_receipt
+        ):
+            raise ValueError("working-set config metadata does not match its lease")
+        self.residency_plan.validate_request(self.residency_request)
+        if (
+            self.residency_receipt.request_hash != self.residency_request.request_hash
+            or self.residency_receipt.plan_hash != self.residency_plan.plan_hash
+        ):
+            raise ValueError("working-set receipt does not match request and plan")
 
     @property
     def resolved_device_memory_budget_bytes(self):

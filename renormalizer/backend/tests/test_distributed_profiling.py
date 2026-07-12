@@ -8,7 +8,10 @@ from renormalizer.backend._distributed.profiling import (
     working_set_payload,
 )
 from renormalizer.utils._profiling.aggregate import RunAggregate
-from renormalizer.utils._profiling.events import MAX_INTEGER_DIGITS
+from renormalizer.utils._profiling.events import (
+    MAX_INTEGER_DIGITS,
+    validate_working_set_record_fields,
+)
 
 
 def test_distributed_solve_payload_includes_bounded_cost_metadata():
@@ -89,7 +92,10 @@ def test_distributed_solve_payload_validates_all_shape_values_before_bounding():
         ({"fallback_count": -1}, ValueError),
         ({"compute_s": math.inf}, ValueError),
         ({"global_shape": (4, 8), "local_shape": (4,)}, ValueError),
-        ({"global_shape": (4, 8), "local_shape": (2, 8), "sharding_axis": 1}, ValueError),
+        (
+            {"global_shape": (4, 8), "local_shape": (2, 8), "sharding_axis": 1},
+            ValueError,
+        ),
         ({"global_shape": (4, 8), "local_shape": (4, 9)}, ValueError),
         ({"sharding_axis": 2}, ValueError),
     ],
@@ -158,7 +164,9 @@ def test_working_set_payload_includes_residency_and_dirty_writeback_costs():
         ("dirty_writeback_s", math.nan, ValueError),
     ],
 )
-def test_working_set_payload_rejects_non_python_or_negative_metadata(field, value, error):
+def test_working_set_payload_rejects_non_python_or_negative_metadata(
+    field, value, error
+):
     kwargs = {
         "h2d_bytes": 1,
         "d2h_bytes": 1,
@@ -177,6 +185,48 @@ def test_working_set_payload_rejects_non_python_or_negative_metadata(field, valu
 
     with pytest.raises(error):
         working_set_payload(**kwargs)
+
+
+def test_stage5_working_set_telemetry_has_bounded_planned_and_observed_evidence():
+    payload = {
+        "h2d_bytes": 128,
+        "d2h_bytes": 32,
+        "h2d_s": 0.1,
+        "d2h_s": 0.2,
+        "cache_hits": 3,
+        "cache_misses": 1,
+        "prefetch_overlap_s": 0.05,
+        "prefetch_wait_s": 0.01,
+        "dirty_writeback_bytes": 32,
+        "dirty_writeback_s": 0.02,
+        "dirty_writeback_count": 1,
+        "peak_device_bytes": 4096,
+        "planned_device_peak_bytes": 4096,
+        "observed_device_peak_bytes": 128,
+        "planned_host_peak_bytes": 8192,
+        "observed_host_peak_bytes": 128,
+        "planned_cache_peak_bytes": 128,
+        "observed_cache_peak_bytes": 128,
+        "planned_pinned_peak_bytes": 128,
+        "observed_pinned_peak_bytes": 128,
+        "pageable_fallback_count": 0,
+        "pageable_fallback_bytes": 0,
+        "full_replica": False,
+        "request_hash": "a" * 64,
+        "plan_hash": "b" * 64,
+        "profile_hash": "c" * 64,
+        "rank": 0,
+        "device": "cuda:0",
+    }
+
+    validate_working_set_record_fields(payload)
+
+    assert not {
+        "keys",
+        "slices",
+        "masks",
+        "tensor_values",
+    }.intersection(payload)
 
 
 def test_run_aggregate_has_fixed_schema_and_exact_arithmetic():
@@ -231,7 +281,18 @@ def test_run_aggregate_has_fixed_schema_and_exact_arithmetic():
             "prefetch_wait_s": 0.4,
             "dirty_writeback_bytes": 12,
             "dirty_writeback_s": 0.05,
+            "dirty_writeback_count": 1,
             "peak_device_bytes": 2048,
+            "planned_device_peak_bytes": 4096,
+            "observed_device_peak_bytes": 2048,
+            "planned_host_peak_bytes": 8192,
+            "observed_host_peak_bytes": 1024,
+            "planned_cache_peak_bytes": 2048,
+            "observed_cache_peak_bytes": 1024,
+            "planned_pinned_peak_bytes": 256,
+            "observed_pinned_peak_bytes": 128,
+            "pageable_fallback_count": 1,
+            "pageable_fallback_bytes": 128,
             "full_replica": False,
             "wall_s": 0.75,
         }
@@ -249,7 +310,18 @@ def test_run_aggregate_has_fixed_schema_and_exact_arithmetic():
             "prefetch_wait_s": 0.1,
             "dirty_writeback_bytes": 8,
             "dirty_writeback_s": 0.025,
+            "dirty_writeback_count": 1,
             "peak_device_bytes": 1024,
+            "planned_device_peak_bytes": 2048,
+            "observed_device_peak_bytes": 1024,
+            "planned_host_peak_bytes": 4096,
+            "observed_host_peak_bytes": 512,
+            "planned_cache_peak_bytes": 1024,
+            "observed_cache_peak_bytes": 512,
+            "planned_pinned_peak_bytes": 128,
+            "observed_pinned_peak_bytes": 64,
+            "pageable_fallback_count": 0,
+            "pageable_fallback_bytes": 0,
             "full_replica": True,
         }
     )
@@ -278,6 +350,7 @@ def test_run_aggregate_has_fixed_schema_and_exact_arithmetic():
         "d2h_s": pytest.approx(0.3),
         "dirty_writeback_bytes": 20,
         "dirty_writeback_s": pytest.approx(0.075),
+        "dirty_writeback_count": 2,
         "working_set_wall_s": 0.75,
         "cache_hits": 9,
         "cache_misses": 3,
@@ -285,6 +358,16 @@ def test_run_aggregate_has_fixed_schema_and_exact_arithmetic():
         "prefetch_overlap_s": 0.5,
         "prefetch_wait_s": 0.5,
         "peak_device_bytes": 2048,
+        "planned_device_peak_bytes": 4096,
+        "observed_device_peak_bytes": 2048,
+        "planned_host_peak_bytes": 8192,
+        "observed_host_peak_bytes": 1024,
+        "planned_cache_peak_bytes": 2048,
+        "observed_cache_peak_bytes": 1024,
+        "planned_pinned_peak_bytes": 256,
+        "observed_pinned_peak_bytes": 128,
+        "pageable_fallback_count": 1,
+        "pageable_fallback_bytes": 128,
         "full_replica_detected": True,
         "full_replica_count": 1,
         "event_counts": {
@@ -301,9 +384,11 @@ def test_run_aggregate_has_fixed_schema_and_exact_arithmetic():
     aggregate.add({"event": "run_summary"})
     summary_after_event = aggregate.summary()
     assert summary_after_event["event_counts"]["run_summary"] == 1
-    assert {key: value for key, value in summary_after_event.items() if key != "event_counts"} == {
-        key: value for key, value in summary.items() if key != "event_counts"
-    }
+    assert {
+        key: value
+        for key, value in summary_after_event.items()
+        if key != "event_counts"
+    } == {key: value for key, value in summary.items() if key != "event_counts"}
     assert len(RunAggregate().summary()) == len(summary)
     assert RunAggregate().summary()["ir_call_coverage"] == 0.0
     assert RunAggregate().summary()["cache_hit_rate"] == 0.0
@@ -440,7 +525,10 @@ def test_prepare_rejects_event_count_overflow_without_mutation():
         ({"event": "unknown"}, ValueError),
         ({"event": np.str_("run_start")}, TypeError),
         ({"event": "local_hv_execute", "actual_policy": "execution_ir"}, ValueError),
-        ({"event": "local_hv_execute", "actual_policy": "bad", "wall_s": 1.0}, ValueError),
+        (
+            {"event": "local_hv_execute", "actual_policy": "bad", "wall_s": 1.0},
+            ValueError,
+        ),
         (
             {
                 "event": "grouped_gemm_execute",

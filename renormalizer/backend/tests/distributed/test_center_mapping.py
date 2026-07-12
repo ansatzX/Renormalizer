@@ -138,6 +138,57 @@ def test_adapter_backend_digest_normalizes_valid_rank_local_devices():
     np.testing.assert_array_equal(digest_for_rank(0), digest_for_rank(1))
 
 
+def test_active_backend_validation_rejects_legacy_policy_before_provider_open():
+    from renormalizer.backend._distributed.mesh import DeviceMesh
+    from renormalizer.backend._distributed.residency import MemoryBudgetResolution
+    from renormalizer.backend.config import DistributedExecutionConfig
+
+    class FactoryProvider:
+        residency_policy = "active_working_set"
+        provider_role = "factory"
+        open_calls = 0
+
+        @staticmethod
+        def acquire(request):
+            raise RuntimeError("factory")
+
+        def open_working_set(self, request, plan, store, receipt):
+            self.open_calls += 1
+            raise AssertionError("active provider must not open")
+
+    provider = FactoryProvider()
+    context = DistributedContext(0, 0, 1, 1)
+    execution = DistributedExecutionConfig(
+        context=context,
+        mesh=DeviceMesh((1,), ("rank",), 0),
+        collective=SingleProcessCollective(),
+        provider=provider,
+        residency_policy="active_working_set",
+        device_memory_budget_bytes=1024,
+        host_memory_budget_bytes=2048,
+        device_budget_resolution=MemoryBudgetResolution(
+            1024, 1024, "explicit", None, "device"
+        ),
+        host_budget_resolution=MemoryBudgetResolution(
+            2048, 2048, "explicit", None, "host"
+        ),
+    )
+    selected = create_backend(
+        "numpy",
+        config=BackendConfig(
+            device="cpu",
+            execution_policy="legacy_oe",
+            fallback_policy="legacy_oe",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="backend/runtime validation") as caught:
+        validate_distributed_backend(execution, selected, network="mps")
+
+    assert "execution_ir" in str(caught.value.__cause__)
+    assert provider.open_calls == 0
+
+
 def test_wave9_oversized_qn_shape_product_fails_without_array_allocation():
     oversized_shape = (1 << 62, 4)
     sharding = shard_axis(oversized_shape, 0, 1)

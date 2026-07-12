@@ -13,7 +13,10 @@ from renormalizer.backend._distributed.profiling import (
     distributed_solve_payload,
     working_set_payload,
 )
-from renormalizer.backend._execution.profiling import local_hv_payload, phase_summary_payload
+from renormalizer.backend._execution.profiling import (
+    local_hv_payload,
+    phase_summary_payload,
+)
 from renormalizer.backend._gemm.profiling import grouped_gemm_payload
 from renormalizer.utils import profiling
 from renormalizer.utils._profiling.events import (
@@ -150,10 +153,10 @@ def test_event_filter_and_nested_scope_precedence_are_deterministic(tmp_path):
     assert payloads == [
         {
             "event": "run_start",
-                "backend": "cupy",
-                "rank": 1,
-                "world_size": 2,
-                "stage": "evolve",
+            "backend": "cupy",
+            "rank": 1,
+            "world_size": 2,
+            "stage": "evolve",
         }
     ]
 
@@ -190,7 +193,9 @@ def test_jsonl_converts_numpy_scalars_and_rejects_arrays(tmp_path):
     }
 
 
-def test_default_event_output_name_contains_timestamp_pid_and_rank(tmp_path, monkeypatch):
+def test_default_event_output_name_contains_timestamp_pid_and_rank(
+    tmp_path, monkeypatch
+):
     init_log(PROFILING)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("RANK", "7")
@@ -234,12 +239,12 @@ def test_register_resets_run_aggregate_and_summary_is_explicit(tmp_path):
     profiling.record("run_start", **_run_start_payload())
     profiling.close_event_output()
 
-    assert [json.loads(line)["event"] for line in first_path.read_text().splitlines()] == [
-        "local_hv_execute"
-    ]
-    assert [json.loads(line)["event"] for line in second_path.read_text().splitlines()] == [
-        "run_start"
-    ]
+    assert [
+        json.loads(line)["event"] for line in first_path.read_text().splitlines()
+    ] == ["local_hv_execute"]
+    assert [
+        json.loads(line)["event"] for line in second_path.read_text().splitlines()
+    ] == ["run_start"]
 
 
 def test_record_run_summary_writes_once_without_aggregating_itself(tmp_path):
@@ -494,7 +499,11 @@ def test_public_record_rejects_direct_run_summary(tmp_path):
         ),
         (
             "distributed_solve_summary",
-            {key: value for key, value in _distributed_payload().items() if key != "local_shape"},
+            {
+                key: value
+                for key, value in _distributed_payload().items()
+                if key != "local_shape"
+            },
         ),
         (
             "working_set_transfer",
@@ -545,9 +554,47 @@ def test_public_record_accepts_all_canonical_source_schemas(tmp_path):
     profiling.record("working_set_transfer", **_working_set_payload())
     profiling.close_event_output()
 
-    assert [json.loads(line)["event"] for line in path.read_text().splitlines()] == list(
-        EVENT_NAMES[:-1]
+    assert [
+        json.loads(line)["event"] for line in path.read_text().splitlines()
+    ] == list(EVENT_NAMES[:-1])
+
+
+def test_stage5_working_set_record_preserves_only_bounded_peak_and_hash_evidence(
+    tmp_path,
+):
+    init_log(PROFILING)
+    path = tmp_path / "events.jsonl"
+    profiling.register_event_output(path, events={"working_set_transfer"})
+    payload = _working_set_payload()
+    payload.update(
+        {
+            "planned_device_peak_bytes": 4096,
+            "observed_device_peak_bytes": 2048,
+            "planned_host_peak_bytes": 8192,
+            "observed_host_peak_bytes": 1024,
+            "planned_cache_peak_bytes": 1024,
+            "observed_cache_peak_bytes": 1024,
+            "planned_pinned_peak_bytes": 256,
+            "observed_pinned_peak_bytes": 128,
+            "pageable_fallback_count": 1,
+            "pageable_fallback_bytes": 128,
+            "dirty_writeback_count": 1,
+            "request_hash": "a" * 64,
+            "plan_hash": "b" * 64,
+            "profile_hash": "c" * 64,
+            "rank": 0,
+            "device": "cuda:0",
+        }
     )
+
+    profiling.record("working_set_transfer", **payload)
+    profiling.close_event_output()
+
+    record = json.loads(path.read_text())
+    assert record["planned_device_peak_bytes"] == 4096
+    assert record["observed_pinned_peak_bytes"] == 128
+    assert record["request_hash"] == "a" * 64
+    assert not {"keys", "slices", "masks", "tensor_values"}.intersection(record)
 
 
 def test_writer_failure_leaves_source_aggregate_unchanged(tmp_path, monkeypatch):

@@ -555,25 +555,17 @@ def test_grouped_peak_tracks_python_pack_bindings_across_scalar_bucket():
     pack_references = []
     result_pack_reference = []
     observed_live_peaks = []
-    original_stack = backend.stack
-    original_batched_matmul = backend.batched_matmul
-    original_matmul = backend.matmul
+    original_batched_matmul = backend._execution_batched_matmul_into
+    original_matmul = backend._execution_matmul_into
 
-    def recording_stack(values, *, axis=0):
-        result = original_stack(values, axis=axis)
-        pack_references.append(weakref.ref(result))
-        return result
+    def recording_batched_matmul(left, right, destination, *, workspace=None):
+        pack_references.extend((weakref.ref(left), weakref.ref(right)))
+        result_pack_reference.append(weakref.ref(destination))
+        return original_batched_matmul(left, right, destination, workspace=workspace)
 
-    def recording_batched_matmul(left, right, *, stream=None, workspace=None):
-        result = original_batched_matmul(
-            left, right, stream=stream, workspace=workspace
-        )
-        result_pack_reference.append(weakref.ref(result))
-        return result
-
-    def recording_matmul(left, right, *, stream=None, workspace=None):
+    def recording_matmul(left, right, destination, *, workspace=None):
         result = original_matmul(
-            left, right, stream=stream, workspace=workspace
+            left, right, destination, workspace=workspace
         )
         retained = [
             reference()
@@ -586,9 +578,8 @@ def test_grouped_peak_tracks_python_pack_bindings_across_scalar_bucket():
         )
         return result
 
-    backend.stack = recording_stack
-    backend.batched_matmul = recording_batched_matmul
-    backend.matmul = recording_matmul
+    backend._execution_batched_matmul_into = recording_batched_matmul
+    backend._execution_matmul_into = recording_matmul
 
     result = backend.execute_plan(
         plan,
@@ -865,9 +856,9 @@ def test_local_operator_matches_full_hv_with_ordered_uneven_broadcasts():
         assert counters["broadcast_calls"] == 4
         assert counters["allgather_calls"] == 0
         assert counters["execution_calls"] == 4
-        assert counters["allreduce_calls"] == 12
-        assert collective.allreduce_calls == 12
-        assert collective.inplace_allreduce_calls == 4
+        assert counters["allreduce_calls"] == 13
+        assert collective.allreduce_calls == 13
+        assert collective.inplace_allreduce_calls == 6
 
     np.testing.assert_allclose(np.concatenate(local_results), matrix @ vector)
 
@@ -904,9 +895,9 @@ def test_operator_reuses_preallocated_receive_output_and_status_storage():
     assert host_execution_status.dtype == np.dtype(np.int32)
     assert first is output_storage
     assert second is output_storage
-    assert counters["allreduce_calls"] == 18
-    assert collective.allreduce_calls == 18
-    assert collective.inplace_allreduce_calls == 8
+    assert counters["allreduce_calls"] == 19
+    assert collective.allreduce_calls == 19
+    assert collective.inplace_allreduce_calls == 11
 
 
 def test_numpy_execution_status_copies_into_one_persistent_host_array(monkeypatch):
@@ -936,9 +927,8 @@ def test_numpy_execution_status_copies_into_one_persistent_host_array(monkeypatc
     host_status = operator._host_execution_status
     operator(source_shards[0])
 
-    assert len(destinations) == 4
-    assert all(destination is host_status for destination in destinations)
-    assert collective.inplace_allreduce_calls == 4
+    assert len([value for value in destinations if value is host_status]) == 7
+    assert collective.inplace_allreduce_calls == 7
 
 
 def test_host_execution_status_survives_first_hv_through_projected_solver_work(
@@ -1052,7 +1042,7 @@ def test_cupy_execution_status_uses_asnumpy_out_without_new_host_array(monkeypat
         host_status = operator._host_execution_status
         operator(local_vector)
 
-        assert status_destinations == [host_status, host_status]
+        assert status_destinations == [host_status] * 5
     finally:
         cupy.cuda.Device(previous_device).use()
 
@@ -1163,7 +1153,7 @@ def test_execute_baseexception_is_synchronized_before_next_source_broadcast():
 
     assert isinstance(caught.value.__cause__, _InjectedBaseException)
     assert collective.broadcast_calls == [(0, (3,))]
-    assert counters["allreduce_calls"] == 9
+    assert counters["allreduce_calls"] == 10
     assert counters["allgather_calls"] == 0
 
 
@@ -1192,7 +1182,7 @@ def test_accumulation_baseexception_is_synchronized_before_next_broadcast():
 
     assert isinstance(caught.value.__cause__, _InjectedBaseException)
     assert collective.broadcast_calls == [(0, (3,))]
-    assert counters["allreduce_calls"] == 9
+    assert counters["allreduce_calls"] == 10
     assert operator._active_contribution is None
 
 
@@ -1233,6 +1223,50 @@ def test_contribution_reference_is_released_before_next_execute_call():
 
     assert observed_active_references == [None, None, None, None]
     assert operator._active_contribution is None
+
+
+def test_device_resident_provider_continues_without_internal_owner_hook():
+    class CapturingProvider(DeviceResidentProvider):
+        def __init__(self):
+            self.captured = []
+
+        @contextmanager
+        def acquire(self, request):
+            with super().acquire(request) as base:
+                provider = self
+
+                class Lease:
+                    bindings = base.bindings
+
+                    def _capture_execution_allocation(self, array):
+                        provider.captured.append(array)
+
+                    def mark_dirty(self, key, local_array):
+                        return base.mark_dirty(key, local_array)
+
+                yield Lease()
+
+    matrix = np.arange(30.0).reshape(6, 5)
+    vector = np.arange(5.0)
+    plan = lower_einsum_path("ab,b->a", (matrix.shape, vector.shape))
+    distributed = plan_distributed_execution(
+        plan, variable_key="input_1", world_size=1
+    )
+    provider = CapturingProvider()
+    operator = DistributedLocalOperator(
+        plan=distributed,
+        provider=provider,
+        collective=SingleProcessCollective(),
+        counters={},
+        backend=_numpy_backend(),
+        context=_context(),
+        source_bindings=ExecutionBindings({"input_0": matrix}),
+    )
+
+    result = operator(vector)
+
+    assert provider.captured == []
+    np.testing.assert_allclose(result, matrix @ vector)
 
 
 def test_transitive_multistep_rewrite_executes_numerically():
@@ -1803,7 +1837,7 @@ def test_private_counter_sink_seeds_valid_values_and_preserves_metadata():
 
     assert counters == {
         "broadcast_calls": 7,
-        "allreduce_calls": 17,
+        "allreduce_calls": 18,
         "allgather_calls": 11,
         "execution_calls": 15,
         "metadata": metadata,
@@ -1845,15 +1879,15 @@ def test_external_known_counter_mutation_never_becomes_arithmetic(counter_key):
 
     expected_counters = {
         "broadcast_calls": 4,
-        "allreduce_calls": 14,
+        "allreduce_calls": 15,
         "allgather_calls": 0,
         "execution_calls": 4,
     }
     assert operator._counters == expected_counters
     assert all(counters[key] == value for key, value in expected_counters.items())
     assert counters["metadata"] is metadata
-    assert collective.inplace_allreduce_calls == 4
-    assert collective.allreduce_calls == 14
+    assert collective.inplace_allreduce_calls == 7
+    assert collective.allreduce_calls == 15
     assert len(collective.broadcast_calls) == 4
     np.testing.assert_allclose(
         result,
@@ -1893,7 +1927,7 @@ def test_provider_acquire_failure_is_synchronized_before_broadcast():
         operator(source_shards[0])
 
     assert collective.broadcast_calls == []
-    assert collective.allreduce_calls == 8
+    assert collective.allreduce_calls == 9
 
 
 class _RecordingAcquireProvider(DeviceResidentProvider):
@@ -1962,7 +1996,7 @@ def test_provider_baseexception_closes_already_entered_contexts():
 def test_resource_status_allreduce_failure_closes_all_provider_contexts():
     class FailingStatusCollective(_ReplayBroadcastCollective):
         def allreduce(self, array, *, op="sum"):
-            if self.allreduce_calls == 7:
+            if self.allreduce_calls == 8:
                 raise RuntimeError("injected resource status failure")
             return super().allreduce(array, op=op)
 
@@ -1987,7 +2021,7 @@ def test_resource_status_conversion_failure_closes_all_provider_contexts():
     class InvalidStatusCollective(_ReplayBroadcastCollective):
         def allreduce(self, array, *, op="sum"):
             result = super().allreduce(array, op=op)
-            if self.allreduce_calls == 8:
+            if self.allreduce_calls == 9:
                 return object()
             return result
 
@@ -2169,6 +2203,48 @@ def test_distributed_config_accepts_only_device_resident_stage4_policy():
         )
     with pytest.raises(FrozenInstanceError):
         config.prefetch_depth = 3
+
+
+def test_local_operator_rejects_active_factory_role_at_block_boundary():
+    class FactoryProvider:
+        residency_policy = "active_working_set"
+        provider_role = "factory"
+        hook_calls = 0
+
+        def validate_setup(self, distributed_plan, source_bindings, context):
+            self.hook_calls += 1
+
+        def validate_request(self, request, residency_plan=None):
+            self.hook_calls += 1
+
+        @contextmanager
+        def acquire(self, request):
+            self.hook_calls += 1
+            yield None
+
+    matrix = np.arange(16.0).reshape(4, 4)
+    source = lower_einsum_path("ab,b->a", (matrix.shape, (4,)))
+    plan = plan_distributed_execution(source, variable_key="input_1", world_size=1)
+    provider = FactoryProvider()
+    operator = DistributedLocalOperator(
+        plan=plan,
+        provider=provider,
+        collective=SingleProcessCollective(),
+        counters={},
+        backend=_numpy_backend(),
+        context=_context(),
+        source_bindings=ExecutionBindings({"input_0": matrix}),
+    )
+
+    with pytest.raises(
+        ValueError, match="distributed setup preflight failed"
+    ) as caught:
+        operator.solver_preflight()
+
+    assert "factory provider cannot execute operand blocks" in str(
+        caught.value.__cause__
+    )
+    assert provider.hook_calls == 0
 
 
 def test_root_fallback_calls_operation_only_on_root_for_object_collective():

@@ -1,7 +1,12 @@
+import gc
+import weakref
+
 import numpy as np
 import pytest
 
 from renormalizer import set_backend
+from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
+import renormalizer.backend._execution.executor as execution_executor
 from renormalizer.backend._execution.executor import execute_plan
 from renormalizer.backend._execution.model import (
     BufferRef,
@@ -16,6 +21,8 @@ from renormalizer.backend._execution.model import (
 )
 from renormalizer.backend._execution.planner import plan_einsum
 from renormalizer.backend._execution.workspace import workspace_bytes_for_steps
+from renormalizer.backend._gemm.descriptors import MatmulDesc
+from renormalizer.backend._gemm.executor import execute_grouped_gemm
 
 
 @pytest.fixture(autouse=True)
@@ -187,6 +194,93 @@ def test_executor_runs_explicit_pack_and_output_reorder():
     assert actual.flags.c_contiguous
 
 
+def _shares_published_backing(destination, owner):
+    return any(np.shares_memory(destination, retained) for retained in owner.arrays)
+
+
+def _assert_owner_drains_published_destination(owner, error, destinations):
+    drained = []
+
+    def drain():
+        drained.append(tuple(owner.arrays))
+
+    owner._drainer = drain
+    with pytest.raises(RuntimeError) as caught:
+        owner.fail(error)
+    assert caught.value is error
+    assert len(drained) == 1
+    assert all(
+        any(np.shares_memory(destination, retained) for retained in drained[0])
+        for destination in destinations
+    )
+
+
+def _execution_scope(backend, owner=None):
+    scope_type = getattr(execution_executor, "ExecutionAllocationScope")
+    return scope_type(backend, owner=owner)
+
+
+def test_transform_copy_destination_is_published_before_primitive_raise(monkeypatch):
+    source = np.arange(24.0).reshape(2, 3, 4)
+    input_ref = _ref("input_0", source.shape, ("a", "b", "c"))
+    output_ref = _ref("output", (4, 3, 2), ("c", "b", "a"), layout="F")
+    plan = _specialized_plan(
+        (input_ref,),
+        output_ref,
+        (TransformStep(input_ref, output_ref, (2, 1, 0), True),),
+    )
+    backend = _numpy_backend()
+    error = RuntimeError("injected transform copy launch failure")
+    owner = AsyncResourceOwner("compute")
+    destinations = []
+
+    def fail_after_enqueue(source, destination):
+        assert _shares_published_backing(destination, owner)
+        destinations.append(destination)
+        owner.mark_enqueued()
+        raise error
+
+    monkeypatch.setattr(
+        backend, "_execution_copy_into", fail_after_enqueue, raising=False
+    )
+    with _execution_scope(backend, owner) as scope:
+        with pytest.raises(RuntimeError) as caught:
+            execute_plan(
+                backend,
+                plan,
+                ExecutionBindings({"input_0": source}),
+                _allocation_scope=scope,
+            )
+    assert caught.value is error
+    _assert_owner_drains_published_destination(owner, error, destinations)
+
+
+def test_matmul_destination_is_published_before_primitive_raise(monkeypatch):
+    left = np.arange(6.0).reshape(2, 3)
+    right = np.arange(12.0).reshape(3, 4)
+    plan, bindings = plan_einsum("ab,bc->ac", {"left": left, "right": right})
+    backend = _numpy_backend()
+    error = RuntimeError("injected matmul launch failure")
+    owner = AsyncResourceOwner("compute")
+    destinations = []
+
+    def fail_after_enqueue(left, right, destination, *, workspace=None):
+        assert _shares_published_backing(destination, owner)
+        destinations.append(destination)
+        owner.mark_enqueued()
+        raise error
+
+    monkeypatch.setattr(
+        backend, "_execution_matmul_into", fail_after_enqueue, raising=False
+    )
+    with _execution_scope(backend, owner) as scope:
+        with pytest.raises(RuntimeError) as caught:
+            execute_plan(backend, plan, bindings, _allocation_scope=scope)
+
+    assert caught.value is error
+    _assert_owner_drains_published_destination(owner, error, destinations)
+
+
 def test_executor_reduces_operand_only_modes_with_planned_dtype():
     left = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
     right = np.arange(20, dtype=np.float32).reshape(4, 5)
@@ -210,7 +304,7 @@ def test_reduction_allocates_once_in_exact_planned_layout(monkeypatch, layout):
     )
     backend = _numpy_backend()
     original_empty = backend.empty
-    original_sum = backend.sum
+    original_sum = backend._execution_sum_into
     allocations = []
     sum_outputs = []
 
@@ -219,12 +313,12 @@ def test_reduction_allocates_once_in_exact_planned_layout(monkeypatch, layout):
         allocations.append((shape, np.dtype(dtype).name, order, output))
         return output
 
-    def recording_sum(value, *, out=None, axis=None, dtype=None):
-        sum_outputs.append(out)
-        return original_sum(value, out=out, axis=axis, dtype=dtype)
+    def recording_sum(value, destination, *, axis=None, dtype=None):
+        sum_outputs.append(destination)
+        return original_sum(value, destination, axis=axis, dtype=dtype)
 
     monkeypatch.setattr(backend, "empty", recording_empty)
-    monkeypatch.setattr(backend, "sum", recording_sum)
+    monkeypatch.setattr(backend, "_execution_sum_into", recording_sum)
 
     actual = execute_plan(
         backend, plan, ExecutionBindings({"input_0": source})
@@ -345,14 +439,14 @@ def test_exact_reshape_identity_accepts_empty_view(monkeypatch):
         "ab,bc->ac", {"left": left, "right": right}
     )
     backend = _numpy_backend()
-    original_matmul = backend.matmul
+    original_matmul = backend._execution_matmul_into
     matmul_calls = []
 
-    def recording_matmul(a, b, *, stream=None, workspace=None):
+    def recording_matmul(a, b, destination, *, workspace=None):
         matmul_calls.append((a, b))
-        return original_matmul(a, b, stream=stream, workspace=workspace)
+        return original_matmul(a, b, destination, workspace=workspace)
 
-    monkeypatch.setattr(backend, "matmul", recording_matmul)
+    monkeypatch.setattr(backend, "_execution_matmul_into", recording_matmul)
 
     actual = execute_plan(backend, plan, bindings)
 
@@ -590,13 +684,13 @@ def _grouped_plan(shapes):
 def test_grouped_matmul_same_shape_executes_one_batched_primitive(monkeypatch):
     plan, bindings, operations = _grouped_plan(((2, 4, 3), (2, 4, 3)))
     backend = _numpy_backend()
-    calls = {"scalar": 0, "batched": 0, "stack": 0}
-    original_batched = backend.batched_matmul
-    original_stack = backend.stack
+    calls = {"scalar": 0, "batched": 0, "copy": 0}
+    original_batched = backend._execution_batched_matmul_into
+    original_copy = backend._execution_copy_into
 
     monkeypatch.setattr(
         backend,
-        "matmul",
+        "_execution_matmul_into",
         lambda *args, **kwargs: pytest.fail("same-shape group used scalar matmul"),
     )
 
@@ -604,29 +698,428 @@ def test_grouped_matmul_same_shape_executes_one_batched_primitive(monkeypatch):
         calls["batched"] += 1
         return original_batched(*args, **kwargs)
 
-    def stack(*args, **kwargs):
-        calls["stack"] += 1
-        return original_stack(*args, **kwargs)
+    def copy(*args, **kwargs):
+        calls["copy"] += 1
+        return original_copy(*args, **kwargs)
 
-    monkeypatch.setattr(backend, "batched_matmul", batched)
-    monkeypatch.setattr(backend, "stack", stack)
+    monkeypatch.setattr(backend, "_execution_batched_matmul_into", batched)
+    monkeypatch.setattr(backend, "_execution_copy_into", copy)
 
     actual = execute_plan(backend, plan, bindings)
 
     first = operations[0]
     expected = bindings.arrays[first.left.key] @ bindings.arrays[first.right.key]
     np.testing.assert_allclose(actual, expected)
-    assert calls == {"scalar": 0, "batched": 1, "stack": 2}
+    assert calls == {"scalar": 0, "batched": 1, "copy": 4}
+
+
+@pytest.mark.parametrize(
+    ("method_name", "target_call", "descriptors", "tensors"),
+    [
+        (
+            "_execution_conjugate_into",
+            1,
+            (MatmulDesc("a", "b", "c", 2, 4, 3, "C", "N"),),
+            {
+                "a": np.ones((3, 2), dtype=np.complex128),
+                "b": np.ones((3, 4), dtype=np.complex128),
+            },
+        ),
+        (
+            "_execution_multiply_into",
+            1,
+            (MatmulDesc("a", "b", "c", 2, 4, 3, beta=2),),
+            {
+                "a": np.ones((2, 3)),
+                "b": np.ones((3, 4)),
+                "c": np.ones((2, 4)),
+            },
+        ),
+        (
+            "_execution_matmul_into",
+            1,
+            (MatmulDesc("a", "b", "c", 2, 4, 3),),
+            {"a": np.ones((2, 3)), "b": np.ones((3, 4))},
+        ),
+        (
+            "_execution_copy_into",
+            1,
+            (
+                MatmulDesc("a0", "b0", "c0", 2, 4, 3),
+                MatmulDesc("a1", "b1", "c1", 2, 4, 3),
+            ),
+            {
+                "a0": np.ones((2, 3)),
+                "b0": np.ones((3, 4)),
+                "a1": np.ones((2, 3)),
+                "b1": np.ones((3, 4)),
+            },
+        ),
+        (
+            "_execution_copy_into",
+            3,
+            (
+                MatmulDesc("a0", "b0", "c0", 2, 4, 3),
+                MatmulDesc("a1", "b1", "c1", 2, 4, 3),
+            ),
+            {
+                "a0": np.ones((2, 3)),
+                "b0": np.ones((3, 4)),
+                "a1": np.ones((2, 3)),
+                "b1": np.ones((3, 4)),
+            },
+        ),
+        (
+            "_execution_batched_matmul_into",
+            1,
+            (
+                MatmulDesc("a0", "b0", "c0", 2, 4, 3),
+                MatmulDesc("a1", "b1", "c1", 2, 4, 3),
+            ),
+            {
+                "a0": np.ones((2, 3)),
+                "b0": np.ones((3, 4)),
+                "a1": np.ones((2, 3)),
+                "b1": np.ones((3, 4)),
+            },
+        ),
+    ],
+    ids=("conjugate", "beta", "scalar", "left-pack", "right-pack", "batched-result"),
+)
+def test_grouped_destination_is_published_before_primitive_raise(
+    monkeypatch, method_name, target_call, descriptors, tensors
+):
+    backend = _numpy_backend()
+    original = getattr(backend, method_name)
+    error = RuntimeError("injected grouped primitive launch failure")
+    owner = AsyncResourceOwner("compute")
+    calls = 0
+    destinations = []
+
+    def fail_target(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        destination = (
+            args[2] if "matmul" in method_name or "multiply" in method_name else args[1]
+        )
+        if calls != target_call:
+            return original(*args, **kwargs)
+        assert _shares_published_backing(destination, owner)
+        destinations.append(destination)
+        owner.mark_enqueued()
+        raise error
+
+    monkeypatch.setattr(backend, method_name, fail_target)
+    with _execution_scope(backend, owner) as scope:
+        with pytest.raises(RuntimeError) as caught:
+            execute_grouped_gemm(
+                backend,
+                descriptors,
+                dict(tensors),
+                workspace=4096,
+                _allocation_scope=scope,
+            )
+    assert caught.value is error
+    _assert_owner_drains_published_destination(owner, error, destinations)
+
+
+def test_exact_reshape_rejects_noncontiguous_source_before_backend_call(monkeypatch):
+    backend = _numpy_backend()
+    source = np.arange(12.0).reshape(3, 4).T
+    calls = []
+    monkeypatch.setattr(backend, "reshape", lambda *args: calls.append(args))
+
+    with pytest.raises(ValueError, match="contiguous"):
+        execution_executor._exact_reshape_view(backend, source, (2, 6))
+    assert calls == []
+
+
+def test_no_owner_primitive_drain_failure_quarantines_complete_scope(monkeypatch):
+    source = np.arange(6.0).reshape(2, 3)
+    input_ref = _ref("input_0", source.shape, ("a", "b"))
+    output_ref = _ref("output", source.shape, ("a", "b"))
+    plan = _specialized_plan(
+        (input_ref,), output_ref, (TransformStep(input_ref, output_ref, (0, 1), True),)
+    )
+    backend = _numpy_backend()
+    error = RuntimeError("injected direct primitive failure")
+    drain_error = RuntimeError("injected direct stream drain failure")
+    bindings = ExecutionBindings({"input_0": source})
+    caller = {"source": source, "bindings": bindings}
+    source_ref = weakref.ref(source)
+    bindings_ref = weakref.ref(bindings)
+
+    monkeypatch.setattr(backend, "name", "cupy")
+    monkeypatch.setattr(
+        backend,
+        "_execution_copy_into",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_synchronize_execution_stream",
+        lambda _stream: (_ for _ in ()).throw(drain_error),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        execute_plan(backend, plan, bindings)
+    assert caught.value is error
+    quarantine = backend._execution_terminal_quarantine
+    assert quarantine.first_error is error
+    assert len(quarantine.owners) == 1
+    quarantined_owner = quarantine.owners[0]
+    assert quarantined_owner.error is error
+    assert len(quarantined_owner.arrays) == 2
+    assert any(
+        resource.__class__.__name__ == "ExecutionAllocationScope"
+        for resource in quarantined_owner.resources
+    )
+    assert any(resource is bindings for resource in quarantined_owner.resources)
+    destination = next(
+        array for array in quarantined_owner.arrays if array is not source
+    )
+    destination_ref = weakref.ref(destination)
+
+    with pytest.raises(RuntimeError, match="terminal-poisoned"):
+        execute_plan(backend, plan, ExecutionBindings({"input_0": source}))
+
+    for retained_error in (error, drain_error):
+        retained_error.__traceback__ = None
+        retained_error.__context__ = None
+        retained_error.__cause__ = None
+    caught = None
+    caller.clear()
+    source = None
+    bindings = None
+    destination = None
+    gc.collect()
+
+    assert source_ref() is not None
+    assert bindings_ref() is not None
+    assert destination_ref() is not None
+    assert any(array is source_ref() for array in quarantined_owner.arrays)
+    assert any(resource is bindings_ref() for resource in quarantined_owner.resources)
+
+
+def test_no_owner_grouped_drain_failure_quarantines_all_exact_inputs(monkeypatch):
+    class WeakTensorMap(dict):
+        pass
+
+    left = np.arange(6.0).reshape(2, 3)
+    right = np.arange(12.0).reshape(3, 4)
+    read_write = np.ones((2, 4))
+    tensors = WeakTensorMap(a=left, b=right, c=read_write)
+    descriptor = MatmulDesc("a", "b", "c", 2, 4, 3, beta=1)
+    backend = _numpy_backend()
+    error = RuntimeError("injected direct grouped primitive failure")
+    drain_error = RuntimeError("injected grouped stream drain failure")
+    caller = {
+        "left": left,
+        "right": right,
+        "read_write": read_write,
+        "tensors": tensors,
+    }
+    input_refs = tuple(weakref.ref(array) for array in (left, right, read_write))
+    tensors_ref = weakref.ref(tensors)
+    destination_refs = []
+    original_empty = backend.empty
+
+    def allocate(*args, **kwargs):
+        destination = original_empty(*args, **kwargs)
+        destination_refs.append(weakref.ref(destination))
+        return destination
+
+    monkeypatch.setattr(backend, "name", "cupy")
+    monkeypatch.setattr(backend, "empty", allocate)
+    monkeypatch.setattr(
+        backend,
+        "_execution_matmul_into",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_synchronize_execution_stream",
+        lambda _stream: (_ for _ in ()).throw(drain_error),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        execute_grouped_gemm(backend, (descriptor,), tensors)
+    assert caught.value is error
+    quarantine = backend._execution_terminal_quarantine
+    assert quarantine.first_error is error
+    assert len(quarantine.owners) == 1
+    quarantined_owner = quarantine.owners[0]
+    assert quarantined_owner.error is error
+
+    for retained_error in (error, drain_error):
+        retained_error.__traceback__ = None
+        retained_error.__context__ = None
+        retained_error.__cause__ = None
+    caught = None
+    caller.clear()
+    left = None
+    right = None
+    read_write = None
+    tensors = None
+    gc.collect()
+
+    assert all(reference() is not None for reference in input_refs)
+    assert tensors_ref() is not None
+    assert destination_refs and all(
+        reference() is not None for reference in destination_refs
+    )
+    for reference in input_refs:
+        assert any(array is reference() for array in quarantined_owner.arrays)
+    assert any(resource is tensors_ref() for resource in quarantined_owner.resources)
+
+
+def test_no_owner_grouped_publication_drain_failure_retains_complete_mapping(
+    monkeypatch,
+):
+    publication_error = RuntimeError("injected grouped publication failure")
+    drain_error = RuntimeError("injected grouped publication drain failure")
+    primitive_calls = []
+
+    class RaisingTensorMap(dict):
+        def update(self, *args, **kwargs):
+            assert primitive_calls == [None]
+            raise publication_error
+
+    left = np.arange(6.0).reshape(2, 3)
+    right = np.arange(12.0).reshape(3, 4)
+    read_write = np.ones((2, 4))
+    tensors = RaisingTensorMap(a=left, b=right, c=read_write)
+    descriptor = MatmulDesc("a", "b", "c", 2, 4, 3, beta=1)
+    backend = _numpy_backend()
+    caller = {
+        "left": left,
+        "right": right,
+        "read_write": read_write,
+        "tensors": tensors,
+    }
+    input_refs = tuple(weakref.ref(array) for array in (left, right, read_write))
+    tensors_ref = weakref.ref(tensors)
+    destination_refs = []
+    synchronize_calls = []
+    original_empty = backend.empty
+    original_matmul = backend._execution_matmul_into
+
+    def allocate(*args, **kwargs):
+        destination = original_empty(*args, **kwargs)
+        destination_refs.append(weakref.ref(destination))
+        return destination
+
+    def matmul(*args, **kwargs):
+        result = original_matmul(*args, **kwargs)
+        primitive_calls.append(None)
+        return result
+
+    def fail_drain(stream):
+        synchronize_calls.append(stream)
+        raise drain_error
+
+    monkeypatch.setattr(backend, "name", "cupy")
+    monkeypatch.setattr(backend, "empty", allocate)
+    monkeypatch.setattr(backend, "_execution_matmul_into", matmul)
+    monkeypatch.setattr(
+        backend, "_synchronize_execution_stream", fail_drain, raising=False
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        execute_grouped_gemm(backend, (descriptor,), tensors)
+    assert caught.value is publication_error
+    assert synchronize_calls == [None]
+    quarantine = backend._execution_terminal_quarantine
+    assert quarantine.first_error is publication_error
+    assert len(quarantine.owners) == 1
+    quarantined_owner = quarantine.owners[0]
+    assert quarantined_owner.error is publication_error
+
+    for retained_error in (publication_error, drain_error):
+        retained_error.__traceback__ = None
+        retained_error.__context__ = None
+        retained_error.__cause__ = None
+    caught = None
+    caller.clear()
+    left = None
+    right = None
+    read_write = None
+    tensors = None
+    gc.collect()
+
+    assert all(reference() is not None for reference in input_refs)
+    assert tensors_ref() is not None
+    assert destination_refs and all(
+        reference() is not None for reference in destination_refs
+    )
+    for reference in input_refs:
+        assert any(array is reference() for array in quarantined_owner.arrays)
+    for reference in destination_refs:
+        assert any(array is reference() for array in quarantined_owner.arrays)
+    assert any(resource is tensors_ref() for resource in quarantined_owner.resources)
+
+
+def test_no_owner_destination_validation_failure_drains_before_release(monkeypatch):
+    left = np.arange(6.0).reshape(2, 3)
+    right = np.arange(12.0).reshape(3, 4)
+    plan, bindings = plan_einsum("ab,bc->ac", {"left": left, "right": right})
+    backend = _numpy_backend()
+    original = backend._execution_matmul_into
+    synchronized = []
+
+    def return_unrelated_wrapper(left, right, destination, *, workspace=None):
+        original(left, right, destination, workspace=workspace)
+        return np.empty_like(destination)
+
+    monkeypatch.setattr(backend, "name", "cupy")
+    monkeypatch.setattr(backend, "_execution_matmul_into", return_unrelated_wrapper)
+    monkeypatch.setattr(backend, "_synchronize_execution_stream", synchronized.append)
+
+    with pytest.raises(ValueError, match="published destination"):
+        execute_plan(backend, plan, bindings)
+    assert synchronized == [None]
+
+
+def test_no_owner_post_launch_failure_drains_before_release(monkeypatch):
+    left = np.arange(6.0).reshape(2, 3)
+    right = np.arange(12.0).reshape(3, 4)
+    plan, bindings = plan_einsum("ab,bc->ac", {"left": left, "right": right})
+    backend = _numpy_backend()
+    original = backend._execution_matmul_into
+    launched = []
+    synchronized = []
+    error = RuntimeError("injected post-launch output failure")
+
+    def launch(left, right, destination, *, workspace=None):
+        result = original(left, right, destination, workspace=workspace)
+        launched.append(destination)
+        return result
+
+    def fail_store(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(backend, "name", "cupy")
+    monkeypatch.setattr(backend, "_execution_matmul_into", launch)
+    monkeypatch.setattr(backend, "_synchronize_execution_stream", synchronized.append)
+    monkeypatch.setattr(execution_executor, "_store_output", fail_store)
+
+    with pytest.raises(RuntimeError) as caught:
+        execute_plan(backend, plan, bindings)
+
+    assert caught.value is error
+    assert len(launched) == 1
+    assert synchronized == [None]
 
 
 def test_grouped_matmul_ragged_buckets_use_one_scalar_and_one_batched(monkeypatch):
-    plan, bindings, operations = _grouped_plan(
-        ((2, 4, 3), (5, 2, 3), (2, 4, 3))
-    )
+    plan, bindings, operations = _grouped_plan(((2, 4, 3), (5, 2, 3), (2, 4, 3)))
     backend = _numpy_backend()
     calls = {"scalar": 0, "batched": 0}
-    original_scalar = backend.matmul
-    original_batched = backend.batched_matmul
+    original_scalar = backend._execution_matmul_into
+    original_batched = backend._execution_batched_matmul_into
 
     def scalar(*args, **kwargs):
         calls["scalar"] += 1
@@ -636,8 +1129,8 @@ def test_grouped_matmul_ragged_buckets_use_one_scalar_and_one_batched(monkeypatc
         calls["batched"] += 1
         return original_batched(*args, **kwargs)
 
-    monkeypatch.setattr(backend, "matmul", scalar)
-    monkeypatch.setattr(backend, "batched_matmul", batched)
+    monkeypatch.setattr(backend, "_execution_matmul_into", scalar)
+    monkeypatch.setattr(backend, "_execution_batched_matmul_into", batched)
 
     actual = execute_plan(backend, plan, bindings)
 
@@ -733,19 +1226,19 @@ def test_grouped_matmul_shape_mismatch_is_atomic(monkeypatch):
     plan = _specialized_plan(refs, outputs[0], (grouped,))
     backend = _numpy_backend()
     calls = []
-    original_batched = backend.batched_matmul
+    original_batched = backend._execution_batched_matmul_into
 
     def bad_batched(*args, **kwargs):
         calls.append(True)
         result = original_batched(*args, **kwargs)
         return result[:, :, :-1]
 
-    monkeypatch.setattr(backend, "batched_matmul", bad_batched)
+    monkeypatch.setattr(backend, "_execution_batched_matmul_into", bad_batched)
     bindings = ExecutionBindings(
         {ref.key: np.zeros(ref.spec.shape, dtype=ref.spec.dtype) for ref in refs}
     )
 
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError, match="published destination"):
         execute_plan(backend, plan, bindings)
     assert calls == [True]
 

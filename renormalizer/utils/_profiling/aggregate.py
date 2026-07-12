@@ -29,12 +29,23 @@ _STATE_SLOTS = (
     "_d2h_s",
     "_dirty_writeback_bytes",
     "_dirty_writeback_s",
+    "_dirty_writeback_count",
     "_working_set_wall_s",
     "_cache_hits",
     "_cache_misses",
     "_prefetch_overlap_s",
     "_prefetch_wait_s",
     "_peak_device_bytes",
+    "_planned_device_peak_bytes",
+    "_observed_device_peak_bytes",
+    "_planned_host_peak_bytes",
+    "_observed_host_peak_bytes",
+    "_planned_cache_peak_bytes",
+    "_observed_cache_peak_bytes",
+    "_planned_pinned_peak_bytes",
+    "_observed_pinned_peak_bytes",
+    "_pageable_fallback_count",
+    "_pageable_fallback_bytes",
     "_full_replica_detected",
     "_full_replica_count",
 )
@@ -139,12 +150,23 @@ class RunAggregate:
         self._d2h_s = 0.0
         self._dirty_writeback_bytes = 0
         self._dirty_writeback_s = 0.0
+        self._dirty_writeback_count = 0
         self._working_set_wall_s = 0.0
         self._cache_hits = 0
         self._cache_misses = 0
         self._prefetch_overlap_s = 0.0
         self._prefetch_wait_s = 0.0
         self._peak_device_bytes = 0
+        self._planned_device_peak_bytes = 0
+        self._observed_device_peak_bytes = 0
+        self._planned_host_peak_bytes = 0
+        self._observed_host_peak_bytes = 0
+        self._planned_cache_peak_bytes = 0
+        self._observed_cache_peak_bytes = 0
+        self._planned_pinned_peak_bytes = 0
+        self._observed_pinned_peak_bytes = 0
+        self._pageable_fallback_count = 0
+        self._pageable_fallback_bytes = 0
         self._full_replica_detected = False
         self._full_replica_count = 0
         self._version = 0
@@ -225,7 +247,18 @@ class RunAggregate:
                 prefetch_wait_s,
                 dirty_writeback_bytes,
                 dirty_writeback_s,
+                dirty_writeback_count,
                 peak_device_bytes,
+                planned_device_peak_bytes,
+                observed_device_peak_bytes,
+                planned_host_peak_bytes,
+                observed_host_peak_bytes,
+                planned_cache_peak_bytes,
+                observed_cache_peak_bytes,
+                planned_pinned_peak_bytes,
+                observed_pinned_peak_bytes,
+                pageable_fallback_count,
+                pageable_fallback_bytes,
                 full_replica,
                 wall_s,
             ) = values
@@ -239,8 +272,35 @@ class RunAggregate:
             self._prefetch_wait_s += prefetch_wait_s
             self._dirty_writeback_bytes += dirty_writeback_bytes
             self._dirty_writeback_s += dirty_writeback_s
+            self._dirty_writeback_count += dirty_writeback_count
             self._working_set_wall_s += wall_s
             self._peak_device_bytes = max(self._peak_device_bytes, peak_device_bytes)
+            self._planned_device_peak_bytes = max(
+                self._planned_device_peak_bytes, planned_device_peak_bytes
+            )
+            self._observed_device_peak_bytes = max(
+                self._observed_device_peak_bytes, observed_device_peak_bytes
+            )
+            self._planned_host_peak_bytes = max(
+                self._planned_host_peak_bytes, planned_host_peak_bytes
+            )
+            self._observed_host_peak_bytes = max(
+                self._observed_host_peak_bytes, observed_host_peak_bytes
+            )
+            self._planned_cache_peak_bytes = max(
+                self._planned_cache_peak_bytes, planned_cache_peak_bytes
+            )
+            self._observed_cache_peak_bytes = max(
+                self._observed_cache_peak_bytes, observed_cache_peak_bytes
+            )
+            self._planned_pinned_peak_bytes = max(
+                self._planned_pinned_peak_bytes, planned_pinned_peak_bytes
+            )
+            self._observed_pinned_peak_bytes = max(
+                self._observed_pinned_peak_bytes, observed_pinned_peak_bytes
+            )
+            self._pageable_fallback_count += pageable_fallback_count
+            self._pageable_fallback_bytes += pageable_fallback_bytes
             self._full_replica_detected = self._full_replica_detected or full_replica
             self._full_replica_count += full_replica
 
@@ -302,7 +362,9 @@ class RunAggregate:
             return
         if type(value) is float:
             if value < 0 or not math.isfinite(value):
-                raise ValueError("aggregate state floats must remain finite and non-negative")
+                raise ValueError(
+                    "aggregate state floats must remain finite and non-negative"
+                )
             return
         raise TypeError("aggregate state must contain fixed numeric values only")
 
@@ -330,34 +392,56 @@ class RunAggregate:
                 raise ValueError("grouped execution requires at least two tasks")
             return grouped_execution, task_count
         if event == "distributed_solve_summary":
-            values = tuple(
-                _required_non_negative_int(payload, field)
-                for field in ("hv_count", "collective_calls", "collective_bytes")
-            ) + tuple(
-                _required_non_negative_number(payload, field)
-                for field in ("collective_s", "compute_s", "synchronization_s")
-            ) + (_required_non_negative_int(payload, "fallback_count"),)
+            values = (
+                tuple(
+                    _required_non_negative_int(payload, field)
+                    for field in ("hv_count", "collective_calls", "collective_bytes")
+                )
+                + tuple(
+                    _required_non_negative_number(payload, field)
+                    for field in ("collective_s", "compute_s", "synchronization_s")
+                )
+                + (_required_non_negative_int(payload, "fallback_count"),)
+            )
             if values[-1] > values[0]:
                 raise ValueError("fallback_count must not exceed hv_count")
             return values
         if event == "working_set_transfer":
-            return tuple(
-                _optional_non_negative_int(payload, field)
-                for field in ("h2d_bytes", "d2h_bytes")
-            ) + tuple(
-                _optional_non_negative_number(payload, field) for field in ("h2d_s", "d2h_s")
-            ) + tuple(
-                _optional_non_negative_int(payload, field)
-                for field in ("cache_hits", "cache_misses")
-            ) + tuple(
-                _optional_non_negative_number(payload, field)
-                for field in ("prefetch_overlap_s", "prefetch_wait_s")
-            ) + (
-                _optional_non_negative_int(payload, "dirty_writeback_bytes"),
-                _optional_non_negative_number(payload, "dirty_writeback_s"),
-                _optional_non_negative_int(payload, "peak_device_bytes"),
-                _optional_bool(payload, "full_replica"),
-                _optional_non_negative_number(payload, "wall_s"),
+            return (
+                tuple(
+                    _optional_non_negative_int(payload, field)
+                    for field in ("h2d_bytes", "d2h_bytes")
+                )
+                + tuple(
+                    _optional_non_negative_number(payload, field)
+                    for field in ("h2d_s", "d2h_s")
+                )
+                + tuple(
+                    _optional_non_negative_int(payload, field)
+                    for field in ("cache_hits", "cache_misses")
+                )
+                + tuple(
+                    _optional_non_negative_number(payload, field)
+                    for field in ("prefetch_overlap_s", "prefetch_wait_s")
+                )
+                + (
+                    _optional_non_negative_int(payload, "dirty_writeback_bytes"),
+                    _optional_non_negative_number(payload, "dirty_writeback_s"),
+                    _optional_non_negative_int(payload, "dirty_writeback_count"),
+                    _optional_non_negative_int(payload, "peak_device_bytes"),
+                    _optional_non_negative_int(payload, "planned_device_peak_bytes"),
+                    _optional_non_negative_int(payload, "observed_device_peak_bytes"),
+                    _optional_non_negative_int(payload, "planned_host_peak_bytes"),
+                    _optional_non_negative_int(payload, "observed_host_peak_bytes"),
+                    _optional_non_negative_int(payload, "planned_cache_peak_bytes"),
+                    _optional_non_negative_int(payload, "observed_cache_peak_bytes"),
+                    _optional_non_negative_int(payload, "planned_pinned_peak_bytes"),
+                    _optional_non_negative_int(payload, "observed_pinned_peak_bytes"),
+                    _optional_non_negative_int(payload, "pageable_fallback_count"),
+                    _optional_non_negative_int(payload, "pageable_fallback_bytes"),
+                    _optional_bool(payload, "full_replica"),
+                    _optional_non_negative_number(payload, "wall_s"),
+                )
             )
         return ()
 
@@ -388,16 +472,30 @@ class RunAggregate:
             "d2h_s": self._d2h_s,
             "dirty_writeback_bytes": self._dirty_writeback_bytes,
             "dirty_writeback_s": self._dirty_writeback_s,
+            "dirty_writeback_count": self._dirty_writeback_count,
             "working_set_wall_s": self._working_set_wall_s,
             "cache_hits": self._cache_hits,
             "cache_misses": self._cache_misses,
-            "cache_hit_rate": self._cache_hits / cache_accesses if cache_accesses else 0.0,
+            "cache_hit_rate": self._cache_hits / cache_accesses
+            if cache_accesses
+            else 0.0,
             "prefetch_overlap_s": self._prefetch_overlap_s,
             "prefetch_wait_s": self._prefetch_wait_s,
             "peak_device_bytes": self._peak_device_bytes,
+            "planned_device_peak_bytes": self._planned_device_peak_bytes,
+            "observed_device_peak_bytes": self._observed_device_peak_bytes,
+            "planned_host_peak_bytes": self._planned_host_peak_bytes,
+            "observed_host_peak_bytes": self._observed_host_peak_bytes,
+            "planned_cache_peak_bytes": self._planned_cache_peak_bytes,
+            "observed_cache_peak_bytes": self._observed_cache_peak_bytes,
+            "planned_pinned_peak_bytes": self._planned_pinned_peak_bytes,
+            "observed_pinned_peak_bytes": self._observed_pinned_peak_bytes,
+            "pageable_fallback_count": self._pageable_fallback_count,
+            "pageable_fallback_bytes": self._pageable_fallback_bytes,
             "full_replica_detected": self._full_replica_detected,
             "full_replica_count": self._full_replica_count,
             "event_counts": {
-                name: self._event_counts[index] for index, name in enumerate(EVENT_NAMES)
+                name: self._event_counts[index]
+                for index, name in enumerate(EVENT_NAMES)
             },
         }

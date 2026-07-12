@@ -230,6 +230,43 @@ def test_direct_device_resident_config_may_remain_unresolved_for_compatibility()
     assert config.resolved_host_memory_budget_bytes is None
 
 
+def test_active_factory_config_requires_both_frozen_budget_resolutions():
+    class FactoryProvider:
+        residency_policy = "active_working_set"
+        provider_role = "factory"
+
+        @staticmethod
+        def acquire(request):
+            raise RuntimeError("factory")
+
+        @staticmethod
+        def open_working_set(request, plan, store, receipt):
+            raise AssertionError("not opened by config validation")
+
+    runtime = _runtime()
+    device = MemoryBudgetResolution(1024, 1024, "explicit", None, "device")
+    host = MemoryBudgetResolution(2048, 2048, "explicit", None, "host")
+    kwargs = {
+        "context": runtime.context,
+        "mesh": runtime.mesh,
+        "collective": runtime.collective,
+        "provider": FactoryProvider(),
+        "residency_policy": "active_working_set",
+        "device_memory_budget_bytes": 1024,
+        "host_memory_budget_bytes": 2048,
+    }
+
+    with pytest.raises(ValueError, match="resolved device and host budgets"):
+        DistributedExecutionConfig(**kwargs)
+
+    config = DistributedExecutionConfig(
+        **kwargs,
+        device_budget_resolution=device,
+        host_budget_resolution=host,
+    )
+    assert config.provider.provider_role == "factory"
+
+
 def test_auto_query_failure_is_stable_preflight_failure(monkeypatch):
     runtime = _runtime()
     monkeypatch.setattr(
@@ -255,9 +292,7 @@ def test_invalid_explicit_budget_completes_fixed_fail_closed_schedule(requested)
     with pytest.raises(ValueError, match="device memory budget request validation"):
         runtime._requested_budget_agrees(requested, "device")
 
-    assert [
-        (value.dtype, value.shape, op) for value, op in collective.calls
-    ] == [
+    assert [(value.dtype, value.shape, op) for value, op in collective.calls] == [
         (np.dtype(np.int32), (1,), "max"),
         (np.dtype(np.int64), (1,), "min"),
         (np.dtype(np.int64), (1,), "max"),

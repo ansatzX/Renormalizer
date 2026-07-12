@@ -61,7 +61,9 @@ def normalize_bounded_metadata(value, *, depth=0):
                 raise ValueError("profiling metadata keys exceed the UTF-8 byte limit")
             normalized[key] = normalize_bounded_metadata(item, depth=depth + 1)
         return normalized
-    raise TypeError(f"profiling metadata is not JSON serializable: {value_type.__name__}")
+    raise TypeError(
+        f"profiling metadata is not JSON serializable: {value_type.__name__}"
+    )
 
 
 def normalize_event_filter(events):
@@ -144,7 +146,9 @@ def _require_field(payload, field):
 def validate_run_start_record(payload):
     require_string(_require_field(payload, "backend"), "backend")
     rank = require_non_negative_int(_require_field(payload, "rank"), "rank")
-    world_size = require_positive_int(_require_field(payload, "world_size"), "world_size")
+    world_size = require_positive_int(
+        _require_field(payload, "world_size"), "world_size"
+    )
     if rank >= world_size:
         raise ValueError("rank must be less than world_size")
 
@@ -152,7 +156,9 @@ def validate_run_start_record(payload):
 def validate_phase_summary_record(payload):
     for field in ("phase", "network", "operation"):
         require_string(_require_field(payload, field), field)
-    require_non_negative_int(_require_field(payload, "operation_count"), "operation_count")
+    require_non_negative_int(
+        _require_field(payload, "operation_count"), "operation_count"
+    )
     require_non_negative_number(_require_field(payload, "wall_s"), "wall_s")
 
 
@@ -186,9 +192,13 @@ def validate_local_hv_record(payload):
     for index, shape in enumerate(input_shapes):
         require_shape(shape, f"input_shapes[{index}]")
     input_shape_ranks = _require_field(payload, "input_shape_ranks")
-    if type(input_shape_ranks) is not list or len(input_shape_ranks) != len(input_shapes):
+    if type(input_shape_ranks) is not list or len(input_shape_ranks) != len(
+        input_shapes
+    ):
         raise ValueError("input_shape_ranks must match retained input shapes")
-    for index, (shape, original_rank) in enumerate(zip(input_shapes, input_shape_ranks)):
+    for index, (shape, original_rank) in enumerate(
+        zip(input_shapes, input_shape_ranks)
+    ):
         require_non_negative_int(original_rank, f"input_shape_ranks[{index}]")
         if len(shape) != min(original_rank, MAX_SHAPE_RANK):
             raise ValueError("input shape rank evidence does not match retained shape")
@@ -200,11 +210,15 @@ def validate_local_hv_record(payload):
     )
     expected_input_count = min(input_shape_count, MAX_SHAPES)
     if len(input_shapes) != expected_input_count:
-        raise ValueError("retained input_shapes length does not match input_shape_count")
+        raise ValueError(
+            "retained input_shapes length does not match input_shape_count"
+        )
     expected_input_truncation = input_shape_count > MAX_SHAPES
     if input_shapes_truncated != expected_input_truncation:
         raise ValueError("input_shapes_truncated does not match retained evidence")
-    output_shape = require_shape(_require_field(payload, "output_shape"), "output_shape")
+    output_shape = require_shape(
+        _require_field(payload, "output_shape"), "output_shape"
+    )
     output_shape_rank = require_non_negative_int(
         _require_field(payload, "output_shape_rank"), "output_shape_rank"
     )
@@ -229,7 +243,9 @@ def validate_local_hv_record(payload):
     )
     expected_step_count = min(actual_step_count, MAX_ACTUAL_STEPS)
     if len(actual_steps) != expected_step_count:
-        raise ValueError("retained actual_steps length does not match actual_step_count")
+        raise ValueError(
+            "retained actual_steps length does not match actual_step_count"
+        )
     if actual_steps_truncated != (actual_step_count > MAX_ACTUAL_STEPS):
         raise ValueError("actual_steps_truncated does not match retained evidence")
     require_bool(_require_field(payload, "device_synchronized"), "device_synchronized")
@@ -238,7 +254,9 @@ def validate_local_hv_record(payload):
 
 def validate_grouped_gemm_record(payload):
     require_string(_require_field(payload, "operation"), "operation")
-    task_count = require_non_negative_int(_require_field(payload, "task_count"), "task_count")
+    task_count = require_non_negative_int(
+        _require_field(payload, "task_count"), "task_count"
+    )
     grouped_execution = require_bool(
         _require_field(payload, "grouped_execution"), "grouped_execution"
     )
@@ -260,13 +278,17 @@ def validate_grouped_gemm_record(payload):
     )
     expected_bucket_count = min(bucket_count, MAX_SHAPE_BUCKETS)
     if len(shape_buckets) != expected_bucket_count:
-        raise ValueError("retained shape_buckets length does not match shape_bucket_count")
+        raise ValueError(
+            "retained shape_buckets length does not match shape_bucket_count"
+        )
     if buckets_truncated != (bucket_count > MAX_SHAPE_BUCKETS):
         raise ValueError("shape_buckets_truncated does not match retained evidence")
 
 
 def validate_distributed_record_fields(payload):
-    shape_rank = require_positive_int(_require_field(payload, "shape_rank"), "shape_rank")
+    shape_rank = require_positive_int(
+        _require_field(payload, "shape_rank"), "shape_rank"
+    )
     expected_retained_rank = min(shape_rank, MAX_SHAPE_RANK)
     global_shape = require_shape(
         _require_field(payload, "global_shape"),
@@ -296,7 +318,9 @@ def validate_distributed_record_fields(payload):
     )
     if local_extent > global_extent:
         raise ValueError("local_shard_extent must not exceed global_shard_extent")
-    for axis, (global_dimension, local_dimension) in enumerate(zip(global_shape, local_shape)):
+    for axis, (global_dimension, local_dimension) in enumerate(
+        zip(global_shape, local_shape)
+    ):
         if axis == sharding_axis:
             if (global_dimension, local_dimension) != (global_extent, local_extent):
                 raise ValueError("retained shard extents do not match shape evidence")
@@ -329,6 +353,39 @@ def validate_working_set_record_fields(payload):
     ):
         require_non_negative_number(_require_field(payload, field), field)
     require_bool(_require_field(payload, "full_replica"), "full_replica")
+    for field in (
+        "dirty_writeback_count",
+        "planned_device_peak_bytes",
+        "observed_device_peak_bytes",
+        "planned_host_peak_bytes",
+        "observed_host_peak_bytes",
+        "planned_cache_peak_bytes",
+        "observed_cache_peak_bytes",
+        "planned_pinned_peak_bytes",
+        "observed_pinned_peak_bytes",
+        "pageable_fallback_count",
+        "pageable_fallback_bytes",
+    ):
+        if field in payload:
+            require_non_negative_int(payload[field], field)
+    for field in ("request_hash", "plan_hash", "profile_hash"):
+        if field in payload:
+            value = require_string(payload[field], field)
+            if len(value) != 64:
+                raise ValueError(f"{field} must be a SHA-256 hexadecimal digest")
+            try:
+                int(value, 16)
+            except ValueError as error:
+                raise ValueError(
+                    f"{field} must be a SHA-256 hexadecimal digest"
+                ) from error
+    if "rank" in payload:
+        require_non_negative_int(payload["rank"], "rank")
+    if "device" in payload:
+        require_string(payload["device"], "device")
+    forbidden = {"keys", "slices", "masks", "tensor_values"}.intersection(payload)
+    if forbidden:
+        raise ValueError("working-set telemetry contains unbounded descriptors")
     if "wall_s" in payload:
         require_non_negative_number(payload["wall_s"], "wall_s")
 

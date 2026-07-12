@@ -1,5 +1,10 @@
+from contextlib import nullcontext
 import gc
 import os
+import subprocess
+import sys
+import threading
+import time
 from types import SimpleNamespace
 import weakref
 
@@ -52,6 +57,159 @@ class FailingOnceNcclBackend(FakeNcclBackend):
         self.stop_calls += 1
         if self.stop_calls == 1:
             raise RuntimeError("injected stop failure")
+
+
+class _CpuDevice:
+    def use(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+class _CpuCudaRuntime:
+    @staticmethod
+    def getDeviceCount():
+        return 2
+
+
+class _CpuCuda:
+    runtime = _CpuCudaRuntime()
+
+    @staticmethod
+    def Device(index):
+        return _CpuDevice()
+
+    @staticmethod
+    def get_current_stream():
+        return None
+
+
+class _CpuOnlyCupy:
+    cuda = _CpuCuda()
+
+    ndarray = np.ndarray
+    ascontiguousarray = staticmethod(np.ascontiguousarray)
+    copyto = staticmethod(np.copyto)
+    empty_like = staticmethod(np.empty_like)
+    empty = staticmethod(np.empty)
+    moveaxis = staticmethod(np.moveaxis)
+
+
+class _SharedStore:
+    def __init__(self, parties):
+        self._values = {}
+        self._condition = threading.Condition()
+        self._barrier = threading.Barrier(parties, timeout=3.0)
+
+    def open_handle(self):
+        return _SharedStoreHandle(self)
+
+    def set(self, key, value):
+        with self._condition:
+            self._values[key] = value
+            self._condition.notify_all()
+
+    def get(self, key):
+        with self._condition:
+            return self._values[key]
+
+    def barrier(self):
+        self._barrier.wait()
+
+    def wait_for(self, predicate, *, timeout=3.0):
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: predicate(dict(self._values)), timeout=timeout
+            )
+
+
+class _SharedStoreHandle:
+    def __init__(self, store):
+        self._store = store
+        self._closed = False
+
+    def __setitem__(self, key, value):
+        if self._closed:
+            raise RuntimeError("shared store handle is closed")
+        self._store.set(key, value)
+
+    def __getitem__(self, key):
+        if self._closed:
+            raise RuntimeError("shared store handle is closed")
+        return self._store.get(key)
+
+    def barrier(self):
+        if self._closed:
+            raise RuntimeError("shared store handle is closed")
+        self._store.barrier()
+
+    def close(self):
+        self._closed = True
+
+
+class _RawComm:
+    def __init__(self, *, abort_error=None):
+        self.abort_error = abort_error
+        self.abort_calls = 0
+        self.abort_event = threading.Event()
+        self.destroy_calls = 0
+
+    def abort(self):
+        self.abort_calls += 1
+        self.abort_event.set()
+        if self.abort_error is not None:
+            raise self.abort_error
+
+    def destroy(self):
+        self.destroy_calls += 1
+
+
+class _CpuNcclBackend(FakeNcclBackend):
+    def __init__(self, size, rank, store, raw_comm):
+        super().__init__(size, rank)
+        self._store_proxy = store
+        self._comm = raw_comm
+
+
+def _cpu_collective(rank, size, store, raw_comm):
+    from renormalizer.backend._distributed.collectives import CupyNcclCollective
+
+    context = DistributedContext(rank, rank, size, size)
+    backend = _CpuNcclBackend(size, rank, store.open_handle(), raw_comm)
+    wrapper = CupyNcclCollective(
+        context,
+        cupy_module=_CpuOnlyCupy(),
+        init_process_group=lambda *args, **kwargs: backend,
+        host="127.0.0.1",
+        port=23456,
+    )
+    wrapper._bootstrap_store_proxy = store.open_handle()
+
+    def local_fatal_capability_code():
+        local_code = 0
+        try:
+            backend_store = getattr(backend, "_store_proxy")
+            if type(backend_store) is not _SharedStoreHandle:
+                raise RuntimeError("test private store contract is unavailable")
+            probe_key = "test.status_workspace.rank.{}".format(rank)
+            backend_store[probe_key] = 0
+            if backend_store[probe_key] != 0:
+                raise RuntimeError("test private store round trip failed")
+        except BaseException:
+            local_code |= 4
+        try:
+            if not callable(getattr(backend._comm, "abort", None)):
+                raise RuntimeError("test private communicator abort is unavailable")
+        except BaseException:
+            local_code |= 4
+        return local_code
+
+    wrapper._local_fatal_capability_code = local_fatal_capability_code
+    return wrapper, backend
 
 
 @pytest.fixture
@@ -248,7 +406,1616 @@ def test_collective_close_retries_without_dropping_backend(context):
     assert collective._closed is True
 
 
-def test_runtime_close_retries_without_marking_runtime_closed():
+def test_fatal_bootstrap_rejects_every_rank_when_raw_abort_is_missing():
+    store = _SharedStore(2)
+    wrappers = [_cpu_collective(rank, 2, store, object())[0] for rank in range(2)]
+    results = [None, None]
+    errors = [None, None]
+
+    def run(rank):
+        try:
+            results[rank] = wrappers[rank]._bootstrap_fatal_control()
+        except BaseException as error:
+            errors[rank] = error
+
+    threads = [threading.Thread(target=run, args=(rank,)) for rank in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5.0)
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == [None, None]
+        assert all(result != 0 for result in results)
+    finally:
+        for wrapper in wrappers:
+            wrapper.close()
+
+
+def test_independent_store_proxy_requires_exact_installed_type(monkeypatch):
+    from cupyx.distributed import _store
+
+    from renormalizer.backend._distributed.collectives import CupyNcclCollective
+
+    constructions = []
+
+    class InstalledTCPStoreProxy:
+        def __init__(self, host="127.0.0.1", port=13333):
+            constructions.append((host, port, self))
+
+    class ChangedTCPStoreProxy(InstalledTCPStoreProxy):
+        pass
+
+    class RaisingBackend:
+        @property
+        def _store_proxy(self):
+            raise RuntimeError("injected private store access failure")
+
+    monkeypatch.setattr(_store, "TCPStoreProxy", InstalledTCPStoreProxy)
+    installed = InstalledTCPStoreProxy()
+    created = CupyNcclCollective._independent_store_proxy(
+        SimpleNamespace(_store_proxy=installed), "127.0.0.9", 24567
+    )
+    assert type(created) is InstalledTCPStoreProxy
+    assert created is not installed
+    assert constructions[-1][:2] == ("127.0.0.9", 24567)
+
+    invalid_backends = (
+        SimpleNamespace(),
+        SimpleNamespace(_store_proxy=ChangedTCPStoreProxy()),
+        SimpleNamespace(_store_proxy=object()),
+        RaisingBackend(),
+    )
+    assert all(
+        CupyNcclCollective._independent_store_proxy(backend, "127.0.0.9", 24567) is None
+        for backend in invalid_backends
+    )
+
+
+def test_cpu_control_store_handle_has_separate_identity_and_lifetime():
+    store = _SharedStore(1)
+    wrapper, backend = _cpu_collective(0, 1, store, _RawComm())
+    try:
+        assert wrapper._bootstrap_store_proxy is not backend._store_proxy
+        backend._store_proxy.close()
+        wrapper._bootstrap_store_proxy["independent-control"] = 7
+        assert wrapper._bootstrap_store_proxy["independent-control"] == 7
+    finally:
+        wrapper.close()
+
+
+@pytest.mark.parametrize("missing_capability", ("store", "raising_store", "abort"))
+def test_fatal_bootstrap_rejects_every_rank_for_one_rank_capability_loss(
+    missing_capability,
+):
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    results = [None, None]
+    errors = [None, None]
+
+    if missing_capability == "store":
+        del backends[1]._store_proxy
+    elif missing_capability == "raising_store":
+
+        class RaisingStoreBackend(type(backends[1])):
+            @property
+            def _store_proxy(self):
+                raise RuntimeError("injected private store access failure")
+
+        backends[1].__class__ = RaisingStoreBackend
+    else:
+        backends[1]._comm = object()
+
+    def run(rank):
+        try:
+            results[rank] = wrappers[rank]._bootstrap_fatal_control()
+        except BaseException as error:
+            errors[rank] = error
+
+    threads = [threading.Thread(target=run, args=(rank,)) for rank in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5.0)
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == [None, None]
+        assert all(result != 0 for result in results)
+        assert [raw.abort_calls for raw in raw_comms] == [0, 0]
+        assert all(backend.calls == [] for backend in backends)
+    finally:
+        for wrapper in wrappers:
+            wrapper.close()
+
+
+def _bootstrap_cpu_wrappers(wrappers):
+    errors = [None, None]
+
+    def bootstrap(rank):
+        try:
+            assert wrappers[rank]._bootstrap_fatal_control() == 0
+        except BaseException as error:
+            errors[rank] = error
+
+    threads = [threading.Thread(target=bootstrap, args=(rank,)) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5.0)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == [None, None]
+
+
+def _close_cpu_wrappers(wrappers):
+    errors = [None, None]
+
+    def close(rank):
+        try:
+            wrappers[rank].close()
+        except BaseException as error:
+            errors[rank] = error
+
+    threads = [threading.Thread(target=close, args=(rank,)) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5.0)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == [None, None]
+
+
+def test_staggered_close_stops_rank_zero_store_after_all_close_consumers():
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+    errors = [None, None]
+
+    def close(rank):
+        try:
+            wrappers[rank].close()
+        except BaseException as error:
+            errors[rank] = error
+
+    threads = [threading.Thread(target=close, args=(rank,)) for rank in range(2)]
+    try:
+        threads[0].start()
+        threads[0].join(0.05)
+        assert threads[0].is_alive()
+        assert wrappers[0]._fatal_monitor_stop.is_set() is False
+        assert backends[0].stop_calls == 0
+
+        threads[1].start()
+        for thread in threads:
+            thread.join(5.0)
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == [None, None]
+        assert [backend.stop_calls for backend in backends] == [1, 1]
+        assert wrappers[0]._closed is True
+        assert wrappers[1]._closed is True
+    finally:
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(5.0)
+        for wrapper in wrappers:
+            if not wrapper._closed:
+                wrapper.close()
+
+
+def test_nonzero_fatal_origin_cannot_be_overtaken_by_rank_zero_close(monkeypatch):
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+    origin_waiting = threading.Event()
+    release_origin = threading.Event()
+    original_wait = wrappers[1]._wait_for_fatal_acknowledgments
+
+    def staggered_origin_wait():
+        original_wait()
+        origin_waiting.set()
+        assert release_origin.wait(3.0)
+
+    monkeypatch.setattr(
+        wrappers[1], "_wait_for_fatal_acknowledgments", staggered_origin_wait
+    )
+    primary = RuntimeError("injected rank-1 communicator failure")
+    publish_errors = []
+    close_errors = [None, None]
+
+    def publish():
+        try:
+            wrappers[1]._publish_communicator_fatal(primary)
+        except BaseException as error:
+            publish_errors.append(error)
+
+    def close(rank):
+        try:
+            wrappers[rank].close()
+        except BaseException as error:
+            close_errors[rank] = error
+
+    publisher = threading.Thread(target=publish)
+    closers = [threading.Thread(target=close, args=(rank,)) for rank in range(2)]
+    try:
+        publisher.start()
+        assert origin_waiting.wait(3.0)
+        assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+
+        closers[0].start()
+        closers[0].join(0.05)
+        assert closers[0].is_alive()
+        assert wrappers[0]._fatal_monitor_stop.is_set() is False
+        assert backends[0].stop_calls == 0
+
+        release_origin.set()
+        publisher.join(5.0)
+        assert not publisher.is_alive()
+        closers[1].start()
+        for closer in closers:
+            closer.join(5.0)
+        assert all(not closer.is_alive() for closer in closers)
+        assert publish_errors == []
+        assert close_errors == [None, None]
+        assert wrappers[1]._fatal_error is primary
+        assert wrappers[0]._fatal_origin_rank == 1
+        assert [backend.stop_calls for backend in backends] == [1, 1]
+    finally:
+        release_origin.set()
+        publisher.join(5.0)
+        for closer in closers:
+            if closer.ident is not None:
+                closer.join(5.0)
+        for wrapper in wrappers:
+            if not wrapper._closed:
+                wrapper.close()
+
+
+def test_close_ready_cannot_overtake_unpolled_nonzero_fatal(monkeypatch):
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+
+    rank_zero_monitor = wrappers[0]._fatal_monitor_thread
+    wrappers[0]._fatal_monitor_stop.set()
+    rank_zero_monitor.join(3.0)
+    assert not rank_zero_monitor.is_alive()
+    wrappers[0]._fatal_monitor_stop.clear()
+
+    monitor_waiting = threading.Event()
+    release_monitor = threading.Event()
+    original_monitor = wrappers[0]._monitor_fatal_records
+
+    def delayed_monitor():
+        monitor_waiting.set()
+        assert release_monitor.wait(3.0)
+        original_monitor()
+
+    rank_zero_monitor = threading.Thread(target=delayed_monitor, daemon=True)
+    wrappers[0]._fatal_monitor_thread = rank_zero_monitor
+    rank_zero_monitor.start()
+    assert monitor_waiting.wait(3.0)
+
+    final_consume_waiting = threading.Event()
+    release_final_consume = threading.Event()
+    original_consume = wrappers[1]._consume_terminal_control_records
+
+    def delayed_final_consume():
+        if wrappers[1]._fatal_monitor_stop.is_set():
+            final_consume_waiting.set()
+            assert release_final_consume.wait(3.0)
+        return original_consume()
+
+    monkeypatch.setattr(
+        wrappers[1], "_consume_terminal_control_records", delayed_final_consume
+    )
+
+    primary = RuntimeError("injected rank-1 close-ready race")
+    publish_errors = []
+    close_errors = [None, None]
+
+    def publish():
+        try:
+            wrappers[1]._publish_communicator_fatal(primary)
+        except BaseException as error:
+            publish_errors.append(error)
+
+    def close(rank):
+        try:
+            wrappers[rank].close()
+        except BaseException as error:
+            close_errors[rank] = error
+
+    publisher = threading.Thread(target=publish, daemon=True)
+    closers = [
+        threading.Thread(target=close, args=(rank,), daemon=True) for rank in range(2)
+    ]
+    observed_ack = None
+    observed_aborts = None
+    try:
+        publisher.start()
+        assert store.wait_for(lambda values: values.get(wrappers[1]._fatal_key(1)) == 1)
+        assert raw_comms[1].abort_event.wait(3.0)
+        assert raw_comms[1].abort_calls == 1
+        assert raw_comms[0].abort_calls == 0
+
+        for closer in closers:
+            closer.start()
+        assert store.wait_for(
+            lambda values: all(
+                values.get(wrappers[rank]._close_ready_key(rank)) == 1
+                for rank in range(2)
+            )
+        )
+        observed_ack = store.get(wrappers[0]._fatal_ack_key(0))
+        observed_aborts = [raw.abort_calls for raw in raw_comms]
+    finally:
+        if store.get(wrappers[0]._fatal_ack_key(0)) != 1:
+            store.set(wrappers[0]._fatal_ack_key(0), 1)
+        release_monitor.set()
+        release_final_consume.set()
+        publisher.join(5.0)
+        for closer in closers:
+            if closer.ident is not None:
+                closer.join(5.0)
+        for wrapper in wrappers:
+            if not wrapper._closed:
+                wrapper._fatal_control_initialized = False
+                wrapper.close()
+
+    assert observed_ack == 1
+    assert observed_aborts == [1, 1]
+    assert not publisher.is_alive()
+    assert all(not closer.is_alive() for closer in closers)
+    assert publish_errors == []
+    assert close_errors == [None, None]
+    assert [backend.stop_calls for backend in backends] == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("operation_name", "backend_method"),
+    (
+        ("barrier", "barrier"),
+        ("broadcast", "broadcast"),
+        ("allreduce", "all_reduce"),
+        ("allreduce_inplace", "all_reduce"),
+        ("reduce_scatter", "reduce_scatter"),
+        ("allgather", "all_gather"),
+    ),
+)
+def test_close_intent_waits_for_admitted_operation_fatal_publication(
+    monkeypatch, operation_name, backend_method
+):
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+
+    operation_entered = threading.Event()
+    release_operation = threading.Event()
+    primary = RuntimeError("injected admitted rank-1 communicator failure")
+
+    def fail_collective(*args, **kwargs):
+        operation_entered.set()
+        assert release_operation.wait(3.0)
+        raise primary
+
+    monkeypatch.setattr(wrappers[1], "_validate_array", lambda *args, **kwargs: None)
+    monkeypatch.setattr(backends[1], backend_method, fail_collective)
+    callbacks = [[], []]
+    handlers = []
+    for rank in range(2):
+
+        def handler(error, rank=rank):
+            callbacks[rank].append(error)
+            wrappers[rank]._publish_communicator_fatal(error)
+
+        handlers.append(handler)
+        wrappers[rank]._install_fatal_handler(handler)
+
+    stop_order = []
+    for rank, backend in enumerate(backends):
+        original_stop = backend.stop
+
+        def record_stop(rank=rank, original_stop=original_stop):
+            stop_order.append(rank)
+            return original_stop()
+
+        monkeypatch.setattr(backend, "stop", record_stop)
+
+    operation_errors = []
+    close_errors = [None, None]
+
+    def run_operation():
+        try:
+            array = np.ones((2,), dtype=np.float64)
+            if operation_name == "barrier":
+                wrappers[1].barrier()
+            elif operation_name == "broadcast":
+                wrappers[1].broadcast(array, root=0)
+            elif operation_name in {"allreduce", "allreduce_inplace"}:
+                getattr(wrappers[1], operation_name)(array)
+            else:
+                getattr(wrappers[1], operation_name)(array, axis=0)
+        except BaseException as error:
+            operation_errors.append(error)
+
+    def close(rank):
+        try:
+            wrappers[rank].close()
+        except BaseException as error:
+            close_errors[rank] = error
+
+    operation = threading.Thread(target=run_operation, daemon=True)
+    closers = [
+        threading.Thread(target=close, args=(rank,), daemon=True) for rank in range(2)
+    ]
+    try:
+        operation.start()
+        assert operation_entered.wait(3.0)
+
+        closers[1].start()
+        assert store.wait_for(lambda values: wrappers[1]._closing)
+        closers[0].start()
+        release_operation.set()
+
+        operation.join(5.0)
+        for closer in closers:
+            closer.join(5.0)
+    finally:
+        release_operation.set()
+        operation.join(5.0)
+        for closer in closers:
+            if closer.ident is not None:
+                closer.join(5.0)
+        for wrapper in wrappers:
+            if not wrapper._closed:
+                wrapper._fatal_control_initialized = False
+                wrapper.close()
+
+    assert not operation.is_alive()
+    assert all(not closer.is_alive() for closer in closers)
+    assert operation_errors == [primary]
+    assert close_errors == [None, None]
+    assert len(callbacks[0]) == 1
+    assert callbacks[0][0].origin_rank == 1
+    assert callbacks[1] == [primary]
+    assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+    assert [
+        store.get(wrapper._fatal_key(rank)) for rank, wrapper in enumerate(wrappers)
+    ] == [
+        1,
+        1,
+    ]
+    assert [
+        store.get(wrapper._fatal_ack_key(rank)) for rank, wrapper in enumerate(wrappers)
+    ] == [1, 1]
+    assert stop_order == [1, 0]
+
+
+def test_close_joins_monitor_fatal_needed_by_admitted_peer(monkeypatch):
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+
+    operation_entered = [threading.Event(), threading.Event()]
+    release_failure = threading.Event()
+    release_rank_zero_for_cleanup = threading.Event()
+    primary = RuntimeError("injected admitted rank-1 communicator failure")
+
+    def block_rank_zero():
+        operation_entered[0].set()
+        deadline = time.monotonic() + 5.0
+        while not (
+            raw_comms[0].abort_event.is_set() or release_rank_zero_for_cleanup.is_set()
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+
+    def fail_rank_one():
+        operation_entered[1].set()
+        assert release_failure.wait(3.0)
+        raise primary
+
+    monkeypatch.setattr(backends[0], "barrier", block_rank_zero)
+    monkeypatch.setattr(backends[1], "barrier", fail_rank_one)
+
+    callbacks = [[], []]
+    handlers = []
+    for rank in range(2):
+
+        def handler(error, rank=rank):
+            callbacks[rank].append(error)
+            wrappers[rank]._publish_communicator_fatal(error)
+
+        handlers.append(handler)
+        wrappers[rank]._install_fatal_handler(handler)
+
+    stop_order = []
+    for rank, backend in enumerate(backends):
+        original_stop = backend.stop
+
+        def record_stop(rank=rank, original_stop=original_stop):
+            stop_order.append(rank)
+            return original_stop()
+
+        monkeypatch.setattr(backend, "stop", record_stop)
+
+    hard_exits = []
+    for rank, wrapper in enumerate(wrappers):
+
+        def hard_exit(rank=rank):
+            hard_exits.append(rank)
+            raise AssertionError(
+                "unexpected communicator hard exit on rank {}".format(rank)
+            )
+
+        monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    operation_errors = [[], []]
+    close_errors = [[], []]
+
+    def run_operation(rank):
+        try:
+            wrappers[rank].barrier()
+        except BaseException as error:
+            operation_errors[rank].append(error)
+
+    def close(rank):
+        try:
+            wrappers[rank].close()
+        except BaseException as error:
+            close_errors[rank].append(error)
+
+    operations = [
+        threading.Thread(target=run_operation, args=(rank,), daemon=True)
+        for rank in range(2)
+    ]
+    closers = [
+        threading.Thread(target=close, args=(rank,), daemon=True) for rank in range(2)
+    ]
+    needed_external_cleanup = False
+    try:
+        for operation in operations:
+            operation.start()
+        assert all(entered.wait(3.0) for entered in operation_entered)
+        assert [wrapper._admitted_operations for wrapper in wrappers] == [1, 1]
+
+        for closer in closers:
+            closer.start()
+        assert store.wait_for(
+            lambda values: all(wrapper._closing for wrapper in wrappers)
+        )
+        release_failure.set()
+
+        for actor in (*operations, *closers):
+            actor.join(1.0)
+        needed_external_cleanup = any(
+            actor.is_alive() for actor in (*operations, *closers)
+        )
+    finally:
+        release_failure.set()
+        if any(actor.is_alive() for actor in (*operations, *closers)):
+            store.set(wrappers[0]._fatal_ack_key(0), 1)
+            release_rank_zero_for_cleanup.set()
+        for actor in (*operations, *closers):
+            if actor.ident is not None:
+                actor.join(5.0)
+        for wrapper in wrappers:
+            if not wrapper._closed:
+                wrapper._fatal_control_initialized = False
+                wrapper.close()
+
+    assert needed_external_cleanup is False
+    assert all(not actor.is_alive() for actor in (*operations, *closers))
+    assert operation_errors == [[], [primary]]
+    assert close_errors == [[], []]
+    assert len(callbacks[0]) == 1
+    assert callbacks[0][0].origin_rank == 1
+    assert callbacks[1] == [primary]
+    assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+    assert [
+        store.get(wrapper._fatal_key(rank)) for rank, wrapper in enumerate(wrappers)
+    ] == [
+        1,
+        1,
+    ]
+    assert [
+        store.get(wrapper._fatal_ack_key(rank)) for rank, wrapper in enumerate(wrappers)
+    ] == [1, 1]
+    assert [wrapper._admitted_operations for wrapper in wrappers] == [0, 0]
+    assert [wrapper._fatal_publications for wrapper in wrappers] == [0, 0]
+    assert hard_exits == []
+    assert stop_order == [1, 0]
+
+
+@pytest.mark.parametrize("fatal", (False, True))
+def test_close_waits_for_complete_active_broadcast_agreement(monkeypatch, fatal):
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+    for wrapper in wrappers:
+        monkeypatch.setattr(wrapper, "_validate_array", lambda *args, **kwargs: None)
+
+    primary = RuntimeError("injected active broadcast communicator failure")
+    if fatal:
+        original_broadcast = backends[1].broadcast
+
+        def fail_after_broadcast(*args, **kwargs):
+            original_broadcast(*args, **kwargs)
+            raise primary
+
+        monkeypatch.setattr(backends[1], "broadcast", fail_after_broadcast)
+
+    callbacks = [[], []]
+    handlers = []
+    for rank, wrapper in enumerate(wrappers):
+
+        def handler(error, rank=rank, wrapper=wrapper):
+            callbacks[rank].append(error)
+            wrapper._publish_communicator_fatal(error)
+
+        handlers.append(handler)
+        wrapper._install_fatal_handler(handler)
+
+    agreement_entered = [threading.Event(), threading.Event()]
+    release_agreement = threading.Event()
+    for rank, wrapper in enumerate(wrappers):
+        original_set = wrapper._fatal_store_set
+
+        def pause_active_record(key, value, rank=rank, original_set=original_set):
+            if key == wrappers[rank]._active_b_key(rank):
+                sequence, _ = wrappers[rank]._decode_active_b(value)
+                if int(sequence) == 1:
+                    agreement_entered[rank].set()
+                    assert release_agreement.wait(3.0)
+            return original_set(key, value)
+
+        monkeypatch.setattr(wrapper, "_fatal_store_set", pause_active_record)
+
+    hard_exits = []
+    for rank, wrapper in enumerate(wrappers):
+
+        def hard_exit(rank=rank):
+            hard_exits.append(rank)
+            raise AssertionError(
+                "unexpected communicator hard exit on rank {}".format(rank)
+            )
+
+        monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    stop_order = []
+    for rank, backend in enumerate(backends):
+        original_stop = backend.stop
+
+        def record_stop(rank=rank, original_stop=original_stop):
+            stop_order.append(rank)
+            return original_stop()
+
+        monkeypatch.setattr(backend, "stop", record_stop)
+
+    operation_errors = [[], []]
+    close_errors = [[], []]
+
+    def run_active_broadcast(rank):
+        wrapper = wrappers[rank]
+        admission = getattr(wrapper, "_active_broadcast_admission", None)
+        boundary = (
+            nullcontext((wrapper.broadcast, wrapper._agree_active_broadcast))
+            if admission is None
+            else admission()
+        )
+        try:
+            with boundary as (broadcast, agree):
+                broadcast_error = None
+                try:
+                    broadcast(np.ones((2,), dtype=np.float64), root=0)
+                except BaseException as error:
+                    broadcast_error = error
+                try:
+                    agree(broadcast_error is not None)
+                except BaseException:
+                    if broadcast_error is not None:
+                        raise broadcast_error
+                    raise
+                if broadcast_error is not None:
+                    raise broadcast_error
+        except BaseException as error:
+            operation_errors[rank].append(error)
+
+    def close(rank):
+        try:
+            wrappers[rank].close()
+        except BaseException as error:
+            close_errors[rank].append(error)
+
+    operations = [
+        threading.Thread(target=run_active_broadcast, args=(rank,), daemon=True)
+        for rank in range(2)
+    ]
+    closers = [
+        threading.Thread(target=close, args=(rank,), daemon=True) for rank in range(2)
+    ]
+    try:
+        for operation in operations:
+            operation.start()
+        assert all(entered.wait(3.0) for entered in agreement_entered)
+
+        for closer in closers:
+            closer.start()
+        assert store.wait_for(
+            lambda values: all(wrapper._closing for wrapper in wrappers)
+        )
+        for closer in closers:
+            closer.join(0.05)
+        assert all(closer.is_alive() for closer in closers)
+        assert [backend.stop_calls for backend in backends] == [0, 0]
+        assert [wrapper._admitted_operations for wrapper in wrappers] == [1, 1]
+
+        release_agreement.set()
+        for actor in (*operations, *closers):
+            actor.join(5.0)
+    finally:
+        release_agreement.set()
+        for actor in (*operations, *closers):
+            if actor.ident is not None:
+                actor.join(5.0)
+        for wrapper in wrappers:
+            if not wrapper._closed:
+                wrapper._fatal_control_initialized = False
+                wrapper.close()
+
+    assert all(not actor.is_alive() for actor in (*operations, *closers))
+    if fatal:
+        assert operation_errors[1] == [primary]
+        assert len(operation_errors[0]) == 1
+        assert callbacks[1] == [primary]
+        assert len(callbacks[0]) == 1
+        assert callbacks[0][0].origin_rank == 1
+        assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+    else:
+        assert operation_errors == [[], []]
+        assert callbacks == [[], []]
+        assert [raw.abort_calls for raw in raw_comms] == [0, 0]
+    assert close_errors == [[], []]
+    assert [wrapper._admitted_operations for wrapper in wrappers] == [0, 0]
+    assert [wrapper._fatal_publications for wrapper in wrappers] == [0, 0]
+    assert hard_exits == []
+    assert stop_order == [1, 0]
+
+
+def test_runtime_origin_fatal_reservation_precedes_terminal_visibility_and_close(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed.context import DistributedRendezvous
+    from renormalizer.backend._distributed.mesh import DeviceMesh
+    from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
+
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+    runtimes = [
+        CupyDistributedRuntime(
+            backend=backends[rank],
+            context=wrappers[rank]._context,
+            rendezvous=DistributedRendezvous("127.0.0.1", 23456),
+            mesh=DeviceMesh((2,), ("rank",), rank),
+            collective=wrappers[rank],
+        )
+        for rank in range(2)
+    ]
+    callbacks = [[], []]
+    callback_entered = [threading.Event(), threading.Event()]
+    handlers = []
+    for rank, (runtime, wrapper) in enumerate(zip(runtimes, wrappers)):
+
+        def handler(error, rank=rank, runtime=runtime):
+            callbacks[rank].append(error)
+            callback_entered[rank].set()
+            return runtime._enter_communicator_fatal(error)
+
+        handlers.append(handler)
+        wrapper._install_fatal_handler(handler)
+
+    publication_starts = [[], []]
+    for rank, wrapper in enumerate(wrappers):
+        original_begin = wrapper._begin_fatal_publication
+
+        def record_begin(
+            *args, rank=rank, wrapper=wrapper, original=original_begin, **kwargs
+        ):
+            result = original(*args, **kwargs)
+            if result[2]:
+                publication_starts[rank].append(wrapper._fatal_publications)
+            return result
+
+        monkeypatch.setattr(wrapper, "_begin_fatal_publication", record_begin)
+
+    handoff_entered = threading.Event()
+    release_handoff = threading.Event()
+    original_publish = wrappers[1]._publish_communicator_fatal
+
+    def pause_runtime_handoff(error, **kwargs):
+        handoff_entered.set()
+        assert release_handoff.wait(3.0)
+        return original_publish(error, **kwargs)
+
+    monkeypatch.setattr(
+        wrappers[1], "_publish_communicator_fatal", pause_runtime_handoff
+    )
+
+    hard_exits = []
+    for rank, wrapper in enumerate(wrappers):
+
+        def hard_exit(rank=rank):
+            hard_exits.append(rank)
+            raise AssertionError(
+                "unexpected communicator hard exit on rank {}".format(rank)
+            )
+
+        monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    stop_order = []
+    for rank, backend in enumerate(backends):
+        original_stop = backend.stop
+
+        def record_stop(rank=rank, original=original_stop):
+            stop_order.append(rank)
+            return original()
+
+        monkeypatch.setattr(backend, "stop", record_stop)
+
+    primary = RuntimeError("injected direct runtime communicator failure")
+    fatal_errors = []
+    close_errors = [[], []]
+
+    def enter_fatal():
+        try:
+            assert runtimes[1]._enter_communicator_fatal(primary) is primary
+        except BaseException as error:
+            fatal_errors.append(error)
+
+    def close(rank):
+        try:
+            runtimes[rank].close()
+        except BaseException as error:
+            close_errors[rank].append(error)
+
+    publisher = threading.Thread(target=enter_fatal, daemon=True)
+    closers = [
+        threading.Thread(target=close, args=(rank,), daemon=True) for rank in range(2)
+    ]
+    state_at_visibility = None
+    callback_before_close = None
+    close_joined_reservation = None
+    try:
+        publisher.start()
+        assert handoff_entered.wait(3.0)
+        state_at_visibility = (
+            wrappers[1]._fatal_publications,
+            wrappers[1]._fatal_abort_started,
+            store.get(wrappers[1]._fatal_key(1)),
+        )
+        callback_before_close = callback_entered[0].wait(0.5)
+
+        for closer in closers:
+            closer.start()
+        assert store.wait_for(
+            lambda values: all(wrapper._closing for wrapper in wrappers)
+        )
+        for closer in closers:
+            closer.join(0.05)
+        close_joined_reservation = all(closer.is_alive() for closer in closers)
+
+        release_handoff.set()
+        publisher.join(5.0)
+        for closer in closers:
+            closer.join(5.0)
+    finally:
+        release_handoff.set()
+        if publisher.ident is not None:
+            publisher.join(5.0)
+        for closer in closers:
+            if closer.ident is not None:
+                closer.join(5.0)
+        for runtime in runtimes:
+            if not runtime._closed:
+                try:
+                    runtime.close()
+                except BaseException:
+                    pass
+
+    assert state_at_visibility == (1, True, 1)
+    assert callback_before_close is True
+    assert close_joined_reservation is True
+    assert not publisher.is_alive()
+    assert all(not closer.is_alive() for closer in closers)
+    assert fatal_errors == []
+    assert callbacks[0][0].origin_rank == 1
+    assert callbacks[1] == []
+    assert len(callbacks[0]) == 1
+    assert publication_starts == [[1], [1]]
+    assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+    assert [
+        store.get(wrapper._fatal_key(rank)) for rank, wrapper in enumerate(wrappers)
+    ] == [
+        1,
+        1,
+    ]
+    assert [
+        store.get(wrapper._fatal_ack_key(rank)) for rank, wrapper in enumerate(wrappers)
+    ] == [1, 1]
+    assert [wrapper._admitted_operations for wrapper in wrappers] == [0, 0]
+    assert [wrapper._fatal_publications for wrapper in wrappers] == [0, 0]
+    assert runtimes[1]._terminal_error is primary
+    assert close_errors == [
+        [runtimes[0]._terminal_error],
+        [primary],
+    ]
+    assert hard_exits == []
+    assert stop_order == [1, 0]
+
+
+def test_failed_owner_terminal_slot_holds_fatal_reservation_against_close(monkeypatch):
+    from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
+    from renormalizer.backend._distributed.context import DistributedRendezvous
+    from renormalizer.backend._distributed.mesh import DeviceMesh
+    from renormalizer.backend._distributed.providers import ActiveWorkingSetProvider
+    from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
+
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+    runtimes = [
+        CupyDistributedRuntime(
+            backend=backends[rank],
+            context=wrappers[rank]._context,
+            rendezvous=DistributedRendezvous("127.0.0.1", 23456),
+            mesh=DeviceMesh((2,), ("rank",), rank),
+            collective=wrappers[rank],
+        )
+        for rank in range(2)
+    ]
+    budget = SimpleNamespace(resolved_bytes=0)
+    providers = [
+        ActiveWorkingSetProvider(
+            runtime,
+            device_budget_resolution=budget,
+            host_budget_resolution=budget,
+        )
+        for runtime in runtimes
+    ]
+    for runtime in runtimes:
+        runtime._arm_communicator_fatal()
+
+    primary = RuntimeError("injected failed owner primary")
+    drain_error = RuntimeError("injected failed owner drain failure")
+    cohort_owner = AsyncResourceOwner("h2d")
+    cohort_owner.force_quarantine(primary)
+    failed_owner = AsyncResourceOwner(
+        "compute",
+        drainer=lambda: (_ for _ in ()).throw(drain_error),
+        quarantine=providers[1]._accept_async_quarantine,
+    )
+    failed_owner.mark_enqueued()
+    providers[1]._active_lease = SimpleNamespace(
+        scheduler=SimpleNamespace(_quarantined_owners=[cohort_owner]),
+        pool=None,
+        _poisoned_error=None,
+        _active_operator_owner=None,
+        _status_workspace=None,
+        close=lambda: None,
+    )
+
+    terminal_slot_visible = threading.Event()
+    release_quarantine = threading.Event()
+    retain_calls = []
+    original_retain = runtimes[1]._terminal_quarantine.retain
+
+    def pause_first_retain(owner, error=None):
+        retain_calls.append((owner, error))
+        if len(retain_calls) == 1:
+            terminal_slot_visible.set()
+            assert release_quarantine.wait(3.0)
+        return original_retain(owner, error)
+
+    monkeypatch.setattr(runtimes[1]._terminal_quarantine, "retain", pause_first_retain)
+
+    publication_starts = [[], []]
+    control_writes = [[], []]
+    for rank, wrapper in enumerate(wrappers):
+        original_begin = wrapper._begin_fatal_publication
+        original_set = wrapper._fatal_store_set
+
+        def record_begin(
+            *args, rank=rank, wrapper=wrapper, original=original_begin, **kwargs
+        ):
+            result = original(*args, **kwargs)
+            if result[2]:
+                publication_starts[rank].append(wrapper._fatal_publications)
+            return result
+
+        def record_set(key, value, rank=rank, original=original_set):
+            if int(value) == 1:
+                control_writes[rank].append(key)
+            return original(key, value)
+
+        monkeypatch.setattr(wrapper, "_begin_fatal_publication", record_begin)
+        monkeypatch.setattr(wrapper, "_fatal_store_set", record_set)
+
+    hard_exits = []
+    stop_order = []
+    for rank, (wrapper, backend) in enumerate(zip(wrappers, backends)):
+        original_stop = backend.stop
+
+        def hard_exit(rank=rank):
+            hard_exits.append(rank)
+            raise AssertionError(
+                "unexpected communicator hard exit on rank {}".format(rank)
+            )
+
+        def record_stop(rank=rank, original=original_stop):
+            stop_order.append(rank)
+            return original()
+
+        monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+        monkeypatch.setattr(backend, "stop", record_stop)
+
+    operation_errors = []
+    close_errors = [[], []]
+
+    def fail_owner():
+        try:
+            failed_owner.fail(primary)
+        except BaseException as error:
+            operation_errors.append(error)
+
+    def close(rank):
+        try:
+            runtimes[rank].close()
+        except BaseException as error:
+            close_errors[rank].append(error)
+
+    operation = threading.Thread(target=fail_owner, daemon=True)
+    closers = [
+        threading.Thread(target=close, args=(rank,), daemon=True) for rank in range(2)
+    ]
+    state_at_first_terminal = None
+    close_joined_reservation = None
+    try:
+        operation.start()
+        assert terminal_slot_visible.wait(3.0)
+        state_at_first_terminal = (
+            providers[1]._terminal_error,
+            runtimes[1]._terminal_error,
+            getattr(backends[1], "_execution_terminal_error", None),
+            wrappers[1]._fatal_publications,
+            wrappers[1]._fatal_abort_started,
+            store.get(wrappers[1]._fatal_key(1)),
+        )
+        deadline = time.monotonic() + 3.0
+        while wrappers[0]._fatal_publications != 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+
+        for closer in closers:
+            closer.start()
+        assert store.wait_for(
+            lambda values: all(wrapper._closing for wrapper in wrappers)
+        )
+        for closer in closers:
+            closer.join(0.05)
+        close_joined_reservation = all(closer.is_alive() for closer in closers)
+
+        release_quarantine.set()
+        operation.join(5.0)
+        for closer in closers:
+            closer.join(5.0)
+    finally:
+        release_quarantine.set()
+        if operation.ident is not None:
+            operation.join(5.0)
+        for closer in closers:
+            if closer.ident is not None:
+                closer.join(5.0)
+        for runtime in runtimes:
+            if not runtime._closed:
+                try:
+                    runtime.close()
+                except BaseException:
+                    pass
+
+    assert state_at_first_terminal == (primary, None, None, 1, True, 1)
+    assert close_joined_reservation is True
+    assert not operation.is_alive()
+    assert all(not closer.is_alive() for closer in closers)
+    assert operation_errors == [primary]
+    assert close_errors == [[runtimes[0]._terminal_error], [primary]]
+    assert publication_starts == [[1], [1]]
+    assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+    assert [
+        writes.count(wrapper._fatal_key(rank))
+        for rank, (wrapper, writes) in enumerate(zip(wrappers, control_writes))
+    ] == [1, 1]
+    assert [
+        writes.count(wrapper._fatal_ack_key(rank))
+        for rank, (wrapper, writes) in enumerate(zip(wrappers, control_writes))
+    ] == [1, 1]
+    assert [wrapper._fatal_publications for wrapper in wrappers] == [0, 0]
+    assert set(runtimes[1]._terminal_quarantine.owners) == {
+        cohort_owner,
+        failed_owner,
+    }
+    assert runtimes[1]._terminal_quarantine.first_error is primary
+    assert failed_owner.error is primary
+    assert failed_owner.secondary_errors == (drain_error,)
+    assert hard_exits == []
+    assert stop_order == [1, 0]
+
+
+def test_monitor_atomically_joins_existing_local_fatal_publication(monkeypatch):
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
+    wrappers = [pair[0] for pair in pairs]
+    backends = [pair[1] for pair in pairs]
+    _bootstrap_cpu_wrappers(wrappers)
+    for wrapper in wrappers:
+        wrapper._fatal_monitor_stop.set()
+    for wrapper in wrappers:
+        wrapper._fatal_monitor_thread.join(3.0)
+        assert not wrapper._fatal_monitor_thread.is_alive()
+        wrapper._fatal_monitor_stop.clear()
+
+    store.set(wrappers[0]._fatal_key(0), 1)
+    store.set(wrappers[0]._fatal_ack_key(0), 1)
+    monitor_observed = threading.Event()
+    release_monitor = threading.Event()
+    monitor_admitted = threading.Event()
+    direct_live = threading.Event()
+    release_direct = threading.Event()
+    original_enter = wrappers[1]._enter_observed_fatal
+
+    def pause_monitor(error, origin_rank, **kwargs):
+        monitor_observed.set()
+        assert release_monitor.wait(3.0)
+        return original_enter(error, origin_rank, **kwargs)
+
+    monkeypatch.setattr(wrappers[1], "_enter_observed_fatal", pause_monitor)
+    admissions = []
+    original_begin = wrappers[1]._begin_fatal_publication
+    monitor = None
+
+    def record_begin(*args, **kwargs):
+        result = original_begin(*args, **kwargs)
+        if threading.current_thread() is monitor:
+            admissions.append((result[2], wrappers[1]._fatal_publications))
+            monitor_admitted.set()
+        return result
+
+    monkeypatch.setattr(wrappers[1], "_begin_fatal_publication", record_begin)
+
+    control_writes = [[], []]
+    for rank, wrapper in enumerate(wrappers):
+        original_set = wrapper._fatal_store_set
+
+        def record_set(key, value, rank=rank, original=original_set):
+            if int(value) == 1:
+                control_writes[rank].append(key)
+            return original(key, value)
+
+        monkeypatch.setattr(wrapper, "_fatal_store_set", record_set)
+
+    hard_exits = []
+    stop_order = []
+    for rank, (wrapper, backend) in enumerate(zip(wrappers, backends)):
+        original_stop = backend.stop
+
+        def hard_exit(rank=rank):
+            hard_exits.append(rank)
+            raise AssertionError(
+                "unexpected communicator hard exit on rank {}".format(rank)
+            )
+
+        def record_stop(rank=rank, original=original_stop):
+            stop_order.append(rank)
+            return original()
+
+        monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+        monkeypatch.setattr(backend, "stop", record_stop)
+
+    primary = RuntimeError("injected direct local fatal")
+    direct_errors = []
+
+    def publish_direct():
+        try:
+            with wrappers[1]._communicator_fatal_reservation(primary) as reservation:
+                assert reservation.primary is primary
+                direct_live.set()
+                assert release_direct.wait(3.0)
+        except BaseException as error:
+            direct_errors.append(error)
+
+    monitor = threading.Thread(target=wrappers[1]._monitor_fatal_records, daemon=True)
+    wrappers[1]._fatal_monitor_thread = monitor
+    publisher = threading.Thread(target=publish_direct, daemon=True)
+    try:
+        monitor.start()
+        assert monitor_observed.wait(3.0)
+        publisher.start()
+        assert direct_live.wait(3.0)
+        assert wrappers[1]._fatal_publications == 1
+
+        release_monitor.set()
+        assert monitor_admitted.wait(3.0)
+        peak_publications = wrappers[1]._fatal_publications
+        monitor.join(0.05)
+        monitor_waited_for_owner = monitor.is_alive()
+
+        release_direct.set()
+        publisher.join(5.0)
+        monitor.join(5.0)
+    finally:
+        release_monitor.set()
+        release_direct.set()
+        if publisher.ident is not None:
+            publisher.join(5.0)
+        if monitor.ident is not None:
+            monitor.join(5.0)
+
+    assert admissions == [(False, 1)]
+    assert peak_publications == 1
+    assert monitor_waited_for_owner is True
+    assert not publisher.is_alive()
+    assert not monitor.is_alive()
+    assert direct_errors == []
+    assert wrappers[1]._fatal_error is primary
+    assert wrappers[1]._fatal_publications == 0
+    assert raw_comms[1].abort_calls == 1
+    assert control_writes[1].count(wrappers[1]._fatal_key(1)) == 1
+    assert control_writes[1].count(wrappers[1]._fatal_ack_key(1)) == 1
+
+    _close_cpu_wrappers(wrappers)
+
+    assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+    assert [
+        writes.count(wrapper._fatal_key(rank))
+        for rank, (wrapper, writes) in enumerate(zip(wrappers, control_writes))
+    ] == [1, 1]
+    assert [
+        writes.count(wrapper._fatal_ack_key(rank))
+        for rank, (wrapper, writes) in enumerate(zip(wrappers, control_writes))
+    ] == [1, 1]
+    assert hard_exits == []
+    assert stop_order == [1, 0]
+
+
+def test_uninitialized_close_waits_for_admitted_operation(monkeypatch):
+    store = _SharedStore(1)
+    raw_comm = _RawComm()
+    wrapper, backend = _cpu_collective(0, 1, store, raw_comm)
+    operation_entered = threading.Event()
+    release_operation = threading.Event()
+
+    def blocking_barrier():
+        operation_entered.set()
+        assert release_operation.wait(3.0)
+
+    monkeypatch.setattr(backend, "barrier", blocking_barrier)
+    operation_errors = []
+    close_errors = []
+
+    def run_operation():
+        try:
+            wrapper.barrier()
+        except BaseException as error:
+            operation_errors.append(error)
+
+    def close():
+        try:
+            wrapper.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    operation = threading.Thread(target=run_operation, daemon=True)
+    closer = threading.Thread(target=close, daemon=True)
+    try:
+        operation.start()
+        assert operation_entered.wait(3.0)
+        closer.start()
+        deadline = time.monotonic() + 3.0
+        while not wrapper._closing:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        closer.join(0.05)
+        assert closer.is_alive()
+        assert backend.stop_calls == 0
+        release_operation.set()
+        operation.join(5.0)
+        closer.join(5.0)
+    finally:
+        release_operation.set()
+        operation.join(5.0)
+        if closer.ident is not None:
+            closer.join(5.0)
+        if not wrapper._closed:
+            wrapper.close()
+
+    assert not operation.is_alive()
+    assert not closer.is_alive()
+    assert operation_errors == []
+    assert close_errors == []
+    assert backend.stop_calls == 1
+
+
+def test_local_and_remote_fatal_abort_once_without_destroy_or_stop():
+    store = _SharedStore(2)
+    raw_comms = [_RawComm(), _RawComm()]
+    wrappers = [
+        _cpu_collective(rank, 2, store, raw_comms[rank])[0] for rank in range(2)
+    ]
+    bootstrap_errors = [None, None]
+
+    def bootstrap(rank):
+        try:
+            assert wrappers[rank]._bootstrap_fatal_control() == 0
+        except BaseException as error:
+            bootstrap_errors[rank] = error
+
+    threads = [threading.Thread(target=bootstrap, args=(rank,)) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5.0)
+    assert all(not thread.is_alive() for thread in threads)
+    assert bootstrap_errors == [None, None]
+
+    primary = RuntimeError("injected local communicator failure")
+    publish_error = []
+
+    def publish():
+        try:
+            wrappers[0]._publish_communicator_fatal(primary)
+        except BaseException as error:
+            publish_error.append(error)
+
+    publisher = threading.Thread(target=publish)
+    try:
+        publisher.start()
+        publisher.join(5.0)
+        assert not publisher.is_alive()
+        assert publish_error == []
+        assert wrappers[0]._fatal_error is primary
+        assert wrappers[1]._fatal_error is not primary
+        assert (
+            str(wrappers[1]._fatal_error) == "remote communicator failure from rank 0"
+        )
+        assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+        assert [raw.destroy_calls for raw in raw_comms] == [0, 0]
+        assert [wrapper._backend.stop_calls for wrapper in wrappers] == [0, 0]
+
+        wrappers[0]._publish_communicator_fatal(RuntimeError("later failure"))
+        assert [raw.abort_calls for raw in raw_comms] == [1, 1]
+    finally:
+        _close_cpu_wrappers(wrappers)
+
+
+def test_fatal_handler_runs_after_abort_start_without_waiting_for_completion():
+    store = _SharedStore(1)
+    raw_comm = _RawComm()
+    wrapper, _ = _cpu_collective(0, 1, store, raw_comm)
+    assert wrapper._bootstrap_fatal_control() == 0
+    wrapper._fatal_monitor_stop.set()
+    wrapper._fatal_monitor_thread.join(5.0)
+    abort_entered = threading.Event()
+    release_abort = threading.Event()
+
+    def blocking_abort():
+        raw_comm.abort_calls += 1
+        abort_entered.set()
+        assert release_abort.wait(3.0)
+
+    raw_comm.abort = blocking_abort
+    observed = []
+
+    def handler(error):
+        observed.append(
+            (
+                error,
+                wrapper._fatal_abort_started,
+                wrapper._fatal_abort_completed,
+            )
+        )
+        wrapper._publish_communicator_fatal(error)
+
+    wrapper._install_fatal_handler(handler)
+    primary = RuntimeError("injected remote communicator failure")
+    errors = []
+
+    def observe():
+        try:
+            wrapper._enter_observed_fatal(primary, 0)
+        except BaseException as error:
+            errors.append(error)
+
+    observer = threading.Thread(target=observe)
+    try:
+        observer.start()
+        assert abort_entered.wait(3.0)
+        observer.join(0.05)
+        assert observer.is_alive()
+        release_abort.set()
+        observer.join(5.0)
+        assert not observer.is_alive()
+        assert errors == []
+        assert len(observed) == 1
+        error, abort_started, abort_completed = observed[0]
+        assert error is primary
+        assert abort_started is True
+        assert abort_completed is False
+    finally:
+        release_abort.set()
+        observer.join(5.0)
+        wrapper.close()
+
+
+def test_terminal_collective_rejects_every_public_entry_before_sentinel_access():
+    class Sentinel:
+        def __getattribute__(self, name):
+            raise AssertionError("terminal collective touched array sentinel")
+
+    store = _SharedStore(1)
+    raw_comm = _RawComm()
+    wrapper, backend = _cpu_collective(0, 1, store, raw_comm)
+    primary = RuntimeError("injected terminal communicator failure")
+    assert wrapper._bootstrap_fatal_control() == 0
+    wrapper._publish_communicator_fatal(primary)
+    try:
+        operations = (
+            wrapper.barrier,
+            lambda: wrapper.broadcast(Sentinel(), root=0),
+            lambda: wrapper.allreduce(Sentinel()),
+            lambda: wrapper.allreduce_inplace(Sentinel()),
+            lambda: wrapper.reduce_scatter(Sentinel(), axis=0),
+            lambda: wrapper.allgather(Sentinel(), axis=0),
+        )
+        for operation in operations:
+            with pytest.raises(RuntimeError, match="terminal-aborted") as caught:
+                operation()
+            assert caught.value.__cause__ is primary
+        assert backend.calls == []
+        assert raw_comm.abort_calls == 1
+        assert raw_comm.destroy_calls == 0
+    finally:
+        wrapper.close()
+
+
+def test_abort_failure_is_secondary_to_immutable_fatal_primary(monkeypatch):
+    abort_error = RuntimeError("injected raw abort failure")
+    store = _SharedStore(1)
+    raw_comm = _RawComm(abort_error=abort_error)
+    wrapper, backend = _cpu_collective(0, 1, store, raw_comm)
+    primary = RuntimeError("injected communicator primary")
+    assert wrapper._bootstrap_fatal_control() == 0
+    wrapper._fatal_monitor_stop.set()
+    wrapper._fatal_monitor_thread.join(5.0)
+
+    def hard_exit():
+        raise SystemExit(86)
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+    try:
+        with pytest.raises(SystemExit) as caught:
+            wrapper._publish_communicator_fatal(primary)
+        assert caught.value.code == 86
+        assert wrapper._fatal_error is primary
+        assert wrapper._fatal_secondary_errors == (abort_error,)
+        assert raw_comm.abort_calls == 1
+        assert raw_comm.destroy_calls == 0
+        assert backend.stop_calls == 0
+    finally:
+        wrapper._fatal_control_initialized = False
+        wrapper.close()
+
+
+def test_abort_failure_hard_exits_subprocess_instead_of_returning():
+    script = r"""
+from renormalizer.backend._distributed.collectives import CupyNcclCollective
+from renormalizer.backend._distributed.context import DistributedContext
+
+class Device:
+    def use(self):
+        pass
+
+class Runtime:
+    @staticmethod
+    def getDeviceCount():
+        return 1
+
+class Cuda:
+    runtime = Runtime()
+    Device = staticmethod(lambda index: Device())
+
+class Cupy:
+    cuda = Cuda()
+    class ndarray:
+        pass
+
+class Store:
+    def __init__(self):
+        self.values = {}
+    def __setitem__(self, key, value):
+        self.values[key] = value
+    def __getitem__(self, key):
+        return self.values[key]
+    def barrier(self):
+        pass
+
+class Raw:
+    def abort(self):
+        raise RuntimeError("injected raw abort failure")
+
+class Backend:
+    rank = 0
+    def __init__(self):
+        self._store_proxy = Store()
+        self._comm = Raw()
+    def stop(self):
+        raise AssertionError("stop must not substitute for abort")
+
+backend = Backend()
+collective = CupyNcclCollective(
+    DistributedContext(0, 0, 1, 1),
+    cupy_module=Cupy(),
+    init_process_group=lambda *args, **kwargs: backend,
+    host="127.0.0.1",
+    port=23456,
+)
+collective._bootstrap_store_proxy = Store()
+collective._local_fatal_capability_code = lambda: 0
+assert collective._bootstrap_fatal_control() == 0
+collective._publish_communicator_fatal(RuntimeError("primary"))
+raise AssertionError("abort failure returned to ordinary Python")
+"""
+    environment = dict(os.environ)
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.getcwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=15.0,
+    )
+    assert completed.returncode == 86, (completed.stdout, completed.stderr)
+
+
+def test_runtime_close_failure_is_terminal_without_collective_retry():
     from renormalizer.backend._distributed.context import DistributedRendezvous
     from renormalizer.backend._distributed.mesh import DeviceMesh
     from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
@@ -277,15 +2044,19 @@ def test_runtime_close_retries_without_marking_runtime_closed():
     with pytest.raises(RuntimeError, match="injected collective close failure"):
         runtime.close()
 
-    assert runtime._closed is False
+    assert runtime._closed is True
+    assert runtime.collective is None
+    assert collective.close_calls == 1
     assert collective.live is True
 
     runtime.close()
     runtime.close()
 
     assert runtime._closed is True
-    assert collective.live is False
-    assert collective.close_calls == 2
+    assert collective.live is True
+    assert collective.close_calls == 1
+    with pytest.raises(RuntimeError, match="distributed runtime is closed"):
+        runtime.barrier()
 
 
 def test_runtime_execution_config_is_a_borrowed_frozen_view():
@@ -381,7 +2152,9 @@ def test_runtime_execution_config_synchronizes_active_backend_mismatch(
         collective=collective,
     )
 
-    with pytest.raises(RuntimeError, match="distributed runtime backend validation failed"):
+    with pytest.raises(
+        RuntimeError, match="distributed runtime backend validation failed"
+    ):
         runtime.execution_config()
 
     assert collective.trace == [

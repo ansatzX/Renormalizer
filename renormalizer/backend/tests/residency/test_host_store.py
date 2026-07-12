@@ -7,6 +7,7 @@ import pytest
 
 from renormalizer.backend._distributed.residency import (
     ForeignHostTensorRefError,
+    HostTensorError,
     HostTensorRef,
     HostTensorStore,
     HostTensorStoreClosedError,
@@ -77,9 +78,7 @@ def test_update_is_shape_and_dtype_changing_cas_and_old_ref_is_stale():
     store = HostTensorStore(store_id="run-a")
     old = store.put("center", np.zeros((2, 3), dtype=np.float32))
 
-    new = store.update(
-        "center", np.ones((4,), dtype=np.complex128), expected_version=0
-    )
+    new = store.update("center", np.ones((4,), dtype=np.complex128), expected_version=0)
 
     assert new.version == 1
     assert new.generation == old.generation
@@ -215,6 +214,7 @@ def test_store_snapshot_and_writeback_allocation_are_canonical_immutable_metadat
     assert snapshot.store_id == "run-a"
     assert snapshot.refs == (first, second)
     assert snapshot.current_bytes == first.nbytes + second.nbytes
+    assert snapshot.namespace_revision == 2
     assert allocation.nbytes == 3 * 2 * np.dtype(np.complex128).itemsize
     assert allocation.layout == "C"
     with pytest.raises(FrozenInstanceError):
@@ -260,6 +260,73 @@ def test_read_validates_canonical_slice_and_returns_c_contiguous_copy():
     np.testing.assert_array_equal(snapshot, np.arange(24).reshape(4, 6)[1:3, 2:6])
     with pytest.raises(ValueError, match="slice"):
         store.read(ref, (slice(None), slice(0, 6, 2)))
+
+
+def test_copy_into_writes_exact_destination_without_snapshot_allocation(monkeypatch):
+    residency = importlib.import_module("renormalizer.backend._distributed.residency")
+    store = HostTensorStore(store_id="copy-into")
+    value = np.arange(24, dtype=np.float64).reshape(6, 4)
+    ref = store.put("tensor", value)
+    destination = np.empty((2, 4), dtype=np.float64, order="C")
+
+    def fail_snapshot(*args, **kwargs):
+        raise AssertionError("copy_into must not allocate an owning snapshot")
+
+    monkeypatch.setattr(residency, "_canonical_copy", fail_snapshot)
+    result = store.copy_into(
+        ref,
+        destination,
+        (slice(2, 4, 1), slice(0, 4, 1)),
+    )
+
+    assert result is None
+    np.testing.assert_array_equal(destination, value[2:4])
+    with pytest.raises(ValueError, match="destination shape"):
+        store.copy_into(ref, np.empty((1, 4), dtype=np.float64))
+    with pytest.raises(ValueError, match="destination dtype"):
+        store.copy_into(ref, np.empty((6, 4), dtype=np.float32))
+
+
+def test_store_reservation_freezes_complete_snapshot_and_commits_one_owned_cas():
+    store = HostTensorStore(store_id="reserved")
+    ref = store.put("center", np.zeros(4, dtype=np.float64))
+    unrelated = store.put("unrelated", np.ones(2, dtype=np.float64))
+    snapshot = store.snapshot()
+    reservation = store.reserve(snapshot, dirty_ref=ref)
+
+    with pytest.raises(HostTensorError, match="reserved"):
+        store.put("late", np.ones(1, dtype=np.float64))
+    with pytest.raises(HostTensorError, match="reserved"):
+        store.update("center", np.ones(4), expected_version=ref.version)
+    with pytest.raises(HostTensorError, match="reserved"):
+        store.update("unrelated", np.zeros(2), expected_version=unrelated.version)
+    with pytest.raises(HostTensorError, match="reserved"):
+        store.remove("unrelated", expected_version=unrelated.version)
+    with pytest.raises(HostTensorError, match="reservations"):
+        store.close()
+
+    updated = reservation.commit(ref, np.arange(4.0))
+    assert updated.version == ref.version + 1
+    assert reservation.snapshot == store.snapshot()
+    assert reservation.snapshot.namespace_revision == snapshot.namespace_revision + 1
+    np.testing.assert_array_equal(store.read(updated), np.arange(4.0))
+    with pytest.raises(HostTensorError, match="already committed"):
+        reservation.commit(updated, np.ones(4))
+    reservation.close()
+    reservation.close()
+    store.close()
+
+
+def test_store_reservation_atomically_rejects_a_stale_complete_snapshot():
+    store = HostTensorStore(store_id="snapshot-race")
+    dirty = store.put("center", np.zeros(2, dtype=np.float64))
+    snapshot = store.snapshot()
+    store.put("unrelated", np.ones(1, dtype=np.float64))
+
+    with pytest.raises(HostTensorError, match="complete snapshot"):
+        store.reserve(snapshot, dirty_ref=dirty)
+
+    store.close()
 
 
 def test_close_is_idempotent_invalidates_refs_and_blocks_all_operations():

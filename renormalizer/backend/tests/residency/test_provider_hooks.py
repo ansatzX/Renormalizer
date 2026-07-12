@@ -125,7 +125,7 @@ def _active_operator(
         backend_name="numpy",
         store_bytes=None,
         external_host_bytes=(0, 0),
-        transfer_staging_host_bytes=(0, 0),
+        transfer_staging_host_bytes=None,
         dirty_writeback_bytes=None,
         solver_input_sharding=distributed.input_sharding,
         solver_output_sharding=distributed.input_sharding,
@@ -237,7 +237,7 @@ def _real_active_case(
         backend_name=runtime.backend.name,
         store_bytes=None,
         external_host_bytes=(0, 0),
-        transfer_staging_host_bytes=(0, 0),
+        transfer_staging_host_bytes=None,
         dirty_writeback_bytes=None,
         solver_input_sharding=distributed.input_sharding,
         solver_output_sharding=distributed.input_sharding,
@@ -406,6 +406,41 @@ def test_wave8_active_policy_rejects_legacy_and_fallback_before_acquire(
     assert provider.setup_calls == 0
     assert provider.request_calls == 0
     assert provider.acquire_calls == 0
+
+
+def test_factory_role_is_rejected_at_block_execution_before_provider_hooks():
+    class FactoryProvider:
+        residency_policy = "active_working_set"
+        provider_role = "factory"
+
+        def __init__(self):
+            self.hook_calls = 0
+
+        def validate_setup(self, distributed_plan, source_bindings, context):
+            self.hook_calls += 1
+
+        def validate_request(self, request, residency_plan=None):
+            self.hook_calls += 1
+
+        @contextmanager
+        def acquire(self, request):
+            self.hook_calls += 1
+            yield None
+
+    provider = FactoryProvider()
+    operator, store = _active_operator(provider, _AgreeingCollective())
+    try:
+        with pytest.raises(
+            ValueError, match="distributed setup preflight failed"
+        ) as caught:
+            operator.solver_preflight()
+    finally:
+        store.close()
+
+    assert "factory provider cannot execute operand blocks" in str(
+        caught.value.__cause__
+    )
+    assert provider.hook_calls == 0
 
 
 def test_wave8_active_policy_rejects_incomplete_ir_before_callback():
