@@ -9,7 +9,9 @@ import hashlib
 import json
 import math
 import os
+import threading
 import uuid
+import weakref
 
 import numpy as np
 
@@ -29,6 +31,12 @@ from renormalizer.backend._distributed.residency import (
     ResidencyPreflightReceipt,
     ResidencyRequest,
     budget_resolution_hash,
+)
+from renormalizer.backend._distributed.terminal import (
+    _FatalTransition,
+    _TerminalLifecycleGate,
+    _TerminalPhase,
+    _TERMINAL_TIMEOUT_S,
 )
 from renormalizer.backend.config import BackendConfig, DistributedExecutionConfig
 from renormalizer.backend.factory import create_backend
@@ -61,6 +69,35 @@ def _host_available_bytes():
     return int(psutil.virtual_memory().available)
 
 
+class _RuntimeCommunicatorFatalHook:
+    def __init__(self, runtime):
+        self._runtime_ref = weakref.ref(runtime)
+
+    def _runtime(self):
+        runtime = self._runtime_ref()
+        if runtime is None:
+            raise RuntimeError("distributed runtime fatal hook is unavailable")
+        return runtime
+
+    def __call__(self, primary):
+        runtime = self._runtime()
+        discovering_token = runtime._terminal_gate._current_thread_admission()
+        return runtime._enter_communicator_fatal(
+            primary, discovering_token=discovering_token
+        )
+
+    def begin(self, primary, *, owner=None, discovering_token=None):
+        return self._runtime()._begin_communicator_fatal(
+            primary, owner=owner, discovering_token=discovering_token
+        )
+
+    def publish(self, transition):
+        return self._runtime()._publish_communicator_fatal_transition(transition)
+
+    def complete(self, transition, snapshot):
+        self._runtime()._terminal_gate.publish_fatal(transition, snapshot)
+
+
 @dataclass
 class CupyDistributedRuntime:
     backend: object
@@ -80,6 +117,17 @@ class CupyDistributedRuntime:
         default_factory=RuntimeTerminalQuarantine, init=False, repr=False
     )
     _terminal_error: object = field(default=None, init=False, repr=False)
+    _terminal_gate: _TerminalLifecycleGate = field(
+        default_factory=_TerminalLifecycleGate, init=False, repr=False
+    )
+    _terminal_state_lock: object = field(
+        default_factory=threading.RLock, init=False, repr=False
+    )
+    _communicator_fatal_hook: object = field(default=None, init=False, repr=False)
+    _pending_fatal_context: object = field(default=None, init=False, repr=False)
+    _legacy_fatal_publication_owner: int | None = field(
+        default=None, init=False, repr=False
+    )
 
     @property
     def rank(self):
@@ -121,20 +169,26 @@ class CupyDistributedRuntime:
         install = getattr(self.collective, "_install_fatal_handler", None)
         if not callable(install):
             raise RuntimeError("collective does not provide fatal observation")
-        install(self._enter_communicator_fatal)
+        hook = _RuntimeCommunicatorFatalHook(self)
+        self._communicator_fatal_hook = hook
+        install(hook)
 
     @contextmanager
     def _communicator_fatal_reservation(self, primary):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
         reserve = getattr(self.collective, "_communicator_fatal_reservation", None)
-        boundary = reserve(primary) if callable(reserve) else nullcontext(None)
+        boundary = (
+            reserve(primary, join_existing=True)
+            if callable(reserve)
+            else nullcontext(None)
+        )
         with boundary as reservation:
             if reservation is not None:
                 primary = reservation.primary
             yield primary, reservation
 
-    def _enter_communicator_fatal(self, primary, owner=None):
+    def _normalize_communicator_fatal(self, primary, owner):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
         provider = self._active_provider
@@ -150,22 +204,51 @@ class CupyDistributedRuntime:
             primary = self._terminal_error
         elif call is not None and call.primary_error is not None:
             primary = call.primary_error
+        return primary, provider, lease, owner
+
+    def _begin_communicator_fatal(
+        self, primary, *, owner=None, discovering_token=None
+    ):
+        primary, provider, lease, owner = self._normalize_communicator_fatal(
+            primary, owner
+        )
+        transition = self._terminal_gate.begin_fatal(primary, discovering_token)
+        with self._terminal_state_lock:
+            if self._pending_fatal_context is None:
+                self._pending_fatal_context = (provider, lease, owner)
+            elif owner is not None and self._pending_fatal_context[2] is None:
+                retained_provider, retained_lease, _ = self._pending_fatal_context
+                self._pending_fatal_context = (
+                    retained_provider,
+                    retained_lease,
+                    owner,
+                )
+        return transition
+
+    def _publish_communicator_fatal_transition(self, transition):
+        if not isinstance(transition, _FatalTransition):
+            raise TypeError("communicator fatal transition is invalid")
+        primary = transition.primary
+        owner = None
         try:
-            with self._communicator_fatal_reservation(primary) as (
-                primary,
-                reservation,
-            ):
-                if reservation is not None and not reservation.started:
-                    return primary
+            self._terminal_gate.wait_for_admissions(
+                transition, _TERMINAL_TIMEOUT_S
+            )
+            with self._terminal_state_lock:
+                context = self._pending_fatal_context
+            provider, lease, owner = (
+                (None, None, None) if context is None else context
+            )
+            if owner is not None:
+                if owner.state not in {"detached", "quarantined"}:
+                    owner.force_quarantine(primary)
+                if owner.state == "quarantined":
+                    self._terminal_quarantine.retain(owner, primary)
+            self._terminal_quarantine.retain_error(primary)
+            with self._terminal_state_lock:
                 if self._terminal_error is None:
                     self._terminal_error = primary
                 primary = self._terminal_error
-                if owner is not None:
-                    if owner.state not in {"detached", "quarantined"}:
-                        owner.force_quarantine(primary)
-                    if owner.state == "quarantined":
-                        self._terminal_quarantine.retain(owner, primary)
-                self._terminal_quarantine.retain_error(primary)
                 if provider is not None:
                     if provider._terminal_error is None:
                         provider._terminal_error = primary
@@ -174,10 +257,6 @@ class CupyDistributedRuntime:
                 backend = self.backend
                 if getattr(backend, "_execution_terminal_error", None) is None:
                     backend._execution_terminal_error = primary
-                publish = getattr(self.collective, "_publish_communicator_fatal", None)
-                if not callable(publish):
-                    raise RuntimeError("collective does not provide fatal publication")
-                publish(primary)
         except BaseException as error:
             if owner is not None:
                 owner._remember_secondary(error)
@@ -185,6 +264,68 @@ class CupyDistributedRuntime:
                 raise primary
             raise
         return primary
+
+    def _enter_communicator_fatal(
+        self, primary, owner=None, discovering_token=None
+    ):
+        primary, _, _, owner = self._normalize_communicator_fatal(primary, owner)
+        collective = self.collective
+        if collective is None:
+            with self._terminal_gate._condition:
+                transition = self._terminal_gate._fatal_transition
+            if transition is not None:
+                return transition.primary
+        publish = getattr(collective, "_publish_communicator_fatal", None)
+        if not callable(publish):
+            raise RuntimeError("collective does not provide fatal publication")
+        if callable(getattr(collective, "_begin_fatal_publication", None)):
+            active = getattr(
+                collective._fatal_publication_local, "reservation", None
+            )
+            if active is not None and not isinstance(
+                active.handler, _RuntimeCommunicatorFatalHook
+            ):
+                transition = self._begin_communicator_fatal(
+                    active.primary,
+                    owner=owner,
+                    discovering_token=discovering_token,
+                )
+                snapshot = self._publish_communicator_fatal_transition(transition)
+                active.transition = transition
+                active.snapshot = snapshot
+                active.completion = lambda: self._terminal_gate.publish_fatal(
+                    transition, snapshot
+                )
+                return snapshot
+            hook = self._communicator_fatal_hook
+            if hook is None:
+                hook = _RuntimeCommunicatorFatalHook(self)
+                self._communicator_fatal_hook = hook
+            return publish(
+                primary,
+                fatal_owner=owner,
+                discovering_token=discovering_token,
+                join_existing=True,
+                handler_override=hook,
+            )
+
+        transition = self._begin_communicator_fatal(
+            primary, owner=owner, discovering_token=discovering_token
+        )
+        thread_id = threading.get_ident()
+        with self._terminal_state_lock:
+            publication_owner = self._legacy_fatal_publication_owner
+            owns_publication = publication_owner is None
+            if owns_publication:
+                self._legacy_fatal_publication_owner = thread_id
+        if publication_owner == thread_id:
+            return transition.primary
+        if not owns_publication:
+            return self._terminal_gate.wait_for_published(_TERMINAL_TIMEOUT_S)
+        snapshot = self._publish_communicator_fatal_transition(transition)
+        publish(snapshot)
+        self._terminal_gate.publish_fatal(transition, snapshot)
+        return snapshot
 
     def barrier(self):
         self._require_usable()
@@ -701,37 +842,112 @@ class CupyDistributedRuntime:
             int(expected_precision),
         )
 
+    def _clear_runtime_references(
+        self, error, *, publish_error=True, mark_closed=True
+    ):
+        self._issued_receipts.clear()
+        self._active_provider = None
+        self.collective = None
+        if mark_closed:
+            self._closed = True
+        if publish_error and self._terminal_error is None:
+            self._terminal_error = error
+        return error
+
+    def _release_runtime_close_step(self, token):
+        if token is None:
+            return
+        try:
+            self._terminal_gate.release(token)
+        except RuntimeError as error:
+            if "converted" not in str(error):
+                raise
+
+    def _commit_fatal_runtime_close(self, transition, error):
+        result = self._terminal_gate.commit_runtime_close(
+            transition,
+            lambda: self._clear_runtime_references(
+                error, publish_error=False, mark_closed=False
+            ),
+        )
+        if not self._closed:
+            self._clear_runtime_references(error)
+        return result
+
     def close(self):
         if self._closed:
             return
         error = self._terminal_error
         if error is None:
             error = getattr(self.backend, "_execution_terminal_error", None)
+        request = None
+        try:
+            request = self._terminal_gate.admit_runtime("begin_runtime_close")
+        except RuntimeError:
+            transition = self._terminal_gate.begin_runtime_close(None)
+        else:
+            transition = self._terminal_gate.begin_runtime_close(request)
+        if isinstance(transition, _FatalTransition):
+            error = transition.primary
+            self._commit_fatal_runtime_close(transition, error)
+            raise error
+        if transition.owner_thread_id != threading.get_ident():
+            result = self._terminal_gate.commit_runtime_close(
+                transition, lambda: None
+            )
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
         provider = self._active_provider
         collective = self.collective
         if provider is not None:
+            provider_token = self._terminal_gate.admit_runtime_close(
+                transition, "provider_close"
+            )
             try:
                 provider.close()
             except BaseException as caught:
                 if error is None:
                     error = caught
+            finally:
+                self._release_runtime_close_step(provider_token)
         try:
-            if collective is not None:
-                collective.close()
+            if collective is not None and self._terminal_gate.phase not in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+            ):
+                close_for_runtime = getattr(collective, "_close_for_runtime", None)
+                if callable(close_for_runtime):
+                    close_for_runtime(self._terminal_gate, transition)
+                else:
+                    collective_token = self._terminal_gate.admit_runtime_close(
+                        transition, "collective_close"
+                    )
+                    try:
+                        collective.close()
+                    finally:
+                        self._release_runtime_close_step(collective_token)
         except BaseException as caught:
             if error is None:
                 error = caught
-        finally:
-            if self._terminal_error is not None:
-                error = self._terminal_error
-            self._issued_receipts.clear()
-            self._active_provider = None
-            self.collective = None
-            self._closed = True
-            if self._terminal_error is None:
-                self._terminal_error = error
+
+        if self._terminal_gate.phase in (
+            _TerminalPhase.FATAL_PENDING,
+            _TerminalPhase.FATAL_PUBLISHED,
+        ):
+            fatal_transition = self._terminal_gate.begin_runtime_close(None)
+            error = fatal_transition.primary
+            self._commit_fatal_runtime_close(fatal_transition, error)
+            raise error
+        if self._terminal_error is not None:
+            error = self._terminal_error
+        result = self._terminal_gate.commit_runtime_close(
+            transition, lambda: self._clear_runtime_references(error)
+        )
         if error is not None:
             raise error
+        return result
 
     def resource_state(self):
         if self._active_provider is None:

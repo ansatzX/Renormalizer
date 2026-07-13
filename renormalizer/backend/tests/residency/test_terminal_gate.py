@@ -842,3 +842,86 @@ def test_first_pending_primary_is_immutable():
     snapshot = object()
     gate.publish_fatal(later_transition, snapshot)
     assert gate.wait_for_published(_TIMEOUT_S) is snapshot
+
+
+def test_fatal_preempts_runtime_close_before_commit():
+    gate = _TerminalLifecycleGate()
+    close_transition = gate.begin_runtime_close(None)
+    primary = RuntimeError("fatal before runtime close commit")
+    fatal_transition = gate.begin_fatal(primary)
+    finalizer_called = threading.Event()
+    finalizer_observations = []
+
+    def close_pending_runtime():
+        def finalizer():
+            finalizer_observations.append(
+                (gate.phase, gate._has_active_tokens())
+            )
+            finalizer_called.set()
+
+        return gate.commit_runtime_close(fatal_transition, finalizer)
+
+    wait_entries = _observe_condition_waits(gate, 1)
+    closer, results, errors, done = _start(close_pending_runtime)
+    assert finalizer_called.wait(_TIMEOUT_S)
+    assert wait_entries[0].wait(_TIMEOUT_S)
+    assert finalizer_observations == [(_TerminalPhase.FATAL_PENDING, False)]
+    with pytest.raises(RuntimeError, match="preempted"):
+        gate.admit_runtime_close(close_transition, "late_collective_close")
+
+    snapshot = object()
+    gate.publish_fatal(fatal_transition, snapshot)
+    _join(closer, done)
+
+    assert errors == []
+    assert results == [snapshot]
+    assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+
+
+def test_fatal_after_runtime_close_commit_touches_no_collective():
+    gate = _TerminalLifecycleGate()
+    close_transition = gate.begin_runtime_close(None)
+    collective_touches = []
+    step = gate.admit_runtime_close(close_transition, "collective_close")
+    collective_touches.append(step.sequence)
+    gate.release(step)
+
+    assert gate.commit_runtime_close(close_transition, lambda: None) is None
+    with pytest.raises(RuntimeError, match="closed"):
+        gate.begin_fatal(RuntimeError("late fatal"))
+
+    assert collective_touches == [step.sequence]
+    assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+
+
+def test_close_during_pending_joins_publication():
+    gate = _TerminalLifecycleGate()
+    primary = RuntimeError("pending fatal")
+    fatal_transition = gate.begin_fatal(primary)
+    finalizer_called = threading.Event()
+    finalized = []
+
+    def close_runtime():
+        joined = gate.begin_runtime_close(None)
+        assert joined is fatal_transition
+
+        def finalizer():
+            finalized.append(primary)
+            finalizer_called.set()
+
+        return gate.commit_runtime_close(joined, finalizer)
+
+    wait_entries = _observe_condition_waits(gate, 1)
+    closer, results, errors, done = _start(close_runtime)
+    assert finalizer_called.wait(_TIMEOUT_S)
+    assert wait_entries[0].wait(_TIMEOUT_S)
+    assert gate.phase is _TerminalPhase.FATAL_PENDING
+
+    snapshot = object()
+    gate.publish_fatal(fatal_transition, snapshot)
+    _join(closer, done)
+
+    assert errors == []
+    assert results == [snapshot]
+    assert finalized == [primary]
+    assert gate._fatal_transition.primary is primary

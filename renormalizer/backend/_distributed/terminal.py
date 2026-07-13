@@ -8,6 +8,9 @@ import time
 from typing import Literal
 
 
+_TERMINAL_TIMEOUT_S = 5.0
+
+
 class _TerminalPhase(enum.Enum):
     HEALTHY = "healthy"
     FATAL_PENDING = "fatal_pending"
@@ -55,6 +58,71 @@ class _RuntimeCloseTransition:
     gate_id: int
     owner_thread_id: int
     sequence: int
+
+
+@dataclass(frozen=True)
+class _MonitorOutcome:
+    kind: Literal["fatal_elected", "stopped_clean"]
+    primary: BaseException | None = None
+    generation: int | None = None
+
+
+class _FatalMonitorHandoff:
+    """Coordinates one monitor stop generation or an elected fatal outcome."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._next_generation = 1
+        self._requested_generation: int | None = None
+        self._outcome: _MonitorOutcome | None = None
+
+    def request_stop(self) -> int:
+        with self._condition:
+            if self._requested_generation is None:
+                self._requested_generation = self._next_generation
+                self._next_generation += 1
+            self._condition.notify_all()
+            return self._requested_generation
+
+    def observe_stop(self) -> int | None:
+        with self._condition:
+            return self._requested_generation
+
+    def select_fatal(self, primary: BaseException) -> _MonitorOutcome:
+        if not isinstance(primary, BaseException):
+            raise TypeError("monitor fatal primary must be an exception")
+        with self._condition:
+            if self._outcome is None:
+                self._outcome = _MonitorOutcome(
+                    kind="fatal_elected", primary=primary
+                )
+                self._condition.notify_all()
+            return self._outcome
+
+    def select_clean(self, generation: int) -> _MonitorOutcome:
+        with self._condition:
+            if generation != self._requested_generation:
+                raise RuntimeError("monitor stop generation is not current")
+            if self._outcome is None:
+                self._outcome = _MonitorOutcome(
+                    kind="stopped_clean", generation=generation
+                )
+                self._condition.notify_all()
+            return self._outcome
+
+    def wait_for_outcome(
+        self, generation: int, timeout_s: float
+    ) -> _MonitorOutcome:
+        deadline = _TerminalLifecycleGate._deadline(timeout_s)
+        with self._condition:
+            if generation != self._requested_generation:
+                raise RuntimeError("monitor stop generation is not current")
+            while self._outcome is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("fatal monitor acknowledgment timed out")
+                self._condition.wait(remaining)
+            return self._outcome
 
 
 _MISSING = object()
@@ -542,6 +610,16 @@ class _TerminalLifecycleGate:
                 self._thread_tokens.pop(state.token.thread_id, None)
             state.async_capability = _MISSING
             self._condition.notify_all()
+
+    def _current_thread_admission(self) -> _ResourceAdmission | None:
+        with self._condition:
+            sequence = self._thread_tokens.get(threading.get_ident())
+            if sequence is None:
+                return None
+            state = self._tokens.get(sequence)
+            if state is None or state.status != "active":
+                raise RuntimeError("resource admission thread state is inconsistent")
+            return state.token
 
     def begin_fatal(
         self,
