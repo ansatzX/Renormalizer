@@ -1,0 +1,718 @@
+"""Resource-neutral coordination for distributed runtime terminal transitions."""
+
+from dataclasses import dataclass, replace
+import enum
+import threading
+import time
+from typing import Literal
+
+
+class _TerminalPhase(enum.Enum):
+    HEALTHY = "healthy"
+    FATAL_PENDING = "fatal_pending"
+    FATAL_PUBLISHED = "fatal_published"
+    RUNTIME_CLOSING = "runtime_closing"
+    RUNTIME_CLOSED = "runtime_closed"
+
+
+@dataclass(frozen=True)
+class _ResourceAdmission:
+    gate_id: int
+    scope: Literal[
+        "runtime",
+        "runtime_setup",
+        "construction",
+        "lease",
+        "lease_close",
+        "runtime_close",
+    ]
+    epoch: int | None
+    thread_id: int
+    operation: str
+    sequence: int
+    parent_sequence: int | None = None
+    transition_sequence: int | None = None
+
+
+@dataclass(frozen=True)
+class _FatalTransition:
+    gate_id: int
+    primary: BaseException
+    sequence: int
+
+
+@dataclass(frozen=True)
+class _LeaseCloseTransition:
+    gate_id: int
+    epoch: int
+    owner_thread_id: int
+    sequence: int
+
+
+@dataclass(frozen=True)
+class _RuntimeCloseTransition:
+    gate_id: int
+    owner_thread_id: int
+    sequence: int
+
+
+@dataclass
+class _TokenState:
+    token: _ResourceAdmission
+    status: Literal["active", "released", "converted"] = "active"
+    async_owner_id: int | None = None
+    async_claimed: bool = False
+
+
+@dataclass
+class _LeaseState:
+    phase: Literal[
+        "constructing", "open", "closing", "closed", "fatal_retained"
+    ]
+    transition: _LeaseCloseTransition | None = None
+    result: object = None
+    has_result: bool = False
+
+
+_MISSING = object()
+
+
+class _TerminalLifecycleGate:
+    """Linearizes admissions, lease epochs, fatal publication, and close."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._gate_id = id(self)
+        self._phase = _TerminalPhase.HEALTHY
+        self._next_epoch = 1
+        self._next_sequence = 1
+        self._tokens: dict[int, _TokenState] = {}
+        self._thread_tokens: dict[int, int] = {}
+        self._leases: dict[int, _LeaseState] = {}
+        self._live_epoch: int | None = None
+        self._fatal_transition: _FatalTransition | None = None
+        self._fatal_snapshot = _MISSING
+        self._runtime_close_transition: _RuntimeCloseTransition | None = None
+        self._runtime_close_result = _MISSING
+
+    @property
+    def phase(self):
+        with self._condition:
+            return self._phase
+
+    def _sequence(self):
+        sequence = self._next_sequence
+        self._next_sequence += 1
+        return sequence
+
+    @staticmethod
+    def _require_operation(operation):
+        if not isinstance(operation, str) or not operation:
+            raise ValueError("admission operation must be a non-empty string")
+
+    @staticmethod
+    def _deadline(timeout_s):
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+            raise TypeError("admission timeout must be a number")
+        if timeout_s < 0:
+            raise ValueError("admission timeout must be non-negative")
+        return time.monotonic() + timeout_s
+
+    def _raise_for_terminal_phase(self):
+        if self._phase in (
+            _TerminalPhase.FATAL_PENDING,
+            _TerminalPhase.FATAL_PUBLISHED,
+        ):
+            error = RuntimeError("runtime is fatal")
+            if self._fatal_transition is not None:
+                raise error from self._fatal_transition.primary
+            raise error
+        if self._phase is _TerminalPhase.RUNTIME_CLOSING:
+            raise RuntimeError("runtime is closing")
+        if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+            raise RuntimeError("runtime is closed")
+
+    def _require_no_nested_token(self, thread_id):
+        if thread_id in self._thread_tokens:
+            raise RuntimeError("nested resource admission is not allowed")
+
+    def _has_closing_lease(self):
+        return any(lease.phase == "closing" for lease in self._leases.values())
+
+    def _has_active_tokens(self):
+        return any(state.status == "active" for state in self._tokens.values())
+
+    def _has_active_scope(self, scope):
+        return any(
+            state.status == "active" and state.token.scope == scope
+            for state in self._tokens.values()
+        )
+
+    def _new_token(
+        self,
+        scope,
+        epoch,
+        operation,
+        *,
+        parent_sequence=None,
+        transition_sequence=None,
+        async_owner_id=None,
+    ):
+        self._require_operation(operation)
+        thread_id = threading.get_ident()
+        if parent_sequence is None:
+            self._require_no_nested_token(thread_id)
+        token = _ResourceAdmission(
+            gate_id=self._gate_id,
+            scope=scope,
+            epoch=epoch,
+            thread_id=thread_id,
+            operation=operation,
+            sequence=self._sequence(),
+            parent_sequence=parent_sequence,
+            transition_sequence=transition_sequence,
+        )
+        self._tokens[token.sequence] = _TokenState(
+            token=token,
+            async_owner_id=async_owner_id,
+        )
+        if parent_sequence is None:
+            self._thread_tokens[thread_id] = token.sequence
+        return token
+
+    def _token_state(self, token):
+        if not isinstance(token, _ResourceAdmission):
+            raise TypeError("resource admission token is required")
+        if token.gate_id != self._gate_id:
+            raise RuntimeError("resource admission belongs to another terminal gate")
+        state = self._tokens.get(token.sequence)
+        if state is None:
+            raise RuntimeError("resource admission token is unknown")
+        if state.status == "released":
+            raise RuntimeError("resource admission token was already released")
+        if state.status == "converted":
+            raise RuntimeError("resource admission token was already converted")
+        if state.token != token:
+            raise RuntimeError("stale resource admission token")
+        return state
+
+    def _require_token_thread(self, state):
+        thread_id = threading.get_ident()
+        if state.token.thread_id != thread_id:
+            raise RuntimeError("resource admission belongs to another thread")
+        if state.async_owner_id is None or state.async_claimed:
+            if self._thread_tokens.get(thread_id) != state.token.sequence:
+                raise RuntimeError("resource admission thread state is inconsistent")
+
+    def _convert_token(self, token):
+        state = self._token_state(token)
+        self._require_token_thread(state)
+        if state.async_owner_id is not None and not state.async_claimed:
+            raise RuntimeError("unclaimed async admission cannot be converted")
+        state.status = "converted"
+        self._thread_tokens.pop(state.token.thread_id, None)
+        self._condition.notify_all()
+
+    def _wait_until(self, predicate, timeout_s, message):
+        deadline = self._deadline(timeout_s)
+        while not predicate():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(message)
+            self._condition.wait(remaining)
+
+    def _require_fatal_transition(self, transition):
+        if not isinstance(transition, _FatalTransition):
+            raise TypeError("fatal transition is required")
+        if transition.gate_id != self._gate_id:
+            raise RuntimeError("fatal transition belongs to another terminal gate")
+        if transition != self._fatal_transition:
+            raise RuntimeError("stale fatal transition")
+
+    def _lease_state(self, epoch):
+        if type(epoch) is not int or epoch <= 0:
+            raise RuntimeError("stale lease epoch")
+        lease = self._leases.get(epoch)
+        if lease is None:
+            raise RuntimeError("stale lease epoch")
+        return lease
+
+    def _require_lease_transition(self, transition):
+        if not isinstance(transition, _LeaseCloseTransition):
+            raise TypeError("lease close transition is required")
+        if transition.gate_id != self._gate_id:
+            raise RuntimeError("lease close transition belongs to another terminal gate")
+        lease = self._lease_state(transition.epoch)
+        if lease.transition != transition:
+            raise RuntimeError("stale lease close transition")
+        return lease
+
+    def _require_lease_close_owner(self, transition):
+        if transition.owner_thread_id != threading.get_ident():
+            raise RuntimeError("only the elected lease close owner may run close steps")
+
+    def _require_runtime_transition(self, transition):
+        if not isinstance(transition, _RuntimeCloseTransition):
+            raise TypeError("runtime close transition is required")
+        if transition.gate_id != self._gate_id:
+            raise RuntimeError("runtime close transition belongs to another terminal gate")
+        if transition != self._runtime_close_transition:
+            raise RuntimeError("stale runtime close transition")
+
+    def admit_runtime(self, operation: str) -> _ResourceAdmission:
+        with self._condition:
+            self._raise_for_terminal_phase()
+            if self._has_closing_lease():
+                raise RuntimeError("lease is closing")
+            return self._new_token("runtime", None, operation)
+
+    def admit_runtime_setup(self, operation: str) -> _ResourceAdmission:
+        with self._condition:
+            self._raise_for_terminal_phase()
+            if self._live_epoch is not None:
+                raise RuntimeError("runtime setup requires no live lease")
+            return self._new_token("runtime_setup", None, operation)
+
+    def begin_lease(self, operation: str) -> tuple[int, _ResourceAdmission]:
+        with self._condition:
+            self._raise_for_terminal_phase()
+            if self._live_epoch is not None:
+                raise RuntimeError("a lease epoch is already live")
+            if self._has_active_scope("runtime_setup"):
+                raise RuntimeError("runtime setup is active")
+            self._require_no_nested_token(threading.get_ident())
+            epoch = self._next_epoch
+            self._next_epoch += 1
+            self._leases[epoch] = _LeaseState("constructing")
+            self._live_epoch = epoch
+            token = self._new_token("construction", epoch, operation)
+            return epoch, token
+
+    def activate_lease(self, epoch: int, token: _ResourceAdmission) -> None:
+        with self._condition:
+            self._raise_for_terminal_phase()
+            lease = self._lease_state(epoch)
+            if lease.phase != "constructing" or self._live_epoch != epoch:
+                raise RuntimeError("lease epoch is not constructing")
+            state = self._token_state(token)
+            self._require_token_thread(state)
+            if token.scope != "construction" or token.epoch != epoch:
+                raise RuntimeError("lease activation requires its construction admission")
+            lease.phase = "open"
+            self._condition.notify_all()
+
+    def admit_lease(self, epoch: int, operation: str) -> _ResourceAdmission:
+        with self._condition:
+            self._raise_for_terminal_phase()
+            lease = self._lease_state(epoch)
+            if lease.phase == "closed" or self._live_epoch != epoch:
+                raise RuntimeError("stale lease epoch")
+            if lease.phase == "closing":
+                raise RuntimeError("lease is closing")
+            if lease.phase != "open":
+                raise RuntimeError("lease is not open")
+            return self._new_token("lease", epoch, operation)
+
+    def begin_lease_close(self, epoch: int) -> tuple[_LeaseCloseTransition, bool]:
+        with self._condition:
+            lease = self._lease_state(epoch)
+            if lease.transition is not None:
+                return lease.transition, False
+            if lease.phase == "closed" or self._live_epoch != epoch:
+                raise RuntimeError("stale lease epoch")
+            if self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+                _TerminalPhase.RUNTIME_CLOSED,
+            ):
+                self._raise_for_terminal_phase()
+            transition = _LeaseCloseTransition(
+                gate_id=self._gate_id,
+                epoch=epoch,
+                owner_thread_id=threading.get_ident(),
+                sequence=self._sequence(),
+            )
+            lease.phase = "closing"
+            lease.transition = transition
+            self._condition.notify_all()
+            return transition, True
+
+    def wait_for_lease_admissions(self, transition, timeout_s) -> None:
+        with self._condition:
+            self._require_lease_transition(transition)
+            if threading.get_ident() in self._thread_tokens:
+                raise RuntimeError("cannot drain admissions while holding an admission")
+            self._wait_until(
+                lambda: not self._has_active_tokens(),
+                timeout_s,
+                "lease admission drain timed out",
+            )
+
+    def admit_lease_close(
+        self, transition, operation: str
+    ) -> _ResourceAdmission:
+        with self._condition:
+            lease = self._require_lease_transition(transition)
+            self._require_lease_close_owner(transition)
+            if self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+            ):
+                raise RuntimeError("fatal transition preempted lease close") from (
+                    self._fatal_transition.primary
+                    if self._fatal_transition is not None
+                    else None
+                )
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                raise RuntimeError("runtime is closed")
+            if lease.phase != "closing":
+                raise RuntimeError("lease is not closing")
+            if self._has_active_tokens():
+                raise RuntimeError("lease admissions have not drained")
+            return self._new_token(
+                "lease_close",
+                transition.epoch,
+                operation,
+                transition_sequence=transition.sequence,
+            )
+
+    def wait_for_lease_closed(self, transition, timeout_s) -> object:
+        with self._condition:
+            lease = self._require_lease_transition(transition)
+            if threading.get_ident() in self._thread_tokens:
+                raise RuntimeError("cannot join lease close while holding an admission")
+            deadline = self._deadline(timeout_s)
+            while lease.phase != "closed":
+                if self._phase in (
+                    _TerminalPhase.FATAL_PENDING,
+                    _TerminalPhase.FATAL_PUBLISHED,
+                ):
+                    raise RuntimeError("fatal transition preempted lease close") from (
+                        self._fatal_transition.primary
+                        if self._fatal_transition is not None
+                        else None
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("lease close join timed out")
+                self._condition.wait(remaining)
+            return lease.result
+
+    def commit_lease_close(self, transition, finalizer) -> object:
+        if not callable(finalizer):
+            raise TypeError("lease close finalizer must be callable")
+        with self._condition:
+            lease = self._require_lease_transition(transition)
+            self._require_lease_close_owner(transition)
+            if self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+            ):
+                raise RuntimeError("fatal transition preempted lease close") from (
+                    self._fatal_transition.primary
+                    if self._fatal_transition is not None
+                    else None
+                )
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                raise RuntimeError("runtime is closed")
+            if lease.phase != "closing":
+                raise RuntimeError("lease is not closing")
+            if self._has_active_tokens():
+                raise RuntimeError("lease close commit requires zero live admissions")
+            result = finalizer()
+            lease.phase = "closed"
+            lease.result = result
+            lease.has_result = True
+            self._live_epoch = None
+            self._condition.notify_all()
+            return result
+
+    def spawn_async(
+        self, parent: _ResourceAdmission, owner_identity: object
+    ) -> _ResourceAdmission:
+        with self._condition:
+            state = self._token_state(parent)
+            self._require_token_thread(state)
+            if state.async_owner_id is not None:
+                raise RuntimeError("async descendants cannot spawn nested descendants")
+            if any(
+                retained.token.parent_sequence == parent.sequence
+                and retained.async_owner_id == id(owner_identity)
+                for retained in self._tokens.values()
+            ):
+                raise RuntimeError("async owner already has a descendant admission")
+            if parent.scope in ("runtime", "runtime_setup"):
+                self._raise_for_terminal_phase()
+                if self._has_closing_lease():
+                    raise RuntimeError("lease is closing")
+            elif parent.scope == "construction":
+                self._raise_for_terminal_phase()
+                lease = self._lease_state(parent.epoch)
+                if lease.phase not in ("constructing", "open"):
+                    raise RuntimeError("construction epoch is closing")
+            elif parent.scope == "lease":
+                self._raise_for_terminal_phase()
+                lease = self._lease_state(parent.epoch)
+                if lease.phase != "open":
+                    raise RuntimeError("lease is closing")
+            elif parent.scope == "lease_close":
+                lease = self._lease_state(parent.epoch)
+                if (
+                    lease.phase != "closing"
+                    or lease.transition is None
+                    or parent.transition_sequence != lease.transition.sequence
+                ):
+                    raise RuntimeError("stale lease close admission")
+                if self._phase in (
+                    _TerminalPhase.FATAL_PENDING,
+                    _TerminalPhase.FATAL_PUBLISHED,
+                    _TerminalPhase.RUNTIME_CLOSED,
+                ):
+                    self._raise_for_terminal_phase()
+            elif parent.scope == "runtime_close":
+                if (
+                    self._phase is not _TerminalPhase.RUNTIME_CLOSING
+                    or self._runtime_close_transition is None
+                    or parent.transition_sequence
+                    != self._runtime_close_transition.sequence
+                ):
+                    raise RuntimeError("stale runtime close admission")
+            return self._new_token(
+                parent.scope,
+                parent.epoch,
+                parent.operation,
+                parent_sequence=parent.sequence,
+                transition_sequence=parent.transition_sequence,
+                async_owner_id=id(owner_identity),
+            )
+
+    def claim_async(
+        self, token: _ResourceAdmission, operation: str
+    ) -> _ResourceAdmission:
+        with self._condition:
+            self._require_operation(operation)
+            state = self._token_state(token)
+            if state.async_owner_id is None:
+                raise RuntimeError("resource admission is not an async descendant")
+            if state.async_claimed:
+                raise RuntimeError("async admission was already claimed")
+            thread_id = threading.get_ident()
+            self._require_no_nested_token(thread_id)
+            claimed = replace(token, thread_id=thread_id, operation=operation)
+            state.token = claimed
+            state.async_claimed = True
+            self._thread_tokens[thread_id] = claimed.sequence
+            return claimed
+
+    def release(self, token: _ResourceAdmission) -> None:
+        with self._condition:
+            state = self._token_state(token)
+            self._require_token_thread(state)
+            state.status = "released"
+            if state.async_owner_id is None or state.async_claimed:
+                self._thread_tokens.pop(state.token.thread_id, None)
+            self._condition.notify_all()
+
+    def begin_fatal(
+        self,
+        primary: BaseException,
+        discovering_token: _ResourceAdmission | None = None,
+    ) -> _FatalTransition:
+        if not isinstance(primary, BaseException):
+            raise TypeError("fatal primary must be an exception")
+        with self._condition:
+            if (
+                self._phase is _TerminalPhase.RUNTIME_CLOSED
+                and self._fatal_transition is None
+            ):
+                raise RuntimeError("runtime is closed")
+            if discovering_token is not None:
+                state = self._token_state(discovering_token)
+                self._require_token_thread(state)
+            if self._fatal_transition is None:
+                self._fatal_transition = _FatalTransition(
+                    gate_id=self._gate_id,
+                    primary=primary,
+                    sequence=self._sequence(),
+                )
+            if self._phase in (
+                _TerminalPhase.HEALTHY,
+                _TerminalPhase.RUNTIME_CLOSING,
+            ):
+                self._phase = _TerminalPhase.FATAL_PENDING
+                if self._live_epoch is not None:
+                    self._leases[self._live_epoch].phase = "fatal_retained"
+            if discovering_token is not None:
+                self._convert_token(discovering_token)
+            self._condition.notify_all()
+            return self._fatal_transition
+
+    def wait_for_admissions(
+        self, transition: _FatalTransition, timeout_s: float
+    ) -> None:
+        with self._condition:
+            self._require_fatal_transition(transition)
+            if threading.get_ident() in self._thread_tokens:
+                raise RuntimeError("cannot drain admissions while holding an admission")
+            self._wait_until(
+                lambda: not self._has_active_tokens(),
+                timeout_s,
+                "fatal admission drain timed out",
+            )
+
+    def publish_fatal(self, transition, snapshot) -> None:
+        with self._condition:
+            self._require_fatal_transition(transition)
+            if self._phase is not _TerminalPhase.FATAL_PENDING:
+                raise RuntimeError("fatal transition is not pending")
+            if self._has_active_tokens():
+                raise RuntimeError("fatal publication requires zero live admissions")
+            self._fatal_snapshot = snapshot
+            self._phase = _TerminalPhase.FATAL_PUBLISHED
+            self._condition.notify_all()
+
+    def wait_for_published(self, timeout_s: float):
+        with self._condition:
+            self._wait_until(
+                lambda: self._fatal_snapshot is not _MISSING,
+                timeout_s,
+                "fatal publication wait timed out",
+            )
+            return self._fatal_snapshot
+
+    def begin_runtime_close(
+        self, discovering_token: _ResourceAdmission | None
+    ):
+        with self._condition:
+            thread_id = threading.get_ident()
+            if discovering_token is not None:
+                state = self._token_state(discovering_token)
+                self._require_token_thread(state)
+                if discovering_token.scope != "runtime":
+                    raise RuntimeError(
+                        "runtime close requires an initiating runtime admission"
+                    )
+            elif thread_id in self._thread_tokens:
+                raise RuntimeError("runtime close cannot wait while holding an admission")
+
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                if self._fatal_transition is not None:
+                    return self._fatal_transition
+                return self._runtime_close_transition
+            if self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+            ):
+                if discovering_token is not None:
+                    self._convert_token(discovering_token)
+                return self._fatal_transition
+            if self._phase is _TerminalPhase.HEALTHY:
+                self._runtime_close_transition = _RuntimeCloseTransition(
+                    gate_id=self._gate_id,
+                    owner_thread_id=thread_id,
+                    sequence=self._sequence(),
+                )
+                self._phase = _TerminalPhase.RUNTIME_CLOSING
+            if discovering_token is not None:
+                self._convert_token(discovering_token)
+            self._condition.notify_all()
+
+            while self._has_active_tokens():
+                self._condition.wait()
+                if self._phase is _TerminalPhase.FATAL_PENDING:
+                    return self._fatal_transition
+
+            if self._live_epoch is not None:
+                lease = self._leases[self._live_epoch]
+                if (
+                    lease.phase == "closing"
+                    and lease.transition is not None
+                    and lease.transition.owner_thread_id != thread_id
+                ):
+                    while lease.phase != "closed":
+                        self._condition.wait()
+                        if self._phase in (
+                            _TerminalPhase.FATAL_PENDING,
+                            _TerminalPhase.FATAL_PUBLISHED,
+                        ):
+                            return self._fatal_transition
+            return self._runtime_close_transition
+
+    def admit_runtime_close(self, transition, operation: str):
+        with self._condition:
+            if self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+            ):
+                raise RuntimeError("fatal transition preempted runtime close") from (
+                    self._fatal_transition.primary
+                    if self._fatal_transition is not None
+                    else None
+                )
+            self._require_runtime_transition(transition)
+            if transition.owner_thread_id != threading.get_ident():
+                raise RuntimeError(
+                    "only the elected runtime close owner may run close steps"
+                )
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                raise RuntimeError("runtime is closed")
+            if self._phase is not _TerminalPhase.RUNTIME_CLOSING:
+                raise RuntimeError("runtime is not closing")
+            if self._live_epoch is not None:
+                raise RuntimeError("runtime close requires no live lease")
+            if self._has_active_tokens():
+                raise RuntimeError("runtime admissions have not drained")
+            return self._new_token(
+                "runtime_close",
+                None,
+                operation,
+                transition_sequence=transition.sequence,
+            )
+
+    def _commit_fatal_runtime_close(self, transition, finalizer):
+        self._require_fatal_transition(transition)
+        while self._fatal_snapshot is _MISSING:
+            self._condition.wait()
+        if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+            return self._runtime_close_result
+        if self._has_active_tokens():
+            raise RuntimeError("runtime close commit requires zero live admissions")
+        result = finalizer()
+        self._phase = _TerminalPhase.RUNTIME_CLOSED
+        self._runtime_close_result = self._fatal_snapshot
+        self._condition.notify_all()
+        return self._runtime_close_result
+
+    def commit_runtime_close(self, transition, finalizer):
+        if not callable(finalizer):
+            raise TypeError("runtime close finalizer must be callable")
+        with self._condition:
+            if isinstance(transition, _FatalTransition):
+                return self._commit_fatal_runtime_close(transition, finalizer)
+            self._require_runtime_transition(transition)
+            if transition.owner_thread_id != threading.get_ident():
+                while self._phase is _TerminalPhase.RUNTIME_CLOSING:
+                    self._condition.wait()
+                if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                    return self._runtime_close_result
+                return self._commit_fatal_runtime_close(
+                    self._fatal_transition, lambda: None
+                )
+            if self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+            ):
+                return self._commit_fatal_runtime_close(
+                    self._fatal_transition, finalizer
+                )
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                return self._runtime_close_result
+            if self._live_epoch is not None:
+                raise RuntimeError("runtime close commit requires no live lease")
+            if self._has_active_tokens():
+                raise RuntimeError("runtime close commit requires zero live admissions")
+            result = finalizer()
+            self._phase = _TerminalPhase.RUNTIME_CLOSED
+            self._runtime_close_result = result
+            self._condition.notify_all()
+            return result
