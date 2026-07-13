@@ -750,6 +750,28 @@ def test_pending_runtime_finalizer_precedes_publication_and_published_join_skips
     assert finalized_after_publication == []
 
 
+def test_failed_fatal_publication_wakes_pending_runtime_close_after_finalizer():
+    gate = _TerminalLifecycleGate()
+    primary = RuntimeError("fatal publication failed")
+    transition = gate.begin_fatal(primary)
+    finalizer_called = threading.Event()
+    wait_entries = _observe_condition_waits(gate, 1)
+
+    def close_runtime():
+        joined = gate.begin_runtime_close(None)
+        return gate.commit_runtime_close(joined, finalizer_called.set)
+
+    closer, results, errors, done = _start(close_runtime)
+    assert finalizer_called.wait(_TIMEOUT_S)
+    assert wait_entries[0].wait(_TIMEOUT_S)
+    gate._fail_fatal_publication(transition, primary)
+    _join(closer, done)
+
+    assert results == []
+    assert errors == [primary]
+    assert gate.phase is _TerminalPhase.FATAL_PENDING
+
+
 def test_fatal_publication_waits_for_elected_runtime_finalizer():
     gate = _TerminalLifecycleGate()
     blocker = gate.admit_runtime("block_pending_finalizer")

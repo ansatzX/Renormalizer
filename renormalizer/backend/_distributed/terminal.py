@@ -219,6 +219,7 @@ class _TerminalLifecycleGate:
         self._live_epoch: int | None = None
         self._fatal_transition: _FatalTransition | None = None
         self._fatal_snapshot = _MISSING
+        self._fatal_publication_failure = _MISSING
         self._fatal_runtime_finalizer_state = "none"
         self._fatal_runtime_finalizer_owner: int | None = None
         self._runtime_close_transition: _RuntimeCloseTransition | None = None
@@ -744,20 +745,42 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("fatal publication requires zero live admissions")
             while self._fatal_runtime_finalizer_state == "pending":
                 self._condition.wait()
+            if self._fatal_publication_failure is not _MISSING:
+                raise self._fatal_publication_failure
             if self._phase is not _TerminalPhase.FATAL_PENDING:
                 raise RuntimeError("fatal transition is not pending")
             self._fatal_snapshot = snapshot
             self._phase = _TerminalPhase.FATAL_PUBLISHED
             self._condition.notify_all()
 
+    def _fail_fatal_publication(self, transition, failure):
+        if not isinstance(failure, BaseException):
+            raise TypeError("fatal publication failure must be an exception")
+        with self._condition:
+            self._require_fatal_transition(transition)
+            if failure is not transition.primary:
+                raise RuntimeError("fatal publication primary changed")
+            if self._fatal_snapshot is not _MISSING:
+                return
+            if self._fatal_publication_failure is _MISSING:
+                self._fatal_publication_failure = failure
+            elif self._fatal_publication_failure is not failure:
+                raise RuntimeError("fatal publication failure changed")
+            self._condition.notify_all()
+
     def wait_for_published(self, timeout_s: float):
         with self._condition:
             self._require_no_held_admission("wait for fatal publication")
             self._wait_until(
-                lambda: self._fatal_snapshot is not _MISSING,
+                lambda: (
+                    self._fatal_snapshot is not _MISSING
+                    or self._fatal_publication_failure is not _MISSING
+                ),
                 timeout_s,
                 "fatal publication wait timed out",
             )
+            if self._fatal_publication_failure is not _MISSING:
+                raise self._fatal_publication_failure
             return self._fatal_snapshot
 
     def begin_runtime_close(
@@ -904,8 +927,12 @@ class _TerminalLifecycleGate:
                 self._fatal_runtime_finalizer_state == "pending"
                 and self._fatal_snapshot is _MISSING
             ):
+                if self._fatal_publication_failure is not _MISSING:
+                    raise self._fatal_publication_failure
                 self._condition.wait()
         while self._fatal_snapshot is _MISSING:
+            if self._fatal_publication_failure is not _MISSING:
+                raise self._fatal_publication_failure
             self._condition.wait()
         if self._phase is _TerminalPhase.RUNTIME_CLOSED:
             return self._runtime_close_result

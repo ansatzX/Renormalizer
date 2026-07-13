@@ -97,6 +97,11 @@ class _RuntimeCommunicatorFatalHook:
     def complete(self, transition, snapshot):
         self._runtime()._terminal_gate.publish_fatal(transition, snapshot)
 
+    def fail(self, transition, failure):
+        self._runtime()._terminal_gate._fail_fatal_publication(
+            transition, failure
+        )
+
 
 @dataclass
 class CupyDistributedRuntime:
@@ -513,6 +518,8 @@ class CupyDistributedRuntime:
         except BaseException as error:
             if owner is not None:
                 owner._remember_secondary(error)
+            with self._terminal_state_lock:
+                self._remember_terminal_secondary_locked(error, primary, owner)
             if error is not primary:
                 raise primary
             raise
@@ -555,9 +562,14 @@ class CupyDistributedRuntime:
             ):
                 if active.primary is not transition.primary:
                     raise RuntimeError("communicator fatal primary changed")
-                snapshot = self._publish_communicator_fatal_transition(transition)
                 active.transition = transition
+                if active.completion_deferred:
+                    return transition.primary
+                if active.transition_published:
+                    return active.snapshot
+                snapshot = self._publish_communicator_fatal_transition(transition)
                 active.snapshot = snapshot
+                active.transition_published = True
                 active.completion = lambda: self._terminal_gate.publish_fatal(
                     transition, snapshot
                 )
@@ -1154,15 +1166,41 @@ class CupyDistributedRuntime:
                 raise
 
     def _commit_fatal_runtime_close(self, transition, error):
-        result = self._terminal_gate.commit_runtime_close(
-            transition,
-            lambda: self._clear_runtime_references(
+        def finalize_pending():
+            return self._clear_runtime_references(
                 error,
                 publish_error=False,
                 mark_closed=False,
                 clear_collective=False,
-            ),
-        )
+            )
+
+        try:
+            result = self._terminal_gate.commit_runtime_close(
+                transition,
+                finalize_pending,
+            )
+        except BaseException:
+            with self._terminal_gate._condition:
+                publication_failed = (
+                    self._terminal_gate._fatal_transition is transition
+                    and self._terminal_gate._fatal_publication_failure
+                    is transition.primary
+                )
+            if publication_failed:
+                with self._terminal_state_lock:
+                    collective = self._pending_fatal_collective
+                join_publication = (
+                    None
+                    if collective is None
+                    else getattr(
+                        collective,
+                        "_wait_for_joined_fatal_publication",
+                        None,
+                    )
+                )
+                if callable(join_publication):
+                    join_publication()
+            raise
         if not self._closed:
             self._clear_runtime_references(error)
         return result

@@ -46,6 +46,8 @@ class _FatalPublicationReservation:
         "handler",
         "transition_handler",
         "handler_started",
+        "transition_published",
+        "fail_stopped",
         "transition",
         "snapshot",
         "completion",
@@ -72,6 +74,8 @@ class _FatalPublicationReservation:
         self.handler = handler
         self.transition_handler = transition_handler
         self.handler_started = False
+        self.transition_published = False
+        self.fail_stopped = False
         self.transition = transition
         self.snapshot = None
         self.completion = None
@@ -92,8 +96,8 @@ class _DeferredFatalPublication:
     def complete(self):
         if self.completed:
             return self.primary
-        self.completed = True
         self.boundary.__exit__(None, None, None)
+        self.completed = True
         return self.primary
 
 
@@ -274,7 +278,9 @@ class CupyNcclCollective:
         self._fatal_publication_local = threading.local()
         self._active_broadcast_local = threading.local()
         self._admitted_operations = 0
+        self._active_broadcast_agreements = 0
         self._fatal_publications = 0
+        self._fatal_publication_failure = None
         self._fatal_publication_owner_reservation = None
         self._closing = False
         self._fatal_pending_primary = None
@@ -350,7 +356,7 @@ class CupyNcclCollective:
             raise RuntimeError("collective is closing")
         self._require_open()
 
-    def _begin_collective_operation(self):
+    def _begin_collective_operation(self, *, active_broadcast=False):
         with self._fatal_condition:
             if self._fatal_error is not None:
                 raise RuntimeError(
@@ -365,11 +371,19 @@ class CupyNcclCollective:
             if self._closing:
                 raise RuntimeError("collective is closing")
             self._admitted_operations += 1
+            if active_broadcast:
+                self._active_broadcast_agreements += 1
 
-    def _finish_collective_operation(self):
+    def _finish_collective_operation(self, *, active_broadcast=False):
         with self._fatal_condition:
             if self._admitted_operations <= 0:
                 raise RuntimeError("collective operation count is inconsistent")
+            if active_broadcast:
+                if self._active_broadcast_agreements <= 0:
+                    raise RuntimeError(
+                        "active broadcast agreement count is inconsistent"
+                    )
+                self._active_broadcast_agreements -= 1
             self._admitted_operations -= 1
             self._fatal_condition.notify_all()
 
@@ -518,8 +532,12 @@ class CupyNcclCollective:
 
     def _wait_for_joined_fatal_publication(self):
         deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        publication_failure = None
         with self._fatal_condition:
             while self._fatal_publications:
+                publication_failure = self._fatal_publication_failure
+                if publication_failure is not None:
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     error = RuntimeError(
@@ -528,12 +546,31 @@ class CupyNcclCollective:
                     self._record_fatal_secondary(error)
                     self._fatal_hard_exit()
                 self._fatal_condition.wait(remaining)
-            if not self._fatal_protocol_completed:
+            if (
+                publication_failure is None
+                and not self._fatal_protocol_completed
+            ):
                 error = RuntimeError(
                     "communicator fatal publication ended without completion"
                 )
                 self._record_fatal_secondary(error)
                 self._fatal_hard_exit()
+        if publication_failure is not None:
+            self._fatal_hard_exit()
+            raise publication_failure
+
+    def _wait_for_active_broadcast_agreements(self):
+        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        with self._fatal_condition:
+            while self._active_broadcast_agreements:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error = RuntimeError(
+                        "active broadcast publication barrier timed out"
+                    )
+                    self._record_fatal_secondary(error)
+                    self._fatal_hard_exit()
+                self._fatal_condition.wait(remaining)
 
     @contextmanager
     def _communicator_fatal_reservation(
@@ -642,11 +679,18 @@ class CupyNcclCollective:
                     fatal_owner=fatal_owner,
                     discovering_token=discovering_token,
                 )
+            attach_deferred_join = joined and defer_completion
             try:
+                if attach_deferred_join:
+                    self._fatal_publication_local.reservation = reservation
                 yield reservation
             finally:
-                if joined:
-                    self._wait_for_joined_fatal_publication()
+                try:
+                    if joined:
+                        self._wait_for_joined_fatal_publication()
+                finally:
+                    if attach_deferred_join:
+                        del self._fatal_publication_local.reservation
             return
         try:
             self._fatal_publication_local.reservation = reservation
@@ -656,6 +700,7 @@ class CupyNcclCollective:
                 discovering_token=discovering_token,
             )
             if not defer_completion:
+                self._wait_for_active_broadcast_agreements()
                 self._prepare_local_fatal_locked()
             try:
                 yield reservation
@@ -665,7 +710,7 @@ class CupyNcclCollective:
                 raise
             else:
                 if defer_completion:
-                    reservation.completion_deferred = False
+                    self._wait_for_active_broadcast_agreements()
                     self._prepare_local_fatal_locked()
                 self._run_fatal_handler(reservation)
                 self._publish_communicator_fatal_locked(primary)
@@ -674,7 +719,8 @@ class CupyNcclCollective:
             try:
                 del self._fatal_publication_local.reservation
             finally:
-                self._finish_fatal_publication()
+                if not reservation.fail_stopped:
+                    self._finish_fatal_publication()
 
     @contextmanager
     def _adopt_communicator_fatal_reservation_locked(self, error, origin_rank):
@@ -734,27 +780,61 @@ class CupyNcclCollective:
 
     def _run_fatal_handler(self, reservation):
         if reservation.handler_started or reservation.handler is None:
+            reservation.completion_deferred = False
             return reservation.snapshot
         reservation.handler_started = True
-        publish = getattr(reservation.handler, "publish", None)
         try:
+            if (
+                reservation.completion_deferred
+                and reservation.transition is not None
+                and reservation.transition_handler is not None
+                and reservation.transition_handler is not reservation.handler
+            ):
+                publish_transition = getattr(
+                    reservation.transition_handler, "publish", None
+                )
+                if callable(publish_transition):
+                    reservation.snapshot = publish_transition(
+                        reservation.transition
+                    )
+                    reservation.transition_published = True
+            reservation.completion_deferred = False
+            publish = getattr(reservation.handler, "publish", None)
             if callable(publish):
                 reservation.snapshot = publish(reservation.transition)
+                if reservation.handler is reservation.transition_handler:
+                    reservation.transition_published = True
             else:
-                reservation.snapshot = reservation.handler(reservation.primary)
+                handler_snapshot = reservation.handler(reservation.primary)
+                if reservation.snapshot is None:
+                    reservation.snapshot = handler_snapshot
             if (
                 reservation.transition is not None
                 and reservation.transition_handler is not None
                 and reservation.transition_handler is not reservation.handler
-                and reservation.completion is None
+                and not reservation.transition_published
             ):
                 publish_transition = getattr(
                     reservation.transition_handler, "publish", None
                 )
                 if callable(publish_transition):
                     reservation.snapshot = publish_transition(reservation.transition)
-        except TimeoutError as error:
+                    reservation.transition_published = True
+        except BaseException as error:
             self._record_fatal_secondary(error)
+            with self._fatal_condition:
+                reservation.fail_stopped = True
+                if self._fatal_publication_failure is None:
+                    self._fatal_publication_failure = reservation.primary
+                self._fatal_condition.notify_all()
+            failure_handler = getattr(
+                reservation.transition_handler, "fail", None
+            )
+            if callable(failure_handler) and reservation.transition is not None:
+                try:
+                    failure_handler(reservation.transition, reservation.primary)
+                except BaseException as signal_error:
+                    self._record_fatal_secondary(signal_error)
             self._fatal_hard_exit()
             raise
         return reservation.snapshot
@@ -1431,14 +1511,14 @@ class CupyNcclCollective:
 
     @contextmanager
     def _active_broadcast_admission(self):
-        self._begin_collective_operation()
+        self._begin_collective_operation(active_broadcast=True)
         self._active_broadcast_local.deferral = None
         try:
             yield self._broadcast_unadmitted, self._agree_admitted_active_broadcast
         finally:
             deferral = self._active_broadcast_local.deferral
             try:
-                self._finish_collective_operation()
+                self._finish_collective_operation(active_broadcast=True)
                 if deferral is not None:
                     deferral.complete()
             finally:
