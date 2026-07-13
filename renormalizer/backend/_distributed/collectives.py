@@ -46,7 +46,9 @@ class _FatalPublicationReservation:
         "handler",
         "transition_handler",
         "handler_started",
+        "transition_publish_started",
         "transition_published",
+        "failure_signaled",
         "fail_stopped",
         "transition",
         "snapshot",
@@ -74,7 +76,9 @@ class _FatalPublicationReservation:
         self.handler = handler
         self.transition_handler = transition_handler
         self.handler_started = False
+        self.transition_publish_started = False
         self.transition_published = False
+        self.failure_signaled = False
         self.fail_stopped = False
         self.transition = transition
         self.snapshot = None
@@ -652,10 +656,6 @@ class CupyNcclCollective:
                 join_existing=join_existing,
             )
         )
-        if transition is not None and transition.primary is not primary:
-            raise RuntimeError("communicator fatal primary changed")
-        if transition is not None and started:
-            self._confirm_runtime_fatal_outcome(primary)
         reservation = _FatalPublicationReservation(
             primary,
             installed,
@@ -692,8 +692,15 @@ class CupyNcclCollective:
                     if attach_deferred_join:
                         del self._fatal_publication_local.reservation
             return
+        publication_succeeded = False
+        local_installed = False
         try:
             self._fatal_publication_local.reservation = reservation
+            local_installed = True
+            if transition is not None and transition.primary is not primary:
+                raise RuntimeError("communicator fatal primary changed")
+            if transition is not None:
+                self._confirm_runtime_fatal_outcome(primary)
             self._refresh_fatal_handler(
                 reservation,
                 fatal_owner=fatal_owner,
@@ -702,24 +709,24 @@ class CupyNcclCollective:
             if not defer_completion:
                 self._wait_for_active_broadcast_agreements()
                 self._prepare_local_fatal_locked()
-            try:
-                yield reservation
-            except TimeoutError as error:
-                self._record_fatal_secondary(error)
-                self._fatal_hard_exit()
-                raise
-            else:
-                if defer_completion:
-                    self._wait_for_active_broadcast_agreements()
-                    self._prepare_local_fatal_locked()
-                self._run_fatal_handler(reservation)
-                self._publish_communicator_fatal_locked(primary)
-                self._complete_fatal_handler(reservation)
+            yield reservation
+            if defer_completion:
+                self._wait_for_active_broadcast_agreements()
+                self._prepare_local_fatal_locked()
+            self._run_fatal_handler(reservation)
+            self._publish_communicator_fatal_locked(primary)
+            self._complete_fatal_handler(reservation)
+            publication_succeeded = True
+        except BaseException as error:
+            self._fail_fatal_publication(reservation, error)
+            self._fatal_hard_exit()
+            raise
         finally:
             try:
-                del self._fatal_publication_local.reservation
+                if local_installed:
+                    del self._fatal_publication_local.reservation
             finally:
-                if not reservation.fail_stopped:
+                if publication_succeeded:
                     self._finish_fatal_publication()
 
     @contextmanager
@@ -783,61 +790,80 @@ class CupyNcclCollective:
             reservation.completion_deferred = False
             return reservation.snapshot
         reservation.handler_started = True
-        try:
-            if (
-                reservation.completion_deferred
-                and reservation.transition is not None
-                and reservation.transition_handler is not None
-                and reservation.transition_handler is not reservation.handler
-            ):
-                publish_transition = getattr(
-                    reservation.transition_handler, "publish", None
-                )
-                if callable(publish_transition):
+        publish_transition_first = (
+            reservation.completion_deferred
+            and reservation.transition is not None
+            and reservation.transition_handler is not None
+            and reservation.transition_handler is not reservation.handler
+        )
+        reservation.completion_deferred = False
+        if publish_transition_first:
+            publish_transition = getattr(
+                reservation.transition_handler, "publish", None
+            )
+            if callable(publish_transition):
+                reservation.transition_publish_started = True
+                try:
                     reservation.snapshot = publish_transition(
                         reservation.transition
                     )
-                    reservation.transition_published = True
-            reservation.completion_deferred = False
-            publish = getattr(reservation.handler, "publish", None)
-            if callable(publish):
+                finally:
+                    reservation.transition_publish_started = False
+                reservation.transition_published = True
+        publish = getattr(reservation.handler, "publish", None)
+        if callable(publish):
+            reservation.transition_publish_started = True
+            try:
                 reservation.snapshot = publish(reservation.transition)
-                if reservation.handler is reservation.transition_handler:
-                    reservation.transition_published = True
-            else:
-                handler_snapshot = reservation.handler(reservation.primary)
-                if reservation.snapshot is None:
-                    reservation.snapshot = handler_snapshot
-            if (
-                reservation.transition is not None
-                and reservation.transition_handler is not None
-                and reservation.transition_handler is not reservation.handler
-                and not reservation.transition_published
-            ):
-                publish_transition = getattr(
-                    reservation.transition_handler, "publish", None
-                )
-                if callable(publish_transition):
-                    reservation.snapshot = publish_transition(reservation.transition)
-                    reservation.transition_published = True
-        except BaseException as error:
-            self._record_fatal_secondary(error)
-            with self._fatal_condition:
-                reservation.fail_stopped = True
-                if self._fatal_publication_failure is None:
-                    self._fatal_publication_failure = reservation.primary
-                self._fatal_condition.notify_all()
-            failure_handler = getattr(
-                reservation.transition_handler, "fail", None
+            finally:
+                reservation.transition_publish_started = False
+            if reservation.handler is reservation.transition_handler:
+                reservation.transition_published = True
+        else:
+            handler_snapshot = reservation.handler(reservation.primary)
+            if reservation.snapshot is None:
+                reservation.snapshot = handler_snapshot
+        if (
+            reservation.transition is not None
+            and reservation.transition_handler is not None
+            and reservation.transition_handler is not reservation.handler
+            and not reservation.transition_published
+        ):
+            publish_transition = getattr(
+                reservation.transition_handler, "publish", None
             )
-            if callable(failure_handler) and reservation.transition is not None:
+            if callable(publish_transition):
+                reservation.transition_publish_started = True
                 try:
-                    failure_handler(reservation.transition, reservation.primary)
-                except BaseException as signal_error:
-                    self._record_fatal_secondary(signal_error)
-            self._fatal_hard_exit()
-            raise
+                    reservation.snapshot = publish_transition(
+                        reservation.transition
+                    )
+                finally:
+                    reservation.transition_publish_started = False
+                reservation.transition_published = True
         return reservation.snapshot
+
+    def _fail_fatal_publication(self, reservation, error):
+        with self._fatal_condition:
+            if reservation.failure_signaled:
+                return
+            reservation.failure_signaled = True
+            reservation.fail_stopped = True
+            if self._fatal_publication_failure is None:
+                self._fatal_publication_failure = reservation.primary
+            elif self._fatal_publication_failure is not reservation.primary:
+                error = RuntimeError("communicator fatal publication failure changed")
+            self._fatal_condition.notify_all()
+        if not (
+            isinstance(error, SystemExit) and error.code == _FATAL_EXIT_CODE
+        ):
+            self._record_fatal_secondary(error)
+        failure_handler = getattr(reservation.transition_handler, "fail", None)
+        if callable(failure_handler) and reservation.transition is not None:
+            try:
+                failure_handler(reservation.transition, reservation.primary)
+            except BaseException as signal_error:
+                self._record_fatal_secondary(signal_error)
 
     @staticmethod
     def _complete_fatal_handler(reservation):
@@ -1088,16 +1114,70 @@ class CupyNcclCollective:
             self._run_fatal_handler(reservation)
             return reservation.primary
 
-    def _defer_active_broadcast_fatal(self, error, origin_rank):
+    def _current_thread_has_active_broadcast(self):
+        return hasattr(self._active_broadcast_local, "deferral")
+
+    def _current_fatal_publication_is_deferred(self):
+        reservation = getattr(self._fatal_publication_local, "reservation", None)
+        return bool(
+            reservation is not None and reservation.completion_deferred
+        )
+
+    def _defer_current_active_broadcast_fatal(
+        self,
+        error,
+        *,
+        origin_rank=None,
+        fatal_owner=None,
+        discovering_token=None,
+        transition=None,
+    ):
+        if not self._current_thread_has_active_broadcast():
+            return None
+        if origin_rank is None:
+            origin_rank = self.rank
+        return self._defer_active_broadcast_fatal(
+            error,
+            origin_rank,
+            fatal_owner=fatal_owner,
+            discovering_token=discovering_token,
+            transition=transition,
+        )
+
+    def _defer_active_broadcast_fatal(
+        self,
+        error,
+        origin_rank,
+        *,
+        fatal_owner=None,
+        discovering_token=None,
+        transition=None,
+    ):
         deferral = self._active_broadcast_local.deferral
         if deferral is not None:
             if error is not deferral.primary:
                 self._record_fatal_secondary(error)
+            reservation = deferral.reservation
+            if transition is not None:
+                if reservation.transition is None:
+                    reservation.transition = transition
+                elif reservation.transition is not transition:
+                    raise RuntimeError("communicator fatal transition changed")
+                if transition.primary is not reservation.primary:
+                    raise RuntimeError("communicator fatal primary changed")
+            self._refresh_fatal_handler(
+                reservation,
+                fatal_owner=fatal_owner,
+                discovering_token=discovering_token,
+            )
             return deferral.primary
         boundary = self._communicator_fatal_reservation(
             error,
             origin_rank=origin_rank,
             admitted=True,
+            fatal_owner=fatal_owner,
+            discovering_token=discovering_token,
+            transition=transition,
             defer_completion=True,
         )
         reservation = boundary.__enter__()
@@ -1494,8 +1574,16 @@ class CupyNcclCollective:
         return aggregate
 
     def _broadcast_unadmitted(self, array, *, root):
-        self._validate_root(root)
-        self._validate_array(array)
+        try:
+            self._validate_root(root)
+            self._validate_array(array)
+        except BaseException as error:
+            if not self._current_thread_has_active_broadcast():
+                raise
+            primary = self._defer_active_broadcast_fatal(error, self.rank)
+            if primary is error:
+                raise
+            raise primary
 
         def execute():
             cupy = self._cupy

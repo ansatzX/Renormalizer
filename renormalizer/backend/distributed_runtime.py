@@ -103,6 +103,19 @@ class _RuntimeCommunicatorFatalHook:
         )
 
 
+_MISSING_TERMINAL_FIELD = object()
+
+
+class _DeferredAsyncQuarantine:
+    __slots__ = ("owner", "callback", "triggered", "completed")
+
+    def __init__(self, owner, callback):
+        self.owner = owner
+        self.callback = callback
+        self.triggered = False
+        self.completed = False
+
+
 @dataclass
 class CupyDistributedRuntime:
     backend: object
@@ -136,6 +149,9 @@ class CupyDistributedRuntime:
     _pending_fatal_collective: object = field(default=None, init=False, repr=False)
     _legacy_fatal_publication_owner: int | None = field(
         default=None, init=False, repr=False
+    )
+    _deferred_async_quarantines: list = field(
+        default_factory=list, init=False, repr=False
     )
 
     @property
@@ -190,10 +206,207 @@ class CupyDistributedRuntime:
                 "distributed runtime is terminal-poisoned"
             ) from primary
 
+    def _fatal_collective(self):
+        collective = self._pending_fatal_collective
+        return self.collective if collective is None else collective
+
+    def _defer_current_active_broadcast_fatal(
+        self, primary, *, owner=None, discovering_token=None
+    ):
+        collective = self._fatal_collective()
+        defer = (
+            None
+            if collective is None
+            else getattr(
+                collective, "_defer_current_active_broadcast_fatal", None
+            )
+        )
+        if not callable(defer):
+            return None
+        return defer(
+            primary,
+            origin_rank=self.rank,
+            fatal_owner=owner,
+            discovering_token=discovering_token,
+        )
+
+    def _current_fatal_publication_is_deferred(self):
+        collective = self._fatal_collective()
+        probe = (
+            None
+            if collective is None
+            else getattr(
+                collective, "_current_fatal_publication_is_deferred", None
+            )
+        )
+        return bool(callable(probe) and probe())
+
+    def _retain_deferred_terminal_error(self, error, owner=None):
+        gate = self._terminal_gate
+        with gate._condition:
+            transition = gate._fatal_transition
+            if transition is None:
+                raise RuntimeError("deferred communicator fatal is not elected")
+            with self._terminal_state_lock:
+                primary, _, _, owner = self._normalize_communicator_fatal(
+                    error, owner
+                )
+                self._force_async_primary_locked(owner, primary)
+                self._terminal_quarantine.first_error = primary
+                self._terminal_quarantine.retain_error(primary)
+                if owner is not None:
+                    self._terminal_quarantine.retain(owner, primary)
+                return primary
+
+    def _stage_active_broadcast_quarantine_locked(self, owner, collective):
+        if owner is None:
+            return
+        active = getattr(
+            collective, "_current_thread_has_active_broadcast", None
+        )
+        if not callable(active) or not active():
+            return
+        if any(
+            retained.owner is owner for retained in self._deferred_async_quarantines
+        ):
+            return
+        callback = getattr(owner, "_quarantine", None)
+        if not callable(callback):
+            return
+        record = _DeferredAsyncQuarantine(owner, callback)
+        runtime_ref = weakref.ref(self)
+
+        def defer_quarantine(retained_owner):
+            runtime = runtime_ref()
+            if runtime is None:
+                return callback(retained_owner)
+            return runtime._accept_deferred_async_quarantine(
+                record, retained_owner
+            )
+
+        owner._quarantine = defer_quarantine
+        self._deferred_async_quarantines.append(record)
+
+    def _accept_deferred_async_quarantine(self, record, owner):
+        if record.owner is not owner:
+            raise RuntimeError("deferred async quarantine owner changed")
+        primary = self._retain_deferred_terminal_error(owner.error, owner)
+        with self._terminal_state_lock:
+            record.triggered = True
+        return primary
+
+    def _publish_deferred_async_quarantines(self):
+        with self._terminal_state_lock:
+            records = tuple(
+                record
+                for record in self._deferred_async_quarantines
+                if record.triggered and not record.completed
+            )
+        for record in records:
+            record.callback(record.owner)
+            with self._terminal_state_lock:
+                record.completed = True
+
+    @staticmethod
+    def _terminal_field_snapshot(owner, name):
+        if owner is None:
+            return _MISSING_TERMINAL_FIELD
+        return getattr(owner, name, _MISSING_TERMINAL_FIELD)
+
+    @staticmethod
+    def _restore_terminal_field(owner, name, value):
+        if owner is None:
+            return
+        if value is _MISSING_TERMINAL_FIELD:
+            if hasattr(owner, name):
+                delattr(owner, name)
+            return
+        setattr(owner, name, value)
+
+    def _begin_deferred_terminal_public_state(self, reservation):
+        if reservation is None or not reservation.completion_deferred:
+            return None
+        gate = self._terminal_gate
+        with gate._condition:
+            if gate._phase is not _TerminalPhase.FATAL_PENDING:
+                return None
+            with self._terminal_state_lock:
+                provider = self._active_provider
+                lease = (
+                    None
+                    if provider is None
+                    else getattr(provider, "_active_lease", None)
+                )
+                backend = self.backend
+                snapshot = {
+                    "runtime_error": self._terminal_error,
+                    "backend": backend,
+                    "backend_error": self._terminal_field_snapshot(
+                        backend, "_execution_terminal_error"
+                    ),
+                    "provider": provider,
+                    "provider_error": self._terminal_field_snapshot(
+                        provider, "_terminal_error"
+                    ),
+                    "lease": lease,
+                    "lease_error": self._terminal_field_snapshot(
+                        lease, "_poisoned_error"
+                    ),
+                    "overrides": [],
+                }
+
+                def retain_only(error):
+                    return self._retain_deferred_terminal_error(error)
+
+                for target, name in (
+                    (lease, "_poison"),
+                    (provider, "_poison_terminal"),
+                ):
+                    namespace = getattr(target, "__dict__", None)
+                    if namespace is None:
+                        continue
+                    previous = namespace.get(name, _MISSING_TERMINAL_FIELD)
+                    setattr(target, name, retain_only)
+                    snapshot["overrides"].append((target, name, previous))
+                return snapshot
+
+    def _restore_deferred_terminal_public_state(self, reservation, snapshot):
+        if snapshot is None:
+            return
+        gate = self._terminal_gate
+        with gate._condition:
+            with self._terminal_state_lock:
+                for target, name, previous in reversed(snapshot["overrides"]):
+                    self._restore_terminal_field(target, name, previous)
+                if (
+                    not reservation.completion_deferred
+                    or gate._phase is not _TerminalPhase.FATAL_PENDING
+                ):
+                    return
+                self._terminal_error = snapshot["runtime_error"]
+                self._restore_terminal_field(
+                    snapshot["backend"],
+                    "_execution_terminal_error",
+                    snapshot["backend_error"],
+                )
+                self._restore_terminal_field(
+                    snapshot["provider"],
+                    "_terminal_error",
+                    snapshot["provider_error"],
+                )
+                self._restore_terminal_field(
+                    snapshot["lease"],
+                    "_poisoned_error",
+                    snapshot["lease_error"],
+                )
+
     def _accept_async_quarantine(self, owner, primary=None):
         error = owner.error if primary is None else primary
         if not isinstance(error, BaseException):
             raise TypeError("async quarantine failure must be an exception")
+        if self._current_fatal_publication_is_deferred():
+            self._retain_deferred_terminal_error(error, owner)
+            return
         with self._terminal_gate._condition:
             transition = self._terminal_gate._fatal_transition
             if transition is not None and self._terminal_gate._phase in (
@@ -225,7 +438,15 @@ class CupyDistributedRuntime:
     def _communicator_fatal_reservation(self, primary):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
-        reserve = getattr(self.collective, "_communicator_fatal_reservation", None)
+        deferred_primary = self._defer_current_active_broadcast_fatal(primary)
+        if deferred_primary is not None:
+            primary = deferred_primary
+        collective = self._fatal_collective()
+        reserve = (
+            None
+            if collective is None
+            else getattr(collective, "_communicator_fatal_reservation", None)
+        )
         boundary = (
             reserve(primary, join_existing=True)
             if callable(reserve)
@@ -234,7 +455,13 @@ class CupyDistributedRuntime:
         with boundary as reservation:
             if reservation is not None:
                 primary = reservation.primary
-            yield primary, reservation
+            snapshot = self._begin_deferred_terminal_public_state(reservation)
+            try:
+                yield primary, reservation
+            finally:
+                self._restore_deferred_terminal_public_state(
+                    reservation, snapshot
+                )
 
     def _remember_terminal_secondary_locked(self, error, primary, owner=None):
         if not isinstance(error, BaseException):
@@ -441,6 +668,9 @@ class CupyDistributedRuntime:
                             retained_lease,
                             owner,
                         )
+                    self._stage_active_broadcast_quarantine_locked(
+                        owner, collective
+                    )
 
                 if callable(reserve_outcome):
                     if discovering_token is not None:
@@ -502,6 +732,7 @@ class CupyDistributedRuntime:
             if owner is not None:
                 if owner.state not in {"detached", "quarantined"}:
                     owner.force_quarantine(primary)
+            self._publish_deferred_async_quarantines()
             with self._terminal_gate._condition:
                 if self._terminal_gate._fatal_transition is not transition:
                     raise RuntimeError("communicator fatal transition changed")
@@ -530,6 +761,14 @@ class CupyDistributedRuntime:
     ):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
+        deferred_primary = self._defer_current_active_broadcast_fatal(
+            primary,
+            owner=owner,
+            discovering_token=discovering_token,
+        )
+        if deferred_primary is not None:
+            primary = deferred_primary
+            discovering_token = None
         transition = self._begin_communicator_fatal(
             primary,
             owner=owner,
@@ -557,12 +796,15 @@ class CupyDistributedRuntime:
             active = getattr(
                 collective._fatal_publication_local, "reservation", None
             )
-            if active is not None and not isinstance(
-                active.handler, _RuntimeCommunicatorFatalHook
-            ):
+            if active is not None:
                 if active.primary is not transition.primary:
                     raise RuntimeError("communicator fatal primary changed")
                 active.transition = transition
+                if active.transition_publish_started:
+                    return transition.primary
+            if active is not None and not isinstance(
+                active.handler, _RuntimeCommunicatorFatalHook
+            ):
                 if active.completion_deferred:
                     return transition.primary
                 if active.transition_published:
