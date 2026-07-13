@@ -125,6 +125,7 @@ class CupyDistributedRuntime:
     )
     _communicator_fatal_hook: object = field(default=None, init=False, repr=False)
     _pending_fatal_context: object = field(default=None, init=False, repr=False)
+    _pending_fatal_collective: object = field(default=None, init=False, repr=False)
     _legacy_fatal_publication_owner: int | None = field(
         default=None, init=False, repr=False
     )
@@ -230,12 +231,13 @@ class CupyDistributedRuntime:
                 if transition is not None:
                     return transition
                 raise RuntimeError("distributed runtime is closed")
+            if gate._runtime_close_commit_selected:
+                raise RuntimeError("runtime close is committed")
             with self._terminal_state_lock:
                 primary, provider, lease, owner = (
                     self._normalize_communicator_fatal(primary, owner)
                 )
-                transition = gate.begin_fatal(primary, discovering_token)
-                if transition.primary is not primary:
+                if transition is not None and transition.primary is not primary:
                     call = (
                         None
                         if owner is None
@@ -254,6 +256,33 @@ class CupyDistributedRuntime:
                         )
                         if callable(remember_secondary):
                             remember_secondary(primary)
+                    primary = transition.primary
+                collective = self._pending_fatal_collective
+                if collective is None:
+                    collective = self.collective
+                publish = (
+                    None
+                    if collective is None
+                    else getattr(collective, "_publish_communicator_fatal", None)
+                )
+                if not callable(publish):
+                    raise RuntimeError(
+                        "collective does not provide fatal publication"
+                    )
+                reserve_outcome = getattr(
+                    collective, "_reserve_runtime_fatal_outcome", None
+                )
+                if callable(reserve_outcome):
+                    if discovering_token is not None:
+                        gate._convertible_token_state(discovering_token)
+                    outcome = reserve_outcome(primary)
+                    if outcome.primary is not primary:
+                        primary = outcome.primary
+                transition = gate.begin_fatal(primary, discovering_token)
+                if transition.primary is not primary:
+                    raise RuntimeError("communicator fatal primary changed")
+                if self._pending_fatal_collective is None:
+                    self._pending_fatal_collective = collective
                 if self._pending_fatal_context is None:
                     self._pending_fatal_context = (provider, lease, owner)
                 elif owner is not None and self._pending_fatal_context[2] is None:
@@ -329,12 +358,9 @@ class CupyDistributedRuntime:
             context = self._pending_fatal_context
             if context is not None:
                 owner = context[2]
-        collective = self.collective
+            collective = self._pending_fatal_collective
         if collective is None:
-            with self._terminal_gate._condition:
-                transition = self._terminal_gate._fatal_transition
-            if transition is not None:
-                return transition.primary
+            raise RuntimeError("fatal publication collective was not retained")
         publish = getattr(collective, "_publish_communicator_fatal", None)
         if not callable(publish):
             raise RuntimeError("collective does not provide fatal publication")
@@ -898,11 +924,17 @@ class CupyDistributedRuntime:
         )
 
     def _clear_runtime_references(
-        self, error, *, publish_error=True, mark_closed=True
+        self,
+        error,
+        *,
+        publish_error=True,
+        mark_closed=True,
+        clear_collective=True,
     ):
         self._issued_receipts.clear()
         self._active_provider = None
-        self.collective = None
+        if clear_collective:
+            self.collective = None
         if mark_closed:
             self._closed = True
         if publish_error and self._terminal_error is None:
@@ -922,7 +954,10 @@ class CupyDistributedRuntime:
         result = self._terminal_gate.commit_runtime_close(
             transition,
             lambda: self._clear_runtime_references(
-                error, publish_error=False, mark_closed=False
+                error,
+                publish_error=False,
+                mark_closed=False,
+                clear_collective=False,
             ),
         )
         if not self._closed:

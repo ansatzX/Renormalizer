@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from renormalizer.backend._distributed.context import DistributedContext
+from renormalizer.backend._distributed.terminal import _TerminalPhase
 
 
 cupy = pytest.importorskip("cupy")
@@ -1306,6 +1307,309 @@ def test_active_operator_primary_is_canonical_before_collective_publication(
     assert acknowledgments == [(earlier,) * 6]
     assert call.secondary_errors == [later]
     assert wrapper._fatal_secondary_errors == (later,)
+
+
+def test_fatal_election_retains_collective_across_pending_close_finalizer(
+    monkeypatch,
+):
+    runtime, wrapper, backend, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("fatal retained across pending close")
+    elected = threading.Event()
+    release_resolution = threading.Event()
+    pending_finalizer = threading.Event()
+    original_begin = runtime._begin_communicator_fatal
+
+    def pause_after_election(*args, **kwargs):
+        transition = original_begin(*args, **kwargs)
+        elected.set()
+        assert release_resolution.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return transition
+
+    monkeypatch.setattr(runtime, "_begin_communicator_fatal", pause_after_election)
+    original_clear = runtime._clear_runtime_references
+
+    def record_pending_finalizer(*args, **kwargs):
+        result = original_clear(*args, **kwargs)
+        if kwargs.get("mark_closed") is False:
+            pending_finalizer.set()
+        return result
+
+    monkeypatch.setattr(runtime, "_clear_runtime_references", record_pending_finalizer)
+
+    publisher, results, errors, done = _start_task_18_2_call(
+        lambda: runtime._enter_communicator_fatal(primary),
+        name="task-18.2-retained-fatal-publisher",
+    )
+    assert elected.wait(_TASK_18_2_TIMEOUT_S)
+    closer, close_results, close_errors, close_done = _start_task_18_2_call(
+        runtime.close, name="task-18.2-retained-fatal-closer"
+    )
+    try:
+        assert pending_finalizer.wait(_TASK_18_2_TIMEOUT_S)
+        assert runtime.collective is wrapper
+        assert runtime._pending_fatal_collective is wrapper
+        assert wrapper._backend is backend
+        assert wrapper._closed is False
+        assert not close_done.is_set()
+    finally:
+        release_resolution.set()
+        _join_task_18_2_call(publisher, done)
+        with gate._condition:
+            if gate._phase is _TerminalPhase.FATAL_PENDING:
+                gate.publish_fatal(gate._fatal_transition, primary)
+        _join_task_18_2_call(closer, close_done)
+
+    assert errors == []
+    assert results == [primary]
+    assert close_results == []
+    assert close_errors == [primary]
+    assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+
+
+def test_runtime_close_selects_clean_before_collective_teardown_gap(monkeypatch):
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    teardown_complete = threading.Event()
+    release_runtime_commit = threading.Event()
+    publication_calls = []
+    original_close = wrapper._close_for_runtime
+
+    def pause_after_collective_teardown(close_gate, transition):
+        result = original_close(close_gate, transition)
+        teardown_complete.set()
+        assert release_runtime_commit.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return result
+
+    monkeypatch.setattr(wrapper, "_close_for_runtime", pause_after_collective_teardown)
+    original_publish = wrapper._publish_communicator_fatal
+
+    def record_publication(*args, **kwargs):
+        publication_calls.append((args, kwargs))
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(wrapper, "_publish_communicator_fatal", record_publication)
+
+    closer, close_results, close_errors, close_done = _start_task_18_2_call(
+        runtime.close, name="task-18.2-close-before-runtime-commit"
+    )
+    assert teardown_complete.wait(_TASK_18_2_TIMEOUT_S)
+    primary = RuntimeError("fatal after collective teardown")
+    publisher, results, errors, done = _start_task_18_2_call(
+        lambda: runtime._enter_communicator_fatal(primary),
+        name="task-18.2-fatal-after-collective-teardown",
+    )
+    try:
+        _join_task_18_2_call(publisher, done)
+        assert results == []
+        assert len(errors) == 1
+        assert "committed" in str(errors[0])
+        assert publication_calls == []
+        assert gate._fatal_transition is None
+        assert gate._runtime_close_commit_selected is True
+        assert not close_done.is_set()
+    finally:
+        with gate._condition:
+            if gate._phase is _TerminalPhase.FATAL_PENDING:
+                gate.publish_fatal(gate._fatal_transition, primary)
+        release_runtime_commit.set()
+        _join_task_18_2_call(closer, close_done)
+
+    assert close_errors == []
+    assert close_results == [None]
+    assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+
+
+def test_gate_fatal_election_preselects_monitor_before_collective_prepare(
+    monkeypatch,
+):
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("gate and monitor share fatal winner")
+    prepare_entered = threading.Event()
+    release_prepare = threading.Event()
+    original_prepare = wrapper._prepare_local_fatal_locked
+
+    def pause_collective_prepare():
+        prepare_entered.set()
+        assert release_prepare.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return original_prepare()
+
+    monkeypatch.setattr(wrapper, "_prepare_local_fatal_locked", pause_collective_prepare)
+    publisher, results, errors, done = _start_task_18_2_call(
+        lambda: runtime._enter_communicator_fatal(primary),
+        name="task-18.2-gate-monitor-election",
+    )
+    try:
+        assert prepare_entered.wait(_TASK_18_2_TIMEOUT_S)
+        generation = wrapper._request_fatal_monitor_stop()
+        clean_attempt = wrapper._select_fatal_monitor_outcome(
+            "stopped_clean", generation
+        )
+        assert gate._fatal_transition.primary is primary
+        assert wrapper._fatal_pending_primary is primary
+        assert clean_attempt.kind == "fatal_elected"
+        assert clean_attempt.primary is primary
+        assert wrapper._observe_fatal_monitor_outcome() is clean_attempt
+    finally:
+        release_prepare.set()
+        _join_task_18_2_call(publisher, done)
+
+    assert errors == []
+    assert results == [primary]
+    assert gate.phase is _TerminalPhase.FATAL_PUBLISHED
+
+
+def test_protocol_completed_reporter_joins_until_gate_publication(monkeypatch):
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("reporter joins immutable gate publication")
+    gate_publish_entered = threading.Event()
+    release_gate_publish = threading.Event()
+    reporter_joining = threading.Event()
+    original_gate_publish = gate.publish_fatal
+
+    def pause_gate_publish(transition, snapshot):
+        gate_publish_entered.set()
+        assert release_gate_publish.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return original_gate_publish(transition, snapshot)
+
+    monkeypatch.setattr(gate, "publish_fatal", pause_gate_publish)
+    original_join = wrapper._wait_for_joined_fatal_publication
+
+    def record_reporter_join():
+        if threading.current_thread().name == "task-18.2-protocol-reporter":
+            reporter_joining.set()
+        return original_join()
+
+    monkeypatch.setattr(
+        wrapper, "_wait_for_joined_fatal_publication", record_reporter_join
+    )
+
+    owner, owner_results, owner_errors, owner_done = _start_task_18_2_call(
+        lambda: runtime._enter_communicator_fatal(primary),
+        name="task-18.2-protocol-owner",
+    )
+    assert gate_publish_entered.wait(_TASK_18_2_TIMEOUT_S)
+    assert wrapper._fatal_protocol_completed is True
+    assert wrapper._fatal_publications == 1
+    assert gate.phase is _TerminalPhase.FATAL_PENDING
+    reporter, reporter_results, reporter_errors, reporter_done = (
+        _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(primary),
+            name="task-18.2-protocol-reporter",
+        )
+    )
+    try:
+        assert reporter_joining.wait(_TASK_18_2_TIMEOUT_S)
+        assert not reporter_done.is_set()
+        assert gate.phase is _TerminalPhase.FATAL_PENDING
+    finally:
+        release_gate_publish.set()
+        _join_task_18_2_call(owner, owner_done)
+        _join_task_18_2_call(reporter, reporter_done)
+
+    assert owner_errors == []
+    assert reporter_errors == []
+    assert owner_results == [primary]
+    assert reporter_results == [primary]
+    assert gate.phase is _TerminalPhase.FATAL_PUBLISHED
+
+
+def test_legacy_callable_adopts_active_operator_primary_before_publication(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
+
+    runtime, wrapper, backend, _, raw_comm = _single_rank_task_18_2_runtime(
+        monkeypatch
+    )
+    earlier = RuntimeError("legacy earlier operator primary")
+    later = RuntimeError("legacy later communicator failure")
+
+    class OperatorCall:
+        def __init__(self):
+            self.primary_error = earlier
+            self.secondary_errors = []
+
+        def record_secondary(self, error):
+            if error is not self.primary_error and error not in self.secondary_errors:
+                self.secondary_errors.append(error)
+
+    call = OperatorCall()
+    owner = AsyncResourceOwner("legacy-compute")
+    owner._operator_call = call
+    owner.mark_enqueued()
+    owner.force_quarantine(earlier)
+    lease = SimpleNamespace(
+        _active_operator_owner=owner,
+        _status_workspace=None,
+        _poisoned_error=None,
+    )
+    provider = SimpleNamespace(_active_lease=lease, _terminal_error=None)
+    runtime._active_provider = provider
+    sentinels = []
+    original_store_set = wrapper._fatal_store_set
+
+    def record_store(key, value):
+        if key == wrapper._fatal_key(wrapper.rank):
+            sentinels.append(
+                (
+                    "store",
+                    wrapper._fatal_pending_primary,
+                    runtime._terminal_gate._fatal_transition.primary,
+                )
+            )
+        return original_store_set(key, value)
+
+    monkeypatch.setattr(wrapper, "_fatal_store_set", record_store)
+    original_abort = wrapper._abort_local_communicator
+
+    def record_abort():
+        sentinels.append(
+            (
+                "abort",
+                wrapper._fatal_pending_primary,
+                runtime._terminal_gate._fatal_transition.primary,
+            )
+        )
+        return original_abort()
+
+    monkeypatch.setattr(wrapper, "_abort_local_communicator", record_abort)
+    callbacks = []
+
+    def legacy_handler(error):
+        callbacks.append(error)
+        sentinels.append(
+            (
+                "handler",
+                wrapper._fatal_pending_primary,
+                runtime._terminal_gate._fatal_transition.primary,
+            )
+        )
+        return runtime._enter_communicator_fatal(error)
+
+    wrapper._install_fatal_handler(legacy_handler)
+
+    result = wrapper._enter_observed_fatal(later, wrapper.rank, join_existing=True)
+
+    assert result is earlier
+    assert callbacks == [earlier]
+    assert sentinels == [
+        ("store", earlier, earlier),
+        ("abort", earlier, earlier),
+        ("handler", earlier, earlier),
+    ]
+    assert runtime._terminal_gate._fatal_transition.primary is earlier
+    assert wrapper._fatal_pending_primary is earlier
+    assert wrapper._fatal_error is earlier
+    assert runtime._terminal_error is earlier
+    assert provider._terminal_error is earlier
+    assert lease._poisoned_error is earlier
+    assert backend._execution_terminal_error is earlier
+    assert call.secondary_errors == [later]
+    assert wrapper._fatal_secondary_errors == (later,)
+    assert raw_comm.abort_calls == 1
 
 
 def _install_task_18_2_monitor_barriers(monkeypatch, wrapper):

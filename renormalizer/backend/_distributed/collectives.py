@@ -43,6 +43,7 @@ class _FatalPublicationReservation:
         "joined",
         "monitor_deferred",
         "handler",
+        "transition_handler",
         "handler_started",
         "transition",
         "snapshot",
@@ -57,6 +58,7 @@ class _FatalPublicationReservation:
         joined=False,
         monitor_deferred=False,
         handler=None,
+        transition_handler=None,
         transition=None,
     ):
         self.primary = primary
@@ -65,6 +67,7 @@ class _FatalPublicationReservation:
         self.joined = joined
         self.monitor_deferred = monitor_deferred
         self.handler = handler
+        self.transition_handler = transition_handler
         self.handler_started = False
         self.transition = transition
         self.snapshot = None
@@ -252,10 +255,12 @@ class CupyNcclCollective:
         self._fatal_abort_error = None
         self._fatal_protocol_completed = False
         self._fatal_handler = None
+        self._fatal_transition_handler = None
         self._fatal_monitor_stop = threading.Event()
         self._fatal_monitor_thread = None
         self._fatal_monitor_handoff = _FatalMonitorHandoff()
         self._fatal_monitor_outcome = None
+        self._fatal_monitor_outcome_confirmed = False
         self._fatal_monitor_publisher_thread = None
         self._fatal_control_initialized = False
         self._active_broadcast_sequence = 1
@@ -388,7 +393,13 @@ class CupyNcclCollective:
             raise TypeError("communicator fatal failure must be an exception")
         with self._fatal_condition:
             if self._fatal_protocol_completed:
-                return self._fatal_pending_primary, False, False, False, False
+                return (
+                    self._fatal_pending_primary,
+                    False,
+                    False,
+                    self._fatal_publications > 0,
+                    False,
+                )
             if (
                 self._fatal_pending_primary is not None
                 and self._fatal_publications > 0
@@ -488,7 +499,17 @@ class CupyNcclCollective:
             if handler_override is not None
             else self._fatal_handler_callback()
         )
+        transition_handler = handler
         begin = None if handler is None else getattr(handler, "begin", None)
+        if not callable(begin):
+            transition_handler = self._fatal_transition_handler_callback()
+            begin = (
+                None
+                if transition_handler is None
+                else getattr(transition_handler, "begin", None)
+            )
+        if handler is None:
+            handler = transition_handler
         if transition is None and callable(begin):
             transition = begin(
                 error,
@@ -501,8 +522,16 @@ class CupyNcclCollective:
                 raise TypeError("communicator fatal transition primary is invalid")
             if error is not primary:
                 self._record_fatal_secondary(error)
+            outcome = self._observe_fatal_monitor_outcome()
+            if (
+                outcome is None
+                or outcome.kind != "fatal_elected"
+                or outcome.primary is not primary
+            ):
+                raise RuntimeError("communicator fatal handoff was not reserved")
         else:
-            primary = error
+            outcome = self._elect_collective_fatal_outcome(error)
+            primary = outcome.primary
         primary, installed, started, joined, monitor_deferred = (
             self._begin_fatal_publication(
                 primary,
@@ -514,6 +543,8 @@ class CupyNcclCollective:
         )
         if transition is not None and transition.primary is not primary:
             raise RuntimeError("communicator fatal primary changed")
+        if transition is not None and started:
+            self._confirm_runtime_fatal_outcome(primary)
         reservation = _FatalPublicationReservation(
             primary,
             installed,
@@ -521,6 +552,7 @@ class CupyNcclCollective:
             joined=joined,
             monitor_deferred=monitor_deferred,
             handler=handler,
+            transition_handler=transition_handler,
             transition=transition,
         )
         if not started:
@@ -581,10 +613,17 @@ class CupyNcclCollective:
             reference = weakref.ref(handler)
         with self._fatal_lock:
             self._fatal_handler = reference
+            if callable(getattr(handler, "begin", None)):
+                self._fatal_transition_handler = reference
 
     def _fatal_handler_callback(self):
         with self._fatal_lock:
             reference = self._fatal_handler
+        return None if reference is None else reference()
+
+    def _fatal_transition_handler_callback(self):
+        with self._fatal_lock:
+            reference = self._fatal_transition_handler
         return None if reference is None else reference()
 
     def _refresh_fatal_handler(
@@ -594,7 +633,7 @@ class CupyNcclCollective:
         fatal_owner=None,
         discovering_token=None,
     ):
-        handler = reservation.handler
+        handler = reservation.transition_handler
         begin = None if handler is None else getattr(handler, "begin", None)
         if not callable(begin):
             return
@@ -624,6 +663,17 @@ class CupyNcclCollective:
                 reservation.snapshot = publish(reservation.transition)
             else:
                 reservation.snapshot = reservation.handler(reservation.primary)
+            if (
+                reservation.transition is not None
+                and reservation.transition_handler is not None
+                and reservation.transition_handler is not reservation.handler
+                and reservation.completion is None
+            ):
+                publish_transition = getattr(
+                    reservation.transition_handler, "publish", None
+                )
+                if callable(publish_transition):
+                    reservation.snapshot = publish_transition(reservation.transition)
         except TimeoutError as error:
             self._record_fatal_secondary(error)
             self._fatal_hard_exit()
@@ -635,9 +685,12 @@ class CupyNcclCollective:
         if reservation.completion is not None:
             reservation.completion()
             return
-        if reservation.handler is None or reservation.transition is None:
+        if reservation.transition is None:
             return
-        complete = getattr(reservation.handler, "complete", None)
+        handler = reservation.transition_handler
+        if handler is None:
+            handler = reservation.handler
+        complete = None if handler is None else getattr(handler, "complete", None)
         if callable(complete):
             complete(reservation.transition, reservation.snapshot)
 
@@ -786,9 +839,7 @@ class CupyNcclCollective:
             primary = self._fatal_pending_primary
             monitor = self._fatal_monitor_thread
             monitor_live = monitor is not None and monitor.is_alive()
-        outcome = self._select_fatal_monitor_outcome("fatal_elected", primary)
-        self._fatal_monitor_outcome = outcome
-        self._fatal_monitor_stop.set()
+        outcome = self._select_runtime_fatal_outcome(primary)
         if monitor is threading.current_thread():
             raise RuntimeError("fatal monitor cannot own communicator publication")
         elif monitor_live:
@@ -900,6 +951,47 @@ class CupyNcclCollective:
         if kind == "stopped_clean":
             return self._fatal_monitor_handoff.select_clean(value)
         raise ValueError("fatal monitor outcome is invalid")
+
+    def _reserve_runtime_fatal_outcome(self, primary):
+        outcome = self._fatal_monitor_handoff.select_fatal(primary)
+        if outcome.kind != "fatal_elected":
+            raise RuntimeError("clean monitor stop preempted communicator fatal")
+        if outcome.primary is not primary:
+            self._record_fatal_secondary(primary)
+        return outcome
+
+    def _elect_collective_fatal_outcome(self, candidate):
+        outcome = self._select_fatal_monitor_outcome("fatal_elected", candidate)
+        if outcome.kind != "fatal_elected":
+            raise RuntimeError("clean monitor stop preempted communicator fatal")
+        if outcome.primary is not candidate:
+            self._record_fatal_secondary(candidate)
+        with self._fatal_lock:
+            self._fatal_monitor_outcome = outcome
+            self._fatal_monitor_outcome_confirmed = True
+        self._fatal_monitor_stop.set()
+        return outcome
+
+    def _confirm_runtime_fatal_outcome(self, primary):
+        outcome = self._select_fatal_monitor_outcome("fatal_elected", primary)
+        if outcome.kind != "fatal_elected" or outcome.primary is not primary:
+            raise RuntimeError("clean monitor stop preempted communicator fatal")
+        with self._fatal_lock:
+            self._fatal_monitor_outcome = outcome
+            self._fatal_monitor_outcome_confirmed = True
+        self._fatal_monitor_stop.set()
+        return outcome
+
+    def _select_runtime_fatal_outcome(self, primary):
+        with self._fatal_lock:
+            confirmed = self._fatal_monitor_outcome_confirmed
+            outcome = self._fatal_monitor_outcome
+        if not confirmed:
+            return self._confirm_runtime_fatal_outcome(primary)
+        if outcome.kind != "fatal_elected" or outcome.primary is not primary:
+            raise RuntimeError("clean monitor stop preempted communicator fatal")
+        self._fatal_monitor_stop.set()
+        return outcome
 
     def _wait_for_fatal_monitor_outcome(self, generation):
         try:
@@ -1520,6 +1612,12 @@ class CupyNcclCollective:
             self._wait_for_joined_fatal_publication()
             return outcome
 
+        if gate is not None:
+            selected = gate.select_runtime_close_commit(transition)
+            if selected is not transition:
+                self._wait_for_joined_fatal_publication()
+                return self._fatal_monitor_outcome
+
         close_token = self._admit_runtime_close_step(
             gate, transition, "collective_close"
         )
@@ -1615,19 +1713,33 @@ class CupyNcclCollective:
                     thread = self._fatal_monitor_thread
                     if thread is not None and thread is not threading.current_thread():
                         thread.join(_FATAL_TIMEOUT_S)
-                    backend.stop()
-                    outcome = None
+                    selected = (
+                        transition
+                        if gate is None
+                        else gate.select_runtime_close_commit(transition)
+                    )
+                    if selected is transition:
+                        backend.stop()
+                        outcome = None
+                    else:
+                        self._wait_for_joined_fatal_publication()
+                        outcome = self._fatal_monitor_outcome
             except BaseException:
                 if not self._fatal_control_initialized:
                     with self._fatal_condition:
                         self._closing = False
                         self._fatal_condition.notify_all()
                 raise
-            self._backend = None
-            self._bootstrap_store_proxy = None
-            self._fatal_handler = None
-            self._fatal_monitor_thread = None
-            self._closed = True
+            fatal_retained = self._fatal_error is not None or (
+                outcome is not None and outcome.kind == "fatal_elected"
+            )
+            if not fatal_retained:
+                self._backend = None
+                self._bootstrap_store_proxy = None
+                self._fatal_handler = None
+                self._fatal_transition_handler = None
+                self._fatal_monitor_thread = None
+                self._closed = True
             return outcome
         finally:
             self._release_close_owner()

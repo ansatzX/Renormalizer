@@ -216,6 +216,7 @@ class _TerminalLifecycleGate:
         self._fatal_runtime_finalizer_state = "none"
         self._fatal_runtime_finalizer_owner: int | None = None
         self._runtime_close_transition: _RuntimeCloseTransition | None = None
+        self._runtime_close_commit_selected = False
         self._runtime_close_result = _MISSING
 
     @property
@@ -689,6 +690,14 @@ class _TerminalLifecycleGate:
                 and self._fatal_transition is None
             ):
                 raise RuntimeError("runtime is closed")
+            if (
+                self._runtime_close_commit_selected
+                and self._fatal_transition is None
+            ):
+                if discovering_state is not None:
+                    self._convert_token_state(discovering_state)
+                    self._condition.notify_all()
+                raise RuntimeError("runtime close is committed")
             if self._fatal_transition is None:
                 self._fatal_transition = _FatalTransition(
                     gate_id=self._gate_id,
@@ -835,6 +844,33 @@ class _TerminalLifecycleGate:
                 transition_sequence=transition.sequence,
             )
 
+    def select_runtime_close_commit(self, transition):
+        """Make healthy runtime close irrevocable before destructive close work."""
+        with self._condition:
+            self._require_runtime_transition(transition)
+            if transition.owner_thread_id != threading.get_ident():
+                raise RuntimeError(
+                    "only the elected runtime close owner may select close commit"
+                )
+            if self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+            ):
+                return self._fatal_transition
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                return transition
+            if self._phase is not _TerminalPhase.RUNTIME_CLOSING:
+                raise RuntimeError("runtime is not closing")
+            if self._live_epoch is not None:
+                raise RuntimeError("runtime close commit requires no live lease")
+            if self._has_active_tokens():
+                raise RuntimeError(
+                    "runtime close commit requires zero live admissions"
+                )
+            self._runtime_close_commit_selected = True
+            self._condition.notify_all()
+            return transition
+
     def _commit_fatal_runtime_close(
         self, transition, finalizer, *, may_finalize=True
     ):
@@ -901,6 +937,7 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("runtime close commit requires no live lease")
             if self._has_active_tokens():
                 raise RuntimeError("runtime close commit requires zero live admissions")
+            self._runtime_close_commit_selected = True
             result = finalizer()
             self._phase = _TerminalPhase.RUNTIME_CLOSED
             self._runtime_close_result = result

@@ -691,6 +691,27 @@ def test_fatal_preempts_runtime_close_only_before_commit():
         committed.begin_fatal(RuntimeError("fatal after runtime commit"))
 
 
+def test_runtime_close_commit_selection_is_fatal_linearization_point():
+    gate = _TerminalLifecycleGate()
+    transition = gate.begin_runtime_close(None)
+
+    assert gate.select_runtime_close_commit(transition) is transition
+    assert gate._runtime_close_commit_selected is True
+
+    with pytest.raises(RuntimeError, match="committed"):
+        gate.begin_fatal(RuntimeError("fatal after close selection"))
+    assert gate._fatal_transition is None
+
+    close_step = gate.admit_runtime_close(transition, "selected_collective_close")
+    gate.release(close_step)
+    finalized = []
+    assert gate.commit_runtime_close(
+        transition, lambda: finalized.append("closed")
+    ) is None
+    assert finalized == ["closed"]
+    assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+
+
 def test_pending_runtime_finalizer_precedes_publication_and_published_join_skips_it():
     pending = _TerminalLifecycleGate()
     pending_transition = pending.begin_fatal(RuntimeError("pending fatal"))
