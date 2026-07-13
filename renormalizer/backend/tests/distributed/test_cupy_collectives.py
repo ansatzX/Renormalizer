@@ -1135,8 +1135,8 @@ def test_close_joins_local_fatal_publication_before_clearing_collective(
     monkeypatch.setattr(wrapper, "_request_fatal_monitor_stop", record_stop_request)
     original_select = wrapper._select_fatal_monitor_outcome
 
-    def record_fatal_selection(kind, value):
-        outcome = original_select(kind, value)
+    def record_fatal_selection(kind, value, **kwargs):
+        outcome = original_select(kind, value, **kwargs)
         if kind == "fatal_elected":
             fatal_selected.set()
         return outcome
@@ -1226,6 +1226,107 @@ def test_close_joins_local_fatal_publication_before_clearing_collective(
     assert runtime._closed is True
 
 
+def test_visible_fatal_handoff_has_joinable_pre_reserved_owner(monkeypatch):
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    monitor_before_stop = threading.Event()
+    release_monitor = threading.Event()
+    stop_requested = threading.Event()
+    ordinary_begin_entered = threading.Event()
+    release_ordinary_begin = threading.Event()
+    close_join_entered = threading.Event()
+    close_join_observations = []
+    hard_exits = []
+    owner_name = "task-18.2-pre-reserved-fatal-owner"
+    close_name = "task-18.2-pre-reserved-fatal-close"
+
+    original_observe_stop = wrapper._observe_fatal_monitor_stop
+
+    def pause_before_stop_observation():
+        monitor_before_stop.set()
+        assert release_monitor.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return original_observe_stop()
+
+    monkeypatch.setattr(
+        wrapper, "_observe_fatal_monitor_stop", pause_before_stop_observation
+    )
+    original_request_stop = wrapper._request_fatal_monitor_stop
+
+    def record_stop_request():
+        generation = original_request_stop()
+        stop_requested.set()
+        return generation
+
+    monkeypatch.setattr(wrapper, "_request_fatal_monitor_stop", record_stop_request)
+    original_begin = wrapper._begin_fatal_publication
+
+    def pause_before_ordinary_begin(*args, **kwargs):
+        if threading.current_thread().name == owner_name:
+            ordinary_begin_entered.set()
+            assert release_ordinary_begin.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(wrapper, "_begin_fatal_publication", pause_before_ordinary_begin)
+    original_join = wrapper._wait_for_joined_fatal_publication
+
+    def record_close_join():
+        if threading.current_thread().name == close_name:
+            with wrapper._fatal_condition:
+                close_join_observations.append(
+                    (
+                        wrapper._fatal_publications,
+                        wrapper._fatal_protocol_completed,
+                    )
+                )
+            close_join_entered.set()
+        return original_join()
+
+    monkeypatch.setattr(
+        wrapper, "_wait_for_joined_fatal_publication", record_close_join
+    )
+
+    def hard_exit():
+        hard_exits.append(threading.current_thread().name)
+        raise AssertionError("unexpected communicator hard exit")
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    wrapper._start_fatal_monitor()
+    monitor = wrapper._fatal_monitor_thread
+    assert monitor_before_stop.wait(_TASK_18_2_TIMEOUT_S)
+    closer, close_results, close_errors, close_done = _start_task_18_2_call(
+        runtime.close, name=close_name
+    )
+    owner = None
+    primary = RuntimeError("fatal handoff owns publication before visibility")
+    try:
+        assert stop_requested.wait(_TASK_18_2_TIMEOUT_S)
+        owner, owner_results, owner_errors, owner_done = _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(primary), name=owner_name
+        )
+        assert ordinary_begin_entered.wait(_TASK_18_2_TIMEOUT_S)
+        release_monitor.set()
+        assert close_join_entered.wait(_TASK_18_2_TIMEOUT_S)
+        assert close_join_observations == [(1, False)]
+        assert hard_exits == []
+        assert not close_done.is_set()
+    finally:
+        release_monitor.set()
+        release_ordinary_begin.set()
+        if owner is not None:
+            _join_task_18_2_call(owner, owner_done)
+        _join_task_18_2_call(closer, close_done)
+        if monitor.is_alive():
+            monitor.join(_TASK_18_2_TIMEOUT_S)
+
+    assert owner_errors == []
+    assert owner_results == [primary]
+    assert close_results == []
+    assert close_errors == [primary]
+    assert close_join_observations == [(1, False)]
+    assert hard_exits == []
+    assert wrapper._fatal_publications == 0
+
+
 def test_active_operator_primary_is_canonical_before_collective_publication(
     monkeypatch,
 ):
@@ -1260,8 +1361,8 @@ def test_active_operator_primary_is_canonical_before_collective_publication(
     acknowledgments = []
     original_select = wrapper._select_fatal_monitor_outcome
 
-    def record_selection(kind, value):
-        outcome = original_select(kind, value)
+    def record_selection(kind, value, **kwargs):
+        outcome = original_select(kind, value, **kwargs)
         if kind == "fatal_elected":
             selections.append(
                 (
@@ -1306,6 +1407,93 @@ def test_active_operator_primary_is_canonical_before_collective_publication(
     assert backend._execution_terminal_error is earlier
     assert acknowledgments == [(earlier,) * 6]
     assert call.secondary_errors == [later]
+    assert wrapper._fatal_secondary_errors == (later,)
+
+
+def test_preexisting_backend_poison_is_canonical_for_fatal_publication(
+    monkeypatch,
+):
+    runtime, wrapper, backend, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    earlier = RuntimeError("preexisting backend terminal poison")
+    later = RuntimeError("later communicator failure")
+    backend._execution_terminal_error = earlier
+
+    result = runtime._enter_communicator_fatal(later)
+    snapshot = runtime._terminal_gate.wait_for_published(_TASK_18_2_TIMEOUT_S)
+
+    assert result is earlier
+    assert snapshot is earlier
+    assert runtime._terminal_gate._fatal_transition.primary is earlier
+    assert wrapper._fatal_pending_primary is earlier
+    assert wrapper._fatal_error is earlier
+    assert runtime._terminal_error is earlier
+    assert backend._execution_terminal_error is earlier
+    assert runtime._terminal_quarantine.first_error is earlier
+    assert wrapper._fatal_secondary_errors == (later,)
+
+
+def test_quarantine_after_election_cannot_replace_canonical_primary(monkeypatch):
+    from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
+
+    runtime, wrapper, backend, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("elected communicator primary")
+    later = RuntimeError("late concurrent quarantine failure")
+    drain_entered = threading.Event()
+    release_drain = threading.Event()
+    original_wait = gate.wait_for_admissions
+
+    def pause_after_election(transition, timeout_s):
+        assert transition.primary is primary
+        drain_entered.set()
+        assert release_drain.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return original_wait(transition, timeout_s)
+
+    monkeypatch.setattr(gate, "wait_for_admissions", pause_after_election)
+    owner = AsyncResourceOwner("late-quarantine")
+    owner.mark_enqueued()
+    owner.force_quarantine(later)
+    publisher, results, errors, done = _start_task_18_2_call(
+        lambda: runtime._enter_communicator_fatal(primary),
+        name="task-18.2-canonical-publication-owner",
+    )
+    quarantine = None
+    try:
+        assert drain_entered.wait(_TASK_18_2_TIMEOUT_S)
+        quarantine, quarantine_results, quarantine_errors, quarantine_done = (
+            _start_task_18_2_call(
+                lambda: runtime._accept_async_quarantine(owner, later),
+                name="task-18.2-late-quarantine-writer",
+            )
+        )
+        _join_task_18_2_call(quarantine, quarantine_done)
+        pending_identities = (
+            gate._fatal_transition.primary,
+            wrapper._fatal_pending_primary,
+            runtime._terminal_error,
+            backend._execution_terminal_error,
+            runtime._terminal_quarantine.first_error,
+        )
+    finally:
+        release_drain.set()
+        _join_task_18_2_call(publisher, done)
+        if quarantine is not None and quarantine.is_alive():
+            _join_task_18_2_call(quarantine, quarantine_done)
+
+    snapshot = gate.wait_for_published(_TASK_18_2_TIMEOUT_S)
+    assert quarantine_errors == []
+    assert quarantine_results == [None]
+    assert all(value is primary for value in pending_identities)
+    assert errors == []
+    assert results == [primary]
+    assert snapshot is primary
+    assert gate._fatal_transition.primary is primary
+    assert wrapper._fatal_pending_primary is primary
+    assert wrapper._fatal_error is primary
+    assert runtime._terminal_error is primary
+    assert backend._execution_terminal_error is primary
+    assert runtime._terminal_quarantine.first_error is primary
+    assert runtime._terminal_quarantine.owners == (owner,)
     assert wrapper._fatal_secondary_errors == (later,)
 
 
@@ -1646,8 +1834,8 @@ def _install_task_18_2_monitor_barriers(monkeypatch, wrapper):
         wrapper, "_select_fatal_monitor_outcome", lambda kind, value: None
     )
 
-    def select_outcome(kind, value):
-        outcome = original_select(kind, value)
+    def select_outcome(kind, value, **kwargs):
+        outcome = original_select(kind, value, **kwargs)
         selected.append(outcome)
         outcome_selected.set()
         assert release_outcome.wait(_TASK_18_2_TIMEOUT_S)
@@ -1710,8 +1898,8 @@ def test_local_fatal_waits_for_delayed_monitor_exit_before_publication(
     )
     original_select = wrapper._select_fatal_monitor_outcome
 
-    def select_outcome(kind, value):
-        outcome = original_select(kind, value)
+    def select_outcome(kind, value, **kwargs):
+        outcome = original_select(kind, value, **kwargs)
         if threading.current_thread().name == "task-18.2-delayed-monitor-owner":
             outcome_selected.set()
             assert release_selection.wait(_TASK_18_2_TIMEOUT_S * 2)
@@ -1831,8 +2019,8 @@ def test_close_ready_fatal_joins_monitor_before_publication_and_prevents_late_st
     monkeypatch.setattr(wrapper, "_read_fatal_origin", read_fatal_origin)
     original_select = wrapper._select_fatal_monitor_outcome
 
-    def select_outcome(kind, value):
-        outcome = original_select(kind, value)
+    def select_outcome(kind, value, **kwargs):
+        outcome = original_select(kind, value, **kwargs)
         selected_outcomes.append(outcome)
         outcome_selected.set()
         return outcome
@@ -2202,8 +2390,8 @@ def test_close_ready_cannot_overtake_unpolled_nonzero_fatal(monkeypatch):
     )
     original_select_outcome = wrappers[0]._select_fatal_monitor_outcome
 
-    def record_outcome_selection(kind, value):
-        outcome = original_select_outcome(kind, value)
+    def record_outcome_selection(kind, value, **kwargs):
+        outcome = original_select_outcome(kind, value, **kwargs)
         if outcome.kind == "fatal_elected":
             rank_zero_outcome_selected.set()
         return outcome
@@ -3099,9 +3287,9 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
     monitor_observed = threading.Event()
     release_monitor = threading.Event()
     worker_admitted = threading.Event()
-    direct_selected = threading.Event()
+    direct_owner_reserved = threading.Event()
     direct_live = threading.Event()
-    release_direct = threading.Event()
+    release_direct_owner = threading.Event()
     original_enter = wrappers[1]._enter_observed_fatal
 
     def pause_monitor(error, origin_rank, **kwargs):
@@ -3111,12 +3299,18 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
 
     monkeypatch.setattr(wrappers[1], "_enter_observed_fatal", pause_monitor)
     admissions = []
+    direct_begins = []
     original_begin = wrappers[1]._begin_fatal_publication
     monitor = None
 
     def record_begin(*args, **kwargs):
         result = original_begin(*args, **kwargs)
-        if threading.current_thread().name == "renormalizer-fatal-publisher-rank-1":
+        thread_name = threading.current_thread().name
+        if thread_name == "task-18.2-direct-publisher":
+            direct_begins.append(
+                (result[2], result[3], result[4], wrappers[1]._fatal_publications)
+            )
+        elif thread_name == "renormalizer-fatal-publisher-rank-1":
             admissions.append(
                 (
                     result[2],
@@ -3129,16 +3323,19 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
         return result
 
     monkeypatch.setattr(wrappers[1], "_begin_fatal_publication", record_begin)
-    original_select = wrappers[1]._select_fatal_monitor_outcome
+    original_prepare = wrappers[1]._prepare_local_fatal_locked
 
-    def record_selection(kind, value):
-        outcome = original_select(kind, value)
+    def hold_observable_direct_owner():
         if threading.current_thread().name == "task-18.2-direct-publisher":
-            direct_selected.set()
-        return outcome
+            reservation = wrappers[1]._fatal_publication_local.reservation
+            assert reservation.started is True
+            assert direct_begins == [(True, False, False, 1)]
+            direct_owner_reserved.set()
+            assert release_direct_owner.wait(3.0)
+        return original_prepare()
 
     monkeypatch.setattr(
-        wrappers[1], "_select_fatal_monitor_outcome", record_selection
+        wrappers[1], "_prepare_local_fatal_locked", hold_observable_direct_owner
     )
 
     control_writes = [[], []]
@@ -3178,7 +3375,6 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
             with wrappers[1]._communicator_fatal_reservation(primary) as reservation:
                 assert reservation.primary is primary
                 direct_live.set()
-                assert release_direct.wait(3.0)
         except BaseException as error:
             direct_errors.append(error)
 
@@ -3197,7 +3393,7 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
         monitor.start()
         assert monitor_observed.wait(3.0)
         publisher.start()
-        assert direct_selected.wait(3.0)
+        assert direct_owner_reserved.wait(3.0)
         assert wrappers[1]._fatal_publications == 1
 
         release_monitor.set()
@@ -3206,15 +3402,15 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
         peak_publications = wrappers[1]._fatal_publications
         monitor.join(3.0)
         assert not monitor.is_alive()
-        assert direct_live.wait(3.0)
 
-        release_direct.set()
+        release_direct_owner.set()
+        assert direct_live.wait(3.0)
         publisher.join(5.0)
         worker.join(5.0)
         monitor.join(5.0)
     finally:
         release_monitor.set()
-        release_direct.set()
+        release_direct_owner.set()
         if publisher.ident is not None:
             publisher.join(5.0)
         if monitor.ident is not None:
@@ -3223,6 +3419,7 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
         if worker is not None and worker.ident is not None:
             worker.join(5.0)
 
+    assert direct_begins == [(True, False, False, 1)]
     assert admissions == [(False, True, False, 1)]
     assert peak_publications == 1
     assert not publisher.is_alive()

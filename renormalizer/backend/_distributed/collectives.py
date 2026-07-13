@@ -74,6 +74,15 @@ class _FatalPublicationReservation:
         self.completion = None
 
 
+class _FatalPublicationOwnerReservation:
+    __slots__ = ("primary", "owner_thread_id", "installed")
+
+    def __init__(self, primary, owner_thread_id, installed):
+        self.primary = primary
+        self.owner_thread_id = owner_thread_id
+        self.installed = installed
+
+
 def _validate_reduction_op(op):
     if op not in _REDUCTION_OPS:
         raise ValueError("unsupported reduction op {!r}".format(op))
@@ -242,6 +251,7 @@ class CupyNcclCollective:
         self._fatal_publication_local = threading.local()
         self._admitted_operations = 0
         self._fatal_publications = 0
+        self._fatal_publication_owner_reservation = None
         self._closing = False
         self._fatal_pending_primary = None
         self._fatal_pending_origin_rank = None
@@ -380,6 +390,28 @@ class CupyNcclCollective:
                 self._fatal_pending_origin_rank = origin_rank
             return self._fatal_pending_primary, installed
 
+    def _pre_reserve_fatal_publication(self, error, origin_rank=None):
+        """Install one joinable owner before exposing fatal monitor selection."""
+        if not isinstance(error, BaseException):
+            raise TypeError("communicator fatal failure must be an exception")
+        with self._fatal_condition:
+            if self._fatal_protocol_completed:
+                return self._fatal_pending_primary, False
+            if self._fatal_publications > 0:
+                return self._fatal_pending_primary, False
+            if self._closed:
+                raise RuntimeError("collective is closed")
+            primary, installed = self._install_fatal(error, origin_rank)
+            self._fatal_publications += 1
+            self._fatal_publication_owner_reservation = (
+                _FatalPublicationOwnerReservation(
+                    primary,
+                    threading.get_ident(),
+                    installed,
+                )
+            )
+            return primary, True
+
     def _begin_fatal_publication(
         self,
         error,
@@ -392,6 +424,23 @@ class CupyNcclCollective:
         if not isinstance(error, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
         with self._fatal_condition:
+            owner_reservation = self._fatal_publication_owner_reservation
+            if (
+                owner_reservation is not None
+                and owner_reservation.owner_thread_id == threading.get_ident()
+            ):
+                if owner_reservation.primary is not error:
+                    raise RuntimeError("communicator fatal primary changed")
+                if self._fatal_pending_origin_rank is None:
+                    self._fatal_pending_origin_rank = origin_rank
+                self._fatal_publication_owner_reservation = None
+                return (
+                    owner_reservation.primary,
+                    owner_reservation.installed,
+                    True,
+                    False,
+                    False,
+                )
             if self._fatal_protocol_completed:
                 return (
                     self._fatal_pending_primary,
@@ -530,7 +579,7 @@ class CupyNcclCollective:
             ):
                 raise RuntimeError("communicator fatal handoff was not reserved")
         else:
-            outcome = self._elect_collective_fatal_outcome(error)
+            outcome = self._elect_collective_fatal_outcome(error, origin_rank)
             primary = outcome.primary
         primary, installed, started, joined, monitor_deferred = (
             self._begin_fatal_publication(
@@ -945,27 +994,61 @@ class CupyNcclCollective:
         self._fatal_monitor_stop.set()
         return generation
 
-    def _select_fatal_monitor_outcome(self, kind, value):
+    def _select_fatal_monitor_outcome(
+        self, kind, value, *, before_select=None
+    ):
         if kind == "fatal_elected":
-            return self._fatal_monitor_handoff.select_fatal(value)
+            return self._fatal_monitor_handoff.select_fatal(
+                value, before_select=before_select
+            )
         if kind == "stopped_clean":
+            if before_select is not None:
+                raise ValueError("clean monitor outcome cannot prepare fatal state")
             return self._fatal_monitor_handoff.select_clean(value)
         raise ValueError("fatal monitor outcome is invalid")
 
-    def _reserve_runtime_fatal_outcome(self, primary):
-        outcome = self._fatal_monitor_handoff.select_fatal(primary)
+    def _reserve_runtime_fatal_outcome(self, primary, *, before_select=None):
+        outcome = self._fatal_monitor_handoff.select_fatal(
+            primary, before_select=before_select
+        )
         if outcome.kind != "fatal_elected":
             raise RuntimeError("clean monitor stop preempted communicator fatal")
         if outcome.primary is not primary:
             self._record_fatal_secondary(primary)
         return outcome
 
-    def _elect_collective_fatal_outcome(self, candidate):
-        outcome = self._select_fatal_monitor_outcome("fatal_elected", candidate)
+    def _elect_collective_fatal_outcome(self, candidate, origin_rank):
+        with self._fatal_lock:
+            primary = (
+                candidate
+                if self._fatal_pending_primary is None
+                else self._fatal_pending_primary
+            )
+        if primary is not candidate:
+            self._record_fatal_secondary(candidate)
+
+        def pre_reserve_owner():
+            reserved, started = self._pre_reserve_fatal_publication(
+                primary, origin_rank
+            )
+            if reserved is not primary:
+                raise RuntimeError("communicator fatal primary changed")
+            if not started:
+                with self._fatal_lock:
+                    if self._fatal_publications <= 0:
+                        raise RuntimeError(
+                            "communicator fatal publication is not joinable"
+                        )
+
+        outcome = self._select_fatal_monitor_outcome(
+            "fatal_elected",
+            primary,
+            before_select=pre_reserve_owner,
+        )
         if outcome.kind != "fatal_elected":
             raise RuntimeError("clean monitor stop preempted communicator fatal")
-        if outcome.primary is not candidate:
-            self._record_fatal_secondary(candidate)
+        if outcome.primary is not primary:
+            self._record_fatal_secondary(primary)
         with self._fatal_lock:
             self._fatal_monitor_outcome = outcome
             self._fatal_monitor_outcome_confirmed = True

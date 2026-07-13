@@ -1013,6 +1013,37 @@ def test_fatal_monitor_handoff_requires_distinct_exit_acknowledgment():
     assert handoff.wait_for_exit(outcome, _TIMEOUT_S) is outcome
 
 
+def test_fatal_monitor_handoff_hides_selection_until_reservation_is_joinable():
+    handoff = _FatalMonitorHandoff()
+    primary = RuntimeError("fatal selection waits for reservation")
+    prepare_entered = threading.Event()
+    release_prepare = threading.Event()
+    prepared = []
+
+    def prepare():
+        assert handoff._outcome is None
+        prepared.append(primary)
+        prepare_entered.set()
+        assert release_prepare.wait(_TIMEOUT_S)
+
+    selector, results, errors, done = _start(
+        lambda: handoff.select_fatal(primary, before_select=prepare)
+    )
+    try:
+        assert prepare_entered.wait(_TIMEOUT_S)
+        assert handoff._outcome is None
+        assert prepared == [primary]
+    finally:
+        release_prepare.set()
+        _join(selector, done)
+
+    assert errors == []
+    assert len(results) == 1
+    assert results[0].kind == "fatal_elected"
+    assert results[0].primary is primary
+    assert handoff.observe_outcome() is results[0]
+
+
 def test_close_during_pending_joins_publication():
     gate = _TerminalLifecycleGate()
     primary = RuntimeError("pending fatal")

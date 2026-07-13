@@ -117,6 +117,9 @@ class CupyDistributedRuntime:
         default_factory=RuntimeTerminalQuarantine, init=False, repr=False
     )
     _terminal_error: object = field(default=None, init=False, repr=False)
+    _terminal_secondary_errors: tuple = field(
+        default_factory=tuple, init=False, repr=False
+    )
     _terminal_gate: _TerminalLifecycleGate = field(
         default_factory=_TerminalLifecycleGate, init=False, repr=False
     )
@@ -147,24 +150,63 @@ class CupyDistributedRuntime:
         return self._terminal_error is not None
 
     def _require_usable(self):
-        if self._closed:
-            raise RuntimeError("distributed runtime is closed")
-        backend_error = getattr(self.backend, "_execution_terminal_error", None)
-        if self._terminal_error is None and backend_error is not None:
-            self._terminal_error = backend_error
-        if self._terminal_error is not None:
+        primary = None
+        with self._terminal_gate._condition:
+            if self._closed:
+                raise RuntimeError("distributed runtime is closed")
+            transition = self._terminal_gate._fatal_transition
+            if transition is not None and self._terminal_gate._phase in (
+                _TerminalPhase.FATAL_PUBLISHED,
+                _TerminalPhase.RUNTIME_CLOSED,
+            ):
+                primary = transition.primary
+            else:
+                with self._terminal_state_lock:
+                    backend_error = getattr(
+                        self.backend, "_execution_terminal_error", None
+                    )
+                    candidate = (
+                        self._terminal_error
+                        if self._terminal_error is not None
+                        else backend_error
+                    )
+                    if isinstance(candidate, BaseException):
+                        primary, provider, lease, owner = (
+                            self._normalize_communicator_fatal(candidate, None)
+                        )
+                        self._force_terminal_primary_locked(
+                            primary,
+                            provider=provider,
+                            lease=lease,
+                            owner=owner,
+                        )
+        if primary is not None:
             raise RuntimeError(
                 "distributed runtime is terminal-poisoned"
-            ) from self._terminal_error
+            ) from primary
 
     def _accept_async_quarantine(self, owner, primary=None):
         error = owner.error if primary is None else primary
-        self._terminal_quarantine.retain(owner, error)
-        if self._terminal_error is None:
-            self._terminal_error = error
-        backend = self.backend
-        if getattr(backend, "_execution_terminal_error", None) is None:
-            backend._execution_terminal_error = error
+        if not isinstance(error, BaseException):
+            raise TypeError("async quarantine failure must be an exception")
+        with self._terminal_gate._condition:
+            transition = self._terminal_gate._fatal_transition
+            if transition is not None and self._terminal_gate._phase in (
+                _TerminalPhase.FATAL_PUBLISHED,
+                _TerminalPhase.RUNTIME_CLOSED,
+            ):
+                return
+            with self._terminal_state_lock:
+                canonical, provider, lease, owner = (
+                    self._normalize_communicator_fatal(error, owner)
+                )
+                self._force_terminal_primary_locked(
+                    canonical,
+                    provider=provider,
+                    lease=lease,
+                    owner=owner,
+                    retain_owner=True,
+                )
 
     def _arm_communicator_fatal(self):
         install = getattr(self.collective, "_install_fatal_handler", None)
@@ -189,34 +231,135 @@ class CupyDistributedRuntime:
                 primary = reservation.primary
             yield primary, reservation
 
+    def _remember_terminal_secondary_locked(self, error, primary, owner=None):
+        if not isinstance(error, BaseException):
+            return
+        if error is primary:
+            return
+        if not any(
+            retained is error for retained in self._terminal_secondary_errors
+        ):
+            self._terminal_secondary_errors = (
+                *self._terminal_secondary_errors,
+                error,
+            )
+        call = None if owner is None else getattr(owner, "_operator_call", None)
+        record_secondary = (
+            None if call is None else getattr(call, "record_secondary", None)
+        )
+        if callable(record_secondary):
+            record_secondary(error)
+        elif owner is not None:
+            remember_secondary = getattr(owner, "_remember_secondary", None)
+            if callable(remember_secondary):
+                remember_secondary(error)
+        collective = self._pending_fatal_collective
+        if collective is None:
+            collective = self.collective
+        record_collective = (
+            None
+            if collective is None
+            else getattr(collective, "_record_fatal_secondary", None)
+        )
+        if callable(record_collective):
+            record_collective(error)
+
     def _normalize_communicator_fatal(self, primary, owner):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
         discovered = primary
         provider = self._active_provider
-        lease = None if provider is None else provider._active_lease
+        lease = (
+            None
+            if provider is None
+            else getattr(provider, "_active_lease", None)
+        )
         if owner is None and lease is not None:
-            owner = lease._active_operator_owner
+            owner = getattr(lease, "_active_operator_owner", None)
             if owner is None:
-                status_workspace = lease._status_workspace
+                status_workspace = getattr(lease, "_status_workspace", None)
                 if status_workspace is not None:
                     owner = status_workspace.borrower
         call = None if owner is None else getattr(owner, "_operator_call", None)
-        if self._terminal_error is not None:
-            primary = self._terminal_error
-        elif call is not None and call.primary_error is not None:
-            primary = call.primary_error
-        if discovered is not primary:
-            record_secondary = (
-                None if call is None else getattr(call, "record_secondary", None)
+        backend = self.backend
+        transition = self._terminal_gate._fatal_transition
+        candidates = (
+            self._terminal_error,
+            None
+            if backend is None
+            else getattr(backend, "_execution_terminal_error", None),
+            self._terminal_quarantine.first_error,
+            None
+            if provider is None
+            else getattr(provider, "_terminal_error", None),
+            None if lease is None else getattr(lease, "_poisoned_error", None),
+            None if call is None else call.primary_error,
+            discovered,
+        )
+        if transition is not None:
+            primary = transition.primary
+        else:
+            primary = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if isinstance(candidate, BaseException)
+                ),
+                discovered,
             )
-            if callable(record_secondary):
-                record_secondary(discovered)
-            elif owner is not None:
-                remember_secondary = getattr(owner, "_remember_secondary", None)
-                if callable(remember_secondary):
-                    remember_secondary(discovered)
+        for candidate in candidates:
+            self._remember_terminal_secondary_locked(candidate, primary, owner)
         return primary, provider, lease, owner
+
+    def _force_terminal_primary_locked(
+        self,
+        primary,
+        *,
+        provider=None,
+        lease=None,
+        owner=None,
+        retain_owner=False,
+    ):
+        if not isinstance(primary, BaseException):
+            raise TypeError("terminal primary must be an exception")
+        transition = self._terminal_gate._fatal_transition
+        if transition is not None and self._terminal_gate._phase in (
+            _TerminalPhase.FATAL_PUBLISHED,
+            _TerminalPhase.RUNTIME_CLOSED,
+        ):
+            return transition.primary
+        if transition is not None and transition.primary is not primary:
+            self._remember_terminal_secondary_locked(primary, transition.primary, owner)
+            primary = transition.primary
+        backend = self.backend
+        existing = (
+            self._terminal_error,
+            None
+            if backend is None
+            else getattr(backend, "_execution_terminal_error", None),
+            self._terminal_quarantine.first_error,
+            None
+            if provider is None
+            else getattr(provider, "_terminal_error", None),
+            None if lease is None else getattr(lease, "_poisoned_error", None),
+        )
+        for error in existing:
+            self._remember_terminal_secondary_locked(error, primary, owner)
+        self._terminal_quarantine.first_error = primary
+        self._terminal_quarantine.retain_error(primary)
+        if retain_owner and owner is not None:
+            self._terminal_quarantine.retain(owner, primary)
+        self._terminal_error = primary
+        if backend is not None and (
+            hasattr(backend, "_execution_terminal_error")
+            or hasattr(backend, "__dict__")
+        ):
+            backend._execution_terminal_error = primary
+        if provider is not None:
+            provider._terminal_error = primary
+        if lease is not None:
+            lease._poisoned_error = primary
+        return primary
 
     def _begin_communicator_fatal(
         self, primary, *, owner=None, discovering_token=None
@@ -237,26 +380,6 @@ class CupyDistributedRuntime:
                 primary, provider, lease, owner = (
                     self._normalize_communicator_fatal(primary, owner)
                 )
-                if transition is not None and transition.primary is not primary:
-                    call = (
-                        None
-                        if owner is None
-                        else getattr(owner, "_operator_call", None)
-                    )
-                    record_secondary = (
-                        None
-                        if call is None
-                        else getattr(call, "record_secondary", None)
-                    )
-                    if callable(record_secondary):
-                        record_secondary(primary)
-                    elif owner is not None:
-                        remember_secondary = getattr(
-                            owner, "_remember_secondary", None
-                        )
-                        if callable(remember_secondary):
-                            remember_secondary(primary)
-                    primary = transition.primary
                 collective = self._pending_fatal_collective
                 if collective is None:
                     collective = self.collective
@@ -272,28 +395,67 @@ class CupyDistributedRuntime:
                 reserve_outcome = getattr(
                     collective, "_reserve_runtime_fatal_outcome", None
                 )
+                elected_here = False
+
+                def retain_fatal_context():
+                    if self._pending_fatal_collective is None:
+                        self._pending_fatal_collective = collective
+                    if self._pending_fatal_context is None:
+                        self._pending_fatal_context = (provider, lease, owner)
+                    elif (
+                        owner is not None
+                        and self._pending_fatal_context[2] is None
+                    ):
+                        retained_provider, retained_lease, _ = (
+                            self._pending_fatal_context
+                        )
+                        self._pending_fatal_context = (
+                            retained_provider,
+                            retained_lease,
+                            owner,
+                        )
+
                 if callable(reserve_outcome):
                     if discovering_token is not None:
                         gate._convertible_token_state(discovering_token)
-                    outcome = reserve_outcome(primary)
+                    pre_reserve = getattr(
+                        collective, "_pre_reserve_fatal_publication", None
+                    )
+                    if not callable(pre_reserve):
+                        raise RuntimeError(
+                            "collective cannot pre-reserve fatal publication"
+                        )
+
+                    def elect_joinable_fatal():
+                        nonlocal elected_here, transition
+                        reserved_primary, started = pre_reserve(primary)
+                        if reserved_primary is not primary or not started:
+                            raise RuntimeError(
+                                "communicator fatal owner was not reserved"
+                            )
+                        transition = gate.begin_fatal(
+                            primary, discovering_token
+                        )
+                        if transition.primary is not primary:
+                            raise RuntimeError(
+                                "communicator fatal primary changed"
+                            )
+                        elected_here = True
+                        retain_fatal_context()
+
+                    outcome = reserve_outcome(
+                        primary, before_select=elect_joinable_fatal
+                    )
                     if outcome.primary is not primary:
+                        self._remember_terminal_secondary_locked(
+                            primary, outcome.primary, owner
+                        )
                         primary = outcome.primary
-                transition = gate.begin_fatal(primary, discovering_token)
+                if not elected_here:
+                    transition = gate.begin_fatal(primary, discovering_token)
                 if transition.primary is not primary:
                     raise RuntimeError("communicator fatal primary changed")
-                if self._pending_fatal_collective is None:
-                    self._pending_fatal_collective = collective
-                if self._pending_fatal_context is None:
-                    self._pending_fatal_context = (provider, lease, owner)
-                elif owner is not None and self._pending_fatal_context[2] is None:
-                    retained_provider, retained_lease, _ = (
-                        self._pending_fatal_context
-                    )
-                    self._pending_fatal_context = (
-                        retained_provider,
-                        retained_lease,
-                        owner,
-                    )
+                retain_fatal_context()
                 return transition
 
     def _publish_communicator_fatal_transition(self, transition):
@@ -313,21 +475,19 @@ class CupyDistributedRuntime:
             if owner is not None:
                 if owner.state not in {"detached", "quarantined"}:
                     owner.force_quarantine(primary)
-                if owner.state == "quarantined":
-                    self._terminal_quarantine.retain(owner, primary)
-            self._terminal_quarantine.retain_error(primary)
-            with self._terminal_state_lock:
-                if self._terminal_error is None:
-                    self._terminal_error = primary
-                primary = self._terminal_error
-                if provider is not None:
-                    if provider._terminal_error is None:
-                        provider._terminal_error = primary
-                    if lease is not None and lease._poisoned_error is None:
-                        lease._poisoned_error = primary
-                backend = self.backend
-                if getattr(backend, "_execution_terminal_error", None) is None:
-                    backend._execution_terminal_error = primary
+            with self._terminal_gate._condition:
+                if self._terminal_gate._fatal_transition is not transition:
+                    raise RuntimeError("communicator fatal transition changed")
+                with self._terminal_state_lock:
+                    primary = self._force_terminal_primary_locked(
+                        transition.primary,
+                        provider=provider,
+                        lease=lease,
+                        owner=owner,
+                        retain_owner=(
+                            owner is not None and owner.state == "quarantined"
+                        ),
+                    )
         except BaseException as error:
             if owner is not None:
                 owner._remember_secondary(error)
@@ -931,14 +1091,35 @@ class CupyDistributedRuntime:
         mark_closed=True,
         clear_collective=True,
     ):
-        self._issued_receipts.clear()
-        self._active_provider = None
-        if clear_collective:
-            self.collective = None
-        if mark_closed:
-            self._closed = True
-        if publish_error and self._terminal_error is None:
-            self._terminal_error = error
+        with self._terminal_gate._condition:
+            with self._terminal_state_lock:
+                transition = self._terminal_gate._fatal_transition
+                fatal_is_public = (
+                    transition is not None
+                    and self._terminal_gate._phase
+                    in (
+                        _TerminalPhase.FATAL_PUBLISHED,
+                        _TerminalPhase.RUNTIME_CLOSED,
+                    )
+                )
+                if fatal_is_public:
+                    error = transition.primary
+                elif publish_error and isinstance(error, BaseException):
+                    error, provider, lease, owner = (
+                        self._normalize_communicator_fatal(error, None)
+                    )
+                    error = self._force_terminal_primary_locked(
+                        error,
+                        provider=provider,
+                        lease=lease,
+                        owner=owner,
+                    )
+                self._issued_receipts.clear()
+                self._active_provider = None
+                if clear_collective:
+                    self.collective = None
+                if mark_closed:
+                    self._closed = True
         return error
 
     def _release_runtime_close_step(self, token):

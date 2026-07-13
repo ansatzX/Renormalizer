@@ -101,11 +101,17 @@ class _FatalMonitorHandoff:
                 return self._outcome, None
             return None, read()
 
-    def select_fatal(self, primary: BaseException) -> _MonitorOutcome:
+    def select_fatal(
+        self, primary: BaseException, *, before_select=None
+    ) -> _MonitorOutcome:
         if not isinstance(primary, BaseException):
             raise TypeError("monitor fatal primary must be an exception")
+        if before_select is not None and not callable(before_select):
+            raise TypeError("monitor fatal preparation must be callable")
         with self._condition:
             if self._outcome is None:
+                if before_select is not None:
+                    before_select()
                 self._outcome = _MonitorOutcome(
                     kind="fatal_elected", primary=primary
                 )
