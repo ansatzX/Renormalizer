@@ -300,6 +300,7 @@ class CupyNcclCollective:
         self._fatal_publication_failure = None
         self._fatal_publication_gate_failure_state = _FATAL_GATE_FAILURE_IDLE
         self._fatal_publication_gate_failure_owner = None
+        self._fatal_publication_gate_failure_deadline = None
         self._fatal_publication_owner_reservation = None
         self._closing = False
         self._fatal_pending_primary = None
@@ -919,6 +920,159 @@ class CupyNcclCollective:
                 reservation.transition_published = True
         return reservation.snapshot
 
+    @staticmethod
+    def _invoke_fatal_gate_failure_callback(
+        failure_handler, transition, primary
+    ):
+        return failure_handler(transition, primary)
+
+    @staticmethod
+    def _verify_fatal_gate_failure_callback(
+        failure_confirmed, transition, primary
+    ):
+        return bool(failure_confirmed(transition, primary))
+
+    def _repair_fatal_gate_failure_claim(self, claim_owner, confirmed):
+        with self._fatal_condition:
+            state = self._fatal_publication_gate_failure_state
+            owner = self._fatal_publication_gate_failure_owner
+            if state == _FATAL_GATE_FAILURE_SIGNALED:
+                self._fatal_publication_gate_failure_owner = None
+                self._fatal_publication_gate_failure_deadline = None
+                self._fatal_condition.notify_all()
+                return True
+            if (
+                state == _FATAL_GATE_FAILURE_INFLIGHT
+                and owner is claim_owner
+            ):
+                self._fatal_publication_gate_failure_state = (
+                    _FATAL_GATE_FAILURE_SIGNALED
+                    if confirmed
+                    else _FATAL_GATE_FAILURE_IDLE
+                )
+                self._fatal_publication_gate_failure_owner = None
+                self._fatal_publication_gate_failure_deadline = None
+                self._fatal_condition.notify_all()
+                return confirmed
+            if state == _FATAL_GATE_FAILURE_IDLE and (
+                owner is None or owner is claim_owner
+            ):
+                self._fatal_publication_gate_failure_owner = None
+                self._fatal_publication_gate_failure_deadline = None
+                self._fatal_condition.notify_all()
+                return False
+            return False
+
+    def _settle_fatal_gate_failure_claim(self, claim_owner, confirmed):
+        return self._repair_fatal_gate_failure_claim(claim_owner, confirmed)
+
+    def _signal_reserved_fatal_gate_failure(
+        self,
+        primary,
+        transition,
+        failure_handler,
+        failure_confirmed,
+    ):
+        current_thread = threading.current_thread()
+        protocol_deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        signal_errors = []
+        attempts = 0
+        while attempts < 2:
+            claim_owned = False
+            confirmed = False
+            reentrant = False
+            try:
+                with self._fatal_condition:
+                    while True:
+                        state = self._fatal_publication_gate_failure_state
+                        if state == _FATAL_GATE_FAILURE_SIGNALED:
+                            return True, signal_errors
+                        if state == _FATAL_GATE_FAILURE_INFLIGHT:
+                            owner = self._fatal_publication_gate_failure_owner
+                            if owner is current_thread:
+                                reentrant = True
+                                break
+                            claim_deadline = (
+                                self._fatal_publication_gate_failure_deadline
+                            )
+                            now = time.monotonic()
+                            departed = owner is None or not owner.is_alive()
+                            expired = (
+                                claim_deadline is None
+                                or now >= claim_deadline
+                                or now >= protocol_deadline
+                            )
+                            if departed or expired:
+                                self._fatal_publication_gate_failure_state = (
+                                    _FATAL_GATE_FAILURE_IDLE
+                                )
+                                self._fatal_publication_gate_failure_owner = None
+                                self._fatal_publication_gate_failure_deadline = None
+                                self._fatal_condition.notify_all()
+                                continue
+                            remaining = min(
+                                claim_deadline, protocol_deadline
+                            ) - now
+                            self._fatal_condition.wait(remaining)
+                            continue
+                        if state != _FATAL_GATE_FAILURE_IDLE:
+                            signal_errors.append(
+                                RuntimeError(
+                                    "communicator gate failure signal state is invalid"
+                                )
+                            )
+                            return False, signal_errors
+                        claim_owned = True
+                        self._fatal_publication_gate_failure_state = (
+                            _FATAL_GATE_FAILURE_INFLIGHT
+                        )
+                        self._fatal_publication_gate_failure_owner = current_thread
+                        self._fatal_publication_gate_failure_deadline = (
+                            protocol_deadline
+                        )
+                        break
+                if reentrant:
+                    return False, signal_errors
+                attempts += 1
+                try:
+                    self._invoke_fatal_gate_failure_callback(
+                        failure_handler, transition, primary
+                    )
+                except BaseException as error:
+                    signal_errors.append(error)
+                try:
+                    confirmed = self._verify_fatal_gate_failure_callback(
+                        failure_confirmed, transition, primary
+                    )
+                except BaseException as error:
+                    signal_errors.append(error)
+            finally:
+                if claim_owned:
+                    if not confirmed:
+                        try:
+                            confirmed = (
+                                self._verify_fatal_gate_failure_callback(
+                                    failure_confirmed, transition, primary
+                                )
+                            )
+                        except BaseException as error:
+                            signal_errors.append(error)
+                    try:
+                        self._settle_fatal_gate_failure_claim(
+                            current_thread, confirmed
+                        )
+                    except BaseException as error:
+                        signal_errors.append(error)
+                        try:
+                            self._repair_fatal_gate_failure_claim(
+                                current_thread, confirmed
+                            )
+                        except BaseException as repair_error:
+                            signal_errors.append(repair_error)
+            if confirmed:
+                return True, signal_errors
+        return False, signal_errors
+
     def _fail_reserved_fatal_publication(
         self,
         error,
@@ -963,66 +1117,27 @@ class CupyNcclCollective:
                     "communicator fatal publication failure changed"
                 )
             self._fatal_condition.notify_all()
-        signal_errors = []
         signal_gate = transition is not None and callable(failure_handler)
-        while signal_gate:
-            with self._fatal_condition:
-                signal_state = self._fatal_publication_gate_failure_state
-                if signal_state == _FATAL_GATE_FAILURE_SIGNALED:
-                    break
-                if signal_state == _FATAL_GATE_FAILURE_INFLIGHT:
-                    if self._fatal_publication_gate_failure_owner is current_thread:
-                        return owned, first_failure
-                    self._fatal_condition.wait()
-                    continue
-                if signal_state != _FATAL_GATE_FAILURE_IDLE:
-                    consistency_error = RuntimeError(
-                        "communicator gate failure signal state is invalid"
-                    )
-                    break
-                self._fatal_publication_gate_failure_state = (
-                    _FATAL_GATE_FAILURE_INFLIGHT
-                )
-                self._fatal_publication_gate_failure_owner = current_thread
-            signal_error = None
-            confirmed = False
-            try:
-                failure_handler(transition, primary)
-            except BaseException as caught:
-                signal_error = caught
-            if callable(failure_confirmed):
-                try:
-                    confirmed = bool(failure_confirmed(transition, primary))
-                except BaseException as caught:
-                    signal_errors.append(caught)
-            else:
-                confirmed = signal_error is None
-            with self._fatal_condition:
-                if (
-                    self._fatal_publication_gate_failure_state
-                    != _FATAL_GATE_FAILURE_INFLIGHT
-                    or self._fatal_publication_gate_failure_owner is not current_thread
-                ):
-                    consistency_error = RuntimeError(
-                        "communicator gate failure signal claim changed"
-                    )
-                elif confirmed:
-                    self._fatal_publication_gate_failure_state = (
-                        _FATAL_GATE_FAILURE_SIGNALED
-                    )
-                else:
-                    self._fatal_publication_gate_failure_state = (
-                        _FATAL_GATE_FAILURE_IDLE
-                    )
-                self._fatal_publication_gate_failure_owner = None
-                self._fatal_condition.notify_all()
-            if signal_error is not None:
-                signal_errors.append(signal_error)
+        if signal_gate:
+            if not callable(failure_confirmed):
+                legacy_signal = [False]
+                original_failure_handler = failure_handler
+
+                def failure_handler(transition, failure):
+                    original_failure_handler(transition, failure)
+                    legacy_signal[0] = True
+
+                def failure_confirmed(transition, failure):
+                    return legacy_signal[0]
+
+            _, signal_errors = self._signal_reserved_fatal_gate_failure(
+                primary,
+                transition,
+                failure_handler,
+                failure_confirmed,
+            )
             for caught in signal_errors:
                 self._record_fatal_secondary(caught)
-            signal_errors = []
-            if confirmed:
-                break
         if first_failure and not (
             isinstance(error, SystemExit) and error.code == _FATAL_EXIT_CODE
         ):
@@ -1397,13 +1512,10 @@ class CupyNcclCollective:
             return self._fatal_monitor_handoff.select_clean(value)
         raise ValueError("fatal monitor outcome is invalid")
 
-    def _reserve_runtime_fatal_outcome(
-        self, primary, *, before_select=None, after_prepare=None
-    ):
+    def _reserve_runtime_fatal_outcome(self, primary, *, before_select=None):
         outcome = self._fatal_monitor_handoff.select_fatal(
             primary,
             before_select=before_select,
-            after_prepare=after_prepare,
         )
         if outcome.kind != "fatal_elected":
             raise RuntimeError("clean monitor stop preempted communicator fatal")

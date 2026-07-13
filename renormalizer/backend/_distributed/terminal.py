@@ -106,20 +106,15 @@ class _FatalMonitorHandoff:
         primary: BaseException,
         *,
         before_select=None,
-        after_prepare=None,
     ) -> _MonitorOutcome:
         if not isinstance(primary, BaseException):
             raise TypeError("monitor fatal primary must be an exception")
         if before_select is not None and not callable(before_select):
             raise TypeError("monitor fatal preparation must be callable")
-        if after_prepare is not None and not callable(after_prepare):
-            raise TypeError("monitor fatal post-preparation must be callable")
         with self._condition:
             if self._outcome is None:
                 if before_select is not None:
                     before_select()
-                if after_prepare is not None:
-                    after_prepare()
                 self._outcome = _MonitorOutcome(
                     kind="fatal_elected", primary=primary
                 )
@@ -717,7 +712,7 @@ class _TerminalLifecycleGate:
         primary,
         discovering_state,
         *,
-        after_transition=None,
+        prepared_transition=None,
     ):
         if (
             self._phase is _TerminalPhase.RUNTIME_CLOSED
@@ -733,13 +728,19 @@ class _TerminalLifecycleGate:
                 self._condition.notify_all()
             raise RuntimeError("runtime close is committed")
         if self._fatal_transition is None:
-            self._fatal_transition = _FatalTransition(
-                gate_id=self._gate_id,
-                primary=primary,
-                sequence=self._sequence(),
-            )
-        if after_transition is not None:
-            after_transition(self._fatal_transition)
+            if prepared_transition is None:
+                prepared_transition = _FatalTransition(
+                    gate_id=self._gate_id,
+                    primary=primary,
+                    sequence=self._sequence(),
+                )
+            if (
+                not isinstance(prepared_transition, _FatalTransition)
+                or prepared_transition.gate_id != self._gate_id
+                or prepared_transition.primary is not primary
+            ):
+                raise RuntimeError("prepared fatal transition is invalid")
+            self._fatal_transition = prepared_transition
         if self._phase in (
             _TerminalPhase.HEALTHY,
             _TerminalPhase.RUNTIME_CLOSING,
@@ -773,12 +774,10 @@ class _TerminalLifecycleGate:
         primary,
         discovering_token=None,
         *,
-        after_transition=None,
+        prepared_transition=None,
     ):
         if not isinstance(primary, BaseException):
             raise TypeError("fatal primary must be an exception")
-        if after_transition is not None and not callable(after_transition):
-            raise TypeError("fatal transition callback must be callable")
         with self._condition:
             discovering_state = None
             if discovering_token is not None:
@@ -788,7 +787,7 @@ class _TerminalLifecycleGate:
             transition = self._begin_fatal_locked(
                 primary,
                 discovering_state,
-                after_transition=after_transition,
+                prepared_transition=prepared_transition,
             )
             if transition.primary is not primary:
                 raise RuntimeError("fatal primary changed during recovery")
