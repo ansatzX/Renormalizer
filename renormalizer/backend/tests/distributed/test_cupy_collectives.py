@@ -984,6 +984,330 @@ def test_abort_ack_and_first_primary_are_exactly_once(monkeypatch):
     assert monitor_stopped_before_ack == [True]
 
 
+def test_monitor_detected_fatal_retires_before_every_publication_sentinel(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed.terminal import _TerminalPhase
+
+    runtime, wrapper, _, store, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    sentinels = []
+    store_access_phases = []
+    monitor = None
+
+    def record_sentinel(name):
+        with gate._condition:
+            phase = gate._phase
+        sentinels.append(
+            (
+                name,
+                monitor.is_alive(),
+                threading.current_thread() is monitor,
+                phase,
+            )
+        )
+
+    original_store_set = wrapper._fatal_store_set
+
+    def record_store_set(key, value):
+        with gate._condition:
+            store_access_phases.append(("set", key, gate._phase))
+        if key == wrapper._fatal_key(wrapper.rank):
+            record_sentinel("fatal_key")
+        elif key == wrapper._fatal_ack_key(wrapper.rank):
+            record_sentinel("ack")
+        return original_store_set(key, value)
+
+    monkeypatch.setattr(wrapper, "_fatal_store_set", record_store_set)
+    original_store_get = wrapper._fatal_store_get
+
+    def record_store_get(key):
+        with gate._condition:
+            store_access_phases.append(("get", key, gate._phase))
+        return original_store_get(key)
+
+    monkeypatch.setattr(wrapper, "_fatal_store_get", record_store_get)
+    original_read = wrapper._read_fatal_origin
+
+    def record_monitor_read():
+        with gate._condition:
+            store_access_phases.append(("monitor_read", None, gate._phase))
+        return original_read()
+
+    monkeypatch.setattr(wrapper, "_read_fatal_origin", record_monitor_read)
+    original_abort = wrapper._abort_local_communicator
+
+    def record_abort():
+        record_sentinel("abort")
+        return original_abort()
+
+    monkeypatch.setattr(wrapper, "_abort_local_communicator", record_abort)
+    original_runtime_publish = runtime._publish_communicator_fatal_transition
+
+    def record_runtime_publish(transition):
+        record_sentinel("runtime_public")
+        return original_runtime_publish(transition)
+
+    monkeypatch.setattr(
+        runtime,
+        "_publish_communicator_fatal_transition",
+        record_runtime_publish,
+    )
+    original_collective_publish = wrapper._publish_communicator_fatal_locked
+
+    def record_collective_publish(primary):
+        record_sentinel("collective_public")
+        return original_collective_publish(primary)
+
+    monkeypatch.setattr(
+        wrapper,
+        "_publish_communicator_fatal_locked",
+        record_collective_publish,
+    )
+    original_gate_publish = gate.publish_fatal
+
+    def record_gate_publish(transition, snapshot):
+        record_sentinel("gate_public")
+        return original_gate_publish(transition, snapshot)
+
+    monkeypatch.setattr(gate, "publish_fatal", record_gate_publish)
+
+    wrapper._start_fatal_monitor()
+    monitor = wrapper._fatal_monitor_thread
+    store.set(wrapper._fatal_key(wrapper.rank), 1)
+    snapshot = gate.wait_for_published(_TASK_18_2_TIMEOUT_S)
+    wrapper._wait_for_joined_fatal_publication()
+    monitor.join(_TASK_18_2_TIMEOUT_S)
+
+    assert not monitor.is_alive()
+    assert snapshot is gate._fatal_transition.primary
+    assert [entry[0] for entry in sentinels] == [
+        "fatal_key",
+        "abort",
+        "runtime_public",
+        "collective_public",
+        "ack",
+        "gate_public",
+    ]
+    assert all(not alive and not is_monitor for _, alive, is_monitor, _ in sentinels)
+    assert all(phase is _TerminalPhase.FATAL_PENDING for *_, phase in sentinels)
+    assert all(
+        phase not in {_TerminalPhase.FATAL_PUBLISHED, _TerminalPhase.RUNTIME_CLOSED}
+        for *_, phase in store_access_phases
+    )
+
+
+def test_close_joins_local_fatal_publication_before_clearing_collective(
+    monkeypatch,
+):
+    runtime, wrapper, backend, _, raw_comm = _single_rank_task_18_2_runtime(
+        monkeypatch
+    )
+    retained_store = wrapper._bootstrap_store_proxy
+    monitor_before_stop = threading.Event()
+    release_monitor = threading.Event()
+    stop_requested = threading.Event()
+    fatal_selected = threading.Event()
+    owner_after_monitor_exit = threading.Event()
+    release_owner = threading.Event()
+    close_waiting_for_publication = threading.Event()
+    owner_name = "task-18.2-local-fatal-after-stop"
+    close_name = "task-18.2-close-joins-local-fatal"
+
+    original_observe_stop = wrapper._observe_fatal_monitor_stop
+
+    def pause_before_stop_observation():
+        monitor_before_stop.set()
+        assert release_monitor.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return original_observe_stop()
+
+    monkeypatch.setattr(
+        wrapper, "_observe_fatal_monitor_stop", pause_before_stop_observation
+    )
+    original_request_stop = wrapper._request_fatal_monitor_stop
+
+    def record_stop_request():
+        generation = original_request_stop()
+        stop_requested.set()
+        return generation
+
+    monkeypatch.setattr(wrapper, "_request_fatal_monitor_stop", record_stop_request)
+    original_select = wrapper._select_fatal_monitor_outcome
+
+    def record_fatal_selection(kind, value):
+        outcome = original_select(kind, value)
+        if kind == "fatal_elected":
+            fatal_selected.set()
+        return outcome
+
+    monkeypatch.setattr(
+        wrapper, "_select_fatal_monitor_outcome", record_fatal_selection
+    )
+    original_join = wrapper._join_fatal_monitor
+
+    def block_owner_after_monitor_join(thread):
+        result = original_join(thread)
+        if threading.current_thread().name == owner_name:
+            owner_after_monitor_exit.set()
+            assert release_owner.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return result
+
+    monkeypatch.setattr(wrapper, "_join_fatal_monitor", block_owner_after_monitor_join)
+    original_wait_for_publication = wrapper._wait_for_joined_fatal_publication
+
+    def record_publication_join():
+        if threading.current_thread().name == close_name:
+            close_waiting_for_publication.set()
+        return original_wait_for_publication()
+
+    monkeypatch.setattr(
+        wrapper, "_wait_for_joined_fatal_publication", record_publication_join
+    )
+
+    # Keep RED cleanup inside pytest even if the buggy close clears live fields.
+    monkeypatch.setattr(
+        wrapper,
+        "_fatal_store_set",
+        lambda key, value: retained_store.__setitem__(key, value),
+    )
+    monkeypatch.setattr(wrapper, "_fatal_store_get", retained_store.__getitem__)
+
+    def retained_abort():
+        with wrapper._fatal_lock:
+            if not wrapper._fatal_abort_started:
+                wrapper._fatal_abort_started = True
+                raw_comm.abort()
+                wrapper._fatal_abort_completed = True
+                wrapper._fatal_abort_event.set()
+            return wrapper._fatal_abort_event
+
+    monkeypatch.setattr(wrapper, "_abort_local_communicator", retained_abort)
+
+    wrapper._start_fatal_monitor()
+    monitor = wrapper._fatal_monitor_thread
+    assert monitor_before_stop.wait(_TASK_18_2_TIMEOUT_S)
+    closer, close_results, close_errors, close_done = _start_task_18_2_call(
+        runtime.close, name=close_name
+    )
+    owner = None
+    primary = RuntimeError("local fatal after monitor stop request")
+    try:
+        assert stop_requested.wait(_TASK_18_2_TIMEOUT_S)
+        owner, owner_results, owner_errors, owner_done = _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(primary), name=owner_name
+        )
+        assert fatal_selected.wait(_TASK_18_2_TIMEOUT_S)
+        release_monitor.set()
+        assert owner_after_monitor_exit.wait(_TASK_18_2_TIMEOUT_S)
+        assert close_waiting_for_publication.wait(_TASK_18_2_TIMEOUT_S)
+
+        assert not monitor.is_alive()
+        assert not close_done.is_set()
+        assert wrapper._backend is backend
+        assert wrapper._bootstrap_store_proxy is not None
+        assert wrapper._closed is False
+        assert runtime.collective is wrapper
+        assert runtime._closed is False
+    finally:
+        release_monitor.set()
+        release_owner.set()
+        if owner is not None and owner.is_alive():
+            _join_task_18_2_call(owner, owner_done)
+        if closer.is_alive():
+            _join_task_18_2_call(closer, close_done)
+        if monitor.is_alive():
+            monitor.join(_TASK_18_2_TIMEOUT_S)
+
+    assert owner_errors == []
+    assert owner_results == [primary]
+    assert close_results == []
+    assert close_errors == [primary]
+    assert runtime._closed is True
+
+
+def test_active_operator_primary_is_canonical_before_collective_publication(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
+
+    runtime, wrapper, backend, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    earlier = RuntimeError("earlier active operator primary")
+    later = RuntimeError("later communicator failure")
+
+    class OperatorCall:
+        def __init__(self):
+            self.primary_error = earlier
+            self.secondary_errors = []
+
+        def record_secondary(self, error):
+            if error is not self.primary_error and error not in self.secondary_errors:
+                self.secondary_errors.append(error)
+
+    call = OperatorCall()
+    owner = AsyncResourceOwner("compute")
+    owner._operator_call = call
+    owner.mark_enqueued()
+    owner.force_quarantine(earlier)
+    lease = SimpleNamespace(
+        _active_operator_owner=owner,
+        _status_workspace=None,
+        _poisoned_error=None,
+    )
+    provider = SimpleNamespace(_active_lease=lease, _terminal_error=None)
+    runtime._active_provider = provider
+    selections = []
+    acknowledgments = []
+    original_select = wrapper._select_fatal_monitor_outcome
+
+    def record_selection(kind, value):
+        outcome = original_select(kind, value)
+        if kind == "fatal_elected":
+            selections.append(
+                (
+                    value,
+                    wrapper._fatal_pending_primary,
+                    runtime._terminal_gate._fatal_transition.primary,
+                )
+            )
+        return outcome
+
+    monkeypatch.setattr(wrapper, "_select_fatal_monitor_outcome", record_selection)
+    original_store_set = wrapper._fatal_store_set
+
+    def record_acknowledgment(key, value):
+        if key == wrapper._fatal_ack_key(wrapper.rank):
+            acknowledgments.append(
+                (
+                    wrapper._fatal_pending_primary,
+                    wrapper._fatal_error,
+                    runtime._terminal_error,
+                    provider._terminal_error,
+                    lease._poisoned_error,
+                    backend._execution_terminal_error,
+                )
+            )
+        return original_store_set(key, value)
+
+    monkeypatch.setattr(wrapper, "_fatal_store_set", record_acknowledgment)
+
+    result = wrapper._enter_observed_fatal(
+        later, wrapper.rank, join_existing=True
+    )
+
+    assert result is earlier
+    assert selections == [(earlier, earlier, earlier)]
+    assert runtime._terminal_gate._fatal_transition.primary is earlier
+    assert wrapper._fatal_pending_primary is earlier
+    assert wrapper._fatal_error is earlier
+    assert runtime._terminal_error is earlier
+    assert provider._terminal_error is earlier
+    assert lease._poisoned_error is earlier
+    assert backend._execution_terminal_error is earlier
+    assert acknowledgments == [(earlier,) * 6]
+    assert call.secondary_errors == [later]
+    assert wrapper._fatal_secondary_errors == (later,)
+
+
 def _install_task_18_2_monitor_barriers(monkeypatch, wrapper):
     before_stop_observation = threading.Event()
     release_stop_observation = threading.Event()
@@ -2452,7 +2776,7 @@ def test_failed_owner_terminal_slot_holds_fatal_reservation_against_close(monkey
     assert stop_order == []
 
 
-def test_monitor_atomically_defers_to_existing_local_fatal_publication(monkeypatch):
+def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
     store = _SharedStore(2)
     raw_comms = [_RawComm(), _RawComm()]
     pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
@@ -2470,7 +2794,7 @@ def test_monitor_atomically_defers_to_existing_local_fatal_publication(monkeypat
     store.set(wrappers[0]._fatal_ack_key(0), 1)
     monitor_observed = threading.Event()
     release_monitor = threading.Event()
-    monitor_admitted = threading.Event()
+    worker_admitted = threading.Event()
     direct_selected = threading.Event()
     direct_live = threading.Event()
     release_direct = threading.Event()
@@ -2488,11 +2812,16 @@ def test_monitor_atomically_defers_to_existing_local_fatal_publication(monkeypat
 
     def record_begin(*args, **kwargs):
         result = original_begin(*args, **kwargs)
-        if threading.current_thread() is monitor:
+        if threading.current_thread().name == "renormalizer-fatal-publisher-rank-1":
             admissions.append(
-                (result[2], result[4], wrappers[1]._fatal_publications)
+                (
+                    result[2],
+                    result[3],
+                    result[4],
+                    wrappers[1]._fatal_publications,
+                )
             )
-            monitor_admitted.set()
+            worker_admitted.set()
         return result
 
     monkeypatch.setattr(wrappers[1], "_begin_fatal_publication", record_begin)
@@ -2568,7 +2897,8 @@ def test_monitor_atomically_defers_to_existing_local_fatal_publication(monkeypat
         assert wrappers[1]._fatal_publications == 1
 
         release_monitor.set()
-        assert monitor_admitted.wait(3.0)
+        assert worker_admitted.wait(3.0)
+        worker = wrappers[1]._fatal_monitor_publisher_thread
         peak_publications = wrappers[1]._fatal_publications
         monitor.join(3.0)
         assert not monitor.is_alive()
@@ -2576,6 +2906,7 @@ def test_monitor_atomically_defers_to_existing_local_fatal_publication(monkeypat
 
         release_direct.set()
         publisher.join(5.0)
+        worker.join(5.0)
         monitor.join(5.0)
     finally:
         release_monitor.set()
@@ -2584,11 +2915,15 @@ def test_monitor_atomically_defers_to_existing_local_fatal_publication(monkeypat
             publisher.join(5.0)
         if monitor.ident is not None:
             monitor.join(5.0)
+        worker = wrappers[1]._fatal_monitor_publisher_thread
+        if worker is not None and worker.ident is not None:
+            worker.join(5.0)
 
-    assert admissions == [(False, True, 1)]
+    assert admissions == [(False, True, False, 1)]
     assert peak_publications == 1
     assert not publisher.is_alive()
     assert not monitor.is_alive()
+    assert not worker.is_alive()
     assert direct_errors == []
     assert wrappers[1]._fatal_error is primary
     assert wrappers[1]._fatal_publications == 0

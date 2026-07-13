@@ -880,7 +880,7 @@ def test_fatal_preempts_runtime_close_before_commit():
     assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
 
 
-def test_fatal_after_runtime_close_commit_touches_no_collective():
+def test_fatal_after_runtime_close_commit_touches_no_collective(monkeypatch):
     from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
 
     calls = []
@@ -889,15 +889,21 @@ def test_fatal_after_runtime_close_commit_touches_no_collective():
         def __init__(self):
             self._fatal_publication_local = threading.local()
 
-        def close(self):
+        def _close_for_runtime(self, gate, transition):
             calls.append("close")
 
-        def _begin_fatal_publication(self):
-            raise AssertionError("late fatal must not begin collective publication")
+        def _begin_fatal_publication(self, *args, **kwargs):
+            raise AssertionError("fake publication must stay behind runtime entry")
 
         def _publish_communicator_fatal(self, primary, **kwargs):
             calls.append(("fatal", primary, kwargs))
-            return primary
+            hook = kwargs["handler_override"]
+            transition = hook.begin(
+                primary,
+                owner=kwargs.get("fatal_owner"),
+                discovering_token=kwargs.get("discovering_token"),
+            )
+            return transition.primary
 
     backend = SimpleNamespace(_execution_terminal_error=None)
     collective = Collective()
@@ -908,35 +914,50 @@ def test_fatal_after_runtime_close_commit_touches_no_collective():
         mesh=object(),
         collective=collective,
     )
-    invoke_late_fatal = threading.Event()
+    fatal_entered = threading.Event()
+    release_fatal_entry = threading.Event()
     primary = RuntimeError("late fatal")
+    original_begin = runtime._begin_communicator_fatal
+
+    def delay_fatal_entry(*args, **kwargs):
+        fatal_entered.set()
+        assert release_fatal_entry.wait(_TIMEOUT_S)
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_begin_communicator_fatal", delay_fatal_entry)
 
     def publish_late_fatal():
-        assert invoke_late_fatal.wait(_TIMEOUT_S)
         return runtime._enter_communicator_fatal(primary)
 
     late, results, errors, done = _start(publish_late_fatal)
-    runtime.close()
-    assert runtime._terminal_gate.phase is _TerminalPhase.RUNTIME_CLOSED
-    assert runtime._closed is True
-
-    # Retain the closed spy to prove the committed gate wins before resolution.
-    runtime.collective = collective
-    calls_after_close = list(calls)
-    closed_state = (
-        runtime._closed,
-        runtime._terminal_gate.phase,
-        runtime._terminal_error,
-        backend._execution_terminal_error,
-    )
-    invoke_late_fatal.set()
-    _join(late, done)
+    assert fatal_entered.wait(_TIMEOUT_S)
+    closer, close_results, close_errors, close_done = _start(runtime.close)
+    try:
+        _join(closer, close_done)
+        assert close_errors == []
+        assert close_results == [None]
+        assert runtime._terminal_gate.phase is _TerminalPhase.RUNTIME_CLOSED
+        assert runtime._closed is True
+        closed_state = (
+            runtime._closed,
+            runtime._terminal_gate.phase,
+            runtime._terminal_error,
+            backend._execution_terminal_error,
+        )
+        release_fatal_entry.set()
+        _join(late, done)
+    finally:
+        release_fatal_entry.set()
+        if closer.is_alive():
+            _join(closer, close_done)
+        if late.is_alive():
+            _join(late, done)
 
     assert results == []
     assert len(errors) == 1
     assert isinstance(errors[0], RuntimeError)
     assert "closed" in str(errors[0])
-    assert calls == calls_after_close == ["close"]
+    assert calls == ["close"]
     assert (
         runtime._closed,
         runtime._terminal_gate.phase,

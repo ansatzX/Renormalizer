@@ -57,6 +57,7 @@ class _FatalPublicationReservation:
         joined=False,
         monitor_deferred=False,
         handler=None,
+        transition=None,
     ):
         self.primary = primary
         self.installed = installed
@@ -65,7 +66,7 @@ class _FatalPublicationReservation:
         self.monitor_deferred = monitor_deferred
         self.handler = handler
         self.handler_started = False
-        self.transition = None
+        self.transition = transition
         self.snapshot = None
         self.completion = None
 
@@ -255,6 +256,7 @@ class CupyNcclCollective:
         self._fatal_monitor_thread = None
         self._fatal_monitor_handoff = _FatalMonitorHandoff()
         self._fatal_monitor_outcome = None
+        self._fatal_monitor_publisher_thread = None
         self._fatal_control_initialized = False
         self._active_broadcast_sequence = 1
 
@@ -461,9 +463,17 @@ class CupyNcclCollective:
         fatal_owner=None,
         discovering_token=None,
         handler_override=None,
+        transition=None,
     ):
         active = getattr(self._fatal_publication_local, "reservation", None)
         if active is not None:
+            if transition is not None:
+                if active.transition is None:
+                    active.transition = transition
+                elif active.transition is not transition:
+                    raise RuntimeError("communicator fatal transition changed")
+                if transition.primary is not active.primary:
+                    raise RuntimeError("communicator fatal primary changed")
             self._refresh_fatal_handler(
                 active,
                 fatal_owner=fatal_owner,
@@ -473,20 +483,37 @@ class CupyNcclCollective:
             return
         if origin_rank is None:
             origin_rank = self.rank
+        handler = (
+            handler_override
+            if handler_override is not None
+            else self._fatal_handler_callback()
+        )
+        begin = None if handler is None else getattr(handler, "begin", None)
+        if transition is None and callable(begin):
+            transition = begin(
+                error,
+                owner=fatal_owner,
+                discovering_token=discovering_token,
+            )
+        if transition is not None:
+            primary = transition.primary
+            if not isinstance(primary, BaseException):
+                raise TypeError("communicator fatal transition primary is invalid")
+            if error is not primary:
+                self._record_fatal_secondary(error)
+        else:
+            primary = error
         primary, installed, started, joined, monitor_deferred = (
             self._begin_fatal_publication(
-                error,
+                primary,
                 origin_rank,
                 admitted=admitted,
                 release_admitted=release_admitted,
                 join_existing=join_existing,
             )
         )
-        handler = (
-            handler_override
-            if handler_override is not None
-            else self._fatal_handler_callback()
-        )
+        if transition is not None and transition.primary is not primary:
+            raise RuntimeError("communicator fatal primary changed")
         reservation = _FatalPublicationReservation(
             primary,
             installed,
@@ -494,6 +521,7 @@ class CupyNcclCollective:
             joined=joined,
             monitor_deferred=monitor_deferred,
             handler=handler,
+            transition=transition,
         )
         if not started:
             if monitor_deferred:
@@ -501,7 +529,6 @@ class CupyNcclCollective:
                 if outcome.kind != "fatal_elected" or outcome.primary is not primary:
                     raise RuntimeError("deferred monitor fatal outcome changed")
                 self._fatal_monitor_outcome = outcome
-                self._acknowledge_fatal_monitor_exit(outcome)
             if joined:
                 self._refresh_fatal_handler(
                     reservation,
@@ -571,6 +598,10 @@ class CupyNcclCollective:
         begin = None if handler is None else getattr(handler, "begin", None)
         if not callable(begin):
             return
+        if reservation.transition is not None:
+            if reservation.transition.primary is not reservation.primary:
+                raise RuntimeError("communicator fatal primary changed")
+            return
         transition = begin(
             reservation.primary,
             owner=fatal_owner,
@@ -580,6 +611,8 @@ class CupyNcclCollective:
             reservation.transition = transition
         elif reservation.transition is not transition:
             raise RuntimeError("communicator fatal transition changed")
+        if transition.primary is not reservation.primary:
+            raise RuntimeError("communicator fatal primary changed")
 
     def _run_fatal_handler(self, reservation):
         if reservation.handler_started or reservation.handler is None:
@@ -757,7 +790,7 @@ class CupyNcclCollective:
         self._fatal_monitor_outcome = outcome
         self._fatal_monitor_stop.set()
         if monitor is threading.current_thread():
-            self._acknowledge_fatal_monitor_exit(outcome)
+            raise RuntimeError("fatal monitor cannot own communicator publication")
         elif monitor_live:
             self._wait_for_fatal_monitor_exit(outcome)
             self._join_fatal_monitor(monitor)
@@ -796,6 +829,7 @@ class CupyNcclCollective:
         discovering_token=None,
         join_existing=True,
         handler_override=None,
+        transition=None,
     ):
         with self._communicator_fatal_reservation(
             error,
@@ -804,6 +838,7 @@ class CupyNcclCollective:
             discovering_token=discovering_token,
             join_existing=join_existing,
             handler_override=handler_override,
+            transition=transition,
         ) as reservation:
             if reservation.started:
                 self._run_fatal_handler(reservation)
@@ -912,94 +947,97 @@ class CupyNcclCollective:
             self._record_fatal_secondary(error)
             self._fatal_hard_exit()
 
-    def _monitor_fatal_records(self):
-        while True:
+    def _start_fatal_monitor_publication(self, error, origin_rank):
+        def publish():
             try:
-                outcome, origin_rank = (
-                    self._fatal_monitor_handoff.read_store_if_unselected(
-                        self._read_fatal_origin
-                    )
+                self._enter_observed_fatal(
+                    error,
+                    origin_rank,
+                    release_admitted=True,
+                    join_existing=True,
                 )
-                if outcome is not None:
-                    self._fatal_monitor_outcome = outcome
-                    self._acknowledge_fatal_monitor_exit(outcome)
-                    return
-                outcome = self._observe_fatal_monitor_outcome()
-                if outcome is not None:
-                    self._fatal_monitor_outcome = outcome
-                    self._acknowledge_fatal_monitor_exit(outcome)
-                    return
-                generation = self._observe_fatal_monitor_stop()
-                if origin_rank is None and generation is not None:
-                    outcome = self._observe_fatal_monitor_outcome()
-                    if outcome is not None:
-                        self._fatal_monitor_outcome = outcome
-                        self._acknowledge_fatal_monitor_exit(outcome)
-                        return
+            except BaseException as publication_error:
+                if publication_error is not error:
+                    self._record_fatal_secondary(publication_error)
+                self._fatal_hard_exit()
+
+        thread = threading.Thread(
+            target=publish,
+            name="renormalizer-fatal-publisher-rank-{}".format(self.rank),
+            daemon=True,
+        )
+        with self._fatal_lock:
+            self._fatal_monitor_publisher_thread = thread
+        thread.start()
+        return thread
+
+    def _monitor_fatal_records(self):
+        outcome = None
+        try:
+            while True:
+                try:
                     outcome, origin_rank = (
                         self._fatal_monitor_handoff.read_store_if_unselected(
                             self._read_fatal_origin
                         )
                     )
                     if outcome is not None:
-                        self._fatal_monitor_outcome = outcome
-                        self._acknowledge_fatal_monitor_exit(outcome)
                         return
                     outcome = self._observe_fatal_monitor_outcome()
                     if outcome is not None:
-                        self._fatal_monitor_outcome = outcome
-                        self._acknowledge_fatal_monitor_exit(outcome)
                         return
-            except BaseException as error:
+                    generation = self._observe_fatal_monitor_stop()
+                    if origin_rank is None and generation is not None:
+                        outcome = self._observe_fatal_monitor_outcome()
+                        if outcome is not None:
+                            return
+                        outcome, origin_rank = (
+                            self._fatal_monitor_handoff.read_store_if_unselected(
+                                self._read_fatal_origin
+                            )
+                        )
+                        if outcome is not None:
+                            return
+                        outcome = self._observe_fatal_monitor_outcome()
+                        if outcome is not None:
+                            return
+                except BaseException as error:
+                    if self._fatal_monitor_stop.is_set():
+                        outcome = self._observe_fatal_monitor_outcome()
+                        return
+                    self._record_fatal_secondary(error)
+                    self._fatal_hard_exit()
+                if origin_rank is not None:
+                    outcome = self._observe_fatal_monitor_outcome()
+                    if outcome is not None:
+                        return
+                    with self._fatal_condition:
+                        existing = (
+                            self._fatal_pending_primary
+                            if self._fatal_pending_primary is not None
+                            else self._fatal_error
+                        )
+                    error = (
+                        existing
+                        if existing is not None
+                        else _RemoteCommunicatorFailure(origin_rank)
+                    )
+                    self._start_fatal_monitor_publication(error, origin_rank)
+                    outcome = self._wait_for_fatal_monitor_selection()
+                    return
+                if generation is not None:
+                    outcome = self._select_fatal_monitor_outcome(
+                        "stopped_clean", generation
+                    )
+                    return
                 if self._fatal_monitor_stop.is_set():
                     outcome = self._observe_fatal_monitor_outcome()
-                    if outcome is not None:
-                        self._fatal_monitor_outcome = outcome
-                        self._acknowledge_fatal_monitor_exit(outcome)
                     return
-                self._record_fatal_secondary(error)
-                self._fatal_hard_exit()
-            if origin_rank is not None:
-                outcome = self._observe_fatal_monitor_outcome()
-                if outcome is not None:
-                    self._fatal_monitor_outcome = outcome
-                    self._acknowledge_fatal_monitor_exit(outcome)
-                    return
-                with self._fatal_condition:
-                    existing = (
-                        self._fatal_pending_primary
-                        if self._fatal_pending_primary is not None
-                        else self._fatal_error
-                    )
-                error = (
-                    existing
-                    if existing is not None
-                    else _RemoteCommunicatorFailure(origin_rank)
-                )
-                self._enter_observed_fatal(
-                    error,
-                    origin_rank,
-                    release_admitted=True,
-                    join_existing=True,
-                    on_elected=lambda primary: self._select_fatal_monitor_outcome(
-                        "fatal_elected", primary
-                    ),
-                )
-                return
-            if generation is not None:
-                outcome = self._select_fatal_monitor_outcome(
-                    "stopped_clean", generation
-                )
+                self._fatal_monitor_stop.wait(0.001)
+        finally:
+            if outcome is not None:
                 self._fatal_monitor_outcome = outcome
                 self._acknowledge_fatal_monitor_exit(outcome)
-                return
-            if self._fatal_monitor_stop.is_set():
-                outcome = self._observe_fatal_monitor_outcome()
-                if outcome is not None:
-                    self._fatal_monitor_outcome = outcome
-                    self._acknowledge_fatal_monitor_exit(outcome)
-                return
-            self._fatal_monitor_stop.wait(0.001)
 
     def _start_fatal_monitor(self):
         with self._fatal_lock:
@@ -1463,6 +1501,7 @@ class CupyNcclCollective:
             self._release_runtime_close_step(gate, ready_token)
 
         if primary is not None:
+            self._wait_for_joined_fatal_publication()
             return self._fatal_monitor_outcome
 
         stop_token = self._admit_runtime_close_step(
@@ -1478,6 +1517,7 @@ class CupyNcclCollective:
         thread = self._fatal_monitor_thread
         self._join_fatal_monitor(thread)
         if outcome.kind == "fatal_elected":
+            self._wait_for_joined_fatal_publication()
             return outcome
 
         close_token = self._admit_runtime_close_step(

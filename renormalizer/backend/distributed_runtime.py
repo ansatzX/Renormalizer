@@ -191,6 +191,7 @@ class CupyDistributedRuntime:
     def _normalize_communicator_fatal(self, primary, owner):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
+        discovered = primary
         provider = self._active_provider
         lease = None if provider is None else provider._active_lease
         if owner is None and lease is not None:
@@ -204,26 +205,67 @@ class CupyDistributedRuntime:
             primary = self._terminal_error
         elif call is not None and call.primary_error is not None:
             primary = call.primary_error
+        if discovered is not primary:
+            record_secondary = (
+                None if call is None else getattr(call, "record_secondary", None)
+            )
+            if callable(record_secondary):
+                record_secondary(discovered)
+            elif owner is not None:
+                remember_secondary = getattr(owner, "_remember_secondary", None)
+                if callable(remember_secondary):
+                    remember_secondary(discovered)
         return primary, provider, lease, owner
 
     def _begin_communicator_fatal(
         self, primary, *, owner=None, discovering_token=None
     ):
-        primary, provider, lease, owner = self._normalize_communicator_fatal(
-            primary, owner
-        )
-        transition = self._terminal_gate.begin_fatal(primary, discovering_token)
-        with self._terminal_state_lock:
-            if self._pending_fatal_context is None:
-                self._pending_fatal_context = (provider, lease, owner)
-            elif owner is not None and self._pending_fatal_context[2] is None:
-                retained_provider, retained_lease, _ = self._pending_fatal_context
-                self._pending_fatal_context = (
-                    retained_provider,
-                    retained_lease,
-                    owner,
+        gate = self._terminal_gate
+        with gate._condition:
+            transition = gate._fatal_transition
+            if gate._phase in (
+                _TerminalPhase.FATAL_PUBLISHED,
+                _TerminalPhase.RUNTIME_CLOSED,
+            ) or self._closed:
+                if transition is not None:
+                    return transition
+                raise RuntimeError("distributed runtime is closed")
+            with self._terminal_state_lock:
+                primary, provider, lease, owner = (
+                    self._normalize_communicator_fatal(primary, owner)
                 )
-        return transition
+                transition = gate.begin_fatal(primary, discovering_token)
+                if transition.primary is not primary:
+                    call = (
+                        None
+                        if owner is None
+                        else getattr(owner, "_operator_call", None)
+                    )
+                    record_secondary = (
+                        None
+                        if call is None
+                        else getattr(call, "record_secondary", None)
+                    )
+                    if callable(record_secondary):
+                        record_secondary(primary)
+                    elif owner is not None:
+                        remember_secondary = getattr(
+                            owner, "_remember_secondary", None
+                        )
+                        if callable(remember_secondary):
+                            remember_secondary(primary)
+                if self._pending_fatal_context is None:
+                    self._pending_fatal_context = (provider, lease, owner)
+                elif owner is not None and self._pending_fatal_context[2] is None:
+                    retained_provider, retained_lease, _ = (
+                        self._pending_fatal_context
+                    )
+                    self._pending_fatal_context = (
+                        retained_provider,
+                        retained_lease,
+                        owner,
+                    )
+                return transition
 
     def _publish_communicator_fatal_transition(self, transition):
         if not isinstance(transition, _FatalTransition):
@@ -270,15 +312,23 @@ class CupyDistributedRuntime:
     ):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
+        transition = self._begin_communicator_fatal(
+            primary,
+            owner=owner,
+            discovering_token=discovering_token,
+        )
+        primary = transition.primary
         with self._terminal_gate._condition:
             phase = self._terminal_gate._phase
-            transition = self._terminal_gate._fatal_transition
-            runtime_closed = self._closed
-        if phase is _TerminalPhase.RUNTIME_CLOSED or runtime_closed:
-            if transition is not None:
-                return transition.primary
-            raise RuntimeError("distributed runtime is closed")
-        primary, _, _, owner = self._normalize_communicator_fatal(primary, owner)
+        if phase in (
+            _TerminalPhase.FATAL_PUBLISHED,
+            _TerminalPhase.RUNTIME_CLOSED,
+        ):
+            return primary
+        with self._terminal_state_lock:
+            context = self._pending_fatal_context
+            if context is not None:
+                owner = context[2]
         collective = self.collective
         if collective is None:
             with self._terminal_gate._condition:
@@ -295,11 +345,8 @@ class CupyDistributedRuntime:
             if active is not None and not isinstance(
                 active.handler, _RuntimeCommunicatorFatalHook
             ):
-                transition = self._begin_communicator_fatal(
-                    active.primary,
-                    owner=owner,
-                    discovering_token=discovering_token,
-                )
+                if active.primary is not transition.primary:
+                    raise RuntimeError("communicator fatal primary changed")
                 snapshot = self._publish_communicator_fatal_transition(transition)
                 active.transition = transition
                 active.snapshot = snapshot
@@ -317,11 +364,9 @@ class CupyDistributedRuntime:
                 discovering_token=discovering_token,
                 join_existing=True,
                 handler_override=hook,
+                transition=transition,
             )
 
-        transition = self._begin_communicator_fatal(
-            primary, owner=owner, discovering_token=discovering_token
-        )
         thread_id = threading.get_ident()
         with self._terminal_state_lock:
             publication_owner = self._legacy_fatal_publication_owner
