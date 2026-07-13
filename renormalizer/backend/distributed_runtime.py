@@ -264,6 +264,27 @@ class CupyDistributedRuntime:
         if callable(record_collective):
             record_collective(error)
 
+    def _force_async_primary_locked(self, owner, primary):
+        if owner is None:
+            return
+        call = getattr(owner, "_operator_call", None)
+        owner_primary = getattr(owner, "error", None)
+        call_primary = None if call is None else getattr(call, "primary_error", None)
+        if hasattr(owner, "error"):
+            owner.error = primary
+        if call is not None and hasattr(call, "primary_error"):
+            call.primary_error = primary
+        for error in (owner_primary, call_primary):
+            self._remember_terminal_secondary_locked(error, primary)
+        if isinstance(owner_primary, BaseException) and owner_primary is not primary:
+            remember_secondary = getattr(owner, "_remember_secondary", None)
+            if callable(remember_secondary):
+                remember_secondary(owner_primary)
+        if isinstance(call_primary, BaseException) and call_primary is not primary:
+            record_secondary = getattr(call, "record_secondary", None)
+            if callable(record_secondary):
+                record_secondary(call_primary)
+
     def _normalize_communicator_fatal(self, primary, owner):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
@@ -323,14 +344,15 @@ class CupyDistributedRuntime:
         if not isinstance(primary, BaseException):
             raise TypeError("terminal primary must be an exception")
         transition = self._terminal_gate._fatal_transition
+        if transition is not None and transition.primary is not primary:
+            self._remember_terminal_secondary_locked(primary, transition.primary, owner)
+            primary = transition.primary
+        self._force_async_primary_locked(owner, primary)
         if transition is not None and self._terminal_gate._phase in (
             _TerminalPhase.FATAL_PUBLISHED,
             _TerminalPhase.RUNTIME_CLOSED,
         ):
             return transition.primary
-        if transition is not None and transition.primary is not primary:
-            self._remember_terminal_secondary_locked(primary, transition.primary, owner)
-            primary = transition.primary
         backend = self.backend
         existing = (
             self._terminal_error,

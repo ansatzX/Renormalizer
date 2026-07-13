@@ -1497,6 +1497,87 @@ def test_quarantine_after_election_cannot_replace_canonical_primary(monkeypatch)
     assert wrapper._fatal_secondary_errors == (later,)
 
 
+def test_post_election_owner_fail_adopts_canonical_operator_primary(monkeypatch):
+    from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
+    from renormalizer.backend._distributed.providers import _OperatorCall
+
+    runtime, wrapper, backend, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("elected owner failure primary")
+    later = RuntimeError("post-election owner failure")
+    publication_waiting = threading.Event()
+    release_publication = threading.Event()
+    original_wait = gate.wait_for_admissions
+
+    def pause_publication(transition, timeout_s):
+        assert transition.primary is primary
+        publication_waiting.set()
+        assert release_publication.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return original_wait(transition, timeout_s)
+
+    monkeypatch.setattr(gate, "wait_for_admissions", pause_publication)
+
+    def fail_drain():
+        raise later
+
+    def accept_quarantine(owner):
+        runtime._accept_async_quarantine(owner, owner.error)
+
+    owner = AsyncResourceOwner(
+        "post-election-owner",
+        drainer=fail_drain,
+        quarantine=accept_quarantine,
+    )
+    call = _OperatorCall(owner, None, None, entry_error=later)
+    owner._operator_call = call
+    owner.mark_enqueued()
+
+    publisher, publish_results, publish_errors, publish_done = (
+        _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(primary),
+            name="task-18.2-post-election-publication-owner",
+        )
+    )
+    failing_owner = None
+    try:
+        assert publication_waiting.wait(_TASK_18_2_TIMEOUT_S)
+        failing_owner, fail_results, fail_errors, fail_done = _start_task_18_2_call(
+            lambda: owner.fail(later),
+            name="task-18.2-post-election-owner-fail",
+        )
+        _join_task_18_2_call(failing_owner, fail_done)
+        pending_identities = (
+            gate._fatal_transition.primary,
+            wrapper._fatal_pending_primary,
+            runtime._terminal_error,
+            backend._execution_terminal_error,
+            runtime._terminal_quarantine.first_error,
+            owner.error,
+            call.primary_error,
+        )
+    finally:
+        release_publication.set()
+        _join_task_18_2_call(publisher, publish_done)
+        if failing_owner is not None and failing_owner.is_alive():
+            _join_task_18_2_call(failing_owner, fail_done)
+
+    snapshot = gate.wait_for_published(_TASK_18_2_TIMEOUT_S)
+    assert fail_results == []
+    assert fail_errors == [primary]
+    assert all(value is primary for value in pending_identities)
+    assert owner.secondary_errors == (later,)
+    assert call.secondary_errors == (later,)
+    assert publish_errors == []
+    assert publish_results == [primary]
+    assert snapshot is primary
+    assert wrapper._fatal_error is primary
+    assert runtime._terminal_error is primary
+    assert backend._execution_terminal_error is primary
+    assert runtime._terminal_quarantine.owners == (owner,)
+    assert runtime._terminal_secondary_errors == (later,)
+    assert wrapper._fatal_secondary_errors == (later,)
+
+
 def test_fatal_election_retains_collective_across_pending_close_finalizer(
     monkeypatch,
 ):
@@ -2878,6 +2959,177 @@ def test_close_waits_for_complete_active_broadcast_agreement(monkeypatch, fatal)
     assert [wrapper._fatal_publications for wrapper in wrappers] == [0, 0]
     assert hard_exits == []
     assert stop_order == ([] if fatal else [1, 0])
+
+
+def test_active_broadcast_fatal_publication_waits_for_admitted_agreement(
+    monkeypatch,
+):
+    runtime, wrapper, backend, _, raw_comm = _single_rank_task_18_2_runtime(
+        monkeypatch
+    )
+    gate = runtime._terminal_gate
+    primary = RuntimeError("active broadcast deferred fatal")
+    before_agree = threading.Event()
+    release_agree = threading.Event()
+    active_store_entered = threading.Event()
+    release_active_store = threading.Event()
+    close_waiting = threading.Event()
+    store_trace = []
+    publications = []
+    hard_exits = []
+
+    monkeypatch.setattr(wrapper, "_validate_array", lambda *args, **kwargs: None)
+
+    def fail_broadcast(*args, **kwargs):
+        raise primary
+
+    monkeypatch.setattr(backend, "broadcast", fail_broadcast)
+    original_store_set = wrapper._fatal_store_set
+    original_store_get = wrapper._fatal_store_get
+
+    def trace_store_set(key, value):
+        if key == wrapper._active_b_key(wrapper.rank):
+            active_store_entered.set()
+            assert release_active_store.wait(_TASK_18_2_TIMEOUT_S * 2)
+        store_trace.append(("set", key, gate.phase, wrapper._fatal_error))
+        return original_store_set(key, value)
+
+    def trace_store_get(key):
+        store_trace.append(("get", key, gate.phase, wrapper._fatal_error))
+        return original_store_get(key)
+
+    monkeypatch.setattr(wrapper, "_fatal_store_set", trace_store_set)
+    monkeypatch.setattr(wrapper, "_fatal_store_get", trace_store_get)
+    original_publish = gate.publish_fatal
+
+    def record_publication(transition, snapshot):
+        publications.append((transition, snapshot, tuple(store_trace)))
+        return original_publish(transition, snapshot)
+
+    monkeypatch.setattr(gate, "publish_fatal", record_publication)
+
+    def hard_exit():
+        hard_exits.append(True)
+        raise AssertionError("unexpected active broadcast hard exit")
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    close_thread_name = "task-18.2-active-b-close"
+    original_condition_wait = gate._condition.wait
+
+    def observe_close_wait(timeout=None):
+        if threading.current_thread().name == close_thread_name:
+            close_waiting.set()
+        return original_condition_wait(timeout)
+
+    monkeypatch.setattr(gate._condition, "wait", observe_close_wait)
+
+    def run_active_broadcast():
+        with wrapper._active_broadcast_admission() as (broadcast, agree):
+            broadcast_error = None
+            try:
+                broadcast(np.ones((2,), dtype=np.float64), root=0)
+            except BaseException as error:
+                broadcast_error = error
+                assert runtime._enter_communicator_fatal(error) is primary
+                before_agree.set()
+                assert release_agree.wait(_TASK_18_2_TIMEOUT_S * 2)
+            try:
+                agree(broadcast_error is not None)
+            except BaseException:
+                if broadcast_error is not None:
+                    raise broadcast_error
+                raise
+            if broadcast_error is not None:
+                raise broadcast_error
+
+    worker, worker_results, worker_errors, worker_done = _start_task_18_2_call(
+        run_active_broadcast,
+        name="task-18.2-active-b-discoverer",
+    )
+    closer = None
+    try:
+        assert before_agree.wait(_TASK_18_2_TIMEOUT_S)
+        before_state = (
+            gate.phase,
+            wrapper._fatal_pending_primary,
+            wrapper._fatal_error,
+            runtime._terminal_error,
+            wrapper._admitted_operations,
+            wrapper._fatal_publications,
+        )
+        closer, close_results, close_errors, close_done = _start_task_18_2_call(
+            runtime.close,
+            name=close_thread_name,
+        )
+        assert before_state == (
+            _TerminalPhase.FATAL_PENDING,
+            primary,
+            None,
+            None,
+            1,
+            1,
+        )
+        assert close_waiting.wait(_TASK_18_2_TIMEOUT_S)
+        assert not close_done.is_set()
+
+        release_agree.set()
+        assert active_store_entered.wait(_TASK_18_2_TIMEOUT_S)
+        assert gate.phase is _TerminalPhase.FATAL_PENDING
+        assert wrapper._fatal_error is None
+        assert runtime._terminal_error is None
+        assert wrapper._admitted_operations == 1
+        assert wrapper._fatal_publications == 1
+        assert not close_done.is_set()
+
+        release_active_store.set()
+        _join_task_18_2_call(worker, worker_done)
+        _join_task_18_2_call(closer, close_done)
+    finally:
+        release_agree.set()
+        release_active_store.set()
+        if worker.is_alive():
+            _join_task_18_2_call(worker, worker_done)
+        if closer is not None and closer.is_alive():
+            _join_task_18_2_call(closer, close_done)
+
+    active_key = wrapper._active_b_key(wrapper.rank)
+    fatal_key = wrapper._fatal_key(wrapper.rank)
+    fatal_ack_key = wrapper._fatal_ack_key(wrapper.rank)
+    store_keys = [(operation, key) for operation, key, _, _ in store_trace]
+    assert worker_results == []
+    assert worker_errors == [primary]
+    assert close_results == []
+    assert close_errors == [primary]
+    assert len(publications) == 1
+    assert publications[0][0].primary is primary
+    assert publications[0][1] is primary
+    assert all(
+        phase is _TerminalPhase.FATAL_PENDING
+        for _, _, phase, _ in store_trace
+    )
+    assert all(
+        collective_error is None
+        for _, key, _, collective_error in store_trace
+        if key == active_key
+    )
+    assert store_keys.index(("set", active_key)) < store_keys.index(
+        ("set", fatal_key)
+    )
+    assert max(
+        index
+        for index, (_, key) in enumerate(store_keys)
+        if key == active_key
+    ) < store_keys.index(("set", fatal_key))
+    assert store_keys.index(("set", fatal_key)) < store_keys.index(
+        ("set", fatal_ack_key)
+    )
+    assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+    assert wrapper._fatal_error is primary
+    assert wrapper._fatal_publications == 0
+    assert wrapper._admitted_operations == 0
+    assert raw_comm.abort_calls == 1
+    assert hard_exits == []
 
 
 def test_runtime_origin_fatal_reservation_precedes_terminal_visibility_and_close(

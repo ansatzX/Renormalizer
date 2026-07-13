@@ -42,6 +42,7 @@ class _FatalPublicationReservation:
         "started",
         "joined",
         "monitor_deferred",
+        "completion_deferred",
         "handler",
         "transition_handler",
         "handler_started",
@@ -57,6 +58,7 @@ class _FatalPublicationReservation:
         started,
         joined=False,
         monitor_deferred=False,
+        completion_deferred=False,
         handler=None,
         transition_handler=None,
         transition=None,
@@ -66,12 +68,33 @@ class _FatalPublicationReservation:
         self.started = started
         self.joined = joined
         self.monitor_deferred = monitor_deferred
+        self.completion_deferred = completion_deferred
         self.handler = handler
         self.transition_handler = transition_handler
         self.handler_started = False
         self.transition = transition
         self.snapshot = None
         self.completion = None
+
+
+class _DeferredFatalPublication:
+    __slots__ = ("boundary", "reservation", "completed")
+
+    def __init__(self, boundary, reservation):
+        self.boundary = boundary
+        self.reservation = reservation
+        self.completed = False
+
+    @property
+    def primary(self):
+        return self.reservation.primary
+
+    def complete(self):
+        if self.completed:
+            return self.primary
+        self.completed = True
+        self.boundary.__exit__(None, None, None)
+        return self.primary
 
 
 class _FatalPublicationOwnerReservation:
@@ -249,6 +272,7 @@ class CupyNcclCollective:
         self._fatal_condition = threading.Condition(self._fatal_lock)
         self._fatal_publication_lock = threading.RLock()
         self._fatal_publication_local = threading.local()
+        self._active_broadcast_local = threading.local()
         self._admitted_operations = 0
         self._fatal_publications = 0
         self._fatal_publication_owner_reservation = None
@@ -524,6 +548,7 @@ class CupyNcclCollective:
         discovering_token=None,
         handler_override=None,
         transition=None,
+        defer_completion=False,
     ):
         active = getattr(self._fatal_publication_local, "reservation", None)
         if active is not None:
@@ -600,6 +625,7 @@ class CupyNcclCollective:
             started,
             joined=joined,
             monitor_deferred=monitor_deferred,
+            completion_deferred=defer_completion,
             handler=handler,
             transition_handler=transition_handler,
             transition=transition,
@@ -629,7 +655,8 @@ class CupyNcclCollective:
                 fatal_owner=fatal_owner,
                 discovering_token=discovering_token,
             )
-            self._prepare_local_fatal_locked()
+            if not defer_completion:
+                self._prepare_local_fatal_locked()
             try:
                 yield reservation
             except TimeoutError as error:
@@ -637,6 +664,9 @@ class CupyNcclCollective:
                 self._fatal_hard_exit()
                 raise
             else:
+                if defer_completion:
+                    reservation.completion_deferred = False
+                    self._prepare_local_fatal_locked()
                 self._run_fatal_handler(reservation)
                 self._publish_communicator_fatal_locked(primary)
                 self._complete_fatal_handler(reservation)
@@ -940,7 +970,7 @@ class CupyNcclCollective:
             handler_override=handler_override,
             transition=transition,
         ) as reservation:
-            if reservation.started:
+            if reservation.started and not reservation.completion_deferred:
                 self._run_fatal_handler(reservation)
             return reservation.primary
 
@@ -958,6 +988,11 @@ class CupyNcclCollective:
         on_elected=None,
         discovering_token=None,
     ):
+        if admitted and hasattr(self._active_broadcast_local, "deferral"):
+            primary = self._defer_active_broadcast_fatal(error, origin_rank)
+            if on_elected is not None:
+                on_elected(primary)
+            return primary
         with self._communicator_fatal_reservation(
             error,
             origin_rank=origin_rank,
@@ -968,10 +1003,27 @@ class CupyNcclCollective:
         ) as reservation:
             if on_elected is not None:
                 on_elected(reservation.primary)
-            if not reservation.started:
+            if not reservation.started or reservation.completion_deferred:
                 return reservation.primary
             self._run_fatal_handler(reservation)
             return reservation.primary
+
+    def _defer_active_broadcast_fatal(self, error, origin_rank):
+        deferral = self._active_broadcast_local.deferral
+        if deferral is not None:
+            if error is not deferral.primary:
+                self._record_fatal_secondary(error)
+            return deferral.primary
+        boundary = self._communicator_fatal_reservation(
+            error,
+            origin_rank=origin_rank,
+            admitted=True,
+            defer_completion=True,
+        )
+        reservation = boundary.__enter__()
+        deferral = _DeferredFatalPublication(boundary, reservation)
+        self._active_broadcast_local.deferral = deferral
+        return deferral.primary
 
     def _read_fatal_origin(self):
         return next(
@@ -1380,10 +1432,17 @@ class CupyNcclCollective:
     @contextmanager
     def _active_broadcast_admission(self):
         self._begin_collective_operation()
+        self._active_broadcast_local.deferral = None
         try:
             yield self._broadcast_unadmitted, self._agree_admitted_active_broadcast
         finally:
-            self._finish_collective_operation()
+            deferral = self._active_broadcast_local.deferral
+            try:
+                self._finish_collective_operation()
+                if deferral is not None:
+                    deferral.complete()
+            finally:
+                del self._active_broadcast_local.deferral
 
     def broadcast(self, array, *, root):
         self._begin_collective_operation()
@@ -1563,12 +1622,16 @@ class CupyNcclCollective:
         if failed_ranks:
             with self._fatal_lock:
                 primary = self._fatal_error
+                if primary is None:
+                    primary = self._fatal_pending_primary
             if primary is None:
                 origin_rank = failed_ranks[0]
                 primary = _RemoteCommunicatorFailure(origin_rank)
-                self._enter_observed_fatal(primary, origin_rank, admitted=admitted)
             else:
-                self._publish_communicator_fatal(primary, admitted=admitted)
+                origin_rank = self._fatal_pending_origin_rank
+                if origin_rank is None:
+                    origin_rank = failed_ranks[0]
+            self._enter_observed_fatal(primary, origin_rank, admitted=admitted)
             self._raise_terminal()
         if admitted:
             with self._fatal_lock:
