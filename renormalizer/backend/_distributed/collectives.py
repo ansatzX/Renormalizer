@@ -462,6 +462,17 @@ class CupyNcclCollective:
             self._fatal_publications += 1
             return primary, True
 
+    def _current_thread_reserved_fatal_primary(self):
+        with self._fatal_condition:
+            owner = self._fatal_publication_owner_reservation
+            if (
+                self._fatal_publications <= 0
+                or owner is None
+                or owner.owner_thread is not threading.current_thread()
+            ):
+                return None
+            return owner.primary
+
     def _begin_fatal_publication(
         self,
         error,
@@ -559,6 +570,7 @@ class CupyNcclCollective:
     def _wait_for_joined_fatal_publication(self):
         deadline = time.monotonic() + _FATAL_TIMEOUT_S
         publication_failure = None
+        fail_stop_error = None
         with self._fatal_condition:
             while self._fatal_publications:
                 publication_failure = self._fatal_publication_failure
@@ -566,37 +578,41 @@ class CupyNcclCollective:
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    error = RuntimeError(
+                    fail_stop_error = RuntimeError(
                         "communicator fatal publication join timed out"
                     )
-                    self._record_fatal_secondary(error)
-                    self._fatal_hard_exit()
+                    break
                 self._fatal_condition.wait(remaining)
             if (
-                publication_failure is None
+                fail_stop_error is None
+                and publication_failure is None
                 and not self._fatal_protocol_completed
             ):
-                error = RuntimeError(
+                fail_stop_error = RuntimeError(
                     "communicator fatal publication ended without completion"
                 )
-                self._record_fatal_secondary(error)
-                self._fatal_hard_exit()
+        if fail_stop_error is not None:
+            self._record_fatal_secondary(fail_stop_error)
+            self._fatal_hard_exit()
         if publication_failure is not None:
             self._fatal_hard_exit()
             raise publication_failure
 
     def _wait_for_active_broadcast_agreements(self):
         deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        fail_stop_error = None
         with self._fatal_condition:
             while self._active_broadcast_agreements:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    error = RuntimeError(
+                    fail_stop_error = RuntimeError(
                         "active broadcast publication barrier timed out"
                     )
-                    self._record_fatal_secondary(error)
-                    self._fatal_hard_exit()
+                    break
                 self._fatal_condition.wait(remaining)
+        if fail_stop_error is not None:
+            self._record_fatal_secondary(fail_stop_error)
+            self._fatal_hard_exit()
 
     @contextmanager
     def _communicator_fatal_reservation(
@@ -1956,17 +1972,20 @@ class CupyNcclCollective:
 
     def _quiesce_operations_for_close(self):
         deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        fail_stop_error = None
         with self._fatal_condition:
             self._closing = True
             while self._admitted_operations or self._fatal_publications:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    error = RuntimeError(
+                    fail_stop_error = RuntimeError(
                         "communicator fatal publication quiescence timed out"
                     )
-                    self._record_fatal_secondary(error)
-                    self._fatal_hard_exit()
+                    break
                 self._fatal_condition.wait(remaining)
+        if fail_stop_error is not None:
+            self._record_fatal_secondary(fail_stop_error)
+            self._fatal_hard_exit()
 
     @staticmethod
     def _release_runtime_close_step(gate, token):
@@ -2067,14 +2086,19 @@ class CupyNcclCollective:
 
     def _wait_for_close_owner(self):
         deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        fail_stop_error = None
         with self._fatal_condition:
             while self._close_in_progress and not self._closed:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    error = RuntimeError("communicator close join timed out")
-                    self._record_fatal_secondary(error)
-                    self._fatal_hard_exit()
+                    fail_stop_error = RuntimeError(
+                        "communicator close join timed out"
+                    )
+                    break
                 self._fatal_condition.wait(remaining)
+        if fail_stop_error is not None:
+            self._record_fatal_secondary(fail_stop_error)
+            self._fatal_hard_exit()
 
     def _close_impl(self, gate=None, transition=None):
         while True:

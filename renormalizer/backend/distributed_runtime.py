@@ -691,6 +691,7 @@ class CupyDistributedRuntime:
                     collective, "_reserve_runtime_fatal_outcome", None
                 )
                 elected_here = False
+                pre_reservation_failure = None
 
                 def retain_fatal_context():
                     if self._pending_fatal_collective is None:
@@ -726,7 +727,22 @@ class CupyDistributedRuntime:
 
                     def elect_joinable_fatal():
                         nonlocal elected_here, transition
-                        reserved_primary, started = pre_reserve(primary)
+                        nonlocal pre_reservation_failure
+                        try:
+                            reserved_primary, started = pre_reserve(primary)
+                        except BaseException as error:
+                            reserved_primary_for_thread = getattr(
+                                collective,
+                                "_current_thread_reserved_fatal_primary",
+                                None,
+                            )
+                            if not callable(reserved_primary_for_thread):
+                                raise
+                            reserved_primary = reserved_primary_for_thread()
+                            if reserved_primary is None:
+                                raise
+                            started = True
+                            pre_reservation_failure = error
                         if reserved_primary is not primary or not started:
                             raise RuntimeError(
                                 "communicator fatal owner was not reserved"
@@ -744,6 +760,8 @@ class CupyDistributedRuntime:
                     outcome = reserve_outcome(
                         primary, before_select=elect_joinable_fatal
                     )
+                    if pre_reservation_failure is not None:
+                        raise pre_reservation_failure
                     if outcome.primary is not primary:
                         self._remember_terminal_secondary_locked(
                             primary, outcome.primary, owner
