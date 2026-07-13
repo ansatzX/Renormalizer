@@ -106,12 +106,20 @@ class _DeferredFatalPublication:
 
 
 class _FatalPublicationOwnerReservation:
-    __slots__ = ("primary", "owner_thread_id", "installed")
+    __slots__ = (
+        "primary",
+        "owner_thread",
+        "owner_thread_id",
+        "installed",
+        "adopted",
+    )
 
-    def __init__(self, primary, owner_thread_id, installed):
+    def __init__(self, primary, owner_thread, installed):
         self.primary = primary
-        self.owner_thread_id = owner_thread_id
+        self.owner_thread = owner_thread
+        self.owner_thread_id = owner_thread.ident
         self.installed = installed
+        self.adopted = False
 
 
 def _validate_reduction_op(op):
@@ -285,6 +293,7 @@ class CupyNcclCollective:
         self._active_broadcast_agreements = 0
         self._fatal_publications = 0
         self._fatal_publication_failure = None
+        self._fatal_publication_gate_failure_signaled = False
         self._fatal_publication_owner_reservation = None
         self._closing = False
         self._fatal_pending_primary = None
@@ -444,14 +453,13 @@ class CupyNcclCollective:
             if self._closed:
                 raise RuntimeError("collective is closed")
             primary, installed = self._install_fatal(error, origin_rank)
-            self._fatal_publications += 1
-            self._fatal_publication_owner_reservation = (
-                _FatalPublicationOwnerReservation(
-                    primary,
-                    threading.get_ident(),
-                    installed,
-                )
+            owner_reservation = _FatalPublicationOwnerReservation(
+                primary,
+                threading.current_thread(),
+                installed,
             )
+            self._fatal_publication_owner_reservation = owner_reservation
+            self._fatal_publications += 1
             return primary, True
 
     def _begin_fatal_publication(
@@ -469,13 +477,18 @@ class CupyNcclCollective:
             owner_reservation = self._fatal_publication_owner_reservation
             if (
                 owner_reservation is not None
-                and owner_reservation.owner_thread_id == threading.get_ident()
+                and owner_reservation.owner_thread
+                is threading.current_thread()
             ):
+                if owner_reservation.adopted:
+                    raise RuntimeError(
+                        "communicator fatal owner was already adopted"
+                    )
                 if owner_reservation.primary is not error:
                     raise RuntimeError("communicator fatal primary changed")
                 if self._fatal_pending_origin_rank is None:
                     self._fatal_pending_origin_rank = origin_rank
-                self._fatal_publication_owner_reservation = None
+                owner_reservation.adopted = True
                 return (
                     owner_reservation.primary,
                     owner_reservation.installed,
@@ -524,6 +537,13 @@ class CupyNcclCollective:
                     False,
                 )
             primary, installed = self._install_fatal(error, origin_rank)
+            owner_reservation = _FatalPublicationOwnerReservation(
+                primary,
+                threading.current_thread(),
+                installed,
+            )
+            owner_reservation.adopted = True
+            self._fatal_publication_owner_reservation = owner_reservation
             self._fatal_publications += 1
             return primary, installed, True, False, False
 
@@ -532,6 +552,8 @@ class CupyNcclCollective:
             if self._fatal_publications <= 0:
                 raise RuntimeError("fatal publication count is inconsistent")
             self._fatal_publications -= 1
+            if self._fatal_publications == 0:
+                self._fatal_publication_owner_reservation = None
             self._fatal_condition.notify_all()
 
     def _wait_for_joined_fatal_publication(self):
@@ -609,64 +631,81 @@ class CupyNcclCollective:
             return
         if origin_rank is None:
             origin_rank = self.rank
-        handler = (
-            handler_override
-            if handler_override is not None
-            else self._fatal_handler_callback()
-        )
-        transition_handler = handler
-        begin = None if handler is None else getattr(handler, "begin", None)
-        if not callable(begin):
-            transition_handler = self._fatal_transition_handler_callback()
-            begin = (
-                None
-                if transition_handler is None
-                else getattr(transition_handler, "begin", None)
+        transition_handler = handler_override
+        try:
+            handler = (
+                handler_override
+                if handler_override is not None
+                else self._fatal_handler_callback()
             )
-        if handler is None:
-            handler = transition_handler
-        if transition is None and callable(begin):
-            transition = begin(
-                error,
-                owner=fatal_owner,
-                discovering_token=discovering_token,
+            transition_handler = handler
+            begin = None if handler is None else getattr(handler, "begin", None)
+            if not callable(begin):
+                transition_handler = self._fatal_transition_handler_callback()
+                begin = (
+                    None
+                    if transition_handler is None
+                    else getattr(transition_handler, "begin", None)
+                )
+            if handler is None:
+                handler = transition_handler
+            if transition is None and callable(begin):
+                transition = begin(
+                    error,
+                    owner=fatal_owner,
+                    discovering_token=discovering_token,
+                )
+            if transition is not None:
+                primary = transition.primary
+                if not isinstance(primary, BaseException):
+                    raise TypeError(
+                        "communicator fatal transition primary is invalid"
+                    )
+                if error is not primary:
+                    self._record_fatal_secondary(error)
+                outcome = self._observe_fatal_monitor_outcome()
+                if (
+                    outcome is None
+                    or outcome.kind != "fatal_elected"
+                    or outcome.primary is not primary
+                ):
+                    raise RuntimeError(
+                        "communicator fatal handoff was not reserved"
+                    )
+            else:
+                outcome = self._elect_collective_fatal_outcome(
+                    error, origin_rank
+                )
+                primary = outcome.primary
+            primary, installed, started, joined, monitor_deferred = (
+                self._begin_fatal_publication(
+                    primary,
+                    origin_rank,
+                    admitted=admitted,
+                    release_admitted=release_admitted,
+                    join_existing=join_existing,
+                )
             )
-        if transition is not None:
-            primary = transition.primary
-            if not isinstance(primary, BaseException):
-                raise TypeError("communicator fatal transition primary is invalid")
-            if error is not primary:
-                self._record_fatal_secondary(error)
-            outcome = self._observe_fatal_monitor_outcome()
-            if (
-                outcome is None
-                or outcome.kind != "fatal_elected"
-                or outcome.primary is not primary
-            ):
-                raise RuntimeError("communicator fatal handoff was not reserved")
-        else:
-            outcome = self._elect_collective_fatal_outcome(error, origin_rank)
-            primary = outcome.primary
-        primary, installed, started, joined, monitor_deferred = (
-            self._begin_fatal_publication(
+            reservation = _FatalPublicationReservation(
                 primary,
-                origin_rank,
-                admitted=admitted,
-                release_admitted=release_admitted,
-                join_existing=join_existing,
+                installed,
+                started,
+                joined=joined,
+                monitor_deferred=monitor_deferred,
+                completion_deferred=defer_completion,
+                handler=handler,
+                transition_handler=transition_handler,
+                transition=transition,
             )
-        )
-        reservation = _FatalPublicationReservation(
-            primary,
-            installed,
-            started,
-            joined=joined,
-            monitor_deferred=monitor_deferred,
-            completion_deferred=defer_completion,
-            handler=handler,
-            transition_handler=transition_handler,
-            transition=transition,
-        )
+        except BaseException as setup_error:
+            owned, first_failure = self._fail_reserved_fatal_publication(
+                setup_error,
+                transition_handler=transition_handler,
+                transition=transition,
+            )
+            if owned and first_failure:
+                self._fatal_hard_exit()
+            raise
         if not started:
             if monitor_deferred:
                 outcome = self._wait_for_fatal_monitor_selection()
@@ -718,8 +757,9 @@ class CupyNcclCollective:
             self._complete_fatal_handler(reservation)
             publication_succeeded = True
         except BaseException as error:
-            self._fail_fatal_publication(reservation, error)
-            self._fatal_hard_exit()
+            first_failure = self._fail_fatal_publication(reservation, error)
+            if first_failure:
+                self._fatal_hard_exit()
             raise
         finally:
             try:
@@ -843,27 +883,76 @@ class CupyNcclCollective:
                 reservation.transition_published = True
         return reservation.snapshot
 
-    def _fail_fatal_publication(self, reservation, error):
+    def _fail_reserved_fatal_publication(
+        self,
+        error,
+        *,
+        transition_handler=None,
+        transition=None,
+    ):
+        if not isinstance(error, BaseException):
+            raise TypeError("fatal publication failure must be an exception")
+        failure_handler = (
+            None
+            if transition_handler is None
+            else getattr(transition_handler, "fail", None)
+        )
+        consistency_error = None
         with self._fatal_condition:
-            if reservation.failure_signaled:
-                return
-            reservation.failure_signaled = True
-            reservation.fail_stopped = True
+            owner = self._fatal_publication_owner_reservation
+            if (
+                self._fatal_publications <= 0
+                or owner is None
+                or owner.owner_thread is not threading.current_thread()
+            ):
+                return False, False
+            primary = owner.primary
+            if self._fatal_pending_primary is not primary:
+                consistency_error = RuntimeError(
+                    "communicator fatal publication primary changed"
+                )
+            first_failure = self._fatal_publication_failure is None
             if self._fatal_publication_failure is None:
-                self._fatal_publication_failure = reservation.primary
-            elif self._fatal_publication_failure is not reservation.primary:
-                error = RuntimeError("communicator fatal publication failure changed")
+                self._fatal_publication_failure = primary
+            elif self._fatal_publication_failure is not primary:
+                consistency_error = RuntimeError(
+                    "communicator fatal publication failure changed"
+                )
+            signal_gate = (
+                transition is not None
+                and callable(failure_handler)
+                and not self._fatal_publication_gate_failure_signaled
+            )
+            if signal_gate:
+                self._fatal_publication_gate_failure_signaled = True
             self._fatal_condition.notify_all()
-        if not (
+        signal_error = None
+        if signal_gate:
+            try:
+                failure_handler(transition, primary)
+            except BaseException as caught:
+                signal_error = caught
+        if first_failure and not (
             isinstance(error, SystemExit) and error.code == _FATAL_EXIT_CODE
         ):
             self._record_fatal_secondary(error)
-        failure_handler = getattr(reservation.transition_handler, "fail", None)
-        if callable(failure_handler) and reservation.transition is not None:
-            try:
-                failure_handler(reservation.transition, reservation.primary)
-            except BaseException as signal_error:
-                self._record_fatal_secondary(signal_error)
+        if consistency_error is not None:
+            self._record_fatal_secondary(consistency_error)
+        if signal_error is not None:
+            self._record_fatal_secondary(signal_error)
+        return True, first_failure
+
+    def _fail_fatal_publication(self, reservation, error):
+        if reservation.failure_signaled:
+            return False
+        reservation.failure_signaled = True
+        reservation.fail_stopped = True
+        owned, first_failure = self._fail_reserved_fatal_publication(
+            error,
+            transition_handler=reservation.transition_handler,
+            transition=reservation.transition,
+        )
+        return owned and first_failure
 
     @staticmethod
     def _complete_fatal_handler(reservation):

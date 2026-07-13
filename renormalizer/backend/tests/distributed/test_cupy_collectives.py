@@ -5621,6 +5621,341 @@ def test_deferred_gate_completion_failure_retains_owner_and_bounds_close(
     assert completion_error in wrapper._fatal_secondary_errors
 
 
+def test_pre_reserved_fatal_owner_failure_before_adoption_is_fail_stopped(
+    monkeypatch,
+):
+    class PublicationCancelled(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, raw_comm = _single_rank_task_18_2_runtime(
+        monkeypatch
+    )
+    gate = runtime._terminal_gate
+    primary = RuntimeError("pre-adoption fatal primary")
+    later = RuntimeError("later fatal reporter")
+    cancellation = PublicationCancelled(
+        "cancel hidden election before owner adoption"
+    )
+    publisher_name = "task-18.2-pre-adoption-fatal-owner"
+    reporter_name = "task-18.2-pre-adoption-fatal-reporter"
+    close_name = "task-18.2-pre-adoption-fatal-close"
+    injection_observations = []
+    join_observations = []
+    reporter_adoptions = []
+    failure_signals = []
+    hard_exit_observations = []
+
+    original_reserve_outcome = wrapper._reserve_runtime_fatal_outcome
+
+    def cancel_before_adoption(primary, *, before_select=None):
+        outcome = original_reserve_outcome(
+            primary, before_select=before_select
+        )
+        if threading.current_thread().name == publisher_name:
+            with wrapper._fatal_condition:
+                owner = wrapper._fatal_publication_owner_reservation
+                injection_observations.append(
+                    (
+                        wrapper._fatal_publications,
+                        owner is not None,
+                        None if owner is None else owner.owner_thread_id,
+                        wrapper._fatal_pending_primary,
+                    )
+                )
+            raise cancellation
+        return outcome
+
+    monkeypatch.setattr(
+        wrapper,
+        "_reserve_runtime_fatal_outcome",
+        cancel_before_adoption,
+    )
+    original_begin = wrapper._begin_fatal_publication
+
+    def record_reporter_adoption(error, origin_rank, **kwargs):
+        result = original_begin(error, origin_rank, **kwargs)
+        reporter_adoptions.append(result)
+        return result
+
+    monkeypatch.setattr(
+        wrapper, "_begin_fatal_publication", record_reporter_adoption
+    )
+    original_wait = wrapper._wait_for_joined_fatal_publication
+
+    def record_join():
+        with wrapper._fatal_condition:
+            join_observations.append(
+                (
+                    threading.current_thread().name,
+                    wrapper._fatal_publications,
+                    wrapper._fatal_publication_failure,
+                )
+            )
+        return original_wait()
+
+    monkeypatch.setattr(
+        wrapper, "_wait_for_joined_fatal_publication", record_join
+    )
+    original_fail = gate._fail_fatal_publication
+
+    def record_failure(transition, failure):
+        failure_signals.append(
+            (
+                transition,
+                failure,
+                wrapper._fatal_lock._is_owned(),
+            )
+        )
+        return original_fail(transition, failure)
+
+    monkeypatch.setattr(gate, "_fail_fatal_publication", record_failure)
+
+    def hard_exit():
+        hard_exit_observations.append(
+            (
+                threading.current_thread().name,
+                wrapper._fatal_publications,
+                wrapper._fatal_publication_failure,
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit(threading.current_thread().name)
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    publisher, publish_results, publish_errors, publish_done = (
+        _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(primary),
+            name=publisher_name,
+        )
+    )
+    _join_task_18_2_call(publisher, publish_done)
+
+    assert publish_results == []
+    assert len(publish_errors) == 1
+    assert isinstance(publish_errors[0], FatalHardExit)
+    assert injection_observations == [
+        (1, True, publisher.ident, primary),
+    ]
+    assert wrapper._fatal_publications == 1
+    assert wrapper._fatal_publication_failure is primary
+    with wrapper._fatal_condition:
+        retained_owner = wrapper._fatal_publication_owner_reservation
+        assert retained_owner.owner_thread is publisher
+        assert retained_owner.adopted is False
+    with gate._condition:
+        assert gate._fatal_publication_failure is primary
+    assert gate.phase is _TerminalPhase.FATAL_PENDING
+    assert len(failure_signals) == 1
+    assert failure_signals[0][0].primary is primary
+    assert failure_signals[0][1] is primary
+    assert failure_signals[0][2] is False
+
+    reporter, report_results, report_errors, report_done = (
+        _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(later),
+            name=reporter_name,
+        )
+    )
+    _join_task_18_2_call(reporter, report_done)
+
+    assert report_results == []
+    assert len(report_errors) == 1
+    assert isinstance(report_errors[0], FatalHardExit)
+    assert len(reporter_adoptions) == 1
+    assert reporter_adoptions[0][2:] == (False, True, False)
+
+    closer, close_results, close_errors, close_done = _start_task_18_2_call(
+        runtime.close, name=close_name
+    )
+    _join_task_18_2_call(closer, close_done)
+
+    assert close_results == []
+    assert len(close_errors) == 1
+    assert isinstance(close_errors[0], FatalHardExit)
+    assert join_observations == [
+        (reporter_name, 1, primary),
+        (close_name, 1, primary),
+    ]
+    assert hard_exit_observations == [
+        (publisher_name, 1, primary, False, False),
+        (reporter_name, 1, primary, False, False),
+        (close_name, 1, primary, False, False),
+    ]
+    assert len(failure_signals) == 1
+    assert wrapper._fatal_secondary_errors == (cancellation, later)
+    assert raw_comm.abort_calls == 0
+    assert wrapper._fatal_error is None
+    assert runtime._terminal_error is None
+
+
+def test_adopted_fatal_owner_construction_failure_is_fail_stopped(monkeypatch):
+    from renormalizer.backend._distributed import collectives as collectives_module
+
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, raw_comm = _single_rank_task_18_2_runtime(
+        monkeypatch
+    )
+    gate = runtime._terminal_gate
+    primary = RuntimeError("post-adoption fatal primary")
+    later = RuntimeError("later post-adoption reporter")
+    construction_failure = KeyboardInterrupt(
+        "interrupt fatal reservation construction"
+    )
+    publisher_name = "task-18.2-post-adoption-fatal-owner"
+    reporter_name = "task-18.2-post-adoption-fatal-reporter"
+    close_name = "task-18.2-post-adoption-fatal-close"
+    adoption_observations = []
+    construction_observations = []
+    join_observations = []
+    failure_signals = []
+    hard_exit_observations = []
+
+    original_begin = wrapper._begin_fatal_publication
+
+    def record_adoption(error, origin_rank, **kwargs):
+        result = original_begin(error, origin_rank, **kwargs)
+        if threading.current_thread().name == publisher_name:
+            adoption_observations.append(result)
+        return result
+
+    monkeypatch.setattr(wrapper, "_begin_fatal_publication", record_adoption)
+    reservation_type = collectives_module._FatalPublicationReservation
+
+    def fail_owner_construction(*args, **kwargs):
+        if threading.current_thread().name == publisher_name:
+            with wrapper._fatal_condition:
+                construction_observations.append(
+                    (
+                        wrapper._fatal_publications,
+                        wrapper._fatal_pending_primary,
+                    )
+                )
+            raise construction_failure
+        return reservation_type(*args, **kwargs)
+
+    monkeypatch.setattr(
+        collectives_module,
+        "_FatalPublicationReservation",
+        fail_owner_construction,
+    )
+    original_wait = wrapper._wait_for_joined_fatal_publication
+
+    def record_join():
+        with wrapper._fatal_condition:
+            join_observations.append(
+                (
+                    threading.current_thread().name,
+                    wrapper._fatal_publications,
+                    wrapper._fatal_publication_failure,
+                )
+            )
+        return original_wait()
+
+    monkeypatch.setattr(
+        wrapper, "_wait_for_joined_fatal_publication", record_join
+    )
+    original_fail = gate._fail_fatal_publication
+
+    def record_failure(transition, failure):
+        failure_signals.append(
+            (
+                transition,
+                failure,
+                wrapper._fatal_lock._is_owned(),
+            )
+        )
+        return original_fail(transition, failure)
+
+    monkeypatch.setattr(gate, "_fail_fatal_publication", record_failure)
+
+    def hard_exit():
+        hard_exit_observations.append(
+            (
+                threading.current_thread().name,
+                wrapper._fatal_publications,
+                wrapper._fatal_publication_failure,
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit(threading.current_thread().name)
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    publisher, publish_results, publish_errors, publish_done = (
+        _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(primary),
+            name=publisher_name,
+        )
+    )
+    _join_task_18_2_call(publisher, publish_done)
+
+    assert publish_results == []
+    assert len(publish_errors) == 1
+    assert isinstance(publish_errors[0], FatalHardExit)
+    assert len(adoption_observations) == 1
+    assert adoption_observations[0][2:] == (True, False, False)
+    assert construction_observations == [(1, primary)]
+    assert wrapper._fatal_publications == 1
+    assert wrapper._fatal_publication_failure is primary
+    with wrapper._fatal_condition:
+        retained_owner = wrapper._fatal_publication_owner_reservation
+        assert retained_owner.owner_thread is publisher
+        assert retained_owner.adopted is True
+    with gate._condition:
+        assert gate._fatal_publication_failure is primary
+    assert gate.phase is _TerminalPhase.FATAL_PENDING
+    assert len(failure_signals) == 1
+    assert failure_signals[0][0].primary is primary
+    assert failure_signals[0][1] is primary
+    assert failure_signals[0][2] is False
+
+    reporter, report_results, report_errors, report_done = (
+        _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(later),
+            name=reporter_name,
+        )
+    )
+    _join_task_18_2_call(reporter, report_done)
+
+    assert report_results == []
+    assert len(report_errors) == 1
+    assert isinstance(report_errors[0], FatalHardExit)
+
+    closer, close_results, close_errors, close_done = _start_task_18_2_call(
+        runtime.close, name=close_name
+    )
+    _join_task_18_2_call(closer, close_done)
+
+    assert close_results == []
+    assert len(close_errors) == 1
+    assert isinstance(close_errors[0], FatalHardExit)
+    assert join_observations == [
+        (reporter_name, 1, primary),
+        (close_name, 1, primary),
+    ]
+    assert hard_exit_observations == [
+        (publisher_name, 1, primary, False, False),
+        (reporter_name, 1, primary, False, False),
+        (close_name, 1, primary, False, False),
+    ]
+    assert len(failure_signals) == 1
+    assert wrapper._fatal_secondary_errors == (
+        construction_failure,
+        later,
+    )
+    assert raw_comm.abort_calls == 0
+    assert wrapper._fatal_error is None
+    assert runtime._terminal_error is None
+
+
 @pytest.mark.skipif(
     os.environ.get("WORLD_SIZE") != "2",
     reason="requires a two-rank torchrun launcher",

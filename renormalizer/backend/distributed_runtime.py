@@ -618,6 +618,46 @@ class CupyDistributedRuntime:
     def _begin_communicator_fatal(
         self, primary, *, owner=None, discovering_token=None
     ):
+        failure_context = [None]
+        try:
+            return self._elect_communicator_fatal(
+                primary,
+                owner=owner,
+                discovering_token=discovering_token,
+                failure_context=failure_context,
+            )
+        except BaseException as error:
+            collective = failure_context[0]
+            fail_publication = (
+                None
+                if collective is None
+                else getattr(
+                    collective,
+                    "_fail_reserved_fatal_publication",
+                    None,
+                )
+            )
+            if callable(fail_publication):
+                gate = self._terminal_gate
+                with gate._condition:
+                    transition = gate._fatal_transition
+                owned, first_failure = fail_publication(
+                    error,
+                    transition_handler=self._communicator_fatal_hook,
+                    transition=transition,
+                )
+                if owned and first_failure:
+                    collective._fatal_hard_exit()
+            raise
+
+    def _elect_communicator_fatal(
+        self,
+        primary,
+        *,
+        owner=None,
+        discovering_token=None,
+        failure_context,
+    ):
         gate = self._terminal_gate
         with gate._condition:
             transition = gate._fatal_transition
@@ -646,6 +686,7 @@ class CupyDistributedRuntime:
                     raise RuntimeError(
                         "collective does not provide fatal publication"
                     )
+                failure_context[0] = collective
                 reserve_outcome = getattr(
                     collective, "_reserve_runtime_fatal_outcome", None
                 )
