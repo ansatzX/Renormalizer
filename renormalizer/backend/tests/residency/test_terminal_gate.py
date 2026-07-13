@@ -1,4 +1,5 @@
 import gc
+from pathlib import Path
 import threading
 import weakref
 
@@ -13,8 +14,15 @@ from renormalizer.backend._distributed.terminal import (
 _TIMEOUT_S = 3.0
 
 
-class _AsyncOwner:
+class _AsyncClaimCapability:
     pass
+
+
+def test_concurrency_tests_use_exact_wait_entry_handoffs():
+    source = Path(__file__).read_text(encoding="utf-8")
+
+    assert "wait(" + "0." + "05)" not in source
+    assert "allow_runtime_" + "commit" not in source
 
 
 def _start(call):
@@ -33,6 +41,25 @@ def _start(call):
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     return thread, results, errors, done
+
+
+def _observe_condition_waits(gate, count):
+    entered = [threading.Event() for _ in range(count)]
+    counter_lock = threading.Lock()
+    original_wait = gate._condition.wait
+    next_index = 0
+
+    def observe_wait(timeout=None):
+        nonlocal next_index
+        with counter_lock:
+            index = next_index
+            next_index += 1
+        if index < len(entered):
+            entered[index].set()
+        return original_wait(timeout)
+
+    gate._condition.wait = observe_wait
+    return entered
 
 
 def _join(thread, done):
@@ -148,6 +175,57 @@ def test_provisional_epoch_precedes_first_resource_operation():
     _close_lease(gate, epoch)
 
 
+def test_rejected_inputs_do_not_mutate_epochs_phases_or_sequences():
+    lease_gate = _TerminalLifecycleGate()
+    next_epoch = lease_gate._next_epoch
+    next_sequence = lease_gate._next_sequence
+
+    with pytest.raises(ValueError, match="non-empty"):
+        lease_gate.begin_lease("")
+
+    assert lease_gate.phase is _TerminalPhase.HEALTHY
+    assert lease_gate._live_epoch is None
+    assert lease_gate._leases == {}
+    assert lease_gate._next_epoch == next_epoch
+    assert lease_gate._next_sequence == next_sequence
+    epoch, construction = lease_gate.begin_lease("valid_construction")
+    assert epoch == next_epoch
+    assert construction.sequence == next_sequence
+    lease_gate.activate_lease(epoch, construction)
+    lease_gate.release(construction)
+    _close_lease(lease_gate, epoch)
+
+    fatal_gate = _TerminalLifecycleGate()
+    fatal_parent = fatal_gate.admit_runtime("fatal_parent")
+    fatal_capability = _AsyncClaimCapability()
+    fatal_descendant = fatal_gate.spawn_async(fatal_parent, fatal_capability)
+    fatal_sequence = fatal_gate._next_sequence
+
+    with pytest.raises(RuntimeError, match="unclaimed"):
+        fatal_gate.begin_fatal(RuntimeError("rejected fatal"), fatal_descendant)
+
+    assert fatal_gate.phase is _TerminalPhase.HEALTHY
+    assert fatal_gate._fatal_transition is None
+    assert fatal_gate._next_sequence == fatal_sequence
+    fatal_gate.release(fatal_descendant)
+    fatal_gate.release(fatal_parent)
+
+    close_gate = _TerminalLifecycleGate()
+    close_parent = close_gate.admit_runtime("close_parent")
+    close_capability = _AsyncClaimCapability()
+    close_descendant = close_gate.spawn_async(close_parent, close_capability)
+    close_sequence = close_gate._next_sequence
+
+    with pytest.raises(RuntimeError, match="unclaimed"):
+        close_gate.begin_runtime_close(close_descendant)
+
+    assert close_gate.phase is _TerminalPhase.HEALTHY
+    assert close_gate._runtime_close_transition is None
+    assert close_gate._next_sequence == close_sequence
+    close_gate.release(close_descendant)
+    close_gate.release(close_parent)
+
+
 def test_construction_activation_and_rollback_share_provisional_epoch():
     gate = _TerminalLifecycleGate()
     activated_epoch, construction = gate.begin_lease("construct_for_activation")
@@ -220,11 +298,12 @@ def test_remote_fatal_waits_for_existing_admission():
     operation_thread, _, operation_errors, operation_done = _start(operation)
     assert admitted.wait(_TIMEOUT_S)
     transition = gate.begin_fatal(RuntimeError("remote fatal"))
+    wait_entries = _observe_condition_waits(gate, 1)
     wait_thread, _, wait_errors, wait_done = _start(
         lambda: gate.wait_for_admissions(transition, _TIMEOUT_S)
     )
 
-    assert not wait_done.wait(0.05)
+    assert wait_entries[0].wait(_TIMEOUT_S)
     release_operation.set()
     _join(operation_thread, operation_done)
     _join(wait_thread, wait_done)
@@ -235,20 +314,72 @@ def test_remote_fatal_waits_for_existing_admission():
 def test_pending_wait_returns_only_published_snapshot():
     gate = _TerminalLifecycleGate()
     transition = gate.begin_fatal(RuntimeError("fatal"))
-    wait_started = threading.Event()
-
-    def wait_for_snapshot():
-        wait_started.set()
-        return gate.wait_for_published(_TIMEOUT_S)
-
-    waiter, results, errors, done = _start(wait_for_snapshot)
-    assert wait_started.wait(_TIMEOUT_S)
-    assert not done.wait(0.05)
+    wait_entries = _observe_condition_waits(gate, 1)
+    waiter, results, errors, done = _start(
+        lambda: gate.wait_for_published(_TIMEOUT_S)
+    )
+    assert wait_entries[0].wait(_TIMEOUT_S)
     snapshot = object()
     gate.publish_fatal(transition, snapshot)
     _join(waiter, done)
     assert errors == []
     assert results == [snapshot]
+
+
+@pytest.mark.parametrize(
+    "timeout_s", [float("nan"), float("inf"), float("-inf")]
+)
+def test_non_finite_terminal_wait_deadlines_are_rejected(timeout_s):
+    gate = _TerminalLifecycleGate()
+
+    with pytest.raises(ValueError, match="finite"):
+        gate.wait_for_published(timeout_s)
+
+
+def test_token_holding_callers_are_rejected_before_terminal_waits():
+    fatal_gate = _TerminalLifecycleGate()
+    fatal_token = fatal_gate.admit_runtime("held_during_fatal")
+    fatal_transition = fatal_gate.begin_fatal(RuntimeError("fatal"))
+
+    def fail_if_waited(timeout=None):
+        raise AssertionError("condition wait entered with a live token")
+
+    fatal_gate._condition.wait = fail_if_waited
+    with pytest.raises(RuntimeError, match="holding an admission"):
+        fatal_gate.wait_for_published(_TIMEOUT_S)
+    with pytest.raises(RuntimeError, match="holding an admission"):
+        fatal_gate.commit_runtime_close(fatal_transition, lambda: None)
+    with pytest.raises(RuntimeError, match="holding an admission"):
+        fatal_gate.publish_fatal(fatal_transition, object())
+
+    join_gate = _TerminalLifecycleGate()
+    join_token = join_gate.admit_runtime("held_during_runtime_join")
+    owner_waiting = threading.Event()
+    owner_can_start = threading.Event()
+    original_wait = join_gate._condition.wait
+    owner_thread = None
+
+    def observe_owner_wait(timeout=None):
+        if threading.current_thread() is owner_thread:
+            owner_waiting.set()
+            return original_wait(timeout)
+        raise AssertionError("runtime join waited with a live token")
+
+    join_gate._condition.wait = observe_owner_wait
+    owner_thread, _, owner_errors, owner_done = _start(
+        lambda: (
+            owner_can_start.wait(_TIMEOUT_S),
+            join_gate.begin_runtime_close(None),
+        )[1]
+    )
+    owner_can_start.set()
+    assert owner_waiting.wait(_TIMEOUT_S)
+    transition = join_gate._runtime_close_transition
+    with pytest.raises(RuntimeError, match="holding an admission"):
+        join_gate.commit_runtime_close(transition, lambda: None)
+    join_gate.release(join_token)
+    _join(owner_thread, owner_done)
+    assert owner_errors == []
 
 
 def test_begin_lease_close_rejects_new_operator_and_acquire_admissions():
@@ -275,12 +406,15 @@ def test_lease_close_drains_prior_ordinary_and_multiple_async_descendants():
     claimed_callbacks = [threading.Event(), threading.Event()]
     callback_errors = [[], []]
     descendants = [None, None]
-    owners = [_AsyncOwner(), _AsyncOwner()]
-    owner_refs = [weakref.ref(owner) for owner in owners]
+    capabilities = [_AsyncClaimCapability(), _AsyncClaimCapability()]
 
     def callback(index):
         try:
-            claimed = gate.claim_async(descendants[index], "callback_{}".format(index))
+            claimed = gate.claim_async(
+                descendants[index],
+                capabilities[index],
+                "callback_{}".format(index),
+            )
             assert claimed.parent_sequence == parent.sequence
             claimed_callbacks[index].set()
             assert release_callbacks[index].wait(_TIMEOUT_S)
@@ -293,12 +427,8 @@ def test_lease_close_drains_prior_ordinary_and_multiple_async_descendants():
         threading.Thread(target=callback, args=(index,), daemon=True)
         for index in range(2)
     ]
-    for index, owner in enumerate(owners):
-        descendants[index] = gate.spawn_async(parent, owner)
-    del owner
-    owners.clear()
-    gc.collect()
-    assert [owner_ref() for owner_ref in owner_refs] == [None, None]
+    for index, capability in enumerate(capabilities):
+        descendants[index] = gate.spawn_async(parent, capability)
     gate.release(parent)
     transition, owns_close = gate.begin_lease_close(epoch)
     assert owns_close is True
@@ -308,14 +438,15 @@ def test_lease_close_drains_prior_ordinary_and_multiple_async_descendants():
         assert claimed.wait(_TIMEOUT_S)
     assert callback_errors == [[], []]
 
+    wait_entries = _observe_condition_waits(gate, 2)
     waiter, _, wait_errors, wait_done = _start(
         lambda: gate.wait_for_lease_admissions(transition, _TIMEOUT_S)
     )
-    assert not wait_done.wait(0.05)
+    assert wait_entries[0].wait(_TIMEOUT_S)
     release_callbacks[0].set()
     callbacks[0].join(_TIMEOUT_S)
     assert not callbacks[0].is_alive()
-    assert not wait_done.wait(0.05)
+    assert wait_entries[1].wait(_TIMEOUT_S)
     release_callbacks[1].set()
     callbacks[1].join(_TIMEOUT_S)
     assert not callbacks[1].is_alive()
@@ -323,6 +454,33 @@ def test_lease_close_drains_prior_ordinary_and_multiple_async_descendants():
     assert callback_errors == [[], []]
     assert wait_errors == []
     gate.commit_lease_close(transition, lambda: None)
+
+
+def test_async_claim_requires_identical_capability_and_is_exact_once():
+    gate = _TerminalLifecycleGate()
+    epoch = _open_lease(gate)
+    parent = gate.admit_lease(epoch, "schedule_callback")
+    capability = _AsyncClaimCapability()
+    capability_ref = weakref.ref(capability)
+    descendant = gate.spawn_async(parent, capability)
+    gate.release(parent)
+
+    with pytest.raises(RuntimeError, match="capability"):
+        gate.claim_async(
+            descendant, _AsyncClaimCapability(), "foreign_callback"
+        )
+
+    claimed = gate.claim_async(descendant, capability, "recorded_callback")
+    with pytest.raises(RuntimeError, match="already claimed"):
+        gate.claim_async(claimed, capability, "duplicate_callback")
+
+    del capability
+    gc.collect()
+    assert capability_ref() is not None
+    gate.release(claimed)
+    gc.collect()
+    assert capability_ref() is None
+    _close_lease(gate, epoch)
 
 
 def test_only_elected_close_owner_can_admit_close_steps():
@@ -358,9 +516,10 @@ def test_second_close_caller_joins_without_running_steps():
         joined_transition.set()
         return gate.wait_for_lease_closed(joined, _TIMEOUT_S)
 
+    wait_entries = _observe_condition_waits(gate, 1)
     joiner, results, errors, done = _start(join_close)
     assert joined_transition.wait(_TIMEOUT_S)
-    assert not done.wait(0.05)
+    assert wait_entries[0].wait(_TIMEOUT_S)
     result = object()
     gate.wait_for_lease_admissions(transition, _TIMEOUT_S)
     assert gate.commit_lease_close(transition, lambda: result) is result
@@ -393,21 +552,16 @@ def test_runtime_close_joins_in_progress_lease_close():
     epoch = _open_lease(gate)
     lease_transition, owns_close = gate.begin_lease_close(epoch)
     assert owns_close is True
-    runtime_calling = threading.Event()
-    allow_runtime_commit = threading.Event()
 
     def close_runtime():
-        runtime_calling.set()
         transition = gate.begin_runtime_close(None)
-        assert allow_runtime_commit.wait(_TIMEOUT_S)
         return gate.commit_runtime_close(transition, lambda: "runtime_closed")
 
+    wait_entries = _observe_condition_waits(gate, 1)
     closer, results, errors, done = _start(close_runtime)
-    assert runtime_calling.wait(_TIMEOUT_S)
-    assert not done.wait(0.05)
+    assert wait_entries[0].wait(_TIMEOUT_S)
     gate.wait_for_lease_admissions(lease_transition, _TIMEOUT_S)
     gate.commit_lease_close(lease_transition, lambda: "lease_closed")
-    allow_runtime_commit.set()
     _join(closer, done)
     assert errors == []
     assert results == ["runtime_closed"]
@@ -455,6 +609,35 @@ def test_runtime_close_converts_initiating_token_before_drain():
     assert gate.commit_runtime_close(transition, lambda: None) is None
 
 
+def test_runtime_close_drain_returns_fatal_transition_after_publication():
+    gate = _TerminalLifecycleGate()
+    blocker = gate.admit_runtime("block_runtime_close")
+    wait_entered = threading.Event()
+    original_wait = gate._condition.wait
+
+    def observe_wait(timeout=None):
+        wait_entered.set()
+        return original_wait(timeout)
+
+    gate._condition.wait = observe_wait
+    closer, results, errors, done = _start(
+        lambda: gate.begin_runtime_close(None)
+    )
+    assert wait_entered.wait(_TIMEOUT_S)
+    snapshot = object()
+    with gate._condition:
+        fatal_transition = gate.begin_fatal(
+            RuntimeError("fatal during runtime drain"), blocker
+        )
+        gate.publish_fatal(fatal_transition, snapshot)
+    _join(closer, done)
+
+    assert errors == []
+    assert results == [fatal_transition]
+    assert results[0] is gate._fatal_transition
+    assert gate.phase is _TerminalPhase.FATAL_PUBLISHED
+
+
 def test_close_commits_and_join_waits_hold_no_admission():
     gate = _TerminalLifecycleGate()
     epoch = _open_lease(gate)
@@ -496,7 +679,7 @@ def test_fatal_preempts_runtime_close_only_before_commit():
         fatal_transition, lambda: finalized.append("cleared")
     )
     assert result is snapshot
-    assert finalized == ["cleared"]
+    assert finalized == []
     assert preempted.phase is _TerminalPhase.RUNTIME_CLOSED
 
     committed = _TerminalLifecycleGate()
@@ -506,24 +689,130 @@ def test_fatal_preempts_runtime_close_only_before_commit():
         committed.begin_fatal(RuntimeError("fatal after runtime commit"))
 
 
+def test_pending_runtime_finalizer_precedes_publication_and_published_join_skips_it():
+    pending = _TerminalLifecycleGate()
+    pending_transition = pending.begin_fatal(RuntimeError("pending fatal"))
+    finalizer_called = threading.Event()
+    finalizer_observations = []
+
+    def finalize_pending():
+        finalizer_observations.append(
+            (pending.phase, pending._has_active_tokens())
+        )
+        finalizer_called.set()
+
+    def join_pending():
+        transition = pending.begin_runtime_close(None)
+        return pending.commit_runtime_close(transition, finalize_pending)
+
+    closer, results, errors, done = _start(join_pending)
+    assert finalizer_called.wait(_TIMEOUT_S)
+    assert finalizer_observations == [(_TerminalPhase.FATAL_PENDING, False)]
+    snapshot = object()
+    pending.publish_fatal(pending_transition, snapshot)
+    _join(closer, done)
+    assert errors == []
+    assert results == [snapshot]
+
+    published = _TerminalLifecycleGate()
+    published_transition = published.begin_fatal(RuntimeError("published fatal"))
+    published_snapshot = object()
+    published.publish_fatal(published_transition, published_snapshot)
+    finalized_after_publication = []
+    joined = published.begin_runtime_close(None)
+    result = published.commit_runtime_close(
+        joined, lambda: finalized_after_publication.append(True)
+    )
+    assert result is published_snapshot
+    assert finalized_after_publication == []
+
+
+def test_fatal_publication_waits_for_elected_runtime_finalizer():
+    gate = _TerminalLifecycleGate()
+    blocker = gate.admit_runtime("block_pending_finalizer")
+    fatal_transition = gate.begin_fatal(RuntimeError("fatal"))
+    finalizer_observations = []
+    wait_entries = _observe_condition_waits(gate, 3)
+
+    def close_runtime():
+        transition = gate.begin_runtime_close(None)
+
+        def finalizer():
+            finalizer_observations.append(
+                (gate.phase, gate._has_active_tokens())
+            )
+
+        return gate.commit_runtime_close(transition, finalizer)
+
+    closer, results, errors, done = _start(close_runtime)
+    assert wait_entries[0].wait(_TIMEOUT_S)
+    snapshot = object()
+    with gate._condition:
+        gate.release(blocker)
+        gate.publish_fatal(fatal_transition, snapshot)
+
+    assert wait_entries[1].is_set()
+    _join(closer, done)
+    assert errors == []
+    assert results == [snapshot]
+    assert finalizer_observations == [(_TerminalPhase.FATAL_PENDING, False)]
+
+
+def test_waiting_fatal_publishers_cannot_overwrite_snapshot():
+    gate = _TerminalLifecycleGate()
+    transition = gate.begin_fatal(RuntimeError("fatal"))
+    gate._fatal_runtime_finalizer_state = "pending"
+    wait_entries = _observe_condition_waits(gate, 2)
+    first_snapshot = object()
+    second_snapshot = object()
+
+    def publish(snapshot):
+        gate.publish_fatal(transition, snapshot)
+        return snapshot
+
+    first, first_results, first_errors, first_done = _start(
+        lambda: publish(first_snapshot)
+    )
+    second, second_results, second_errors, second_done = _start(
+        lambda: publish(second_snapshot)
+    )
+    assert wait_entries[0].wait(_TIMEOUT_S)
+    assert wait_entries[1].wait(_TIMEOUT_S)
+    with gate._condition:
+        gate._fatal_runtime_finalizer_state = "complete"
+        gate._condition.notify_all()
+    _join(first, first_done)
+    _join(second, second_done)
+
+    results = first_results + second_results
+    errors = first_errors + second_errors
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert gate.wait_for_published(_TIMEOUT_S) is results[0]
+
+
 def test_runtime_close_joins_pending_and_published_fatal():
     pending = _TerminalLifecycleGate()
     primary = RuntimeError("pending fatal")
     fatal_transition = pending.begin_fatal(primary)
-    close_started = threading.Event()
+    finalized = threading.Event()
     cleared = []
 
     def join_pending():
         transition = pending.begin_runtime_close(None)
         assert transition == fatal_transition
-        close_started.set()
-        return pending.commit_runtime_close(
-            transition, lambda: cleared.append("pending")
-        )
 
+        def finalizer():
+            cleared.append("pending")
+            finalized.set()
+
+        return pending.commit_runtime_close(transition, finalizer)
+
+    wait_entries = _observe_condition_waits(pending, 1)
     closer, results, errors, done = _start(join_pending)
-    assert close_started.wait(_TIMEOUT_S)
-    assert not done.wait(0.05)
+    assert finalized.wait(_TIMEOUT_S)
+    assert wait_entries[0].wait(_TIMEOUT_S)
     pending_snapshot = object()
     pending.publish_fatal(fatal_transition, pending_snapshot)
     _join(closer, done)
