@@ -68,13 +68,14 @@ class _MonitorOutcome:
 
 
 class _FatalMonitorHandoff:
-    """Coordinates one monitor stop generation or an elected fatal outcome."""
+    """Linearizes monitor store reads, outcome selection, and exit acknowledgment."""
 
     def __init__(self):
         self._condition = threading.Condition()
         self._next_generation = 1
         self._requested_generation: int | None = None
         self._outcome: _MonitorOutcome | None = None
+        self._exited_outcome: _MonitorOutcome | None = None
 
     def request_stop(self) -> int:
         with self._condition:
@@ -87,6 +88,18 @@ class _FatalMonitorHandoff:
     def observe_stop(self) -> int | None:
         with self._condition:
             return self._requested_generation
+
+    def observe_outcome(self) -> _MonitorOutcome | None:
+        with self._condition:
+            return self._outcome
+
+    def read_store_if_unselected(self, read):
+        if not callable(read):
+            raise TypeError("monitor store read must be callable")
+        with self._condition:
+            if self._outcome is not None:
+                return self._outcome, None
+            return None, read()
 
     def select_fatal(self, primary: BaseException) -> _MonitorOutcome:
         if not isinstance(primary, BaseException):
@@ -123,6 +136,45 @@ class _FatalMonitorHandoff:
                     raise TimeoutError("fatal monitor acknowledgment timed out")
                 self._condition.wait(remaining)
             return self._outcome
+
+    def wait_for_selection(self, timeout_s: float) -> _MonitorOutcome:
+        deadline = _TerminalLifecycleGate._deadline(timeout_s)
+        with self._condition:
+            while self._outcome is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("fatal monitor outcome selection timed out")
+                self._condition.wait(remaining)
+            return self._outcome
+
+    def acknowledge_exit(self, outcome: _MonitorOutcome) -> _MonitorOutcome:
+        with self._condition:
+            if outcome is not self._outcome:
+                raise RuntimeError("monitor exit outcome is not selected")
+            if self._exited_outcome is None:
+                self._exited_outcome = outcome
+                self._condition.notify_all()
+            elif self._exited_outcome is not outcome:
+                raise RuntimeError("monitor exit outcome changed")
+            return self._exited_outcome
+
+    def wait_for_exit(
+        self, outcome: _MonitorOutcome, timeout_s: float
+    ) -> _MonitorOutcome:
+        deadline = _TerminalLifecycleGate._deadline(timeout_s)
+        with self._condition:
+            if outcome is not self._outcome:
+                raise RuntimeError("monitor exit outcome is not selected")
+            while self._exited_outcome is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "fatal monitor exit acknowledgment timed out"
+                    )
+                self._condition.wait(remaining)
+            if self._exited_outcome is not outcome:
+                raise RuntimeError("monitor exit outcome changed")
+            return self._exited_outcome
 
 
 _MISSING = object()

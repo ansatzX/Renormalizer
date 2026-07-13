@@ -1,11 +1,13 @@
 import gc
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 import weakref
 
 import pytest
 
 from renormalizer.backend._distributed.terminal import (
+    _FatalMonitorHandoff,
     _TerminalLifecycleGate,
     _TerminalPhase,
 )
@@ -879,19 +881,94 @@ def test_fatal_preempts_runtime_close_before_commit():
 
 
 def test_fatal_after_runtime_close_commit_touches_no_collective():
-    gate = _TerminalLifecycleGate()
-    close_transition = gate.begin_runtime_close(None)
-    collective_touches = []
-    step = gate.admit_runtime_close(close_transition, "collective_close")
-    collective_touches.append(step.sequence)
-    gate.release(step)
+    from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
 
-    assert gate.commit_runtime_close(close_transition, lambda: None) is None
-    with pytest.raises(RuntimeError, match="closed"):
-        gate.begin_fatal(RuntimeError("late fatal"))
+    calls = []
 
-    assert collective_touches == [step.sequence]
-    assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+    class Collective:
+        def __init__(self):
+            self._fatal_publication_local = threading.local()
+
+        def close(self):
+            calls.append("close")
+
+        def _begin_fatal_publication(self):
+            raise AssertionError("late fatal must not begin collective publication")
+
+        def _publish_communicator_fatal(self, primary, **kwargs):
+            calls.append(("fatal", primary, kwargs))
+            return primary
+
+    backend = SimpleNamespace(_execution_terminal_error=None)
+    collective = Collective()
+    runtime = CupyDistributedRuntime(
+        backend=backend,
+        context=SimpleNamespace(rank=0, local_rank=0, world_size=1),
+        rendezvous=object(),
+        mesh=object(),
+        collective=collective,
+    )
+    invoke_late_fatal = threading.Event()
+    primary = RuntimeError("late fatal")
+
+    def publish_late_fatal():
+        assert invoke_late_fatal.wait(_TIMEOUT_S)
+        return runtime._enter_communicator_fatal(primary)
+
+    late, results, errors, done = _start(publish_late_fatal)
+    runtime.close()
+    assert runtime._terminal_gate.phase is _TerminalPhase.RUNTIME_CLOSED
+    assert runtime._closed is True
+
+    # Retain the closed spy to prove the committed gate wins before resolution.
+    runtime.collective = collective
+    calls_after_close = list(calls)
+    closed_state = (
+        runtime._closed,
+        runtime._terminal_gate.phase,
+        runtime._terminal_error,
+        backend._execution_terminal_error,
+    )
+    invoke_late_fatal.set()
+    _join(late, done)
+
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "closed" in str(errors[0])
+    assert calls == calls_after_close == ["close"]
+    assert (
+        runtime._closed,
+        runtime._terminal_gate.phase,
+        runtime._terminal_error,
+        backend._execution_terminal_error,
+    ) == closed_state
+
+
+def test_fatal_monitor_handoff_requires_distinct_exit_acknowledgment():
+    handoff = _FatalMonitorHandoff()
+    store_reads = []
+
+    observed, value = handoff.read_store_if_unselected(
+        lambda: store_reads.append("read") or 7
+    )
+    assert observed is None
+    assert value == 7
+    outcome = handoff.select_fatal(RuntimeError("fatal monitor outcome"))
+
+    observed, value = handoff.read_store_if_unselected(
+        lambda: store_reads.append("late read")
+    )
+    assert observed is outcome
+    assert value is None
+    assert store_reads == ["read"]
+
+    with pytest.raises(TimeoutError, match="exit acknowledgment"):
+        handoff.wait_for_exit(outcome, 0.0)
+
+    handoff.acknowledge_exit(outcome)
+
+    assert handoff.wait_for_exit(outcome, _TIMEOUT_S) is outcome
 
 
 def test_close_during_pending_joins_publication():

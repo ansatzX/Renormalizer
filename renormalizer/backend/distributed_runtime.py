@@ -268,6 +268,16 @@ class CupyDistributedRuntime:
     def _enter_communicator_fatal(
         self, primary, owner=None, discovering_token=None
     ):
+        if not isinstance(primary, BaseException):
+            raise TypeError("communicator fatal failure must be an exception")
+        with self._terminal_gate._condition:
+            phase = self._terminal_gate._phase
+            transition = self._terminal_gate._fatal_transition
+            runtime_closed = self._closed
+        if phase is _TerminalPhase.RUNTIME_CLOSED or runtime_closed:
+            if transition is not None:
+                return transition.primary
+            raise RuntimeError("distributed runtime is closed")
         primary, _, _, owner = self._normalize_communicator_fatal(primary, owner)
         collective = self.collective
         if collective is None:

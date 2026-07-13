@@ -820,9 +820,12 @@ def test_remote_monitor_and_local_failure_join_one_transition(monkeypatch):
     blocker = gate.admit_runtime("hold_local_publication")
     primary = RuntimeError("local failure wins monitor race")
     pending_entered = threading.Event()
-    monitor_joined = threading.Event()
+    monitor_acknowledged = threading.Event()
     blocker_released = False
     transitions = []
+    monitor_outcomes = []
+    monitor_publication_entries = []
+    monitor = None
 
     original_begin_fatal = gate.begin_fatal
 
@@ -833,17 +836,26 @@ def test_remote_monitor_and_local_failure_join_one_transition(monkeypatch):
         return transition
 
     monkeypatch.setattr(gate, "begin_fatal", record_begin_fatal)
-    monitor = None
     original_begin_publication = wrappers[1]._begin_fatal_publication
 
     def record_begin_publication(*args, **kwargs):
         result = original_begin_publication(*args, **kwargs)
-        if threading.current_thread() is monitor:
-            monitor_joined.set()
+        if threading.current_thread().name == "task-18.2-remote-monitor":
+            monitor_publication_entries.append(result)
         return result
 
     monkeypatch.setattr(
         wrappers[1], "_begin_fatal_publication", record_begin_publication
+    )
+    original_acknowledge = wrappers[1]._acknowledge_fatal_monitor_exit
+
+    def record_acknowledgment(outcome):
+        monitor_outcomes.append(outcome)
+        monitor_acknowledged.set()
+        return original_acknowledge(outcome)
+
+    monkeypatch.setattr(
+        wrappers[1], "_acknowledge_fatal_monitor_exit", record_acknowledgment
     )
     store.set(wrappers[1]._fatal_ack_key(0), 1)
     local, local_results, local_errors, local_done = _start_task_18_2_call(
@@ -861,11 +873,14 @@ def test_remote_monitor_and_local_failure_join_one_transition(monkeypatch):
         )
         wrappers[1]._fatal_monitor_thread = monitor
         monitor.start()
-        assert monitor_joined.wait(_TASK_18_2_TIMEOUT_S)
-        assert len(transitions) == 2
-        assert all(transition is transitions[0] for transition in transitions)
+        assert monitor_acknowledged.wait(_TASK_18_2_TIMEOUT_S)
+        assert len(transitions) == 1
         assert transitions[0] is gate._fatal_transition
         assert transitions[0].primary is primary
+        assert len(monitor_outcomes) == 1
+        assert monitor_outcomes[0].kind == "fatal_elected"
+        assert monitor_outcomes[0].primary is primary
+        assert monitor_publication_entries == []
         gate.release(blocker)
         blocker_released = True
         _join_task_18_2_call(local, local_done)
@@ -917,12 +932,13 @@ def test_abort_ack_and_first_primary_are_exactly_once(monkeypatch):
         return original_store_set(key, value)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", record_store_set)
+    later_thread_name = "task-18.2-later-primary"
     later_thread = None
     original_begin_publication = wrapper._begin_fatal_publication
 
     def record_begin_publication(*args, **kwargs):
         result = original_begin_publication(*args, **kwargs)
-        if threading.current_thread() is later_thread:
+        if threading.current_thread().name == later_thread_name:
             later_joined.set()
         return result
 
@@ -938,7 +954,7 @@ def test_abort_ack_and_first_primary_are_exactly_once(monkeypatch):
         assert pending_entered.wait(_TASK_18_2_TIMEOUT_S)
         later_thread, later_results, later_errors, later_done = _start_task_18_2_call(
             lambda: runtime._enter_communicator_fatal(later),
-            name="task-18.2-later-primary",
+            name=later_thread_name,
         )
         assert later_joined.wait(_TASK_18_2_TIMEOUT_S)
         gate.release(blocker)
@@ -1022,6 +1038,228 @@ def _install_task_18_2_monitor_barriers(monkeypatch, wrapper):
     )
 
 
+def test_local_fatal_waits_for_delayed_monitor_exit_before_publication(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed.terminal import _TerminalPhase
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    monitor_between_reads = threading.Event()
+    release_monitor = threading.Event()
+    outcome_selected = threading.Event()
+    release_selection = threading.Event()
+    monitor_acknowledged = threading.Event()
+    store_read_phases = []
+    monitor_wait_calls = 0
+    monitor_wait_lock = threading.Lock()
+    publisher = None
+
+    original_read = wrapper._read_fatal_origin
+
+    def record_monitor_store_read():
+        with gate._condition:
+            store_read_phases.append(gate._phase)
+        return original_read()
+
+    monkeypatch.setattr(wrapper, "_read_fatal_origin", record_monitor_store_read)
+    original_monitor_wait = wrapper._fatal_monitor_stop.wait
+
+    def wait_between_monitor_reads(timeout=None):
+        nonlocal monitor_wait_calls
+        if threading.current_thread().name == "renormalizer-fatal-monitor-rank-0":
+            with monitor_wait_lock:
+                monitor_wait_calls += 1
+                first_wait = monitor_wait_calls == 1
+            if first_wait:
+                monitor_between_reads.set()
+                assert release_monitor.wait(_TASK_18_2_TIMEOUT_S * 2)
+                return wrapper._fatal_monitor_stop.is_set()
+        return original_monitor_wait(timeout)
+
+    monkeypatch.setattr(
+        wrapper._fatal_monitor_stop, "wait", wait_between_monitor_reads
+    )
+    original_select = wrapper._select_fatal_monitor_outcome
+
+    def select_outcome(kind, value):
+        outcome = original_select(kind, value)
+        if threading.current_thread().name == "task-18.2-delayed-monitor-owner":
+            outcome_selected.set()
+            assert release_selection.wait(_TASK_18_2_TIMEOUT_S * 2)
+        return outcome
+
+    monkeypatch.setattr(wrapper, "_select_fatal_monitor_outcome", select_outcome)
+    original_acknowledge = getattr(
+        wrapper, "_acknowledge_fatal_monitor_exit", lambda outcome: outcome
+    )
+
+    def acknowledge_monitor_exit(outcome):
+        result = original_acknowledge(outcome)
+        monitor_acknowledged.set()
+        return result
+
+    monkeypatch.setattr(
+        wrapper,
+        "_acknowledge_fatal_monitor_exit",
+        acknowledge_monitor_exit,
+        raising=False,
+    )
+
+    wrapper._start_fatal_monitor()
+    monitor = wrapper._fatal_monitor_thread
+    assert monitor_between_reads.wait(_TASK_18_2_TIMEOUT_S)
+    primary = RuntimeError("local fatal with delayed monitor")
+    publisher, results, errors, done = _start_task_18_2_call(
+        lambda: runtime._enter_communicator_fatal(primary),
+        name="task-18.2-delayed-monitor-owner",
+    )
+    try:
+        assert outcome_selected.wait(_TASK_18_2_TIMEOUT_S)
+        with gate._condition:
+            assert gate._phase is _TerminalPhase.FATAL_PENDING
+        release_monitor.set()
+        monitor.join(_TASK_18_2_TIMEOUT_S)
+        assert not monitor.is_alive()
+        assert monitor_acknowledged.wait(_TASK_18_2_TIMEOUT_S)
+        assert store_read_phases == [_TerminalPhase.HEALTHY]
+        release_selection.set()
+        _join_task_18_2_call(publisher, done)
+    finally:
+        release_monitor.set()
+        release_selection.set()
+        if publisher is not None and publisher.is_alive():
+            _join_task_18_2_call(publisher, done)
+        if monitor.is_alive():
+            monitor.join(_TASK_18_2_TIMEOUT_S)
+
+    assert errors == []
+    assert results == [primary]
+    assert gate._fatal_transition.primary is primary
+    assert gate.phase is _TerminalPhase.FATAL_PUBLISHED
+    assert all(
+        phase not in {_TerminalPhase.FATAL_PUBLISHED, _TerminalPhase.RUNTIME_CLOSED}
+        for phase in store_read_phases
+    )
+
+
+def test_close_ready_fatal_joins_monitor_before_publication_and_prevents_late_store_access(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed.terminal import _TerminalPhase
+
+    runtime, wrapper, _, store, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    monitor_waiting = threading.Event()
+    release_monitor = threading.Event()
+    outcome_selected = threading.Event()
+    store_accesses = []
+    selected_outcomes = []
+    exit_waits = []
+    joins = []
+    closer = None
+
+    original_monitor = wrapper._monitor_fatal_records
+
+    def delayed_monitor():
+        monitor_waiting.set()
+        assert release_monitor.wait(_TASK_18_2_TIMEOUT_S)
+        original_monitor()
+
+    monitor = threading.Thread(
+        target=delayed_monitor,
+        name="task-18.2-delayed-close-ready-monitor",
+        daemon=True,
+    )
+    wrapper._fatal_monitor_thread = monitor
+    monitor.start()
+    assert monitor_waiting.wait(_TASK_18_2_TIMEOUT_S)
+    store.set(wrapper._fatal_key(wrapper.rank), 1)
+
+    def record_store_access(operation):
+        with gate._condition:
+            store_accesses.append((operation, gate._phase))
+
+    original_store_get = wrapper._fatal_store_get
+
+    def store_get(key):
+        record_store_access(("get", key))
+        return original_store_get(key)
+
+    monkeypatch.setattr(wrapper, "_fatal_store_get", store_get)
+    original_store_set = wrapper._fatal_store_set
+
+    def store_set(key, value):
+        record_store_access(("set", key))
+        return original_store_set(key, value)
+
+    monkeypatch.setattr(wrapper, "_fatal_store_set", store_set)
+    original_read = wrapper._read_fatal_origin
+
+    def read_fatal_origin():
+        record_store_access("monitor_read")
+        return original_read()
+
+    monkeypatch.setattr(wrapper, "_read_fatal_origin", read_fatal_origin)
+    original_select = wrapper._select_fatal_monitor_outcome
+
+    def select_outcome(kind, value):
+        outcome = original_select(kind, value)
+        selected_outcomes.append(outcome)
+        outcome_selected.set()
+        return outcome
+
+    monkeypatch.setattr(wrapper, "_select_fatal_monitor_outcome", select_outcome)
+    original_wait_for_exit = getattr(
+        wrapper, "_wait_for_fatal_monitor_exit", lambda outcome: outcome
+    )
+
+    def wait_for_exit(outcome):
+        exit_waits.append(outcome)
+        return original_wait_for_exit(outcome)
+
+    monkeypatch.setattr(
+        wrapper, "_wait_for_fatal_monitor_exit", wait_for_exit, raising=False
+    )
+    original_join = wrapper._join_fatal_monitor
+
+    def join_monitor(thread):
+        joins.append(thread)
+        return original_join(thread)
+
+    monkeypatch.setattr(wrapper, "_join_fatal_monitor", join_monitor)
+
+    closer, close_results, close_errors, close_done = _start_task_18_2_call(
+        runtime.close, name="task-18.2-close-ready-fatal"
+    )
+    try:
+        assert outcome_selected.wait(_TASK_18_2_TIMEOUT_S)
+        release_monitor.set()
+        _join_task_18_2_call(closer, close_done)
+        monitor.join(_TASK_18_2_TIMEOUT_S)
+        assert not monitor.is_alive()
+    finally:
+        release_monitor.set()
+        if closer is not None and closer.is_alive():
+            _join_task_18_2_call(closer, close_done)
+        if monitor.is_alive():
+            monitor.join(_TASK_18_2_TIMEOUT_S)
+
+    primary = gate._fatal_transition.primary
+    assert close_results == []
+    assert close_errors == [primary]
+    assert selected_outcomes[0].kind == "fatal_elected"
+    assert selected_outcomes[0].primary is primary
+    assert exit_waits == [selected_outcomes[0]]
+    assert joins == [monitor]
+    assert runtime._closed is True
+    assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+    assert all(
+        phase not in {_TerminalPhase.FATAL_PUBLISHED, _TerminalPhase.RUNTIME_CLOSED}
+        for _, phase in store_accesses
+    )
+
+
 def test_monitor_fatal_before_stop_observation_preempts_close(monkeypatch):
     runtime, wrapper, _, store, raw_comm = _single_rank_task_18_2_runtime(monkeypatch)
     barriers = _install_task_18_2_monitor_barriers(monkeypatch, wrapper)
@@ -1051,8 +1289,8 @@ def test_monitor_fatal_before_stop_observation_preempts_close(monkeypatch):
         outcome = barriers.selected[0]
         assert outcome.kind == "fatal_elected"
         assert outcome.primary is gate._fatal_transition.primary
-        assert close_joining_monitor.wait(_TASK_18_2_TIMEOUT_S)
         barriers.release_outcome.set()
+        assert close_joining_monitor.wait(_TASK_18_2_TIMEOUT_S)
         _join_task_18_2_call(closer, close_done)
     finally:
         barriers.release_stop_observation.set()
@@ -1122,10 +1360,10 @@ def test_monitor_ack_and_join_hold_no_gate_admission_or_publication_lock(
     gate = runtime._terminal_gate
     observations = []
     original_wait = getattr(
-        wrapper, "_wait_for_fatal_monitor_outcome", lambda generation: None
+        wrapper, "_wait_for_fatal_monitor_exit", lambda outcome: outcome
     )
 
-    def checked_wait(generation):
+    def checked_wait(outcome):
         with gate._condition:
             holds_admission = threading.get_ident() in gate._thread_tokens
         observations.append(
@@ -1137,10 +1375,10 @@ def test_monitor_ack_and_join_hold_no_gate_admission_or_publication_lock(
                 wrapper._close_lock.locked(),
             )
         )
-        return original_wait(generation)
+        return original_wait(outcome)
 
     monkeypatch.setattr(
-        wrapper, "_wait_for_fatal_monitor_outcome", checked_wait, raising=False
+        wrapper, "_wait_for_fatal_monitor_exit", checked_wait, raising=False
     )
     original_join = getattr(wrapper, "_join_fatal_monitor", lambda thread: None)
 
@@ -1161,7 +1399,9 @@ def test_monitor_ack_and_join_hold_no_gate_admission_or_publication_lock(
     monkeypatch.setattr(wrapper, "_join_fatal_monitor", checked_join, raising=False)
     wrapper._start_fatal_monitor()
 
-    runtime.close()
+    primary = RuntimeError("fatal monitor lock ordering")
+
+    assert runtime._enter_communicator_fatal(primary) is primary
 
     assert observations == [
         ("ack", False, False, False, False),
@@ -1322,6 +1562,7 @@ def test_close_ready_cannot_overtake_unpolled_nonzero_fatal(monkeypatch):
     publish_errors = []
     close_errors = [None, None]
     rank_zero_stop_requests = []
+    rank_zero_outcome_selected = threading.Event()
     original_request_stop = wrappers[0]._request_fatal_monitor_stop
 
     def record_stop_request():
@@ -1330,6 +1571,19 @@ def test_close_ready_cannot_overtake_unpolled_nonzero_fatal(monkeypatch):
 
     monkeypatch.setattr(
         wrappers[0], "_request_fatal_monitor_stop", record_stop_request
+    )
+    original_select_outcome = wrappers[0]._select_fatal_monitor_outcome
+
+    def record_outcome_selection(kind, value):
+        outcome = original_select_outcome(kind, value)
+        if outcome.kind == "fatal_elected":
+            rank_zero_outcome_selected.set()
+        return outcome
+
+    monkeypatch.setattr(
+        wrappers[0],
+        "_select_fatal_monitor_outcome",
+        record_outcome_selection,
     )
 
     def publish():
@@ -1359,6 +1613,8 @@ def test_close_ready_cannot_overtake_unpolled_nonzero_fatal(monkeypatch):
 
         for closer in closers:
             closer.start()
+        assert rank_zero_outcome_selected.wait(3.0)
+        release_monitor.set()
         assert store.wait_for(
             lambda values: values.get(wrappers[0]._fatal_ack_key(0)) == 1
         )
@@ -2196,7 +2452,7 @@ def test_failed_owner_terminal_slot_holds_fatal_reservation_against_close(monkey
     assert stop_order == []
 
 
-def test_monitor_atomically_joins_existing_local_fatal_publication(monkeypatch):
+def test_monitor_atomically_defers_to_existing_local_fatal_publication(monkeypatch):
     store = _SharedStore(2)
     raw_comms = [_RawComm(), _RawComm()]
     pairs = [_cpu_collective(rank, 2, store, raw_comms[rank]) for rank in range(2)]
@@ -2215,6 +2471,7 @@ def test_monitor_atomically_joins_existing_local_fatal_publication(monkeypatch):
     monitor_observed = threading.Event()
     release_monitor = threading.Event()
     monitor_admitted = threading.Event()
+    direct_selected = threading.Event()
     direct_live = threading.Event()
     release_direct = threading.Event()
     original_enter = wrappers[1]._enter_observed_fatal
@@ -2232,11 +2489,24 @@ def test_monitor_atomically_joins_existing_local_fatal_publication(monkeypatch):
     def record_begin(*args, **kwargs):
         result = original_begin(*args, **kwargs)
         if threading.current_thread() is monitor:
-            admissions.append((result[2], wrappers[1]._fatal_publications))
+            admissions.append(
+                (result[2], result[4], wrappers[1]._fatal_publications)
+            )
             monitor_admitted.set()
         return result
 
     monkeypatch.setattr(wrappers[1], "_begin_fatal_publication", record_begin)
+    original_select = wrappers[1]._select_fatal_monitor_outcome
+
+    def record_selection(kind, value):
+        outcome = original_select(kind, value)
+        if threading.current_thread().name == "task-18.2-direct-publisher":
+            direct_selected.set()
+        return outcome
+
+    monkeypatch.setattr(
+        wrappers[1], "_select_fatal_monitor_outcome", record_selection
+    )
 
     control_writes = [[], []]
     for rank, wrapper in enumerate(wrappers):
@@ -2279,21 +2549,30 @@ def test_monitor_atomically_joins_existing_local_fatal_publication(monkeypatch):
         except BaseException as error:
             direct_errors.append(error)
 
-    monitor = threading.Thread(target=wrappers[1]._monitor_fatal_records, daemon=True)
+    monitor = threading.Thread(
+        target=wrappers[1]._monitor_fatal_records,
+        name="task-18.2-deferred-monitor",
+        daemon=True,
+    )
     wrappers[1]._fatal_monitor_thread = monitor
-    publisher = threading.Thread(target=publish_direct, daemon=True)
+    publisher = threading.Thread(
+        target=publish_direct,
+        name="task-18.2-direct-publisher",
+        daemon=True,
+    )
     try:
         monitor.start()
         assert monitor_observed.wait(3.0)
         publisher.start()
-        assert direct_live.wait(3.0)
+        assert direct_selected.wait(3.0)
         assert wrappers[1]._fatal_publications == 1
 
         release_monitor.set()
         assert monitor_admitted.wait(3.0)
         peak_publications = wrappers[1]._fatal_publications
-        monitor.join(0.05)
-        monitor_waited_for_owner = monitor.is_alive()
+        monitor.join(3.0)
+        assert not monitor.is_alive()
+        assert direct_live.wait(3.0)
 
         release_direct.set()
         publisher.join(5.0)
@@ -2306,9 +2585,8 @@ def test_monitor_atomically_joins_existing_local_fatal_publication(monkeypatch):
         if monitor.ident is not None:
             monitor.join(5.0)
 
-    assert admissions == [(False, 1)]
+    assert admissions == [(False, True, 1)]
     assert peak_publications == 1
-    assert monitor_waited_for_owner is True
     assert not publisher.is_alive()
     assert not monitor.is_alive()
     assert direct_errors == []

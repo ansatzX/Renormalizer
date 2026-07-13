@@ -41,6 +41,7 @@ class _FatalPublicationReservation:
         "installed",
         "started",
         "joined",
+        "monitor_deferred",
         "handler",
         "handler_started",
         "transition",
@@ -54,12 +55,14 @@ class _FatalPublicationReservation:
         installed,
         started,
         joined=False,
+        monitor_deferred=False,
         handler=None,
     ):
         self.primary = primary
         self.installed = installed
         self.started = started
         self.joined = joined
+        self.monitor_deferred = monitor_deferred
         self.handler = handler
         self.handler_started = False
         self.transition = None
@@ -383,12 +386,21 @@ class CupyNcclCollective:
             raise TypeError("communicator fatal failure must be an exception")
         with self._fatal_condition:
             if self._fatal_protocol_completed:
-                return self._fatal_pending_primary, False, False, False
+                return self._fatal_pending_primary, False, False, False, False
             if (
                 self._fatal_pending_primary is not None
                 and self._fatal_publications > 0
             ):
-                return self._fatal_pending_primary, False, False, True
+                monitor_deferred = (
+                    threading.current_thread() is self._fatal_monitor_thread
+                )
+                return (
+                    self._fatal_pending_primary,
+                    False,
+                    False,
+                    not monitor_deferred,
+                    monitor_deferred,
+                )
             needed_by_admitted_operation = (
                 release_admitted and self._admitted_operations > 0
             )
@@ -405,10 +417,11 @@ class CupyNcclCollective:
                     False,
                     False,
                     False,
+                    False,
                 )
             primary, installed = self._install_fatal(error, origin_rank)
             self._fatal_publications += 1
-            return primary, installed, True, False
+            return primary, installed, True, False, False
 
     def _finish_fatal_publication(self):
         with self._fatal_condition:
@@ -460,12 +473,14 @@ class CupyNcclCollective:
             return
         if origin_rank is None:
             origin_rank = self.rank
-        primary, installed, started, joined = self._begin_fatal_publication(
-            error,
-            origin_rank,
-            admitted=admitted,
-            release_admitted=release_admitted,
-            join_existing=join_existing,
+        primary, installed, started, joined, monitor_deferred = (
+            self._begin_fatal_publication(
+                error,
+                origin_rank,
+                admitted=admitted,
+                release_admitted=release_admitted,
+                join_existing=join_existing,
+            )
         )
         handler = (
             handler_override
@@ -477,9 +492,16 @@ class CupyNcclCollective:
             installed,
             started,
             joined=joined,
+            monitor_deferred=monitor_deferred,
             handler=handler,
         )
         if not started:
+            if monitor_deferred:
+                outcome = self._wait_for_fatal_monitor_selection()
+                if outcome.kind != "fatal_elected" or outcome.primary is not primary:
+                    raise RuntimeError("deferred monitor fatal outcome changed")
+                self._fatal_monitor_outcome = outcome
+                self._acknowledge_fatal_monitor_exit(outcome)
             if joined:
                 self._refresh_fatal_handler(
                     reservation,
@@ -729,13 +751,19 @@ class CupyNcclCollective:
             announce = not self._fatal_store_announced
             self._fatal_store_announced = True
             primary = self._fatal_pending_primary
+            monitor = self._fatal_monitor_thread
+            monitor_live = monitor is not None and monitor.is_alive()
+        outcome = self._select_fatal_monitor_outcome("fatal_elected", primary)
+        self._fatal_monitor_outcome = outcome
+        self._fatal_monitor_stop.set()
+        if monitor is threading.current_thread():
+            self._acknowledge_fatal_monitor_exit(outcome)
+        elif monitor_live:
+            self._wait_for_fatal_monitor_exit(outcome)
+            self._join_fatal_monitor(monitor)
         if announce:
             self._fatal_store_set(self._fatal_key(self.rank), 1)
         self._abort_local_communicator()
-        self._fatal_monitor_outcome = self._select_fatal_monitor_outcome(
-            "fatal_elected", primary
-        )
-        self._fatal_monitor_stop.set()
 
     def _publish_communicator_fatal_locked(self, primary):
         with self._fatal_lock:
@@ -823,6 +851,9 @@ class CupyNcclCollective:
     def _observe_fatal_monitor_stop(self):
         return self._fatal_monitor_handoff.observe_stop()
 
+    def _observe_fatal_monitor_outcome(self):
+        return self._fatal_monitor_handoff.observe_outcome()
+
     def _request_fatal_monitor_stop(self):
         generation = self._fatal_monitor_handoff.request_stop()
         self._fatal_monitor_stop.set()
@@ -845,6 +876,33 @@ class CupyNcclCollective:
             self._record_fatal_secondary(error)
             self._fatal_hard_exit()
 
+    def _wait_for_fatal_monitor_selection(self):
+        try:
+            return self._fatal_monitor_handoff.wait_for_selection(
+                _FATAL_TIMEOUT_S
+            )
+        except TimeoutError:
+            error = RuntimeError(
+                "communicator fatal monitor outcome selection timed out"
+            )
+            self._record_fatal_secondary(error)
+            self._fatal_hard_exit()
+
+    def _acknowledge_fatal_monitor_exit(self, outcome):
+        return self._fatal_monitor_handoff.acknowledge_exit(outcome)
+
+    def _wait_for_fatal_monitor_exit(self, outcome):
+        try:
+            return self._fatal_monitor_handoff.wait_for_exit(
+                outcome, _FATAL_TIMEOUT_S
+            )
+        except TimeoutError:
+            error = RuntimeError(
+                "communicator fatal monitor exit acknowledgment timed out"
+            )
+            self._record_fatal_secondary(error)
+            self._fatal_hard_exit()
+
     def _join_fatal_monitor(self, thread):
         if thread is None or thread is threading.current_thread():
             return
@@ -857,16 +915,56 @@ class CupyNcclCollective:
     def _monitor_fatal_records(self):
         while True:
             try:
-                origin_rank = self._read_fatal_origin()
+                outcome, origin_rank = (
+                    self._fatal_monitor_handoff.read_store_if_unselected(
+                        self._read_fatal_origin
+                    )
+                )
+                if outcome is not None:
+                    self._fatal_monitor_outcome = outcome
+                    self._acknowledge_fatal_monitor_exit(outcome)
+                    return
+                outcome = self._observe_fatal_monitor_outcome()
+                if outcome is not None:
+                    self._fatal_monitor_outcome = outcome
+                    self._acknowledge_fatal_monitor_exit(outcome)
+                    return
                 generation = self._observe_fatal_monitor_stop()
                 if origin_rank is None and generation is not None:
-                    origin_rank = self._read_fatal_origin()
+                    outcome = self._observe_fatal_monitor_outcome()
+                    if outcome is not None:
+                        self._fatal_monitor_outcome = outcome
+                        self._acknowledge_fatal_monitor_exit(outcome)
+                        return
+                    outcome, origin_rank = (
+                        self._fatal_monitor_handoff.read_store_if_unselected(
+                            self._read_fatal_origin
+                        )
+                    )
+                    if outcome is not None:
+                        self._fatal_monitor_outcome = outcome
+                        self._acknowledge_fatal_monitor_exit(outcome)
+                        return
+                    outcome = self._observe_fatal_monitor_outcome()
+                    if outcome is not None:
+                        self._fatal_monitor_outcome = outcome
+                        self._acknowledge_fatal_monitor_exit(outcome)
+                        return
             except BaseException as error:
                 if self._fatal_monitor_stop.is_set():
+                    outcome = self._observe_fatal_monitor_outcome()
+                    if outcome is not None:
+                        self._fatal_monitor_outcome = outcome
+                        self._acknowledge_fatal_monitor_exit(outcome)
                     return
                 self._record_fatal_secondary(error)
                 self._fatal_hard_exit()
             if origin_rank is not None:
+                outcome = self._observe_fatal_monitor_outcome()
+                if outcome is not None:
+                    self._fatal_monitor_outcome = outcome
+                    self._acknowledge_fatal_monitor_exit(outcome)
+                    return
                 with self._fatal_condition:
                     existing = (
                         self._fatal_pending_primary
@@ -889,9 +987,17 @@ class CupyNcclCollective:
                 )
                 return
             if generation is not None:
-                self._select_fatal_monitor_outcome("stopped_clean", generation)
+                outcome = self._select_fatal_monitor_outcome(
+                    "stopped_clean", generation
+                )
+                self._fatal_monitor_outcome = outcome
+                self._acknowledge_fatal_monitor_exit(outcome)
                 return
             if self._fatal_monitor_stop.is_set():
+                outcome = self._observe_fatal_monitor_outcome()
+                if outcome is not None:
+                    self._fatal_monitor_outcome = outcome
+                    self._acknowledge_fatal_monitor_exit(outcome)
                 return
             self._fatal_monitor_stop.wait(0.001)
 
@@ -1295,16 +1401,6 @@ class CupyNcclCollective:
                 join_existing=True,
                 discovering_token=discovering_token,
             )
-            acknowledgments = [
-                int(self._fatal_store_get(self._fatal_ack_key(rank)))
-                for rank in range(self.size)
-            ]
-            if not all(acknowledgments):
-                error = RuntimeError(
-                    "communicator close could not complete fatal acknowledgment"
-                )
-                self._record_fatal_secondary(error)
-                self._fatal_hard_exit()
             return self._fatal_pending_primary
         return None
 
@@ -1378,6 +1474,7 @@ class CupyNcclCollective:
             self._release_runtime_close_step(gate, stop_token)
 
         outcome = self._wait_for_fatal_monitor_outcome(generation)
+        self._wait_for_fatal_monitor_exit(outcome)
         thread = self._fatal_monitor_thread
         self._join_fatal_monitor(thread)
         if outcome.kind == "fatal_elected":
