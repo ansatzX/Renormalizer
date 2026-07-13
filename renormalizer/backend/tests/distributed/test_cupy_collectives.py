@@ -762,14 +762,16 @@ def test_admitted_discoverer_converts_token_without_self_deadlock(monkeypatch):
     conversion_errors = []
     joined_primaries = []
 
-    original_begin_fatal = gate.begin_fatal
+    original_begin_fatal = gate._recover_fatal
 
-    def observe_pending(error, discovering_token=None):
-        transition = original_begin_fatal(error, discovering_token)
+    def observe_pending(error, discovering_token=None, **kwargs):
+        transition = original_begin_fatal(
+            error, discovering_token, **kwargs
+        )
         owner_pending.set()
         return transition
 
-    monkeypatch.setattr(gate, "begin_fatal", observe_pending)
+    monkeypatch.setattr(gate, "_recover_fatal", observe_pending)
 
     def discover():
         token = gate.admit_runtime("fatal_discoverer")
@@ -828,15 +830,17 @@ def test_remote_monitor_and_local_failure_join_one_transition(monkeypatch):
     monitor_publication_entries = []
     monitor = None
 
-    original_begin_fatal = gate.begin_fatal
+    original_begin_fatal = gate._recover_fatal
 
-    def record_begin_fatal(error, discovering_token=None):
-        transition = original_begin_fatal(error, discovering_token)
+    def record_begin_fatal(error, discovering_token=None, **kwargs):
+        transition = original_begin_fatal(
+            error, discovering_token, **kwargs
+        )
         transitions.append(transition)
         pending_entered.set()
         return transition
 
-    monkeypatch.setattr(gate, "begin_fatal", record_begin_fatal)
+    monkeypatch.setattr(gate, "_recover_fatal", record_begin_fatal)
     original_begin_publication = wrappers[1]._begin_fatal_publication
 
     def record_begin_publication(*args, **kwargs):
@@ -915,14 +919,16 @@ def test_abort_ack_and_first_primary_are_exactly_once(monkeypatch):
     writes = []
     monitor_stopped_before_ack = []
 
-    original_begin_fatal = gate.begin_fatal
+    original_begin_fatal = gate._recover_fatal
 
-    def record_begin_fatal(error, discovering_token=None):
-        transition = original_begin_fatal(error, discovering_token)
+    def record_begin_fatal(error, discovering_token=None, **kwargs):
+        transition = original_begin_fatal(
+            error, discovering_token, **kwargs
+        )
         pending_entered.set()
         return transition
 
-    monkeypatch.setattr(gate, "begin_fatal", record_begin_fatal)
+    monkeypatch.setattr(gate, "_recover_fatal", record_begin_fatal)
     original_store_set = wrapper._fatal_store_set
 
     def record_store_set(key, value):
@@ -5650,8 +5656,12 @@ def test_immediate_post_pre_reservation_failure_recovers_exact_gate_and_close(
 
     original_pre_reserve = wrapper._pre_reserve_fatal_publication
 
-    def cancel_after_real_pre_reservation(error, origin_rank=None):
-        result = original_pre_reserve(error, origin_rank)
+    def cancel_after_real_pre_reservation(
+        error, origin_rank=None, *, election=None
+    ):
+        result = original_pre_reserve(
+            error, origin_rank, election=election
+        )
         if threading.current_thread().name == publisher_name:
             with wrapper._fatal_condition:
                 owner = wrapper._fatal_publication_owner_reservation
@@ -5677,14 +5687,16 @@ def test_immediate_post_pre_reservation_failure_recovers_exact_gate_and_close(
         "_pre_reserve_fatal_publication",
         cancel_after_real_pre_reservation,
     )
-    original_begin_fatal = gate.begin_fatal
+    original_begin_fatal = gate._recover_fatal
 
-    def record_gate_election(error, discovering_token=None):
-        transition = original_begin_fatal(error, discovering_token)
+    def record_gate_election(error, discovering_token=None, **kwargs):
+        transition = original_begin_fatal(
+            error, discovering_token, **kwargs
+        )
         gate_elections.append((transition, discovering_token))
         return transition
 
-    monkeypatch.setattr(gate, "begin_fatal", record_gate_election)
+    monkeypatch.setattr(gate, "_recover_fatal", record_gate_election)
     original_begin_publication = wrapper._begin_fatal_publication
 
     def record_reporter_adoption(*args, **kwargs):
@@ -5832,6 +5844,457 @@ def test_immediate_post_pre_reservation_failure_recovers_exact_gate_and_close(
     assert runtime._terminal_error is None
 
 
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "after_pre_reserve",
+        "after_owner_query",
+        "after_transition_assignment",
+        "during_context_retention",
+        "before_handoff_outcome",
+    ],
+)
+def test_hidden_fatal_election_recovers_every_reserved_owner_boundary(
+    monkeypatch, failure_stage
+):
+    class ElectionCancelled(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, raw_comm = _single_rank_task_18_2_runtime(
+        monkeypatch
+    )
+    gate = runtime._terminal_gate
+    primary = RuntimeError("recoverable hidden election primary")
+    later = RuntimeError("recoverable hidden election later reporter")
+    cancellation = ElectionCancelled(failure_stage)
+    publisher_name = "task-18.2-hidden-election-{}".format(failure_stage)
+    reporter_name = "task-18.2-hidden-election-reporter-{}".format(
+        failure_stage
+    )
+    close_name = "task-18.2-hidden-election-close-{}".format(failure_stage)
+    tokens = []
+    pre_reserve_returns = []
+    owner_query_returns = []
+    injection_observations = []
+    collective_failure_installs = []
+    gate_failure_signals = []
+    reporter_adoptions = []
+    join_observations = []
+    hard_exit_observations = []
+
+    original_pre_reserve = wrapper._pre_reserve_fatal_publication
+
+    def record_normal_pre_reserve(*args, **kwargs):
+        result = original_pre_reserve(*args, **kwargs)
+        if threading.current_thread().name == publisher_name:
+            pre_reserve_returns.append(result)
+        return result
+
+    monkeypatch.setattr(
+        wrapper, "_pre_reserve_fatal_publication", record_normal_pre_reserve
+    )
+    original_owner_query = wrapper._current_thread_reserved_fatal_primary
+
+    def record_normal_owner_query():
+        result = original_owner_query()
+        if threading.current_thread().name == publisher_name:
+            owner_query_returns.append(result)
+        return result
+
+    monkeypatch.setattr(
+        wrapper,
+        "_current_thread_reserved_fatal_primary",
+        record_normal_owner_query,
+    )
+
+    def cancel_at_checkpoint(stage, election):
+        if (
+            threading.current_thread().name != publisher_name
+            or stage != failure_stage
+            or injection_observations
+        ):
+            return
+        with wrapper._fatal_condition:
+            retained_owner = wrapper._fatal_publication_owner_reservation
+            owner_state = (
+                wrapper._fatal_publications,
+                retained_owner,
+                wrapper._fatal_pending_primary,
+            )
+        with gate._condition:
+            token_state = gate._tokens[tokens[0].sequence]
+            gate_state = (
+                gate._phase,
+                gate._fatal_transition,
+                token_state.status,
+            )
+        outcome = wrapper._fatal_monitor_handoff.observe_outcome()
+        injection_observations.append(
+            (
+                stage,
+                election,
+                election.stage,
+                *owner_state,
+                *gate_state,
+                runtime._pending_fatal_collective,
+                runtime._pending_fatal_context,
+                outcome,
+            )
+        )
+        raise cancellation
+
+    monkeypatch.setattr(
+        runtime,
+        "_fatal_election_test_checkpoint",
+        cancel_at_checkpoint,
+        raising=False,
+    )
+    original_collective_fail = wrapper._fail_reserved_fatal_publication
+
+    def record_collective_failure(*args, **kwargs):
+        with wrapper._fatal_condition:
+            before = wrapper._fatal_publication_failure
+        result = original_collective_fail(*args, **kwargs)
+        with wrapper._fatal_condition:
+            after = wrapper._fatal_publication_failure
+        if before is None and after is primary:
+            collective_failure_installs.append(
+                (
+                    threading.current_thread().name,
+                    result,
+                    wrapper._fatal_condition._is_owned(),
+                    wrapper._fatal_lock._is_owned(),
+                )
+            )
+        return result
+
+    monkeypatch.setattr(
+        wrapper,
+        "_fail_reserved_fatal_publication",
+        record_collective_failure,
+    )
+    original_gate_fail = gate._fail_fatal_publication
+
+    def record_gate_failure(transition, failure):
+        gate_failure_signals.append(
+            (
+                transition,
+                failure,
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        return original_gate_fail(transition, failure)
+
+    monkeypatch.setattr(gate, "_fail_fatal_publication", record_gate_failure)
+    original_begin_publication = wrapper._begin_fatal_publication
+
+    def record_reporter_adoption(*args, **kwargs):
+        result = original_begin_publication(*args, **kwargs)
+        if threading.current_thread().name == reporter_name:
+            reporter_adoptions.append(result)
+        return result
+
+    monkeypatch.setattr(
+        wrapper, "_begin_fatal_publication", record_reporter_adoption
+    )
+    original_wait = wrapper._wait_for_joined_fatal_publication
+
+    def record_join():
+        with wrapper._fatal_condition:
+            join_observations.append(
+                (
+                    threading.current_thread().name,
+                    wrapper._fatal_publications,
+                    wrapper._fatal_publication_failure,
+                )
+            )
+        return original_wait()
+
+    monkeypatch.setattr(
+        wrapper, "_wait_for_joined_fatal_publication", record_join
+    )
+
+    def hard_exit():
+        hard_exit_observations.append(
+            (
+                threading.current_thread().name,
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit(threading.current_thread().name)
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    def publish_from_admission():
+        token = gate.admit_runtime("hidden_election_{}".format(failure_stage))
+        tokens.append(token)
+        return runtime._enter_communicator_fatal(
+            primary, discovering_token=token
+        )
+
+    publisher, publish_results, publish_errors, publish_done = (
+        _start_task_18_2_call(publish_from_admission, name=publisher_name)
+    )
+    _join_task_18_2_call(publisher, publish_done)
+
+    assert publish_results == []
+    assert len(publish_errors) == 1
+    assert isinstance(publish_errors[0], FatalHardExit)
+    assert pre_reserve_returns[0] == (primary, True)
+    assert len(injection_observations) == 1
+    (
+        observed_stage,
+        election,
+        election_stage,
+        owner_count,
+        retained_owner,
+        pending_primary,
+        injection_phase,
+        injection_transition,
+        injection_token_status,
+        injection_collective,
+        injection_context,
+        injection_outcome,
+    ) = injection_observations[0]
+    assert observed_stage == failure_stage
+    assert owner_count == 1
+    assert retained_owner.owner_thread is publisher
+    assert retained_owner.primary is primary
+    assert retained_owner.election is election
+    assert pending_primary is primary
+    assert injection_outcome is None
+    expected_election_stage = {
+        "after_pre_reserve": "owner_reserved",
+        "after_owner_query": "owner_confirmed",
+        "after_transition_assignment": "transition_created",
+        "during_context_retention": "token_converted",
+        "before_handoff_outcome": "context_retained",
+    }
+    assert election_stage == expected_election_stage[failure_stage]
+    if failure_stage in {"after_pre_reserve", "after_owner_query"}:
+        assert injection_phase is _TerminalPhase.HEALTHY
+        assert injection_transition is None
+        assert injection_token_status == "active"
+        assert injection_collective is None
+        assert injection_context is None
+    elif failure_stage == "after_transition_assignment":
+        assert injection_phase is _TerminalPhase.HEALTHY
+        assert injection_transition.primary is primary
+        assert injection_token_status == "active"
+        assert injection_collective is None
+        assert injection_context is None
+    else:
+        assert injection_phase is _TerminalPhase.FATAL_PENDING
+        assert injection_transition.primary is primary
+        assert injection_token_status == "converted"
+        assert injection_collective is wrapper
+        assert injection_context is not None
+    if failure_stage != "after_pre_reserve":
+        assert owner_query_returns[0] is primary
+
+    with wrapper._fatal_condition:
+        assert wrapper._fatal_publications == 1
+        assert wrapper._fatal_publication_owner_reservation is retained_owner
+        assert wrapper._fatal_publication_failure is primary
+        assert wrapper._fatal_publication_gate_failure_state == "signaled"
+    with gate._condition:
+        transition = gate._fatal_transition
+        assert transition.primary is primary
+        assert gate._phase is _TerminalPhase.FATAL_PENDING
+        assert gate._fatal_publication_failure is primary
+        assert gate._tokens[tokens[0].sequence].status == "converted"
+        assert gate._has_active_tokens() is False
+    outcome = wrapper._fatal_monitor_handoff.observe_outcome()
+    assert outcome.kind == "fatal_elected"
+    assert outcome.primary is primary
+    assert runtime._pending_fatal_collective is wrapper
+    assert runtime._pending_fatal_context is not None
+    assert len(collective_failure_installs) == 1
+    assert collective_failure_installs[0][0] == publisher_name
+    assert collective_failure_installs[0][1] == (True, True)
+    assert collective_failure_installs[0][2:] == (False, False)
+    assert gate_failure_signals == [
+        (transition, primary, False, False, False)
+    ]
+    with pytest.raises(RuntimeError, match="converted"):
+        gate.release(tokens[0])
+
+    reporter, report_results, report_errors, report_done = (
+        _start_task_18_2_call(
+            lambda: runtime._enter_communicator_fatal(later),
+            name=reporter_name,
+        )
+    )
+    _join_task_18_2_call(reporter, report_done)
+
+    assert report_results == []
+    assert len(report_errors) == 1
+    assert isinstance(report_errors[0], FatalHardExit)
+    assert len(reporter_adoptions) == 1
+    assert reporter_adoptions[0][2:] == (False, True, False)
+
+    closer, close_results, close_errors, close_done = _start_task_18_2_call(
+        runtime.close, name=close_name
+    )
+    _join_task_18_2_call(closer, close_done)
+
+    assert close_results == []
+    assert len(close_errors) == 1
+    assert isinstance(close_errors[0], FatalHardExit)
+    assert join_observations == [
+        (reporter_name, 1, primary),
+        (close_name, 1, primary),
+    ]
+    assert hard_exit_observations == [
+        (publisher_name, False, False, False),
+        (reporter_name, False, False, False),
+        (close_name, False, False, False),
+    ]
+    assert len(gate_failure_signals) == 1
+    assert sum(
+        retained is cancellation for retained in wrapper._fatal_secondary_errors
+    ) == 1
+    assert raw_comm.abort_calls == 0
+    assert wrapper._fatal_error is None
+    assert runtime._terminal_error is None
+
+
+def test_gate_failure_callback_cancellation_retries_and_wakes_waiters(monkeypatch):
+    class CallbackCancelled(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, raw_comm = _single_rank_task_18_2_runtime(
+        monkeypatch
+    )
+    gate = runtime._terminal_gate
+    hook = runtime._communicator_fatal_hook
+    primary = RuntimeError("retryable gate failure primary")
+    callback_cancellation = CallbackCancelled("cancel first gate callback")
+    owner_name = "task-18.2-retryable-gate-failure-owner"
+    callback_observations = []
+    reentrant_results = []
+    gate_primitive_calls = []
+    hard_exit_observations = []
+    owner_state = []
+
+    real_gate_primitive = gate._fail_fatal_publication
+
+    def record_gate_primitive(transition, failure):
+        gate_primitive_calls.append(
+            (
+                transition,
+                failure,
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        return real_gate_primitive(transition, failure)
+
+    monkeypatch.setattr(gate, "_fail_fatal_publication", record_gate_primitive)
+    real_hook_fail = hook.fail
+
+    def fail_once_then_signal(transition, failure):
+        callback_observations.append(
+            (
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        if len(callback_observations) == 1:
+            reentrant_results.append(
+                wrapper._fail_reserved_fatal_publication(
+                    callback_cancellation,
+                    transition_handler=hook,
+                    transition=transition,
+                )
+            )
+            raise callback_cancellation
+        return real_hook_fail(transition, failure)
+
+    monkeypatch.setattr(hook, "fail", fail_once_then_signal)
+
+    def hard_exit():
+        hard_exit_observations.append(
+            (
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit(owner_name)
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+    waiter, wait_results, wait_errors, wait_done = _start_task_18_2_call(
+        lambda: gate.wait_for_published(0.5),
+        name="task-18.2-retryable-gate-failure-waiter",
+    )
+
+    def fail_reserved_owner():
+        token = gate.admit_runtime("retryable_gate_failure")
+        reserved, started = wrapper._pre_reserve_fatal_publication(primary)
+        assert reserved is primary
+        assert started is True
+        transition = gate.begin_fatal(primary, token)
+        outcome = wrapper._reserve_runtime_fatal_outcome(primary)
+        assert outcome.primary is primary
+        with wrapper._fatal_condition:
+            owner_state.append(wrapper._fatal_publication_owner_reservation)
+        owned, first_failure = wrapper._fail_reserved_fatal_publication(
+            callback_cancellation,
+            transition_handler=hook,
+            transition=transition,
+        )
+        assert (owned, first_failure) == (True, True)
+        wrapper._fatal_hard_exit()
+
+    owner, owner_results, owner_errors, owner_done = _start_task_18_2_call(
+        fail_reserved_owner, name=owner_name
+    )
+    _join_task_18_2_call(owner, owner_done)
+    _join_task_18_2_call(waiter, wait_done)
+
+    assert owner_results == []
+    assert len(owner_errors) == 1
+    assert isinstance(owner_errors[0], FatalHardExit)
+    assert wait_results == []
+    assert wait_errors == [primary]
+    assert owner_state[0].owner_thread is owner
+    assert owner_state[0].primary is primary
+    assert callback_observations == [
+        (False, False, False),
+        (False, False, False),
+    ]
+    assert reentrant_results == [(True, False)]
+    assert len(gate_primitive_calls) == 1
+    assert gate_primitive_calls[0][1] is primary
+    assert gate_primitive_calls[0][2:] == (False, False, False)
+    with wrapper._fatal_condition:
+        assert wrapper._fatal_publications == 1
+        assert wrapper._fatal_publication_failure is primary
+        assert wrapper._fatal_publication_gate_failure_state == "signaled"
+    with gate._condition:
+        assert gate._fatal_publication_failure is primary
+        assert gate._tokens[next(iter(gate._tokens))].status == "converted"
+    assert hard_exit_observations == [(False, False, False)]
+    assert sum(
+        retained is callback_cancellation
+        for retained in wrapper._fatal_secondary_errors
+    ) == 1
+    assert raw_comm.abort_calls == 0
+
+
 def test_pre_reserved_fatal_owner_failure_before_adoption_is_fail_stopped(
     monkeypatch,
 ):
@@ -5861,9 +6324,13 @@ def test_pre_reserved_fatal_owner_failure_before_adoption_is_fail_stopped(
 
     original_reserve_outcome = wrapper._reserve_runtime_fatal_outcome
 
-    def cancel_before_adoption(primary, *, before_select=None):
+    def cancel_before_adoption(
+        primary, *, before_select=None, after_prepare=None
+    ):
         outcome = original_reserve_outcome(
-            primary, before_select=before_select
+            primary,
+            before_select=before_select,
+            after_prepare=after_prepare,
         )
         if threading.current_thread().name == publisher_name:
             with wrapper._fatal_condition:

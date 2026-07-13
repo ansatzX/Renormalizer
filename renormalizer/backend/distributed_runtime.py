@@ -102,18 +102,236 @@ class _RuntimeCommunicatorFatalHook:
             transition, failure
         )
 
+    def failure_recorded(self, transition, failure):
+        return self._runtime()._terminal_gate._fatal_publication_failed(
+            transition, failure
+        )
+
 
 _MISSING_TERMINAL_FIELD = object()
 
 
 class _DeferredAsyncQuarantine:
-    __slots__ = ("owner", "callback", "triggered", "completed")
+    __slots__ = (
+        "owner",
+        "callback",
+        "deferred_callback",
+        "triggered",
+        "completed",
+    )
 
     def __init__(self, owner, callback):
         self.owner = owner
         self.callback = callback
+        self.deferred_callback = None
         self.triggered = False
         self.completed = False
+
+
+class _RecoverableFatalElection:
+    __slots__ = (
+        "runtime",
+        "gate",
+        "collective",
+        "primary",
+        "provider",
+        "lease",
+        "owner",
+        "discovering_token",
+        "stage",
+        "transition",
+        "context_retained",
+        "outcome",
+        "recovery_errors",
+    )
+
+    def __init__(
+        self,
+        runtime,
+        collective,
+        primary,
+        provider,
+        lease,
+        owner,
+        discovering_token,
+    ):
+        self.runtime = runtime
+        self.gate = runtime._terminal_gate
+        self.collective = collective
+        self.primary = primary
+        self.provider = provider
+        self.lease = lease
+        self.owner = owner
+        self.discovering_token = discovering_token
+        self.stage = "created"
+        self.transition = None
+        self.context_retained = False
+        self.outcome = None
+        self.recovery_errors = []
+
+    def _checkpoint(self, stage, recovering):
+        if recovering:
+            return
+        checkpoint = getattr(
+            self.runtime, "_fatal_election_test_checkpoint", None
+        )
+        if callable(checkpoint):
+            checkpoint(stage, self)
+
+    def _remember_recovery_error(self, error):
+        if not any(retained is error for retained in self.recovery_errors):
+            self.recovery_errors.append(error)
+
+    def _transition_assigned(self, transition, recovering):
+        self.transition = transition
+        self.stage = "transition_created"
+        self._checkpoint("after_transition_assignment", recovering)
+
+    def _retain_context_locked(self, recovering):
+        runtime = self.runtime
+        if runtime._pending_fatal_collective is None:
+            runtime._pending_fatal_collective = self.collective
+        if runtime._pending_fatal_context is None:
+            runtime._pending_fatal_context = (
+                self.provider,
+                self.lease,
+                self.owner,
+            )
+        elif (
+            self.owner is not None
+            and runtime._pending_fatal_context[2] is None
+        ):
+            retained_provider, retained_lease, _ = runtime._pending_fatal_context
+            runtime._pending_fatal_context = (
+                retained_provider,
+                retained_lease,
+                self.owner,
+            )
+        self._checkpoint("during_context_retention", recovering)
+        runtime._stage_active_broadcast_quarantine_locked(
+            self.owner, self.collective
+        )
+        self.context_retained = True
+        self.stage = "context_retained"
+
+    def _prepare_locked(self, recovering):
+        pre_reserve = getattr(
+            self.collective, "_pre_reserve_fatal_publication", None
+        )
+        reserved_primary_for_thread = getattr(
+            self.collective,
+            "_current_thread_reserved_fatal_primary",
+            None,
+        )
+        reserved_election_for_thread = getattr(
+            self.collective,
+            "_current_thread_reserved_fatal_election",
+            None,
+        )
+        if (
+            not callable(pre_reserve)
+            or not callable(reserved_primary_for_thread)
+            or not callable(reserved_election_for_thread)
+        ):
+            raise RuntimeError(
+                "collective fatal owner reservation is not recoverable"
+            )
+        owner_election = (
+            reserved_election_for_thread() if recovering else None
+        )
+        if owner_election is self:
+            reserved_primary = reserved_primary_for_thread()
+        else:
+            reserved_primary, _ = pre_reserve(
+                self.primary, election=self
+            )
+            self.stage = "owner_reserved"
+            self._checkpoint("after_pre_reserve", recovering)
+            owner_election = reserved_election_for_thread()
+        owner_primary = reserved_primary_for_thread()
+        self.stage = "owner_confirmed"
+        self._checkpoint("after_owner_query", recovering)
+        if (
+            reserved_primary is not self.primary
+            or owner_primary is not self.primary
+            or owner_election is not self
+        ):
+            raise RuntimeError("communicator fatal owner was not reserved")
+        self.transition = self.gate._recover_fatal(
+            self.primary,
+            self.discovering_token,
+            after_transition=lambda transition: self._transition_assigned(
+                transition, recovering
+            ),
+        )
+        self.stage = "token_converted"
+        self._retain_context_locked(recovering)
+
+    def _select_outcome_locked(self, recovering):
+        if recovering:
+            observe_outcome = getattr(
+                self.collective, "_observe_fatal_monitor_outcome", None
+            )
+            if callable(observe_outcome):
+                outcome = observe_outcome()
+                if outcome is not None:
+                    self.outcome = outcome
+                    self.stage = "handoff_selected"
+                    return outcome
+        reserve_outcome = getattr(
+            self.collective, "_reserve_runtime_fatal_outcome", None
+        )
+        if not callable(reserve_outcome):
+            raise RuntimeError("collective fatal outcome is not reservable")
+        outcome = reserve_outcome(
+            self.primary,
+            before_select=lambda: self._prepare_locked(recovering),
+            after_prepare=lambda: self._checkpoint(
+                "before_handoff_outcome", recovering
+            ),
+        )
+        self.outcome = outcome
+        self.stage = "handoff_selected"
+        return outcome
+
+    def _is_owned_by_current_thread(self):
+        query = getattr(
+            self.collective,
+            "_current_thread_reserved_fatal_election",
+            None,
+        )
+        return callable(query) and query() is self
+
+    def recover_locked(self):
+        while True:
+            try:
+                if not self._is_owned_by_current_thread():
+                    return False
+                outcome = self._select_outcome_locked(recovering=True)
+                if (
+                    outcome.kind != "fatal_elected"
+                    or outcome.primary is not self.primary
+                ):
+                    raise RuntimeError(
+                        "communicator fatal handoff recovery changed"
+                    )
+                if self.transition is None:
+                    self.transition = self.gate._fatal_transition
+                if (
+                    self.transition is None
+                    or self.transition.primary is not self.primary
+                ):
+                    raise RuntimeError(
+                        "communicator fatal transition recovery changed"
+                    )
+                return True
+            except BaseException as error:
+                self._remember_recovery_error(error)
+
+    def recover(self):
+        with self.gate._condition:
+            with self.runtime._terminal_state_lock:
+                return self.recover_locked()
 
 
 @dataclass
@@ -266,26 +484,33 @@ class CupyDistributedRuntime:
         )
         if not callable(active) or not active():
             return
-        if any(
-            retained.owner is owner for retained in self._deferred_async_quarantines
-        ):
-            return
-        callback = getattr(owner, "_quarantine", None)
-        if not callable(callback):
-            return
-        record = _DeferredAsyncQuarantine(owner, callback)
-        runtime_ref = weakref.ref(self)
+        record = next(
+            (
+                retained
+                for retained in self._deferred_async_quarantines
+                if retained.owner is owner
+            ),
+            None,
+        )
+        if record is None:
+            callback = getattr(owner, "_quarantine", None)
+            if not callable(callback):
+                return
+            record = _DeferredAsyncQuarantine(owner, callback)
+            self._deferred_async_quarantines.append(record)
+        if record.deferred_callback is None:
+            runtime_ref = weakref.ref(self)
 
-        def defer_quarantine(retained_owner):
-            runtime = runtime_ref()
-            if runtime is None:
-                return callback(retained_owner)
-            return runtime._accept_deferred_async_quarantine(
-                record, retained_owner
-            )
+            def defer_quarantine(retained_owner):
+                runtime = runtime_ref()
+                if runtime is None:
+                    return record.callback(retained_owner)
+                return runtime._accept_deferred_async_quarantine(
+                    record, retained_owner
+                )
 
-        owner._quarantine = defer_quarantine
-        self._deferred_async_quarantines.append(record)
+            record.deferred_callback = defer_quarantine
+        owner._quarantine = record.deferred_callback
 
     def _accept_deferred_async_quarantine(self, record, owner):
         if record.owner is not owner:
@@ -627,24 +852,22 @@ class CupyDistributedRuntime:
                 failure_context=failure_context,
             )
         except BaseException as error:
-            collective = failure_context[0]
-            fail_publication = (
-                None
-                if collective is None
-                else getattr(
-                    collective,
-                    "_fail_reserved_fatal_publication",
-                    None,
+            election = failure_context[0]
+            if election is not None and election.recover():
+                collective = election.collective
+                for recovery_error in election.recovery_errors:
+                    collective._record_fatal_secondary(recovery_error)
+                fail_publication = getattr(
+                    collective, "_fail_reserved_fatal_publication", None
                 )
-            )
-            if callable(fail_publication):
-                gate = self._terminal_gate
-                with gate._condition:
-                    transition = gate._fatal_transition
+                if not callable(fail_publication):
+                    raise RuntimeError(
+                        "collective cannot fail reserved fatal publication"
+                    ) from error
                 owned, first_failure = fail_publication(
                     error,
                     transition_handler=self._communicator_fatal_hook,
-                    transition=transition,
+                    transition=election.transition,
                 )
                 if owned and first_failure:
                     collective._fatal_hard_exit()
@@ -686,92 +909,48 @@ class CupyDistributedRuntime:
                     raise RuntimeError(
                         "collective does not provide fatal publication"
                     )
-                failure_context[0] = collective
                 reserve_outcome = getattr(
                     collective, "_reserve_runtime_fatal_outcome", None
                 )
-                elected_here = False
-                pre_reservation_failure = None
-
-                def retain_fatal_context():
-                    if self._pending_fatal_collective is None:
-                        self._pending_fatal_collective = collective
-                    if self._pending_fatal_context is None:
-                        self._pending_fatal_context = (provider, lease, owner)
-                    elif (
-                        owner is not None
-                        and self._pending_fatal_context[2] is None
-                    ):
-                        retained_provider, retained_lease, _ = (
-                            self._pending_fatal_context
-                        )
-                        self._pending_fatal_context = (
-                            retained_provider,
-                            retained_lease,
-                            owner,
-                        )
-                    self._stage_active_broadcast_quarantine_locked(
-                        owner, collective
-                    )
-
+                election = _RecoverableFatalElection(
+                    self,
+                    collective,
+                    primary,
+                    provider,
+                    lease,
+                    owner,
+                    discovering_token,
+                )
+                failure_context[0] = election
                 if callable(reserve_outcome):
                     if discovering_token is not None:
                         gate._convertible_token_state(discovering_token)
-                    pre_reserve = getattr(
-                        collective, "_pre_reserve_fatal_publication", None
-                    )
-                    if not callable(pre_reserve):
-                        raise RuntimeError(
-                            "collective cannot pre-reserve fatal publication"
+                    try:
+                        outcome = election._select_outcome_locked(
+                            recovering=False
                         )
-
-                    def elect_joinable_fatal():
-                        nonlocal elected_here, transition
-                        nonlocal pre_reservation_failure
-                        try:
-                            reserved_primary, started = pre_reserve(primary)
-                        except BaseException as error:
-                            reserved_primary_for_thread = getattr(
-                                collective,
-                                "_current_thread_reserved_fatal_primary",
-                                None,
-                            )
-                            if not callable(reserved_primary_for_thread):
-                                raise
-                            reserved_primary = reserved_primary_for_thread()
-                            if reserved_primary is None:
-                                raise
-                            started = True
-                            pre_reservation_failure = error
-                        if reserved_primary is not primary or not started:
-                            raise RuntimeError(
-                                "communicator fatal owner was not reserved"
-                            )
-                        transition = gate.begin_fatal(
-                            primary, discovering_token
-                        )
-                        if transition.primary is not primary:
-                            raise RuntimeError(
-                                "communicator fatal primary changed"
-                            )
-                        elected_here = True
-                        retain_fatal_context()
-
-                    outcome = reserve_outcome(
-                        primary, before_select=elect_joinable_fatal
-                    )
-                    if pre_reservation_failure is not None:
-                        raise pre_reservation_failure
+                    except BaseException:
+                        election.recover_locked()
+                        raise
                     if outcome.primary is not primary:
                         self._remember_terminal_secondary_locked(
                             primary, outcome.primary, owner
                         )
                         primary = outcome.primary
-                if not elected_here:
+                    if election.transition is None:
+                        transition = gate.begin_fatal(
+                            primary, discovering_token
+                        )
+                        election.transition = transition
+                        election._retain_context_locked(recovering=False)
+                    else:
+                        transition = election.transition
+                else:
                     transition = gate.begin_fatal(primary, discovering_token)
+                    election.transition = transition
+                    election._retain_context_locked(recovering=False)
                 if transition.primary is not primary:
                     raise RuntimeError("communicator fatal primary changed")
-                retain_fatal_context()
                 return transition
 
     def _publish_communicator_fatal_transition(self, transition):

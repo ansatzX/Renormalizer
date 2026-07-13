@@ -102,16 +102,24 @@ class _FatalMonitorHandoff:
             return None, read()
 
     def select_fatal(
-        self, primary: BaseException, *, before_select=None
+        self,
+        primary: BaseException,
+        *,
+        before_select=None,
+        after_prepare=None,
     ) -> _MonitorOutcome:
         if not isinstance(primary, BaseException):
             raise TypeError("monitor fatal primary must be an exception")
         if before_select is not None and not callable(before_select):
             raise TypeError("monitor fatal preparation must be callable")
+        if after_prepare is not None and not callable(after_prepare):
+            raise TypeError("monitor fatal post-preparation must be callable")
         with self._condition:
             if self._outcome is None:
                 if before_select is not None:
                     before_select()
+                if after_prepare is not None:
+                    after_prepare()
                 self._outcome = _MonitorOutcome(
                     kind="fatal_elected", primary=primary
                 )
@@ -352,6 +360,29 @@ class _TerminalLifecycleGate:
         self._require_token_thread(state)
         if state.async_capability is not _MISSING and not state.async_claimed:
             raise RuntimeError("unclaimed async admission cannot be converted")
+        return state
+
+    def _recoverable_fatal_token_state(self, token):
+        if not isinstance(token, _ResourceAdmission):
+            raise TypeError("resource admission token is required")
+        if token.gate_id != self._gate_id:
+            raise RuntimeError("resource admission belongs to another terminal gate")
+        state = self._tokens.get(token.sequence)
+        if state is None:
+            raise RuntimeError("resource admission token is unknown")
+        if state.status == "released":
+            raise RuntimeError("resource admission token was already released")
+        if state.token != token:
+            raise RuntimeError("stale resource admission token")
+        if state.status == "active":
+            self._require_token_thread(state)
+            if state.async_capability is not _MISSING and not state.async_claimed:
+                raise RuntimeError("unclaimed async admission cannot be converted")
+        elif state.status == "converted":
+            if state.token.thread_id != threading.get_ident():
+                raise RuntimeError("resource admission belongs to another thread")
+        else:
+            raise RuntimeError("resource admission state is invalid")
         return state
 
     def _convert_token_state(self, state):
@@ -681,6 +712,49 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("resource admission thread state is inconsistent")
             return state.token
 
+    def _begin_fatal_locked(
+        self,
+        primary,
+        discovering_state,
+        *,
+        after_transition=None,
+    ):
+        if (
+            self._phase is _TerminalPhase.RUNTIME_CLOSED
+            and self._fatal_transition is None
+        ):
+            raise RuntimeError("runtime is closed")
+        if self._runtime_close_commit_selected and self._fatal_transition is None:
+            if (
+                discovering_state is not None
+                and discovering_state.status == "active"
+            ):
+                self._convert_token_state(discovering_state)
+                self._condition.notify_all()
+            raise RuntimeError("runtime close is committed")
+        if self._fatal_transition is None:
+            self._fatal_transition = _FatalTransition(
+                gate_id=self._gate_id,
+                primary=primary,
+                sequence=self._sequence(),
+            )
+        if after_transition is not None:
+            after_transition(self._fatal_transition)
+        if self._phase in (
+            _TerminalPhase.HEALTHY,
+            _TerminalPhase.RUNTIME_CLOSING,
+        ):
+            self._phase = _TerminalPhase.FATAL_PENDING
+            if self._live_epoch is not None:
+                self._leases[self._live_epoch].phase = "fatal_retained"
+        if (
+            discovering_state is not None
+            and discovering_state.status == "active"
+        ):
+            self._convert_token_state(discovering_state)
+        self._condition.notify_all()
+        return self._fatal_transition
+
     def begin_fatal(
         self,
         primary: BaseException,
@@ -692,36 +766,33 @@ class _TerminalLifecycleGate:
             discovering_state = None
             if discovering_token is not None:
                 discovering_state = self._convertible_token_state(discovering_token)
-            if (
-                self._phase is _TerminalPhase.RUNTIME_CLOSED
-                and self._fatal_transition is None
-            ):
-                raise RuntimeError("runtime is closed")
-            if (
-                self._runtime_close_commit_selected
-                and self._fatal_transition is None
-            ):
-                if discovering_state is not None:
-                    self._convert_token_state(discovering_state)
-                    self._condition.notify_all()
-                raise RuntimeError("runtime close is committed")
-            if self._fatal_transition is None:
-                self._fatal_transition = _FatalTransition(
-                    gate_id=self._gate_id,
-                    primary=primary,
-                    sequence=self._sequence(),
+            return self._begin_fatal_locked(primary, discovering_state)
+
+    def _recover_fatal(
+        self,
+        primary,
+        discovering_token=None,
+        *,
+        after_transition=None,
+    ):
+        if not isinstance(primary, BaseException):
+            raise TypeError("fatal primary must be an exception")
+        if after_transition is not None and not callable(after_transition):
+            raise TypeError("fatal transition callback must be callable")
+        with self._condition:
+            discovering_state = None
+            if discovering_token is not None:
+                discovering_state = self._recoverable_fatal_token_state(
+                    discovering_token
                 )
-            if self._phase in (
-                _TerminalPhase.HEALTHY,
-                _TerminalPhase.RUNTIME_CLOSING,
-            ):
-                self._phase = _TerminalPhase.FATAL_PENDING
-                if self._live_epoch is not None:
-                    self._leases[self._live_epoch].phase = "fatal_retained"
-            if discovering_state is not None:
-                self._convert_token_state(discovering_state)
-            self._condition.notify_all()
-            return self._fatal_transition
+            transition = self._begin_fatal_locked(
+                primary,
+                discovering_state,
+                after_transition=after_transition,
+            )
+            if transition.primary is not primary:
+                raise RuntimeError("fatal primary changed during recovery")
+            return transition
 
     def wait_for_admissions(
         self, transition: _FatalTransition, timeout_s: float
@@ -767,6 +838,11 @@ class _TerminalLifecycleGate:
             elif self._fatal_publication_failure is not failure:
                 raise RuntimeError("fatal publication failure changed")
             self._condition.notify_all()
+
+    def _fatal_publication_failed(self, transition, failure):
+        with self._condition:
+            self._require_fatal_transition(transition)
+            return self._fatal_publication_failure is failure
 
     def wait_for_published(self, timeout_s: float):
         with self._condition:
