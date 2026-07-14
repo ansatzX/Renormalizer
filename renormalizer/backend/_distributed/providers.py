@@ -2391,15 +2391,18 @@ class ActiveWorkingSetProvider:
         *,
         _admission_token,
         _admission_validator,
+        _construction_transaction=None,
     ):
         _require_resource_admission(
             _admission_token,
             _admission_validator,
         )
-        return self.runtime._terminal_gate.activate_lease(
-            epoch,
-            _admission_token,
-        )
+        if _construction_transaction is None:
+            return self.runtime._terminal_gate.activate_lease(
+                epoch,
+                _admission_token,
+            )
+        return None
 
     def _rollback_partial(
         self,
@@ -2418,12 +2421,11 @@ class ActiveWorkingSetProvider:
             token,
             _admission_validator,
         )
-        error = first_error
+        cleanup_error = None
         try:
             record.restore_consumed_receipts(self.runtime)
         except BaseException as caught:
-            if error is None:
-                error = caught
+            cleanup_error = caught
         for resource in (
             scheduler,
             pool,
@@ -2442,17 +2444,17 @@ class ActiveWorkingSetProvider:
                         _admission_validator=_admission_validator,
                     )
             except BaseException as caught:
-                if error is None:
-                    error = caught
+                if cleanup_error is None:
+                    cleanup_error = caught
         if self._cache is not None:
             try:
                 self._cache._set_resource_recorder(
                     self._persistent_resources.capture
                 )
             except BaseException as caught:
-                if error is None:
-                    error = caught
-        return error
+                if cleanup_error is None:
+                    cleanup_error = caught
+        return cleanup_error
 
     def _raise_construction_transition_preemption(self):
         gate = self.runtime._terminal_gate
@@ -2476,121 +2478,155 @@ class ActiveWorkingSetProvider:
         with runtime._terminal_state_lock:
             runtime._remember_terminal_secondary_locked(error, primary)
 
-    def _fail_stop_construction_rollback(
+    def _record_construction_outcome_secondaries(self, outcome):
+        _, primary, _, secondaries = outcome
+        if not isinstance(primary, BaseException):
+            return
+        for secondary in secondaries:
+            self._remember_construction_rollback_secondary(secondary, primary)
+
+    def _retain_construction_transaction(
         self,
-        transition,
-        primary,
-        secondary,
-        *,
         record,
         retained_record,
+        lease,
+        primary,
     ):
-        runtime = self.runtime
-        gate = runtime._terminal_gate
-        active_lease = self._active_lease
-        if (
-            active_lease is not None
-            and getattr(active_lease, "_resource_record", None) is record
-        ):
+        if lease is not None and self._active_lease is lease:
             self._active_lease = None
-        self._provisional_resources = retained_record
+        retained = retained_record if retained_record is not None else record
+        if retained is not None:
+            self._provisional_resources = retained
+        if self._terminal_error is None:
+            self._terminal_error = primary
 
-        completion_error = None
-        try:
-            gate._fail_elected_lease_close(transition, primary)
-        except BaseException as error:
-            completion_error = error
-
-        try:
-            runtime._enter_communicator_fatal(primary)
-        except BaseException as error:
+    def _resolve_construction_failure(
+        self,
+        transaction,
+        error,
+        *,
+        record,
+        construction_token,
+        construction_validator,
+        lease,
+        scheduler,
+        pool,
+        cache_reservation,
+        store_reservation,
+        status_workspace,
+    ):
+        gate = self.runtime._terminal_gate
+        outcome = gate._lease_construction_outcome(transaction)
+        state, primary, result, _ = outcome
+        if state == "committed":
+            return result
+        if state in {"aborted", "fatal_retained"}:
+            self._record_construction_outcome_secondaries(outcome)
             if error is not primary:
                 self._remember_construction_rollback_secondary(error, primary)
-
-        if completion_error is not None:
-            try:
-                gate._fail_elected_lease_close(transition, primary)
-            except BaseException as error:
-                if error is not completion_error:
-                    self._remember_construction_rollback_secondary(error, primary)
-            self._remember_construction_rollback_secondary(
-                completion_error,
-                primary,
-            )
-        self._remember_construction_rollback_secondary(secondary, primary)
-        raise primary
-
-    def _commit_construction_rollback(
-        self,
-        epoch,
-        record,
-        primary,
-        *,
-        _retained_record=None,
-    ):
-        if not isinstance(primary, BaseException):
-            raise TypeError("construction rollback primary must be an exception")
-        gate = self.runtime._terminal_gate
-        retained_record = (
-            record.snapshot() if _retained_record is None else _retained_record
-        )
-
-        def begin_failure(error):
-            self._remember_construction_rollback_secondary(error, primary)
+            if state == "fatal_retained":
+                try:
+                    self.runtime._enter_communicator_fatal(primary)
+                except BaseException as publication_error:
+                    if publication_error is not primary:
+                        self._remember_construction_rollback_secondary(
+                            publication_error, primary
+                        )
             raise primary
-
-        def join(transition):
+        retained_record = None
+        snapshot_error = None
+        if record is not None:
             try:
-                result = gate.wait_for_lease_closed(
-                    transition,
-                    _TERMINAL_TIMEOUT_S,
+                retained_record = record.snapshot()
+            except BaseException as caught:
+                snapshot_error = caught
+
+        def retain(canonical):
+            self._retain_construction_transaction(
+                record,
+                retained_record,
+                lease,
+                canonical,
+            )
+
+        cleanup_error = snapshot_error
+        with gate._condition:
+            fatal_selected = gate._fatal_transition is not None
+        if (
+            cleanup_error is None
+            and not fatal_selected
+            and isinstance(error, Exception)
+            and record is not None
+        ):
+            try:
+                cleanup_error = self._rollback_partial(
+                    construction_token,
+                    error,
+                    record=record,
+                    _admission_validator=construction_validator,
+                    scheduler=scheduler,
+                    pool=pool,
+                    cache_reservation=cache_reservation,
+                    store_reservation=store_reservation,
+                    status_workspace=status_workspace,
                 )
-            except BaseException as error:
-                self._remember_construction_rollback_secondary(error, primary)
-                raise primary
-            if result is not primary:
-                mismatch = RuntimeError("construction rollback primary changed")
-                self._remember_construction_rollback_secondary(mismatch, primary)
-                raise primary
-            return result
+            except BaseException as caught:
+                cleanup_error = caught
 
-        def elected(transition):
-            gate.wait_for_lease_admissions(transition, _TERMINAL_TIMEOUT_S)
+        if cleanup_error is None and not fatal_selected and isinstance(
+            error, Exception
+        ):
 
-            def finalize():
-                active_lease = self._active_lease
-                if (
-                    active_lease is not None
-                    and getattr(active_lease, "_resource_record", None) is record
-                ):
+            def abort():
+                if lease is not None and self._active_lease is lease:
                     self._active_lease = None
                 if self._provisional_resources is record:
                     self._provisional_resources = None
-                record.clear()
-                return primary
+                if record is not None:
+                    record.clear()
 
-            result = gate.commit_lease_close(transition, finalize)
-            if result is not primary:
-                raise RuntimeError("construction rollback primary changed")
-            return result
-
-        def fail_stop(transition, secondary):
-            return self._fail_stop_construction_rollback(
-                transition,
-                primary,
-                secondary,
-                record=record,
-                retained_record=retained_record,
+            try:
+                gate._abort_lease_construction(
+                    transaction,
+                    error,
+                    abort,
+                    retain,
+                )
+            except BaseException as resolution_error:
+                outcome = gate._lease_construction_outcome(transaction)
+                if outcome[0] == "active":
+                    gate._fail_lease_construction(
+                        transaction,
+                        error,
+                        retain,
+                        secondary=resolution_error,
+                    )
+                elif resolution_error is not outcome[1]:
+                    self._remember_construction_rollback_secondary(
+                        resolution_error, outcome[1]
+                    )
+        else:
+            gate._fail_lease_construction(
+                transaction,
+                error,
+                retain,
+                secondary=cleanup_error,
             )
 
-        return _run_total_elected_lease_close(
-            gate,
-            epoch,
-            begin_failure=begin_failure,
-            join=join,
-            elected=elected,
-            fail_stop=fail_stop,
-        )
+        outcome = gate._lease_construction_outcome(transaction)
+        state, primary, _, _ = outcome
+        self._record_construction_outcome_secondaries(outcome)
+        if error is not primary:
+            self._remember_construction_rollback_secondary(error, primary)
+        if state == "fatal_retained":
+            try:
+                self.runtime._enter_communicator_fatal(primary)
+            except BaseException as publication_error:
+                if publication_error is not primary:
+                    self._remember_construction_rollback_secondary(
+                        publication_error, primary
+                    )
+        raise primary
 
     def open_working_set(self, request, plan, store, receipt):
         if self._terminal_error is not None:
@@ -2631,14 +2667,11 @@ class ActiveWorkingSetProvider:
             raise ValueError("cache reservation does not match residency plan")
 
         gate = self.runtime._terminal_gate
-        epoch, construction_token = gate.begin_lease("lease_construction")
-        construction_validator = self.runtime._exact_admission_validator(
-            construction_token,
-            scope="construction",
-            epoch=epoch,
-        )
-        record = _LeaseResourceRecord(epoch)
-        self._provisional_resources = record
+        transaction = gate._prepare_lease_construction("lease_construction")
+        epoch = None
+        construction_token = None
+        construction_validator = None
+        record = None
         status_workspace = None
         store_reservation = None
         cache_reservation = None
@@ -2648,8 +2681,19 @@ class ActiveWorkingSetProvider:
         profile_enabled = False
         timer = None
         peak_sampler = None
-        cache_recorder = self._lease_cache_recorder(record)
         try:
+            epoch, construction_token = gate.begin_lease(
+                "lease_construction",
+                _transaction=transaction,
+            )
+            construction_validator = self.runtime._exact_admission_validator(
+                construction_token,
+                scope="construction",
+                epoch=epoch,
+            )
+            record = _LeaseResourceRecord(epoch)
+            self._provisional_resources = record
+            cache_recorder = self._lease_cache_recorder(record)
             self.runtime.consume_residency_receipt(
                 receipt,
                 request,
@@ -2775,65 +2819,71 @@ class ActiveWorkingSetProvider:
                 peak_sampler=peak_sampler,
             )
             record.capture(lease)
-            self._active_lease = lease
-            self._last_authorized_cache_bytes = required_bytes
             lease.metrics.full_replica = bool(
                 plan.metadata()["full_replica_prediction"]
             )
             lease.metrics.pageable_fallback_count = pool.pageable_fallback_count
             lease.metrics.pageable_fallback_bytes = pool.pageable_fallback_bytes
-            self.metrics = lease.metrics
             self._activate_lease(
                 epoch,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
+                _construction_transaction=transaction,
             )
             self._raise_construction_transition_preemption()
-        except BaseException as error:
-            first_error = error
-            rollback_record = None
-            terminal_fatal = gate.phase in (
-                _TerminalPhase.FATAL_PENDING,
-                _TerminalPhase.FATAL_PUBLISHED,
-                _TerminalPhase.RUNTIME_CLOSED,
-            )
-            if terminal_fatal and gate._fatal_transition is not None:
-                first_error = gate._fatal_transition.primary
-            if not terminal_fatal:
-                rollback_record = record.snapshot()
-                first_error = self._rollback_partial(
-                    construction_token,
-                    first_error,
-                    record=record,
-                    _admission_validator=construction_validator,
-                    scheduler=scheduler,
-                    pool=pool,
-                    cache_reservation=cache_reservation,
-                    store_reservation=store_reservation,
-                    status_workspace=status_workspace,
-                )
-            self.runtime._release_admission(construction_token)
-            if gate.phase in (
-                _TerminalPhase.FATAL_PENDING,
-                _TerminalPhase.FATAL_PUBLISHED,
-                _TerminalPhase.RUNTIME_CLOSED,
-            ) and gate._fatal_transition is not None:
-                first_error = gate._fatal_transition.primary
-            if not terminal_fatal and gate.phase not in (
-                _TerminalPhase.FATAL_PENDING,
-                _TerminalPhase.FATAL_PUBLISHED,
-                _TerminalPhase.RUNTIME_CLOSED,
-            ):
-                self._commit_construction_rollback(
-                    epoch,
+
+            def commit():
+                self._active_lease = lease
+                self._last_authorized_cache_bytes = required_bytes
+                self.metrics = lease.metrics
+                if self._provisional_resources is record:
+                    self._provisional_resources = None
+
+            def retain(primary):
+                self._retain_construction_transaction(
                     record,
-                    first_error,
-                    _retained_record=rollback_record,
+                    record,
+                    lease,
+                    primary,
                 )
-            raise first_error
-        self.runtime._release_admission(construction_token)
-        self._provisional_resources = None
-        return lease
+
+            gate._commit_lease_construction(
+                transaction,
+                lease,
+                commit,
+                retain,
+            )
+            outcome = gate._lease_construction_outcome(transaction)
+            self._record_construction_outcome_secondaries(outcome)
+            if outcome[0] == "committed":
+                return outcome[2]
+            return self._resolve_construction_failure(
+                transaction,
+                outcome[1],
+                record=record,
+                construction_token=construction_token,
+                construction_validator=construction_validator,
+                lease=lease,
+                scheduler=scheduler,
+                pool=pool,
+                cache_reservation=cache_reservation,
+                store_reservation=store_reservation,
+                status_workspace=status_workspace,
+            )
+        except BaseException as error:
+            return self._resolve_construction_failure(
+                transaction,
+                error,
+                record=record,
+                construction_token=construction_token,
+                construction_validator=construction_validator,
+                lease=lease,
+                scheduler=scheduler,
+                pool=pool,
+                cache_reservation=cache_reservation,
+                store_reservation=store_reservation,
+                status_workspace=status_workspace,
+            )
 
     def _lease_closed(self, lease):
         if self._active_lease is lease:
@@ -2995,11 +3045,11 @@ class ActiveWorkingSetProvider:
             state.update(self._terminal_quarantine.resource_state())
         return state
 
-    def close(
+    def _close_for_runtime(
         self,
         *,
-        _admission_token=None,
-        _admission_validator=None,
+        _admission_token,
+        _admission_validator,
     ):
         _require_resource_admission(
             _admission_token,
@@ -3007,29 +3057,11 @@ class ActiveWorkingSetProvider:
         )
         if self._closed:
             return
-        error = self._terminal_error
+        error = None
         runtime = self.runtime
         lease = self._active_lease
         cache = self._cache
-        if error is not None and isinstance(lease, WorkingSetLease):
-            terminal_resources = (lease.scheduler, lease.pool, cache, lease)
-            retained_resources = list(self._terminal_resources)
-            for resource in terminal_resources:
-                if resource is not None and all(
-                    retained is not resource for retained in retained_resources
-                ):
-                    retained_resources.append(resource)
-            self._terminal_resources = tuple(retained_resources)
-            self._retain_terminal_resources(*terminal_resources)
-            store_reservation = lease._store_reservation
-            if store_reservation is not None:
-                try:
-                    store_reservation.close()
-                except BaseException as caught:
-                    if error is None:
-                        error = caught
-                lease._store_reservation = None
-        elif lease is not None:
+        if lease is not None:
             try:
                 lease.close()
             except BaseException as caught:
@@ -3037,7 +3069,14 @@ class ActiveWorkingSetProvider:
                     error = caught
         if cache is not None and error is None:
             try:
-                cache.close()
+                _require_resource_admission(
+                    _admission_token,
+                    _admission_validator,
+                )
+                cache.close(
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
             except BaseException as caught:
                 if error is None:
                     error = caught
@@ -3063,6 +3102,23 @@ class ActiveWorkingSetProvider:
             self._closed = True
         if error is not None:
             raise error
+
+    def close(self):
+        runtime = self.runtime
+        if runtime is None:
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            return
+        gate = runtime._terminal_gate
+        with gate._condition:
+            transition = gate._fatal_transition
+            if transition is not None and gate._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+                _TerminalPhase.RUNTIME_CLOSED,
+            ):
+                raise transition.primary
+        return runtime.close()
 
 
 __all__ = [

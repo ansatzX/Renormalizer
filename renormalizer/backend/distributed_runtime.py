@@ -171,6 +171,9 @@ class _RuntimeCommunicatorFatalHook:
             transition, failure
         )
 
+    def record_secondary(self, error):
+        self._runtime()._record_structured_fatal_secondary(error)
+
 
 _MISSING_TERMINAL_FIELD = object()
 
@@ -1069,7 +1072,14 @@ class CupyDistributedRuntime:
                     reservation, snapshot
                 )
 
-    def _remember_terminal_secondary_locked(self, error, primary, owner=None):
+    def _remember_terminal_secondary_locked(
+        self,
+        error,
+        primary,
+        owner=None,
+        *,
+        record_collective=True,
+    ):
         if not isinstance(error, BaseException):
             return
         if error is primary:
@@ -1118,23 +1128,41 @@ class CupyDistributedRuntime:
                 except BaseException as diagnostic_error:
                     retain_diagnostic_failure(diagnostic_error)
 
-        try:
-            collective = self._pending_fatal_collective
-            if collective is None:
-                collective = self.collective
-            record_collective = (
-                None
-                if collective is None
-                else getattr(collective, "_record_fatal_secondary", None)
-            )
-        except BaseException as diagnostic_error:
-            retain_diagnostic_failure(diagnostic_error)
-        else:
-            if callable(record_collective):
-                try:
-                    record_collective(error)
-                except BaseException as diagnostic_error:
-                    retain_diagnostic_failure(diagnostic_error)
+        if record_collective:
+            try:
+                collective = self._pending_fatal_collective
+                if collective is None:
+                    collective = self.collective
+                collective_recorder = (
+                    None
+                    if collective is None
+                    else getattr(collective, "_record_fatal_secondary", None)
+                )
+            except BaseException as diagnostic_error:
+                retain_diagnostic_failure(diagnostic_error)
+            else:
+                if callable(collective_recorder):
+                    try:
+                        collective_recorder(error)
+                    except BaseException as diagnostic_error:
+                        retain_diagnostic_failure(diagnostic_error)
+
+    def _record_structured_fatal_secondary(self, error):
+        gate = self._terminal_gate
+        with gate._condition:
+            transition = gate._fatal_transition
+            if transition is None:
+                return
+            primary = transition.primary
+            with self._terminal_state_lock:
+                context = self._pending_fatal_context
+                owner = None if context is None else context[2]
+                self._remember_terminal_secondary_locked(
+                    error,
+                    primary,
+                    owner,
+                    record_collective=False,
+                )
 
     def _terminalize_fatal_publication_failure(
         self,
@@ -1310,22 +1338,22 @@ class CupyDistributedRuntime:
             election = failure_context[0]
             if election is not None and election.recover():
                 collective = election.collective
-                for recovery_error in election.recovery_errors:
-                    collective._record_fatal_secondary(recovery_error)
-                fail_publication = getattr(
-                    collective, "_fail_reserved_fatal_publication", None
+                terminalize = getattr(
+                    collective,
+                    "_terminalize_structured_fatal_failure",
+                    None,
                 )
-                if not callable(fail_publication):
+                if not callable(terminalize):
                     raise RuntimeError(
-                        "collective cannot fail reserved fatal publication"
+                        "collective cannot terminalize fatal publication"
                     ) from error
-                owned, first_failure = fail_publication(
+                primary = terminalize(
                     error,
                     transition_handler=self._communicator_fatal_hook,
                     transition=election.transition,
+                    diagnostics=election.recovery_errors,
                 )
-                if owned and first_failure:
-                    collective._fatal_hard_exit()
+                raise primary
             raise
 
     def _elect_communicator_fatal(
@@ -1456,6 +1484,14 @@ class CupyDistributedRuntime:
                         ),
                     )
         except BaseException as error:
+            with self._terminal_state_lock:
+                collective = self._pending_fatal_collective
+                if collective is None:
+                    collective = self.collective
+            if callable(
+                getattr(collective, "_begin_fatal_publication", None)
+            ):
+                raise
             raise self._terminalize_fatal_publication_failure(
                 transition,
                 error,
@@ -1584,16 +1620,36 @@ class CupyDistributedRuntime:
                 collective = self._pending_fatal_collective
                 if collective is None:
                     collective = self.collective
-            structured_fail_stop = failure_was_recorded and callable(
+            structured_collective = callable(
                 getattr(collective, "_begin_fatal_publication", None)
             )
+            if structured_collective:
+                terminalize = getattr(
+                    collective,
+                    "_terminalize_structured_fatal_failure",
+                    None,
+                )
+                if not callable(terminalize):
+                    if failure_was_recorded:
+                        if publication_error is not primary:
+                            raise
+                        raise primary
+                    raise RuntimeError(
+                        "collective cannot terminalize fatal publication"
+                    ) from publication_error
+                primary = terminalize(
+                    publication_error,
+                    transition_handler=self._communicator_fatal_hook,
+                    transition=transition,
+                )
+                if failure_was_recorded and publication_error is not primary:
+                    raise
+                raise primary
             primary = self._terminalize_fatal_publication_failure(
                 transition,
-                None if structured_fail_stop else publication_error,
+                publication_error,
                 owner=owner,
             )
-            if structured_fail_stop and publication_error is not primary:
-                raise
             raise primary
 
     def barrier(self):
@@ -2757,7 +2813,7 @@ class CupyDistributedRuntime:
                         epoch=None,
                         transition_sequence=transition.sequence,
                     )
-                    provider.close(
+                    provider._close_for_runtime(
                         _admission_token=provider_token,
                         _admission_validator=provider_validator,
                     )

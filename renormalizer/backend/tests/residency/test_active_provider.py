@@ -926,6 +926,7 @@ def _active_operator_case(world_size=1, *, store_id, backend_name="numpy"):
     request, plan, store, _, _ = _active_case(runtime, store_id=store_id)
     receipt = runtime.preflight_residency(request, plan)
     provider = _provider(runtime, request)
+    runtime._active_provider = provider
     working_set = provider.open_working_set(request, plan, store, receipt).__enter__()
     distributed = request.distributed_plan
     operator = DistributedLocalOperator(
@@ -2719,6 +2720,7 @@ def test_terminal_compute_drain_failure_retains_outer_resource_ownership(monkeyp
     )
     receipt = runtime.preflight_residency(request, plan)
     provider = _provider(runtime, request)
+    runtime._active_provider = provider
     working_set = provider.open_working_set(request, plan, store, receipt).__enter__()
     child = working_set.acquire(_block_request(working_set)).__enter__()
     identity = next(
@@ -2757,11 +2759,12 @@ def test_terminal_compute_drain_failure_retains_outer_resource_ownership(monkeyp
     assert scheduler in provider._terminal_resources
     with pytest.raises(RuntimeError, match="scheduler query failure"):
         provider.close()
-    assert provider.closed is True
-    assert provider.runtime is None
-    assert provider._cache is None
+    assert provider.closed is False
+    assert provider.runtime is runtime
+    assert provider._cache is cache
+    assert provider._active_lease is working_set
+    assert working_set._store_reservation is not None
     assert cache in provider._terminal_resources
-    store.close()
     with pytest.raises(RuntimeError, match="scheduler query failure"):
         runtime.close()
 
@@ -4195,7 +4198,7 @@ def test_runtime_close_preserves_provider_error_but_still_closes_collective():
         def __init__(self):
             self.close_calls = 0
 
-        def close(self, **_kwargs):
+        def _close_for_runtime(self, **_kwargs):
             self.close_calls += 1
             if self.close_calls == 1:
                 raise RuntimeError("injected provider close failure")
@@ -4453,6 +4456,7 @@ def test_terminal_close_merges_cache_and_owner_physical_backings_once():
         runtime, store_id="terminal-physical-cache-accounting"
     )
     provider = _provider(runtime, request)
+    runtime._active_provider = provider
     allocations = []
 
     def allocate(spec):
@@ -4516,16 +4520,15 @@ def test_terminal_close_merges_cache_and_owner_physical_backings_once():
     with pytest.raises(RuntimeError) as caught:
         provider.close()
     assert caught.value is terminal_error
-    assert runtime.resource_state()["quarantined_bytes"] == 64
+    assert runtime.resource_state()["quarantined_bytes"] == 32
     assert {record.identity for record in runtime._terminal_quarantine.allocations} == {
-        left_record.identity,
         right_record.identity,
     }
 
     with pytest.raises(RuntimeError) as caught:
         runtime.close()
     assert caught.value is terminal_error
-    assert runtime.resource_state()["quarantined_bytes"] == 64
+    assert runtime.resource_state()["quarantined_bytes"] == 32
 
     reservation = None
     unowned = None
@@ -4696,15 +4699,16 @@ def test_provider_close_failure_is_terminal_and_detaches_owned_factories(monkeyp
         runtime, store_id="provider-terminal-close"
     )
     provider = _provider(runtime, request)
+    runtime._active_provider = provider
     receipt = runtime.preflight_residency(request, plan)
     provider.open_working_set(request, plan, store, receipt).__enter__().close()
     cache = provider.cache
     close_cache = cache.close
     close_calls = []
 
-    def fail_after_cache_close():
+    def fail_after_cache_close(**kwargs):
         close_calls.append(None)
-        close_cache()
+        close_cache(**kwargs)
         raise RuntimeError("injected provider cache close failure")
 
     monkeypatch.setattr(cache, "close", fail_after_cache_close)
@@ -4720,7 +4724,8 @@ def test_provider_close_failure_is_terminal_and_detaches_owned_factories(monkeyp
     assert provider._scheduler_factory is None
     assert provider._event_factory is None
     assert runtime._active_provider is None
-    provider.close()
+    with pytest.raises(RuntimeError, match="provider cache close failure"):
+        provider.close()
     assert len(close_calls) == 1
     store.close()
     runtime.close()
@@ -4730,6 +4735,8 @@ def test_provider_close_keeps_first_terminal_error_over_lease_cleanup_error():
     first_error = RuntimeError("injected first provider terminal failure")
 
     class FailingLease:
+        scheduler = None
+
         def close(self):
             raise RuntimeError("injected later lease cleanup failure")
 
@@ -4740,6 +4747,8 @@ def test_provider_close_keeps_first_terminal_error_over_lease_cleanup_error():
     provider = _provider(runtime, request)
     provider._terminal_error = first_error
     provider._active_lease = FailingLease()
+    runtime._terminal_error = first_error
+    runtime._active_provider = provider
 
     with pytest.raises(RuntimeError, match="first provider terminal failure") as caught:
         provider.close()

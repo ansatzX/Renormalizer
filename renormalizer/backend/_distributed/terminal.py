@@ -234,6 +234,22 @@ class _LeaseState:
     transition: _LeaseCloseTransition | None = None
     result: object = None
     has_result: bool = False
+    construction: object = None
+
+
+@dataclass
+class _LeaseConstructionTransaction:
+    gate_id: int
+    operation: str
+    owner_thread_id: int
+    state: Literal[
+        "prepared", "active", "committed", "aborted", "fatal_retained"
+    ] = "prepared"
+    epoch: int | None = None
+    token: _ResourceAdmission | None = None
+    primary: BaseException | None = None
+    result: object = _MISSING
+    secondaries: tuple[BaseException, ...] = ()
 
 
 class _TerminalLifecycleGate:
@@ -479,9 +495,60 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("runtime setup requires no live lease")
             return self._new_token("runtime_setup", None, operation)
 
-    def begin_lease(self, operation: str) -> tuple[int, _ResourceAdmission]:
+    def _prepare_lease_construction(self, operation):
+        self._require_operation(operation)
+        return _LeaseConstructionTransaction(
+            gate_id=self._gate_id,
+            operation=operation,
+            owner_thread_id=threading.get_ident(),
+        )
+
+    def _require_lease_construction(self, transaction, *, active=False):
+        if not isinstance(transaction, _LeaseConstructionTransaction):
+            raise TypeError("lease construction transaction is required")
+        if transaction.gate_id != self._gate_id:
+            raise RuntimeError(
+                "lease construction transaction belongs to another terminal gate"
+            )
+        if transaction.owner_thread_id != threading.get_ident():
+            raise RuntimeError(
+                "lease construction transaction belongs to another thread"
+            )
+        if transaction.epoch is None:
+            if transaction.token is not None or transaction.state not in {
+                "prepared",
+                "aborted",
+                "fatal_retained",
+            }:
+                raise RuntimeError(
+                    "lease construction transaction state is inconsistent"
+                )
+            if active:
+                raise RuntimeError("lease construction transaction has not begun")
+            return None
+        lease = self._lease_state(transaction.epoch)
+        if lease.construction is not transaction:
+            raise RuntimeError("stale lease construction transaction")
+        if active and transaction.state != "active":
+            raise RuntimeError("lease construction transaction is already resolved")
+        return lease
+
+    def begin_lease(
+        self,
+        operation: str,
+        *,
+        _transaction: _LeaseConstructionTransaction | None = None,
+    ) -> tuple[int, _ResourceAdmission]:
+        transaction = (
+            self._prepare_lease_construction(operation)
+            if _transaction is None
+            else _transaction
+        )
         with self._condition:
             self._require_operation(operation)
+            self._require_lease_construction(transaction)
+            if transaction.operation != operation:
+                raise RuntimeError("lease construction operation changed")
             self._raise_for_terminal_phase()
             if self._live_epoch is not None:
                 raise RuntimeError("a lease epoch is already live")
@@ -492,10 +559,217 @@ class _TerminalLifecycleGate:
             self._require_no_nested_token(threading.get_ident())
             epoch = self._next_epoch
             self._next_epoch += 1
-            self._leases[epoch] = _LeaseState("constructing")
+            self._leases[epoch] = _LeaseState(
+                "constructing", construction=transaction
+            )
             self._live_epoch = epoch
-            token = self._new_token("construction", epoch, operation)
+            transaction.epoch = epoch
+            transaction.state = "active"
+            expected_sequence = self._next_sequence
+            try:
+                token = self._new_token("construction", epoch, operation)
+            except BaseException:
+                token_state = self._tokens.get(expected_sequence)
+                if (
+                    token_state is not None
+                    and token_state.token.scope == "construction"
+                    and token_state.token.epoch == epoch
+                    and token_state.token.operation == operation
+                ):
+                    transaction.token = token_state.token
+                raise
+            transaction.token = token
             return epoch, token
+
+    @staticmethod
+    def _remember_construction_secondary_locked(transaction, error, primary):
+        if (
+            not isinstance(error, BaseException)
+            or error is primary
+            or any(retained is error for retained in transaction.secondaries)
+        ):
+            return
+        transaction.secondaries = (*transaction.secondaries, error)
+
+    def _consume_construction_token_locked(self, transaction):
+        token = transaction.token
+        if token is None:
+            raise RuntimeError("lease construction admission is unavailable")
+        state = self._tokens.get(token.sequence)
+        if state is None or state.token != token:
+            raise RuntimeError("lease construction admission is unknown or stale")
+        if state.status == "released":
+            return
+        if state.status not in {"active", "converted"}:
+            raise RuntimeError("lease construction admission is not consumable")
+        if token.thread_id != threading.get_ident():
+            raise RuntimeError("lease construction admission belongs to another thread")
+        state.status = "released"
+        state.async_capability = _MISSING
+        self._thread_tokens.pop(token.thread_id, None)
+
+    def _retain_failed_lease_construction_locked(
+        self,
+        transaction,
+        primary,
+        finalizer,
+        *,
+        secondary=None,
+    ):
+        lease = self._require_lease_construction(
+            transaction, active=transaction.state == "active"
+        )
+        token = transaction.token
+        token_state = (
+            None if token is None else self._tokens.get(token.sequence)
+        )
+        discovering_state = (
+            token_state
+            if token_state is not None and token_state.status == "active"
+            else None
+        )
+        transition = self._begin_fatal_locked(primary, discovering_state)
+        canonical = transition.primary
+        self._remember_construction_secondary_locked(
+            transaction, primary, canonical
+        )
+        self._remember_construction_secondary_locked(
+            transaction, secondary, canonical
+        )
+        try:
+            finalizer(canonical)
+        except BaseException as error:
+            self._remember_construction_secondary_locked(
+                transaction, error, canonical
+            )
+        if lease is not None:
+            lease.phase = "fatal_retained"
+        transaction.state = "fatal_retained"
+        transaction.primary = canonical
+        transaction.result = canonical
+        if token is not None:
+            self._consume_construction_token_locked(transaction)
+        self._condition.notify_all()
+        return canonical
+
+    def _fail_lease_construction(
+        self,
+        transaction,
+        primary,
+        finalizer,
+        *,
+        secondary=None,
+    ):
+        if not isinstance(primary, BaseException):
+            raise TypeError("lease construction failure must be an exception")
+        if not callable(finalizer):
+            raise TypeError("lease construction fatal finalizer must be callable")
+        with self._condition:
+            if transaction.state not in {"prepared", "active"}:
+                self._require_lease_construction(transaction)
+                return transaction.primary
+            return self._retain_failed_lease_construction_locked(
+                transaction,
+                primary,
+                finalizer,
+                secondary=secondary,
+            )
+
+    def _abort_lease_construction(
+        self,
+        transaction,
+        primary,
+        finalizer,
+        fatal_finalizer,
+    ):
+        if not isinstance(primary, BaseException):
+            raise TypeError("lease construction rollback primary must be an exception")
+        if not callable(finalizer) or not callable(fatal_finalizer):
+            raise TypeError("lease construction finalizers must be callable")
+        with self._condition:
+            if transaction.state not in {"prepared", "active"}:
+                self._require_lease_construction(transaction)
+                return transaction.primary
+            lease = self._require_lease_construction(
+                transaction, active=transaction.state == "active"
+            )
+            if self._fatal_transition is not None or not isinstance(
+                primary, Exception
+            ):
+                return self._retain_failed_lease_construction_locked(
+                    transaction,
+                    primary,
+                    fatal_finalizer,
+                )
+            try:
+                result = finalizer()
+            except BaseException as error:
+                return self._retain_failed_lease_construction_locked(
+                    transaction,
+                    primary,
+                    fatal_finalizer,
+                    secondary=error,
+                )
+            if lease is not None:
+                lease.phase = "closed"
+                lease.result = primary
+                lease.has_result = True
+            transaction.state = "aborted"
+            transaction.primary = primary
+            transaction.result = result
+            if lease is not None:
+                self._live_epoch = None
+                if transaction.token is not None:
+                    self._consume_construction_token_locked(transaction)
+            self._condition.notify_all()
+            return primary
+
+    def _commit_lease_construction(
+        self,
+        transaction,
+        result,
+        finalizer,
+        fatal_finalizer,
+    ):
+        if not callable(finalizer) or not callable(fatal_finalizer):
+            raise TypeError("lease construction finalizers must be callable")
+        with self._condition:
+            if transaction.state != "active":
+                self._require_lease_construction(transaction)
+                return transaction.result
+            lease = self._require_lease_construction(transaction, active=True)
+            if self._fatal_transition is not None:
+                return self._retain_failed_lease_construction_locked(
+                    transaction,
+                    RuntimeError("fatal transition preempted lease construction"),
+                    fatal_finalizer,
+                )
+            if self._phase is not _TerminalPhase.HEALTHY:
+                self._raise_for_terminal_phase()
+            try:
+                finalizer()
+            except BaseException as error:
+                return self._retain_failed_lease_construction_locked(
+                    transaction,
+                    error,
+                    fatal_finalizer,
+                )
+            lease.phase = "open"
+            transaction.state = "committed"
+            transaction.result = result
+            self._consume_construction_token_locked(transaction)
+            self._condition.notify_all()
+            return result
+
+    def _lease_construction_outcome(self, transaction):
+        with self._condition:
+            self._require_lease_construction(transaction)
+            return (
+                transaction.state,
+                transaction.primary,
+                transaction.result,
+                transaction.secondaries,
+            )
 
     def activate_lease(self, epoch: int, token: _ResourceAdmission) -> None:
         with self._condition:

@@ -8814,3 +8814,176 @@ def test_real_two_rank_cupy_nccl_collectives_and_cleanup(dtype):
         ),
         flush=True,
     )
+
+
+def _reserve_task_18_3_structured_failure(runtime, wrapper, primary):
+    gate = runtime._terminal_gate
+    token = gate.admit_runtime("task_18_3_structured_failure")
+    reserved, started = wrapper._pre_reserve_fatal_publication(primary)
+    assert reserved is primary
+    assert started is True
+    transition = gate.begin_fatal(primary, token)
+    outcome = wrapper._reserve_runtime_fatal_outcome(primary)
+    assert outcome.primary is primary
+    with wrapper._fatal_condition:
+        owner = wrapper._fatal_publication_owner_reservation
+        owner.election = SimpleNamespace(transition=transition)
+    return transition
+
+
+@pytest.mark.parametrize("catch_path", ("reserved", "monitor_read", "timeout"))
+def test_structured_terminalizer_marks_before_diagnostic_and_hard_exits_once(
+    monkeypatch,
+    catch_path,
+):
+    class DiagnosticFailure(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("{} structured primary".format(catch_path))
+    trigger = RuntimeError("{} structured trigger".format(catch_path))
+    diagnostic_failure = DiagnosticFailure(
+        "{} structured diagnostic".format(catch_path)
+    )
+    transition = _reserve_task_18_3_structured_failure(
+        runtime, wrapper, primary
+    )
+    diagnostic_calls = []
+    marker_observations = []
+    hard_exits = []
+
+    def fail_diagnostic(error):
+        diagnostic_calls.append(error)
+        with wrapper._fatal_condition:
+            collective_marked = wrapper._fatal_publication_failure is primary
+        with gate._condition:
+            gate_marked = gate._fatal_publication_failure is primary
+        marker_observations.append((collective_marked, gate_marked))
+        raise diagnostic_failure
+
+    def hard_exit():
+        hard_exits.append(
+            (
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit(catch_path)
+
+    monkeypatch.setattr(wrapper, "_record_fatal_secondary", fail_diagnostic)
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+    if catch_path == "monitor_read":
+        handoff = wrapper._fatal_monitor_handoff
+        with handoff._condition:
+            handoff._fatal_reservation = None
+            handoff._outcome = None
+        monkeypatch.setattr(
+            wrapper,
+            "_read_fatal_origin",
+            lambda: (_ for _ in ()).throw(trigger),
+        )
+        call = wrapper._monitor_fatal_records
+    elif catch_path == "timeout":
+        monkeypatch.setattr(
+            wrapper._fatal_monitor_handoff,
+            "wait_for_selection",
+            lambda _timeout: (_ for _ in ()).throw(TimeoutError()),
+        )
+        call = wrapper._wait_for_fatal_monitor_selection
+    else:
+        call = lambda: wrapper._terminalize_structured_fatal_failure(
+            trigger,
+            transition_handler=runtime._communicator_fatal_hook,
+            transition=transition,
+        )
+
+    with pytest.raises(FatalHardExit):
+        call()
+
+    assert len(diagnostic_calls) == 1
+    assert marker_observations == [(True, True)]
+    assert hard_exits == [(False, False, False)]
+    assert diagnostic_failure in wrapper._fatal_secondary_errors
+    with wrapper._fatal_condition:
+        assert wrapper._fatal_publication_failure is primary
+    with gate._condition:
+        assert gate._fatal_publication_failure is primary
+
+
+def test_recovered_structured_election_terminalizes_before_diagnostics(
+    monkeypatch,
+):
+    class ElectionFailure(BaseException):
+        pass
+
+    class RecoveryFailure(BaseException):
+        pass
+
+    class DiagnosticFailure(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("recovered structured primary")
+    election_failure = ElectionFailure("interrupt after owner reservation")
+    recovery_failure = RecoveryFailure("recovery context failed")
+    diagnostic_failure = DiagnosticFailure("recovery diagnostic failed")
+    original_pre_reserve = wrapper._pre_reserve_fatal_publication
+    diagnostic_calls = []
+    marker_observations = []
+    hard_exits = []
+
+    def fail_after_owner(*args, **kwargs):
+        original_pre_reserve(*args, **kwargs)
+        raise election_failure
+
+    def fail_recovery(*_args, **_kwargs):
+        raise recovery_failure
+
+    def fail_diagnostic(error):
+        diagnostic_calls.append(error)
+        with wrapper._fatal_condition:
+            collective_marked = wrapper._fatal_publication_failure is primary
+        with gate._condition:
+            gate_marked = gate._fatal_publication_failure is primary
+        marker_observations.append((collective_marked, gate_marked))
+        raise diagnostic_failure
+
+    def hard_exit():
+        hard_exits.append(
+            (
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit("recovered election")
+
+    monkeypatch.setattr(wrapper, "_pre_reserve_fatal_publication", fail_after_owner)
+    monkeypatch.setattr(
+        runtime, "_stage_active_broadcast_quarantine_locked", fail_recovery
+    )
+    monkeypatch.setattr(wrapper, "_record_fatal_secondary", fail_diagnostic)
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    with pytest.raises(FatalHardExit):
+        runtime._enter_communicator_fatal(primary)
+
+    assert diagnostic_calls == [recovery_failure, election_failure]
+    assert marker_observations == [(True, True), (True, True)]
+    assert hard_exits == [(False, False, False)]
+    assert recovery_failure in wrapper._fatal_secondary_errors
+    assert election_failure in wrapper._fatal_secondary_errors
+    assert diagnostic_failure in wrapper._fatal_secondary_errors
+    with wrapper._fatal_condition:
+        assert wrapper._fatal_publication_failure is primary
+    with gate._condition:
+        assert gate._fatal_publication_failure is primary
