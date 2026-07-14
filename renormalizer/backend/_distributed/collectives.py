@@ -485,22 +485,91 @@ class CupyNcclCollective:
         """Install one joinable owner before exposing fatal monitor selection."""
         if not isinstance(error, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
+        owner_reservation = None
+        if election is not None:
+            owner_reservation = getattr(election, "owner_reservation", None)
+            if (
+                owner_reservation is None
+                or owner_reservation.primary is not error
+                or owner_reservation.election is not election
+            ):
+                raise RuntimeError(
+                    "communicator fatal owner was not preallocated"
+                )
+        return self._install_prepared_fatal_publication_owner(
+            error,
+            origin_rank,
+            owner_reservation=owner_reservation,
+            election=election,
+        )
+
+    def _prepare_runtime_fatal_owner_reservation(self, error, election):
+        if not isinstance(error, BaseException):
+            raise TypeError("communicator fatal failure must be an exception")
+        if election is None:
+            raise TypeError("runtime fatal election is required")
+        return _FatalPublicationOwnerReservation(
+            error,
+            threading.current_thread(),
+            None,
+            election,
+        )
+
+    def _install_prepared_fatal_publication_owner(
+        self,
+        error,
+        origin_rank=None,
+        *,
+        owner_reservation=None,
+        election=None,
+    ):
+        """Install a prepared exact owner without invoking election callbacks."""
+        if not isinstance(error, BaseException):
+            raise TypeError("communicator fatal failure must be an exception")
         with self._fatal_condition:
+            current_owner = self._fatal_publication_owner_reservation
+            if current_owner is owner_reservation and current_owner is not None:
+                if (
+                    self._fatal_publications != 1
+                    or current_owner.primary is not error
+                    or current_owner.election is not election
+                ):
+                    raise RuntimeError(
+                        "communicator fatal owner reservation is inconsistent"
+                    )
+                return current_owner.primary, False
             if self._fatal_protocol_completed:
                 return self._fatal_pending_primary, False
             if self._fatal_publications > 0:
                 return self._fatal_pending_primary, False
             if self._closed:
                 raise RuntimeError("collective is closed")
+            if owner_reservation is not None:
+                owner_reservation.installed = (
+                    self._fatal_pending_primary is None
+                )
             primary, installed = self._install_fatal(error, origin_rank)
-            owner_reservation = _FatalPublicationOwnerReservation(
-                primary,
-                threading.current_thread(),
-                installed,
-                election,
-            )
+            if owner_reservation is None:
+                owner_reservation = _FatalPublicationOwnerReservation(
+                    primary,
+                    threading.current_thread(),
+                    installed,
+                    election,
+                )
+            elif (
+                owner_reservation.owner_thread is not threading.current_thread()
+                or owner_reservation.primary is not primary
+                or owner_reservation.election is not election
+                or owner_reservation.adopted
+            ):
+                raise RuntimeError(
+                    "communicator fatal owner reservation changed"
+                )
+            else:
+                owner_reservation.installed = installed
             self._fatal_publication_owner_reservation = owner_reservation
             self._fatal_publications += 1
+            self._fatal_condition.notify_all()
             return primary, True
 
     def _current_thread_reserved_fatal_primary(self):
@@ -1015,6 +1084,7 @@ class CupyNcclCollective:
             claim_owned = False
             claim_published = False
             confirmed = False
+            verification_conclusive = False
             decision = None
             try:
                 with self._fatal_condition:
@@ -1032,7 +1102,7 @@ class CupyNcclCollective:
                         self._fatal_publication_gate_failure_claim = claim
                         claim_published = True
                         self._fatal_condition.notify_all()
-                        decision = _FATAL_GATE_FAILURE_INFLIGHT
+                        decision = "verify_before_callback"
                     elif current.owner is current_thread:
                         decision = "reentrant"
                     elif not current.owner.is_alive():
@@ -1084,9 +1154,10 @@ class CupyNcclCollective:
                         confirmed = self._verify_fatal_gate_failure_callback(
                             failure_confirmed, transition, primary
                         )
+                        verification_conclusive = True
                     except BaseException as error:
                         signal_errors.append(error)
-                if not confirmed:
+                if verification_conclusive and not confirmed:
                     try:
                         self._invoke_fatal_gate_failure_callback(
                             failure_handler, transition, primary
@@ -1097,6 +1168,7 @@ class CupyNcclCollective:
                         confirmed = self._verify_fatal_gate_failure_callback(
                             failure_confirmed, transition, primary
                         )
+                        verification_conclusive = True
                     except BaseException as error:
                         signal_errors.append(error)
             except BaseException as error:
@@ -1110,6 +1182,7 @@ class CupyNcclCollective:
                                     failure_confirmed, transition, primary
                                 )
                             )
+                            verification_conclusive = True
                         except BaseException as error:
                             signal_errors.append(error)
                     try:

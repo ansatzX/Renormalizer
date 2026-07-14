@@ -143,6 +143,7 @@ class _RecoverableFatalElection:
         "stage",
         "prepared_transition",
         "prepared_outcome",
+        "owner_reservation",
         "transition",
         "context_retained",
         "context_repair_attempted",
@@ -174,6 +175,7 @@ class _RecoverableFatalElection:
         self.stage = "created"
         self.prepared_transition = None
         self.prepared_outcome = None
+        self.owner_reservation = None
         self.transition = None
         self.context_retained = False
         self.context_repair_attempted = False
@@ -232,6 +234,82 @@ class _RecoverableFatalElection:
         self.context_retained = True
         self.stage = "context_retained"
 
+    def _preallocate_owner_locked(self):
+        if self.owner_reservation is not None:
+            return self.owner_reservation
+        prepare_owner = getattr(
+            self.collective,
+            "_prepare_runtime_fatal_owner_reservation",
+            None,
+        )
+        if not callable(prepare_owner):
+            raise RuntimeError(
+                "collective fatal owner reservation is not preparable"
+            )
+        self.owner_reservation = prepare_owner(self.primary, self)
+        self.stage = "owner_preallocated"
+        return self.owner_reservation
+
+    def _repair_owner_locked(self):
+        owner_reservation = self.owner_reservation
+        if owner_reservation is None:
+            raise RuntimeError("communicator fatal owner was not preallocated")
+        collective = self.collective
+        with collective._fatal_condition:
+            retained = collective._fatal_publication_owner_reservation
+            publications = collective._fatal_publications
+            pending = collective._fatal_pending_primary
+            if (
+                owner_reservation.owner_thread
+                is not threading.current_thread()
+                or owner_reservation.primary is not self.primary
+                or owner_reservation.election is not self
+                or owner_reservation.adopted
+            ):
+                raise RuntimeError(
+                    "communicator fatal owner reservation changed"
+                )
+            if retained is None:
+                if publications != 0:
+                    raise RuntimeError(
+                        "communicator fatal owner reservation is inconsistent"
+                    )
+                if collective._fatal_protocol_completed or collective._closed:
+                    raise RuntimeError(
+                        "communicator fatal owner is no longer installable"
+                    )
+            elif retained is owner_reservation:
+                if publications not in (0, 1):
+                    raise RuntimeError(
+                        "communicator fatal owner reservation is inconsistent"
+                    )
+            else:
+                raise RuntimeError(
+                    "communicator fatal owner reservation is inconsistent"
+                )
+            if pending is None:
+                collective._fatal_pending_primary = self.primary
+                collective._fatal_pending_origin_rank = None
+                owner_reservation.installed = True
+            elif pending is not self.primary:
+                raise RuntimeError("communicator fatal owner primary changed")
+            elif owner_reservation.installed is None:
+                owner_reservation.installed = False
+            if retained is None and publications == 0:
+                collective._fatal_publication_owner_reservation = (
+                    owner_reservation
+                )
+                collective._fatal_publications = 1
+            elif retained is owner_reservation and publications == 0:
+                collective._fatal_publications = 1
+            elif retained is not owner_reservation or publications != 1:
+                raise RuntimeError(
+                    "communicator fatal owner reservation is inconsistent"
+                )
+            collective._fatal_condition.notify_all()
+        self.stage = "owner_reserved"
+        return owner_reservation
+
     def _prepare_locked(self):
         self._prepare_artifacts_locked()
         pre_reserve = getattr(
@@ -255,27 +333,35 @@ class _RecoverableFatalElection:
             raise RuntimeError(
                 "collective fatal owner reservation is not recoverable"
             )
-        reserved_primary, _ = pre_reserve(self.primary, election=self)
-        self.stage = "owner_reserved"
-        owner_election = reserved_election_for_thread()
-        owner_primary = reserved_primary_for_thread()
-        self.stage = "owner_confirmed"
-        if (
-            reserved_primary is not self.primary
-            or owner_primary is not self.primary
-            or owner_election is not self
-        ):
-            raise RuntimeError("communicator fatal owner was not reserved")
-        self.transition = self.gate._recover_fatal(
-            self.primary,
-            self.discovering_token,
-            prepared_transition=self.prepared_transition,
-        )
-        self.stage = "token_converted"
-        self._retain_context_locked()
+        try:
+            reserved_primary, _ = pre_reserve(self.primary, election=self)
+            self.stage = "owner_reserved"
+            owner_election = reserved_election_for_thread()
+            owner_primary = reserved_primary_for_thread()
+            self.stage = "owner_confirmed"
+            if (
+                reserved_primary is not self.primary
+                or owner_primary is not self.primary
+                or owner_election is not self
+            ):
+                raise RuntimeError("communicator fatal owner was not reserved")
+            self.transition = self.gate._recover_fatal(
+                self.primary,
+                self.discovering_token,
+                prepared_transition=self.prepared_transition,
+            )
+            self.stage = "token_converted"
+            self._retain_context_locked()
+        except BaseException:
+            try:
+                self._repair_owner_locked()
+            except BaseException as repair_error:
+                self._remember_recovery_error(repair_error)
+            raise
 
     def _select_outcome_locked(self):
         self._prepare_artifacts_locked()
+        self._preallocate_owner_locked()
         reserve_outcome = getattr(
             self.collective, "_reserve_runtime_fatal_outcome", None
         )
@@ -410,7 +496,12 @@ class _RecoverableFatalElection:
         handoff = self.collective._fatal_monitor_handoff
         with handoff._condition:
             if self._retained_owner_locked() is None:
-                return False
+                try:
+                    self._repair_owner_locked()
+                except BaseException as error:
+                    self._remember_recovery_error(error)
+                if self._retained_owner_locked() is None:
+                    return False
             if not self.recovery_complete:
                 try:
                     self._repair_gate_locked()
