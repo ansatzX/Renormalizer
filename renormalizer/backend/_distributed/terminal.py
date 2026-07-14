@@ -74,6 +74,7 @@ class _FatalMonitorHandoff:
         self._condition = threading.Condition()
         self._next_generation = 1
         self._requested_generation: int | None = None
+        self._fatal_reservation: _MonitorOutcome | None = None
         self._outcome: _MonitorOutcome | None = None
         self._exited_outcome: _MonitorOutcome | None = None
 
@@ -99,7 +100,20 @@ class _FatalMonitorHandoff:
         with self._condition:
             if self._outcome is not None:
                 return self._outcome, None
+            if self._fatal_reservation is not None:
+                return self._complete_fatal_reservation_locked(), None
             return None, read()
+
+    def _complete_fatal_reservation_locked(self):
+        reservation = self._fatal_reservation
+        if reservation is None:
+            raise RuntimeError("monitor fatal outcome is not reserved")
+        if self._outcome is None:
+            self._outcome = reservation
+            self._condition.notify_all()
+        elif self._outcome is not reservation:
+            raise RuntimeError("monitor fatal outcome changed")
+        return self._outcome
 
     def select_fatal(
         self,
@@ -113,11 +127,23 @@ class _FatalMonitorHandoff:
             raise TypeError("monitor fatal preparation must be callable")
         with self._condition:
             if self._outcome is None:
-                if before_select is not None:
-                    before_select()
-                self._outcome = _MonitorOutcome(
-                    kind="fatal_elected", primary=primary
-                )
+                reservation = self._fatal_reservation
+                if reservation is None:
+                    reservation = _MonitorOutcome(
+                        kind="fatal_elected", primary=primary
+                    )
+                    try:
+                        self._fatal_reservation = reservation
+                        if before_select is not None:
+                            before_select()
+                        self._outcome = reservation
+                    finally:
+                        if self._outcome is None:
+                            self._complete_fatal_reservation_locked()
+                elif reservation.primary is not primary:
+                    raise RuntimeError("monitor fatal primary changed")
+                else:
+                    self._complete_fatal_reservation_locked()
                 self._condition.notify_all()
             return self._outcome
 
@@ -126,10 +152,13 @@ class _FatalMonitorHandoff:
             if generation != self._requested_generation:
                 raise RuntimeError("monitor stop generation is not current")
             if self._outcome is None:
-                self._outcome = _MonitorOutcome(
-                    kind="stopped_clean", generation=generation
-                )
-                self._condition.notify_all()
+                if self._fatal_reservation is not None:
+                    self._complete_fatal_reservation_locked()
+                else:
+                    self._outcome = _MonitorOutcome(
+                        kind="stopped_clean", generation=generation
+                    )
+                    self._condition.notify_all()
             return self._outcome
 
     def wait_for_outcome(

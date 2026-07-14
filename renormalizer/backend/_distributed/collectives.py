@@ -1,6 +1,7 @@
 """Collective contracts and local collective behavior."""
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import os
 import struct
 import threading
@@ -30,6 +31,36 @@ _ACTIVE_B_RECORD = struct.Struct("!QB")
 _FATAL_GATE_FAILURE_IDLE = "idle"
 _FATAL_GATE_FAILURE_INFLIGHT = "inflight"
 _FATAL_GATE_FAILURE_SIGNALED = "signaled"
+
+
+@dataclass(frozen=True)
+class _FatalGateFailureClaim:
+    state: str
+    owner: Any = None
+    deadline: Any = None
+
+    def __post_init__(self):
+        if self.state == _FATAL_GATE_FAILURE_INFLIGHT:
+            if not isinstance(self.owner, threading.Thread):
+                raise TypeError("inflight gate failure claim requires a thread")
+            if type(self.deadline) is not float:
+                raise TypeError("inflight gate failure claim requires a deadline")
+            return
+        if self.state not in {
+            _FATAL_GATE_FAILURE_IDLE,
+            _FATAL_GATE_FAILURE_SIGNALED,
+        }:
+            raise ValueError("invalid gate failure claim state")
+        if self.owner is not None or self.deadline is not None:
+            raise ValueError("settled gate failure claim cannot retain an owner")
+
+
+_FATAL_GATE_FAILURE_IDLE_CLAIM = _FatalGateFailureClaim(
+    _FATAL_GATE_FAILURE_IDLE
+)
+_FATAL_GATE_FAILURE_SIGNALED_CLAIM = _FatalGateFailureClaim(
+    _FATAL_GATE_FAILURE_SIGNALED
+)
 
 
 class _RemoteCommunicatorFailure(RuntimeError):
@@ -298,9 +329,9 @@ class CupyNcclCollective:
         self._active_broadcast_agreements = 0
         self._fatal_publications = 0
         self._fatal_publication_failure = None
-        self._fatal_publication_gate_failure_state = _FATAL_GATE_FAILURE_IDLE
-        self._fatal_publication_gate_failure_owner = None
-        self._fatal_publication_gate_failure_deadline = None
+        self._fatal_publication_gate_failure_claim = (
+            _FATAL_GATE_FAILURE_IDLE_CLAIM
+        )
         self._fatal_publication_owner_reservation = None
         self._closing = False
         self._fatal_pending_primary = None
@@ -932,39 +963,38 @@ class CupyNcclCollective:
     ):
         return bool(failure_confirmed(transition, primary))
 
-    def _repair_fatal_gate_failure_claim(self, claim_owner, confirmed):
+    def _repair_fatal_gate_failure_claim(self, claim, confirmed):
         with self._fatal_condition:
-            state = self._fatal_publication_gate_failure_state
-            owner = self._fatal_publication_gate_failure_owner
-            if state == _FATAL_GATE_FAILURE_SIGNALED:
-                self._fatal_publication_gate_failure_owner = None
-                self._fatal_publication_gate_failure_deadline = None
-                self._fatal_condition.notify_all()
-                return True
+            current = self._fatal_publication_gate_failure_claim
             if (
-                state == _FATAL_GATE_FAILURE_INFLIGHT
-                and owner is claim_owner
+                isinstance(current, _FatalGateFailureClaim)
+                and current.state == _FATAL_GATE_FAILURE_SIGNALED
             ):
-                self._fatal_publication_gate_failure_state = (
-                    _FATAL_GATE_FAILURE_SIGNALED
-                    if confirmed
-                    else _FATAL_GATE_FAILURE_IDLE
+                self._fatal_publication_gate_failure_claim = (
+                    _FATAL_GATE_FAILURE_SIGNALED_CLAIM
                 )
-                self._fatal_publication_gate_failure_owner = None
-                self._fatal_publication_gate_failure_deadline = None
-                self._fatal_condition.notify_all()
-                return confirmed
-            if state == _FATAL_GATE_FAILURE_IDLE and (
-                owner is None or owner is claim_owner
+                result = True
+            elif confirmed:
+                self._fatal_publication_gate_failure_claim = (
+                    _FATAL_GATE_FAILURE_SIGNALED_CLAIM
+                )
+                result = True
+            elif (
+                current is claim
+                or not isinstance(current, _FatalGateFailureClaim)
+                or current.state == _FATAL_GATE_FAILURE_IDLE
             ):
-                self._fatal_publication_gate_failure_owner = None
-                self._fatal_publication_gate_failure_deadline = None
-                self._fatal_condition.notify_all()
-                return False
-            return False
+                self._fatal_publication_gate_failure_claim = (
+                    _FATAL_GATE_FAILURE_IDLE_CLAIM
+                )
+                result = False
+            else:
+                result = False
+            self._fatal_condition.notify_all()
+            return result
 
-    def _settle_fatal_gate_failure_claim(self, claim_owner, confirmed):
-        return self._repair_fatal_gate_failure_claim(claim_owner, confirmed)
+    def _settle_fatal_gate_failure_claim(self, claim, confirmed):
+        return self._repair_fatal_gate_failure_claim(claim, confirmed)
 
     def _signal_reserved_fatal_gate_failure(
         self,
@@ -976,78 +1006,103 @@ class CupyNcclCollective:
         current_thread = threading.current_thread()
         protocol_deadline = time.monotonic() + _FATAL_TIMEOUT_S
         signal_errors = []
-        attempts = 0
-        while attempts < 2:
+        for _attempt in range(2):
+            claim = _FatalGateFailureClaim(
+                _FATAL_GATE_FAILURE_INFLIGHT,
+                current_thread,
+                protocol_deadline,
+            )
             claim_owned = False
+            claim_published = False
             confirmed = False
-            reentrant = False
+            decision = None
             try:
                 with self._fatal_condition:
-                    while True:
-                        state = self._fatal_publication_gate_failure_state
-                        if state == _FATAL_GATE_FAILURE_SIGNALED:
-                            return True, signal_errors
-                        if state == _FATAL_GATE_FAILURE_INFLIGHT:
-                            owner = self._fatal_publication_gate_failure_owner
-                            if owner is current_thread:
-                                reentrant = True
-                                break
-                            claim_deadline = (
-                                self._fatal_publication_gate_failure_deadline
-                            )
-                            now = time.monotonic()
-                            departed = owner is None or not owner.is_alive()
-                            expired = (
-                                claim_deadline is None
-                                or now >= claim_deadline
-                                or now >= protocol_deadline
-                            )
-                            if departed or expired:
-                                self._fatal_publication_gate_failure_state = (
-                                    _FATAL_GATE_FAILURE_IDLE
-                                )
-                                self._fatal_publication_gate_failure_owner = None
-                                self._fatal_publication_gate_failure_deadline = None
-                                self._fatal_condition.notify_all()
-                                continue
-                            remaining = min(
-                                claim_deadline, protocol_deadline
-                            ) - now
-                            self._fatal_condition.wait(remaining)
-                            continue
-                        if state != _FATAL_GATE_FAILURE_IDLE:
-                            signal_errors.append(
-                                RuntimeError(
-                                    "communicator gate failure signal state is invalid"
-                                )
-                            )
-                            return False, signal_errors
+                    current = self._fatal_publication_gate_failure_claim
+                    if not isinstance(current, _FatalGateFailureClaim):
                         claim_owned = True
-                        self._fatal_publication_gate_failure_state = (
-                            _FATAL_GATE_FAILURE_INFLIGHT
+                        self._fatal_publication_gate_failure_claim = claim
+                        claim_published = True
+                        self._fatal_condition.notify_all()
+                        decision = "verify_before_callback"
+                    elif current.state == _FATAL_GATE_FAILURE_SIGNALED:
+                        decision = _FATAL_GATE_FAILURE_SIGNALED
+                    elif current.state == _FATAL_GATE_FAILURE_IDLE:
+                        claim_owned = True
+                        self._fatal_publication_gate_failure_claim = claim
+                        claim_published = True
+                        self._fatal_condition.notify_all()
+                        decision = _FATAL_GATE_FAILURE_INFLIGHT
+                    elif current.owner is current_thread:
+                        decision = "reentrant"
+                    elif not current.owner.is_alive():
+                        claim_owned = True
+                        self._fatal_publication_gate_failure_claim = claim
+                        claim_published = True
+                        self._fatal_condition.notify_all()
+                        decision = "verify_before_callback"
+                    else:
+                        remaining = max(
+                            0.0, protocol_deadline - time.monotonic()
                         )
-                        self._fatal_publication_gate_failure_owner = current_thread
-                        self._fatal_publication_gate_failure_deadline = (
-                            protocol_deadline
-                        )
-                        break
-                if reentrant:
+                        if remaining:
+                            self._fatal_condition.wait(remaining)
+                        observed = self._fatal_publication_gate_failure_claim
+                        if not isinstance(observed, _FatalGateFailureClaim):
+                            claim_owned = True
+                            self._fatal_publication_gate_failure_claim = claim
+                            claim_published = True
+                            self._fatal_condition.notify_all()
+                            decision = "verify_before_callback"
+                        elif observed.state == _FATAL_GATE_FAILURE_SIGNALED:
+                            decision = _FATAL_GATE_FAILURE_SIGNALED
+                        elif observed.state == _FATAL_GATE_FAILURE_IDLE:
+                            decision = "retry"
+                        elif not observed.owner.is_alive():
+                            claim_owned = True
+                            self._fatal_publication_gate_failure_claim = claim
+                            claim_published = True
+                            self._fatal_condition.notify_all()
+                            decision = "verify_before_callback"
+                        else:
+                            decision = "live_owner_timeout"
+                if decision == _FATAL_GATE_FAILURE_SIGNALED:
+                    return True, signal_errors
+                if decision == "reentrant":
                     return False, signal_errors
-                attempts += 1
-                try:
-                    self._invoke_fatal_gate_failure_callback(
-                        failure_handler, transition, primary
+                if decision == "live_owner_timeout":
+                    signal_errors.append(
+                        TimeoutError(
+                            "communicator gate failure signal owner is still active"
+                        )
                     )
-                except BaseException as error:
-                    signal_errors.append(error)
-                try:
-                    confirmed = self._verify_fatal_gate_failure_callback(
-                        failure_confirmed, transition, primary
-                    )
-                except BaseException as error:
-                    signal_errors.append(error)
+                    return False, signal_errors
+                if decision == "retry":
+                    continue
+                if decision == "verify_before_callback":
+                    try:
+                        confirmed = self._verify_fatal_gate_failure_callback(
+                            failure_confirmed, transition, primary
+                        )
+                    except BaseException as error:
+                        signal_errors.append(error)
+                if not confirmed:
+                    try:
+                        self._invoke_fatal_gate_failure_callback(
+                            failure_handler, transition, primary
+                        )
+                    except BaseException as error:
+                        signal_errors.append(error)
+                    try:
+                        confirmed = self._verify_fatal_gate_failure_callback(
+                            failure_confirmed, transition, primary
+                        )
+                    except BaseException as error:
+                        signal_errors.append(error)
+            except BaseException as error:
+                signal_errors.append(error)
             finally:
-                if claim_owned:
+                if claim_owned or claim_published:
                     if not confirmed:
                         try:
                             confirmed = (
@@ -1058,14 +1113,14 @@ class CupyNcclCollective:
                         except BaseException as error:
                             signal_errors.append(error)
                     try:
-                        self._settle_fatal_gate_failure_claim(
-                            current_thread, confirmed
+                        confirmed = self._settle_fatal_gate_failure_claim(
+                            claim, confirmed
                         )
                     except BaseException as error:
                         signal_errors.append(error)
                         try:
-                            self._repair_fatal_gate_failure_claim(
-                                current_thread, confirmed
+                            confirmed = self._repair_fatal_gate_failure_claim(
+                                claim, confirmed
                             )
                         except BaseException as repair_error:
                             signal_errors.append(repair_error)
