@@ -53,6 +53,11 @@ def _run_total_elected_lease_close(
     try:
         transition, owns_close = gate.begin_lease_close(epoch)
     except BaseException as error:
+        transition, owns_close = gate._recover_lease_close_entry(epoch)
+        if transition is not None and owns_close:
+            return fail_stop(transition, error)
+        if transition is not None:
+            return join(transition)
         return begin_failure(error)
     if not owns_close:
         return join(transition)
@@ -424,6 +429,7 @@ class _LeaseResourceRecord:
     def __init__(self, epoch):
         self.epoch = epoch
         self._resources = []
+        self._construction_resources = {}
         self._consumed_receipts = {}
         self._allocations = {}
         self._cache_allocations = {}
@@ -509,6 +515,20 @@ class _LeaseResourceRecord:
         self._consumed_receipts[id(receipt)] = receipt
         self.capture(receipt)
 
+    def capture_construction_resource(self, name, resource):
+        if not isinstance(name, str) or not name:
+            raise ValueError("construction resource name must be non-empty")
+        if resource is None:
+            raise TypeError("construction resource is required")
+        retained = self._construction_resources.get(name)
+        if retained is not None and retained is not resource:
+            raise RuntimeError("construction resource identity changed")
+        self._construction_resources[name] = resource
+        self.capture(resource)
+
+    def construction_resource(self, name):
+        return self._construction_resources.get(name)
+
     def restore_consumed_receipts(self, runtime):
         for identity, receipt in tuple(self._consumed_receipts.items()):
             issued = runtime._issued_receipts.get(identity)
@@ -522,6 +542,7 @@ class _LeaseResourceRecord:
 
     def clear(self):
         self._resources.clear()
+        self._construction_resources.clear()
         self._consumed_receipts.clear()
         self._allocations.clear()
         self._cache_allocations.clear()
@@ -532,6 +553,7 @@ class _LeaseResourceRecord:
     def snapshot(self):
         retained = type(self)(self.epoch)
         retained._resources = list(self._resources)
+        retained._construction_resources = dict(self._construction_resources)
         retained._consumed_receipts = dict(self._consumed_receipts)
         retained._allocations = dict(self._allocations)
         retained._cache_allocations = dict(self._cache_allocations)
@@ -544,6 +566,11 @@ class _LeaseResourceRecord:
         self._resources = [
             retained for retained in self._resources if retained is not resource
         ]
+        self._construction_resources = {
+            name: retained
+            for name, retained in self._construction_resources.items()
+            if retained is not resource
+        }
         self._allocations.clear()
         self._cache_allocations.clear()
         self._pinned_allocations.clear()
@@ -1714,6 +1741,9 @@ class WorkingSetLease:
         primary = (
             error if fatal_transition is None else fatal_transition.primary
         )
+        if error is not primary:
+            with runtime._terminal_state_lock:
+                runtime._remember_terminal_secondary_locked(error, primary)
         try:
             primary = runtime._enter_communicator_fatal(primary)
         except BaseException as publication_error:
@@ -1971,8 +2001,17 @@ class WorkingSetLease:
         runtime = provider.runtime
         gate = runtime._terminal_gate
 
-        def begin_failure(_error):
-            primary = self._terminal_close_primary()
+        def begin_failure(error):
+            transition = gate._fatal_transition
+            if transition is None:
+                primary = runtime._enter_communicator_fatal(error)
+            else:
+                primary = transition.primary
+                if error is not primary:
+                    with runtime._terminal_state_lock:
+                        runtime._remember_terminal_secondary_locked(
+                            error, primary
+                        )
             self._retain_terminal_lease_safely(provider, primary)
             raise primary
 
@@ -2250,7 +2289,9 @@ class ActiveWorkingSetProvider:
                     "working-set status allocation failed"
                 ) from local_error
             raise ValueError("working-set status allocation failed")
-        return _LeaseStatusWorkspace(device_status, host_status)
+        workspace = _LeaseStatusWorkspace(device_status, host_status)
+        _resource_recorder(resource=workspace)
+        return workspace
 
     def _empty_cache_array(self, spec, *, order):
         backend = self.runtime.backend
@@ -2378,12 +2419,31 @@ class ActiveWorkingSetProvider:
         dirty_ref,
         _admission_token,
         _admission_validator,
+        _resource_recorder=None,
     ):
         _require_resource_admission(
             _admission_token,
             _admission_validator,
         )
-        return store.reserve(snapshot, dirty_ref=dirty_ref)
+        if not callable(_resource_recorder):
+            raise TypeError("store reservation recorder must be callable")
+        reservation = store.reserve(snapshot, dirty_ref=dirty_ref)
+        _resource_recorder(resource=reservation)
+        return reservation
+
+    @staticmethod
+    def _construction_resource_recorder(record, name):
+        construction_resource = None
+
+        def capture(**captured):
+            nonlocal construction_resource
+            record.capture(**captured)
+            resource = captured.get("resource")
+            if resource is not None and construction_resource is None:
+                record.capture_construction_resource(name, resource)
+                construction_resource = resource
+
+        return capture
 
     def _activate_lease(
         self,
@@ -2421,6 +2481,22 @@ class ActiveWorkingSetProvider:
             token,
             _admission_validator,
         )
+        if scheduler is None:
+            scheduler = record.construction_resource("scheduler")
+        if pool is None:
+            pool = record.construction_resource("pool")
+        if cache_reservation is None:
+            cache_reservation = record.construction_resource(
+                "cache_reservation"
+            )
+        if store_reservation is None:
+            store_reservation = record.construction_resource(
+                "store_reservation"
+            )
+        if status_workspace is None:
+            status_workspace = record.construction_resource(
+                "status_workspace"
+            )
         cleanup_error = None
         try:
             record.restore_consumed_receipts(self.runtime)
@@ -2694,6 +2770,23 @@ class ActiveWorkingSetProvider:
             record = _LeaseResourceRecord(epoch)
             self._provisional_resources = record
             cache_recorder = self._lease_cache_recorder(record)
+            status_recorder = self._construction_resource_recorder(
+                record, "status_workspace"
+            )
+            store_recorder = self._construction_resource_recorder(
+                record, "store_reservation"
+            )
+            cache_reservation_recorder = (
+                self._construction_resource_recorder(
+                    record, "cache_reservation"
+                )
+            )
+            pool_recorder = self._construction_resource_recorder(
+                record, "pool"
+            )
+            scheduler_recorder = self._construction_resource_recorder(
+                record, "scheduler"
+            )
             self.runtime.consume_residency_receipt(
                 receipt,
                 request,
@@ -2706,7 +2799,7 @@ class ActiveWorkingSetProvider:
             status_workspace = self._provision_status_workspace(
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
-                _resource_recorder=record.capture,
+                _resource_recorder=status_recorder,
             )
             record.capture(status_workspace)
             self._raise_construction_transition_preemption()
@@ -2716,6 +2809,7 @@ class ActiveWorkingSetProvider:
                 store,
                 request.store_snapshots[self.runtime.rank],
                 dirty_ref=dirty_ref,
+                _resource_recorder=store_recorder,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
             )
@@ -2736,6 +2830,7 @@ class ActiveWorkingSetProvider:
             cache_reservation = self._cache.reserve(
                 allowlist,
                 required_bytes,
+                _resource_recorder=cache_reservation_recorder,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
             )
@@ -2744,7 +2839,7 @@ class ActiveWorkingSetProvider:
             pool = self._pool_factory(
                 request.transfer_profile.rank_staging_bytes[self.runtime.rank],
                 pinned_allocator=self._pinned_allocator,
-                _resource_recorder=record.capture,
+                _resource_recorder=pool_recorder,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
             )
@@ -2772,7 +2867,7 @@ class ActiveWorkingSetProvider:
                         operation,
                     )
                 ),
-                _resource_recorder=record.capture,
+                _resource_recorder=scheduler_recorder,
                 _resource_releaser=record.release,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
@@ -3051,14 +3146,24 @@ class ActiveWorkingSetProvider:
         _admission_token,
         _admission_validator,
     ):
+        if _admission_token is None or _admission_validator is None:
+            raise TypeError(
+                "private provider close requires an exact admission pair"
+            )
         _require_resource_admission(
             _admission_token,
             _admission_validator,
         )
+        runtime = self.runtime
+        if runtime is None:
+            raise RuntimeError("provider runtime is unavailable")
+        runtime._terminal_gate._require_runtime_close_admission(
+            _admission_token,
+            "provider_close",
+        )
         if self._closed:
             return
         error = None
-        runtime = self.runtime
         lease = self._active_lease
         cache = self._cache
         if lease is not None:

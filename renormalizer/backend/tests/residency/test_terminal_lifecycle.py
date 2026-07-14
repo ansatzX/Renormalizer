@@ -5560,6 +5560,130 @@ def test_private_provider_close_requires_exact_runtime_close_admission(
         _close_case(runtime, store)
 
 
+@pytest.mark.parametrize(
+    ("token", "validator"),
+    (
+        (None, None),
+        (object(), None),
+        (None, lambda _token: None),
+    ),
+)
+def test_private_provider_close_rejects_missing_admission_before_read(
+    token,
+    validator,
+):
+    runtime = _runtime()
+    request, _, store, _, _ = _active_case(
+        runtime, store_id="terminal-private-provider-close-missing"
+    )
+    provider = _provider(runtime, request)
+    runtime._active_provider = provider
+    before = (
+        provider.runtime,
+        provider._cache_factory,
+        provider._pool_factory,
+        provider._scheduler_factory,
+        runtime._active_provider,
+        provider._closed,
+    )
+    try:
+        with pytest.raises(TypeError):
+            provider._close_for_runtime(
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+        assert (
+            provider.runtime,
+            provider._cache_factory,
+            provider._pool_factory,
+            provider._scheduler_factory,
+            runtime._active_provider,
+            provider._closed,
+        ) == before
+    finally:
+        _close_case(runtime, store)
+
+
+def test_private_provider_close_rejects_wrong_operation_before_mutation():
+    runtime = _runtime()
+    request, _, store, _, _ = _active_case(
+        runtime, store_id="terminal-private-provider-close-operation"
+    )
+    provider = _provider(runtime, request)
+    runtime._active_provider = provider
+    gate = runtime._terminal_gate
+    request_token = gate.admit_runtime("private_provider_operation_fixture")
+    transition, elected = gate._freeze_runtime_close(request_token)
+    assert elected is True
+    token = gate.admit_runtime_close(transition, "collective_close")
+    validator = runtime._exact_admission_validator(
+        token,
+        scope="runtime_close",
+        epoch=None,
+        transition_sequence=transition.sequence,
+    )
+    before = (
+        provider.runtime,
+        provider._cache_factory,
+        provider._pool_factory,
+        provider._scheduler_factory,
+        runtime._active_provider,
+        provider._closed,
+    )
+    try:
+        with pytest.raises(RuntimeError):
+            provider._close_for_runtime(
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+        assert (
+            provider.runtime,
+            provider._cache_factory,
+            provider._pool_factory,
+            provider._scheduler_factory,
+            runtime._active_provider,
+            provider._closed,
+        ) == before
+    finally:
+        gate.release(token)
+        gate.commit_runtime_close(transition, lambda: None)
+        runtime._closed = True
+        _close_case(runtime, store)
+
+
+def test_private_provider_close_accepts_exact_elected_admission():
+    runtime = _runtime()
+    request, _, store, _, _ = _active_case(
+        runtime, store_id="terminal-private-provider-close-exact"
+    )
+    provider = _provider(runtime, request)
+    runtime._active_provider = provider
+    gate = runtime._terminal_gate
+    request_token = gate.admit_runtime("private_provider_exact_fixture")
+    transition, elected = gate._freeze_runtime_close(request_token)
+    assert elected is True
+    token = gate.admit_runtime_close(transition, "provider_close")
+    validator = runtime._exact_admission_validator(
+        token,
+        scope="runtime_close",
+        epoch=None,
+        transition_sequence=transition.sequence,
+    )
+    try:
+        provider._close_for_runtime(
+            _admission_token=token,
+            _admission_validator=validator,
+        )
+        assert provider._closed is True
+        assert provider.runtime is None
+        assert runtime._active_provider is None
+    finally:
+        gate.release(token)
+        gate.commit_runtime_close(transition, lambda: None)
+        runtime._closed = True
+        _close_case(runtime, store)
+
+
 @pytest.mark.parametrize("phase", ("pending", "published", "closed"))
 def test_public_provider_close_preserves_fatal_retained_ownership(
     monkeypatch,
@@ -5623,3 +5747,392 @@ def test_public_provider_close_preserves_fatal_retained_ownership(
         if phase == "pending":
             gate._fail_fatal_publication(transition, primary)
         _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("row", CONSTRUCTION_MATRIX_ROWS)
+def test_after_real_construction_row_is_owned_by_healthy_rollback(
+    monkeypatch,
+    row,
+):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-after-real-healthy-{}".format(row),
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    gate = runtime._terminal_gate
+    failure = RuntimeError("{} failed after its real operation".format(row))
+    captured = []
+    close_calls = []
+
+    def capture_resource(resource):
+        captured.append(resource)
+        original_close = resource.close
+
+        def close(*args, **kwargs):
+            close_calls.append(resource)
+            return original_close(*args, **kwargs)
+
+        monkeypatch.setattr(resource, "close", close)
+        return resource
+
+    if row == "receipt_consume":
+        original = runtime.consume_residency_receipt
+
+        def fail_after_real(*args, **kwargs):
+            original(*args, **kwargs)
+            raise failure
+
+        monkeypatch.setattr(runtime, "consume_residency_receipt", fail_after_real)
+    elif row == "construct_status":
+        original = provider._provision_status_workspace
+
+        def fail_after_real(*args, **kwargs):
+            capture_resource(original(*args, **kwargs))
+            raise failure
+
+        monkeypatch.setattr(provider, "_provision_status_workspace", fail_after_real)
+    elif row == "construct_store_reservation":
+        original = provider._reserve_store
+
+        def fail_after_real(*args, **kwargs):
+            capture_resource(original(*args, **kwargs))
+            raise failure
+
+        monkeypatch.setattr(provider, "_reserve_store", fail_after_real)
+    elif row == "construct_cache_reservation":
+        original_factory = provider._cache_factory
+
+        def cache_factory(*args, **kwargs):
+            cache = original_factory(*args, **kwargs)
+            original_reserve = cache.reserve
+
+            def fail_after_real(*reserve_args, **reserve_kwargs):
+                capture_resource(
+                    original_reserve(*reserve_args, **reserve_kwargs)
+                )
+                raise failure
+
+            monkeypatch.setattr(cache, "reserve", fail_after_real)
+            return cache
+
+        monkeypatch.setattr(provider, "_cache_factory", cache_factory)
+    elif row == "construct_pool":
+        original = provider._pool_factory
+
+        def fail_after_real(*args, **kwargs):
+            capture_resource(original(*args, **kwargs))
+            raise failure
+
+        monkeypatch.setattr(provider, "_pool_factory", fail_after_real)
+    elif row == "construct_scheduler":
+        original = provider._scheduler_factory
+
+        def fail_after_real(*args, **kwargs):
+            capture_resource(original(*args, **kwargs))
+            raise failure
+
+        monkeypatch.setattr(provider, "_scheduler_factory", fail_after_real)
+    else:
+        original = provider._activate_lease
+
+        def fail_after_real(*args, **kwargs):
+            original(*args, **kwargs)
+            raise failure
+
+        monkeypatch.setattr(provider, "_activate_lease", fail_after_real)
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is failure
+        with gate._condition:
+            assert gate._phase is _TerminalPhase.HEALTHY
+            assert gate._live_epoch is None
+            assert not gate._has_active_tokens()
+            assert all(lease.phase == "closed" for lease in gate._leases.values())
+        assert provider._active_lease is None
+        assert provider._provisional_resources is None
+        assert id(receipt) in runtime._issued_receipts
+        assert store._reservations == {}
+        if provider._cache is not None:
+            assert provider._cache._reservation is None
+        if captured:
+            assert close_calls == captured
+    finally:
+        for resource in captured:
+            if not getattr(resource, "_closed", True):
+                try:
+                    resource.close()
+                except BaseException:
+                    pass
+        _repair_test_construction_state(gate)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "row", ("construct_store_reservation", "construct_cache_reservation")
+)
+def test_after_real_reservation_is_exactly_fatal_retained(monkeypatch, row):
+    class ConstructionFatal(BaseException):
+        pass
+
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-after-real-fatal-{}".format(row),
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    gate = runtime._terminal_gate
+    primary = ConstructionFatal("{} fatal after real".format(row))
+    captured = []
+
+    if row == "construct_store_reservation":
+        original = provider._reserve_store
+
+        def fail_after_real(*args, **kwargs):
+            captured.append(original(*args, **kwargs))
+            raise primary
+
+        monkeypatch.setattr(provider, "_reserve_store", fail_after_real)
+    else:
+        original_factory = provider._cache_factory
+
+        def cache_factory(*args, **kwargs):
+            cache = original_factory(*args, **kwargs)
+            original_reserve = cache.reserve
+
+            def fail_after_real(*reserve_args, **reserve_kwargs):
+                captured.append(
+                    original_reserve(*reserve_args, **reserve_kwargs)
+                )
+                raise primary
+
+            monkeypatch.setattr(cache, "reserve", fail_after_real)
+            return cache
+
+        monkeypatch.setattr(provider, "_cache_factory", cache_factory)
+
+    try:
+        with pytest.raises(ConstructionFatal) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is primary
+        assert len(captured) == 1
+        assert provider._provisional_resources is not None
+        assert any(
+            resource is captured[0]
+            for resource in provider._provisional_resources.resources
+        )
+        assert captured[0]._closed is False
+        with gate._condition:
+            assert gate._fatal_transition.primary is primary
+            assert gate._leases[gate._live_epoch].phase == "fatal_retained"
+            assert not gate._has_active_tokens()
+    finally:
+        for resource in captured:
+            if not resource._closed:
+                resource.close()
+        _close_case(runtime, store)
+
+
+def _repair_test_abandoned_close_entry(gate):
+    """Bound RED probes without adopting a departed production owner."""
+    with gate._condition:
+        for state in gate._tokens.values():
+            if state.status == "active":
+                state.status = "released"
+                gate._thread_tokens.pop(state.token.thread_id, None)
+        if gate._phase is _TerminalPhase.RUNTIME_CLOSING:
+            gate._phase = _TerminalPhase.RUNTIME_CLOSED
+            gate._runtime_close_result = None
+        epoch = gate._live_epoch
+        if epoch is not None:
+            lease_state = gate._leases[epoch]
+            if lease_state.phase == "closing":
+                lease_state.phase = "closed"
+                lease_state.result = None
+                lease_state.has_result = True
+                gate._live_epoch = None
+        gate._condition.notify_all()
+
+
+@pytest.mark.parametrize("concurrent_fatal", (False, True))
+def test_after_real_lease_close_election_has_total_owner(
+    monkeypatch,
+    concurrent_fatal,
+):
+    runtime, _, _, store, provider, lease = _open_active_case(
+        store_id="terminal-after-real-lease-election-{}".format(
+            "fatal" if concurrent_fatal else "healthy"
+        )
+    )
+    gate = runtime._terminal_gate
+    entry_installed = threading.Event()
+    release_entry = threading.Event()
+
+    class CloseEntryFailure(BaseException):
+        pass
+
+    entry_failure = CloseEntryFailure("lease close election wrapper failed")
+    fatal_primary = RuntimeError("lease close concurrent fatal winner")
+    original_begin = gate.begin_lease_close
+
+    def fail_after_real(*args, **kwargs):
+        original_begin(*args, **kwargs)
+        entry_installed.set()
+        assert release_entry.wait(_TIMEOUT_S)
+        raise entry_failure
+
+    monkeypatch.setattr(gate, "begin_lease_close", fail_after_real)
+    closer, close_results, close_errors, close_done = _start(lease.close)
+    fatal = None
+    fatal_results = []
+    fatal_errors = []
+    fatal_done = None
+    try:
+        assert entry_installed.wait(_TIMEOUT_S)
+        if concurrent_fatal:
+            fatal, fatal_results, fatal_errors, fatal_done = _start(
+                lambda: runtime._enter_communicator_fatal(fatal_primary)
+            )
+            _wait_for_phase(runtime, _TerminalPhase.FATAL_PUBLISHED)
+        release_entry.set()
+        _join(closer, close_done)
+        if fatal is not None:
+            _join(fatal, fatal_done)
+
+        expected = fatal_primary if concurrent_fatal else entry_failure
+        assert close_results == []
+        assert close_errors == [expected]
+        if fatal is not None:
+            assert fatal_results == [fatal_primary]
+            assert fatal_errors == []
+        with gate._condition:
+            assert gate._fatal_transition.primary is expected
+            assert gate._leases[lease._epoch].phase == "fatal_retained"
+            assert not gate._has_active_tokens()
+        if concurrent_fatal:
+            assert entry_failure in runtime._terminal_secondary_errors
+    finally:
+        release_entry.set()
+        _repair_test_abandoned_close_entry(gate)
+        for thread, done in ((closer, close_done), (fatal, fatal_done)):
+            if thread is not None and thread.is_alive():
+                _join(thread, done)
+        reservation = lease._store_reservation
+        if reservation is not None and not reservation._closed:
+            reservation.close()
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("admit_runtime", "freeze_runtime_close", "runtime_close_admission"),
+)
+@pytest.mark.parametrize("concurrent_fatal", (False, True))
+def test_after_real_runtime_close_entry_has_total_owner(
+    monkeypatch,
+    boundary,
+    concurrent_fatal,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    entry_installed = threading.Event()
+    release_entry = threading.Event()
+
+    class CloseEntryFailure(BaseException):
+        pass
+
+    entry_failure = CloseEntryFailure("{} wrapper failed".format(boundary))
+    fatal_primary = RuntimeError("{} concurrent fatal winner".format(boundary))
+
+    class Provider:
+        _active_lease = None
+        _terminal_error = None
+
+        def _retain_transition_resources(self, lease):
+            assert lease is None
+
+        def _close_for_runtime(self, **_kwargs):
+            return None
+
+    runtime._active_provider = Provider()
+
+    def after_real(original, *args, **kwargs):
+        original(*args, **kwargs)
+        entry_installed.set()
+        assert release_entry.wait(_TIMEOUT_S)
+        raise entry_failure
+
+    if boundary == "admit_runtime":
+        original = gate.admit_runtime
+
+        def fail_after_real(operation):
+            if operation != "begin_runtime_close":
+                return original(operation)
+            return after_real(original, operation)
+
+        monkeypatch.setattr(gate, "admit_runtime", fail_after_real)
+    elif boundary == "freeze_runtime_close":
+        original = gate._freeze_runtime_close
+
+        def fail_after_real(token):
+            return after_real(original, token)
+
+        monkeypatch.setattr(gate, "_freeze_runtime_close", fail_after_real)
+    else:
+        original = gate.admit_runtime_close
+
+        def fail_after_real(transition, operation):
+            if operation != "provider_close":
+                return original(transition, operation)
+            return after_real(original, transition, operation)
+
+        monkeypatch.setattr(gate, "admit_runtime_close", fail_after_real)
+
+    closer, close_results, close_errors, close_done = _start(runtime.close)
+    fatal = None
+    fatal_results = []
+    fatal_errors = []
+    fatal_done = None
+    try:
+        assert entry_installed.wait(_TIMEOUT_S)
+        if concurrent_fatal:
+            fatal, fatal_results, fatal_errors, fatal_done = _start(
+                lambda: runtime._enter_communicator_fatal(fatal_primary)
+            )
+            with gate._condition:
+                assert gate._condition.wait_for(
+                    lambda: gate._fatal_transition is not None,
+                    timeout=_TIMEOUT_S,
+                )
+        release_entry.set()
+        assert close_done.wait(_TIMEOUT_S)
+        if fatal_done is not None:
+            assert fatal_done.wait(_TIMEOUT_S)
+        _join(closer, close_done)
+        if fatal is not None:
+            _join(fatal, fatal_done)
+
+        expected = fatal_primary if concurrent_fatal else entry_failure
+        assert close_results == []
+        assert close_errors == [expected]
+        if fatal is not None:
+            assert fatal_results == [fatal_primary]
+            assert fatal_errors == []
+        assert runtime._closed is True
+        assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+        with gate._condition:
+            assert not gate._has_active_tokens()
+            assert gate._fatal_transition.primary is expected
+        if concurrent_fatal:
+            assert entry_failure in runtime._terminal_secondary_errors
+    finally:
+        release_entry.set()
+        _repair_test_abandoned_close_entry(gate)
+        for thread, done in ((closer, close_done), (fatal, fatal_done)):
+            if thread is not None and thread.is_alive():
+                _join(thread, done)
+        runtime._closed = True

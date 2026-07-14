@@ -2614,6 +2614,21 @@ class CupyDistributedRuntime:
             if "converted" not in str(error):
                 raise
 
+    def _admit_runtime_close_step(self, transition, operation):
+        gate = self._terminal_gate
+        try:
+            return gate.admit_runtime_close(transition, operation)
+        except BaseException:
+            token = gate._recover_current_thread_admission(
+                scope="runtime_close",
+                operation=operation,
+                epoch=None,
+                transition=transition,
+            )
+            if token is not None:
+                self._release_runtime_close_step(token)
+            raise
+
     def _commit_fatal_runtime_close(self, transition, error):
         def finalize_pending():
             try:
@@ -2705,6 +2720,9 @@ class CupyDistributedRuntime:
         primary = (
             error if fatal_transition is None else fatal_transition.primary
         )
+        if error is not primary:
+            with self._terminal_state_lock:
+                self._remember_terminal_secondary_locked(error, primary)
         if fatal_transition is None and commit_selected:
             secondary = gate._fail_selected_runtime_close(
                 transition,
@@ -2791,7 +2809,7 @@ class CupyDistributedRuntime:
             raise error
         if provider is not None:
             try:
-                provider_token = self._terminal_gate.admit_runtime_close(
+                provider_token = self._admit_runtime_close_step(
                     transition, "provider_close"
                 )
             except Exception as caught:
@@ -2831,7 +2849,7 @@ class CupyDistributedRuntime:
                 if callable(close_for_runtime):
                     close_for_runtime(self._terminal_gate, transition)
                 else:
-                    collective_token = self._terminal_gate.admit_runtime_close(
+                    collective_token = self._admit_runtime_close_step(
                         transition, "collective_close"
                     )
                     try:
@@ -2884,14 +2902,44 @@ class CupyDistributedRuntime:
         if error is None:
             error = getattr(self.backend, "_execution_terminal_error", None)
         request = None
+        entry_error = None
         try:
             request = self._terminal_gate.admit_runtime("begin_runtime_close")
-        except RuntimeError:
-            transition, elected = self._terminal_gate._freeze_runtime_close(None)
-        else:
+        except BaseException as caught:
+            request = self._terminal_gate._recover_current_thread_admission(
+                scope="runtime",
+                operation="begin_runtime_close",
+                epoch=None,
+            )
+            if request is not None or not isinstance(caught, RuntimeError):
+                entry_error = caught
+        try:
             transition, elected = self._terminal_gate._freeze_runtime_close(request)
+        except BaseException as caught:
+            if entry_error is None:
+                entry_error = caught
+            elif caught is not entry_error:
+                with self._terminal_state_lock:
+                    self._remember_terminal_secondary_locked(caught, entry_error)
+            transition, elected = (
+                self._terminal_gate._recover_runtime_close_entry()
+            )
+            if transition is None:
+                self._enter_communicator_fatal(
+                    entry_error,
+                    discovering_token=request,
+                )
+                transition = self._terminal_gate._fatal_transition
+                error = transition.primary
+                self._commit_fatal_runtime_close(transition, error)
+                raise error
         if isinstance(transition, _FatalTransition):
             error = transition.primary
+            if entry_error is not None and entry_error is not error:
+                with self._terminal_state_lock:
+                    self._remember_terminal_secondary_locked(
+                        entry_error, error
+                    )
             self._commit_fatal_runtime_close(transition, error)
             raise error
 
@@ -2906,9 +2954,13 @@ class CupyDistributedRuntime:
             )
             if isinstance(result, BaseException):
                 raise result
+            if entry_error is not None:
+                raise entry_error
             return result
 
         try:
+            if entry_error is not None:
+                raise entry_error
             return self._run_elected_runtime_close(transition, error)
         except BaseException as caught:
             self._fail_stop_elected_runtime_close(transition, caught)

@@ -3626,7 +3626,6 @@ def test_deferred_quarantine_failure_retains_owner_and_fail_stops_close(
             runtime.close,
             name=close_name,
         )
-        assert close_hard_exit.wait(_TASK_18_2_TIMEOUT_S)
         _join_task_18_2_call(closer, close_done)
     finally:
         release_agree.set()
@@ -3641,7 +3640,8 @@ def test_deferred_quarantine_failure_retains_owner_and_fail_stops_close(
     assert isinstance(worker_errors[0], FatalHardExit)
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
+    assert close_hard_exit.is_set() is False
     assert callback_calls == [owner]
     assert owner.state == "quarantined"
     assert owner.error is primary
@@ -3652,14 +3652,6 @@ def test_deferred_quarantine_failure_retains_owner_and_fail_stops_close(
     assert hard_exit_observations == [
         (
             worker_name,
-            1,
-            0,
-            _TerminalPhase.FATAL_PENDING,
-            False,
-            primary,
-        ),
-        (
-            close_name,
             1,
             0,
             _TerminalPhase.FATAL_PENDING,
@@ -5517,10 +5509,9 @@ def test_fatal_owner_cancellation_retains_owner_and_bounds_close(monkeypatch):
 
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert hard_exit_observations == [
         (publisher_name, 1, primary, _TerminalPhase.FATAL_PENDING),
-        (close_name, 1, primary, _TerminalPhase.FATAL_PENDING),
     ]
     assert wrapper._fatal_secondary_errors == (cancellation,)
 
@@ -5616,7 +5607,7 @@ def test_deferred_gate_completion_failure_retains_owner_and_bounds_close(
 
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert hard_exit_observations == [
         (
             publisher_name,
@@ -5625,7 +5616,6 @@ def test_deferred_gate_completion_failure_retains_owner_and_bounds_close(
             True,
             _TerminalPhase.FATAL_PENDING,
         ),
-        (close_name, 1, primary, True, _TerminalPhase.FATAL_PENDING),
     ]
     assert completion_error in wrapper._fatal_secondary_errors
 
@@ -5807,7 +5797,7 @@ def test_immediate_post_pre_reservation_failure_recovers_exact_gate_and_close(
 
     assert report_results == []
     assert len(report_errors) == 1
-    assert isinstance(report_errors[0], FatalHardExit)
+    assert report_errors[0] is primary
     assert len(reporter_adoptions) == 1
     assert reporter_adoptions[0][2:] == (False, True, False)
 
@@ -5818,15 +5808,13 @@ def test_immediate_post_pre_reservation_failure_recovers_exact_gate_and_close(
 
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert join_observations == [
         (reporter_name, 1, primary),
         (close_name, 1, primary),
     ]
     assert hard_exit_observations == [
         (publisher_name, 1, primary, False, False, False),
-        (reporter_name, 1, primary, False, False, False),
-        (close_name, 1, primary, False, False, False),
     ]
     assert len(failure_signals) == 1
     assert cancellation in wrapper._fatal_secondary_errors
@@ -6021,21 +6009,19 @@ def test_hidden_fatal_preparation_escape_repairs_owner_before_handoff_release(
     assert runtime._pending_fatal_context is not None
     assert report_results == []
     assert len(report_errors) == 1
-    assert isinstance(report_errors[0], FatalHardExit)
+    assert report_errors[0] is primary
     assert len(reporter_adoptions) == 1
     assert reporter_adoptions[0][0] is primary
     assert reporter_adoptions[0][2:] == (False, True, False)
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert join_observations == [
         (reporter_name, 1, primary),
         (close_name, 1, primary),
     ]
     assert hard_exit_observations == [
         (publisher_name, False, False, False, False),
-        (reporter_name, False, False, False, False),
-        (close_name, False, False, False, False),
     ]
     assert cancellation in wrapper._fatal_secondary_errors
     assert later in wrapper._fatal_secondary_errors
@@ -6374,13 +6360,13 @@ def test_pre_reserve_escape_backs_transition_token_and_context_before_handoff_re
     assert isinstance(publish_errors[0], FatalHardExit)
     assert report_results == []
     assert len(report_errors) == 1
-    assert isinstance(report_errors[0], FatalHardExit)
+    assert report_errors[0] is primary
     assert len(reporter_adoptions) == 1
     assert reporter_adoptions[0][0] is primary
     assert reporter_adoptions[0][2:] == (False, True, False)
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert collective_failure_signals == [
         (publisher_name, primary, False, False, False)
     ]
@@ -6397,8 +6383,6 @@ def test_pre_reserve_escape_backs_transition_token_and_context_before_handoff_re
     ]
     assert hard_exit_observations == [
         (publisher_name, False, False, False, False, False),
-        (reporter_name, False, False, False, False, False),
-        (close_name, False, False, False, False, False),
     ]
     assert sum(
         retained is cancellation
@@ -6616,10 +6600,10 @@ def test_hidden_fatal_reservation_preempts_clean_after_preparation_escape(
     assert isinstance(publish_errors[0], FatalHardExit)
     assert report_results == []
     assert len(report_errors) == 1
-    assert isinstance(report_errors[0], FatalHardExit)
+    assert report_errors[0] is primary
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     with wrapper._fatal_condition:
         retained_owner = wrapper._fatal_publication_owner_reservation
         assert wrapper._fatal_publications == 1
@@ -6640,8 +6624,6 @@ def test_hidden_fatal_reservation_preempts_clean_after_preparation_escape(
     ]
     assert hard_exit_observations == [
         (publisher_name, False, False, False, False),
-        (reporter_name, False, False, False, False),
-        (close_name, False, False, False, False),
     ]
     assert cancellation in wrapper._fatal_secondary_errors
     assert later in wrapper._fatal_secondary_errors
@@ -7012,7 +6994,7 @@ def test_hidden_fatal_election_recovers_every_reserved_owner_boundary(
 
     assert report_results == []
     assert len(report_errors) == 1
-    assert isinstance(report_errors[0], FatalHardExit)
+    assert report_errors[0] is primary
     assert len(reporter_adoptions) == 1
     assert reporter_adoptions[0][2:] == (False, True, False)
 
@@ -7023,15 +7005,13 @@ def test_hidden_fatal_election_recovers_every_reserved_owner_boundary(
 
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert join_observations == [
         (reporter_name, 1, primary),
         (close_name, 1, primary),
     ]
     assert hard_exit_observations == [
         (publisher_name, False, False, False),
-        (reporter_name, False, False, False),
-        (close_name, False, False, False),
     ]
     assert len(gate_failure_signals) == 1
     assert sum(
@@ -7200,10 +7180,10 @@ def _assert_hidden_fatal_recovery_operation_is_bounded(monkeypatch, *, persisten
     assert isinstance(publish_errors[0], FatalHardExit)
     assert report_results == []
     assert len(report_errors) == 1
-    assert isinstance(report_errors[0], FatalHardExit)
+    assert report_errors[0] is primary
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert len(recovery_calls) == 1
     with wrapper._fatal_condition:
         retained_owner = wrapper._fatal_publication_owner_reservation
@@ -7225,11 +7205,9 @@ def _assert_hidden_fatal_recovery_operation_is_bounded(monkeypatch, *, persisten
     assert runtime._pending_fatal_collective is wrapper
     assert runtime._pending_fatal_context is not None
     assert all(observation[1:] == (False, False, False) for observation in hard_exit_observations)
-    assert {observation[0] for observation in hard_exit_observations} == {
-        publisher_name,
-        reporter_name,
-        close_name,
-    }
+    assert [observation[0] for observation in hard_exit_observations] == [
+        publisher_name
+    ]
     assert sum(
         retained is recovery_failure
         for retained in wrapper._fatal_secondary_errors
@@ -8432,7 +8410,7 @@ def test_pre_reserved_fatal_owner_failure_before_adoption_is_fail_stopped(
 
     assert report_results == []
     assert len(report_errors) == 1
-    assert isinstance(report_errors[0], FatalHardExit)
+    assert report_errors[0] is primary
     assert len(reporter_adoptions) == 1
     assert reporter_adoptions[0][2:] == (False, True, False)
 
@@ -8443,15 +8421,13 @@ def test_pre_reserved_fatal_owner_failure_before_adoption_is_fail_stopped(
 
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert join_observations == [
         (reporter_name, 1, primary),
         (close_name, 1, primary),
     ]
     assert hard_exit_observations == [
         (publisher_name, 1, primary, False, False),
-        (reporter_name, 1, primary, False, False),
-        (close_name, 1, primary, False, False),
     ]
     assert len(failure_signals) == 1
     assert wrapper._fatal_secondary_errors == (cancellation, later)
@@ -8594,7 +8570,7 @@ def test_adopted_fatal_owner_construction_failure_is_fail_stopped(monkeypatch):
 
     assert report_results == []
     assert len(report_errors) == 1
-    assert isinstance(report_errors[0], FatalHardExit)
+    assert report_errors[0] is primary
 
     closer, close_results, close_errors, close_done = _start_task_18_2_call(
         runtime.close, name=close_name
@@ -8603,15 +8579,13 @@ def test_adopted_fatal_owner_construction_failure_is_fail_stopped(monkeypatch):
 
     assert close_results == []
     assert len(close_errors) == 1
-    assert isinstance(close_errors[0], FatalHardExit)
+    assert close_errors[0] is primary
     assert join_observations == [
         (reporter_name, 1, primary),
         (close_name, 1, primary),
     ]
     assert hard_exit_observations == [
         (publisher_name, 1, primary, False, False),
-        (reporter_name, 1, primary, False, False),
-        (close_name, 1, primary, False, False),
     ]
     assert len(failure_signals) == 1
     assert wrapper._fatal_secondary_errors == (
@@ -8987,3 +8961,386 @@ def test_recovered_structured_election_terminalizes_before_diagnostics(
         assert wrapper._fatal_publication_failure is primary
     with gate._condition:
         assert gate._fatal_publication_failure is primary
+
+
+@pytest.mark.parametrize("start_mode", ("before_real", "after_real"))
+def test_remote_fatal_publisher_thread_start_is_transactional(
+    monkeypatch,
+    start_mode,
+):
+    class PublisherStartFailure(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("remote publisher canonical primary")
+    start_failure = PublisherStartFailure(
+        "remote publisher {} start failure".format(start_mode)
+    )
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    original_start = threading.Thread.start
+    original_enter = wrapper._enter_observed_fatal
+    original_record_secondary = wrapper._record_fatal_secondary
+    diagnostic_observations = []
+    hard_exits = []
+
+    def hold_worker(*args, **kwargs):
+        worker_entered.set()
+        assert release_worker.wait(_TASK_18_2_TIMEOUT_S)
+        return original_enter(*args, **kwargs)
+
+    def fail_start(thread):
+        if not thread.name.startswith("renormalizer-fatal-publisher-rank-"):
+            return original_start(thread)
+        if start_mode == "before_real":
+            raise start_failure
+        original_start(thread)
+        assert worker_entered.wait(_TASK_18_2_TIMEOUT_S)
+        raise start_failure
+
+    def marker_state():
+        with wrapper._fatal_condition:
+            collective_marked = wrapper._fatal_publication_failure is primary
+        with gate._condition:
+            gate_marked = gate._fatal_publication_failure is primary
+        return collective_marked, gate_marked
+
+    def record_secondary(error):
+        if error is start_failure:
+            diagnostic_observations.append(marker_state())
+        return original_record_secondary(error)
+
+    def hard_exit():
+        hard_exits.append((threading.current_thread(), marker_state()))
+        raise FatalHardExit()
+
+    monkeypatch.setattr(wrapper, "_enter_observed_fatal", hold_worker)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    monkeypatch.setattr(wrapper, "_record_fatal_secondary", record_secondary)
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+    publisher = None
+    try:
+        if start_mode == "before_real":
+            with pytest.raises(FatalHardExit):
+                wrapper._start_fatal_monitor_publication(primary, 0)
+            with wrapper._fatal_condition:
+                assert wrapper._fatal_monitor_publisher_thread is None
+                assert wrapper._fatal_monitor_publisher_state == "start_failed"
+                assert wrapper._fatal_publication_failure is primary
+            with gate._condition:
+                assert gate._fatal_transition.primary is primary
+                assert gate._fatal_publication_failure is primary
+            assert diagnostic_observations == [(True, True)]
+            assert hard_exits == [
+                (threading.current_thread(), (True, True))
+            ]
+            assert start_failure in wrapper._fatal_secondary_errors
+        else:
+            publisher = wrapper._start_fatal_monitor_publication(primary, 0)
+            assert publisher is wrapper._fatal_monitor_publisher_thread
+            release_worker.set()
+            publisher.join(_TASK_18_2_TIMEOUT_S)
+            assert not publisher.is_alive()
+            with wrapper._fatal_condition:
+                assert wrapper._fatal_monitor_publisher_state == "completed"
+                assert wrapper._fatal_publication_failure is None
+            with gate._condition:
+                assert gate._fatal_transition.primary is primary
+                assert gate._phase is _TerminalPhase.FATAL_PUBLISHED
+            assert hard_exits == []
+            assert diagnostic_observations == [(False, False)]
+            assert start_failure in wrapper._fatal_secondary_errors
+    finally:
+        release_worker.set()
+        if publisher is not None and publisher.ident is not None:
+            publisher.join(_TASK_18_2_TIMEOUT_S)
+
+
+def test_true_pre_owner_monitor_read_failure_marks_before_exit(monkeypatch):
+    class MonitorReadFailure(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = MonitorReadFailure("fatal monitor read failed before election")
+    dispatch_observations = []
+    hard_exits = []
+    original_dispatch = wrapper._dispatch_fatal_secondaries
+
+    def fail_read():
+        raise primary
+
+    def record_dispatch(errors):
+        with wrapper._fatal_condition:
+            collective_marked = wrapper._fatal_publication_failure is primary
+        with gate._condition:
+            gate_marked = gate._fatal_publication_failure is primary
+        dispatch_observations.append((collective_marked, gate_marked))
+        return original_dispatch(errors)
+
+    def hard_exit():
+        hard_exits.append(
+            (
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit()
+
+    monkeypatch.setattr(wrapper, "_read_fatal_origin", fail_read)
+    monkeypatch.setattr(wrapper, "_dispatch_fatal_secondaries", record_dispatch)
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    with pytest.raises(FatalHardExit):
+        wrapper._monitor_fatal_records()
+
+    assert dispatch_observations
+    assert all(observation == (True, True) for observation in dispatch_observations)
+    assert hard_exits == [(False, False, False)]
+    with wrapper._fatal_condition:
+        assert wrapper._fatal_publication_failure is primary
+    with gate._condition:
+        assert gate._fatal_transition.primary is primary
+        assert gate._fatal_publication_failure is primary
+
+
+def test_owner_and_non_owner_fail_stop_share_one_hard_exit(monkeypatch):
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("shared hard-exit primary")
+    later = RuntimeError("non-owner fail-stop reporter")
+    owner_ready = threading.Event()
+    race = threading.Barrier(2)
+    hard_exits = []
+
+    def hard_exit():
+        hard_exits.append(threading.current_thread().name)
+        raise FatalHardExit(threading.current_thread().name)
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    def owner_call():
+        token = gate.admit_runtime("shared_hard_exit_owner")
+        reserved, started = wrapper._pre_reserve_fatal_publication(primary)
+        assert (reserved, started) == (primary, True)
+        transition = gate.begin_fatal(primary, token)
+        outcome = wrapper._reserve_runtime_fatal_outcome(primary)
+        assert outcome.primary is primary
+        with wrapper._fatal_condition:
+            owner = wrapper._fatal_publication_owner_reservation
+            owner.election = SimpleNamespace(transition=transition)
+        owner_ready.set()
+        race.wait(_TASK_18_2_TIMEOUT_S)
+        return wrapper._terminalize_structured_fatal_failure(
+            primary,
+            transition_handler=runtime._communicator_fatal_hook,
+            transition=transition,
+        )
+
+    def non_owner_call():
+        assert owner_ready.wait(_TASK_18_2_TIMEOUT_S)
+        race.wait(_TASK_18_2_TIMEOUT_S)
+        return wrapper._fail_stop_fatal_path(later)
+
+    owner, owner_results, owner_errors, owner_done = _start_task_18_2_call(
+        owner_call,
+        name="task-18.3-hard-exit-owner",
+    )
+    non_owner, non_owner_results, non_owner_errors, non_owner_done = (
+        _start_task_18_2_call(
+            non_owner_call,
+            name="task-18.3-hard-exit-non-owner",
+        )
+    )
+    _join_task_18_2_call(owner, owner_done)
+    _join_task_18_2_call(non_owner, non_owner_done)
+
+    assert owner_results == []
+    assert non_owner_results == []
+    combined = owner_errors + non_owner_errors
+    assert sum(isinstance(error, FatalHardExit) for error in combined) == 1
+    assert sum(error is primary for error in combined) == 1
+    assert len(hard_exits) == 1
+    with wrapper._fatal_condition:
+        assert wrapper._fatal_publication_failure is primary
+    with gate._condition:
+        assert gate._fatal_publication_failure is primary
+
+
+def test_blocked_monitor_read_does_not_block_stop_or_publish_late_result(
+    monkeypatch,
+):
+    _, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    read_entered = threading.Event()
+    release_read = threading.Event()
+    stop_returned = threading.Event()
+    publisher_calls = []
+    stop_results = []
+    read_calls = []
+
+    def blocked_read():
+        read_calls.append(True)
+        if len(read_calls) > 1:
+            return None
+        read_entered.set()
+        assert release_read.wait(_TASK_18_2_TIMEOUT_S)
+        return 0
+
+    def unexpected_publisher(error, origin_rank):
+        publisher_calls.append((error, origin_rank))
+        return None
+
+    monkeypatch.setattr(wrapper, "_read_fatal_origin", blocked_read)
+    monkeypatch.setattr(
+        wrapper, "_start_fatal_monitor_publication", unexpected_publisher
+    )
+    monitor = threading.Thread(
+        target=wrapper._monitor_fatal_records,
+        name="task-18.3-blocked-monitor-read",
+        daemon=True,
+    )
+    wrapper._fatal_monitor_thread = monitor
+
+    def request_stop():
+        stop_results.append(wrapper._request_fatal_monitor_stop())
+        stop_returned.set()
+
+    stopper = threading.Thread(
+        target=request_stop,
+        name="task-18.3-monitor-stopper",
+        daemon=True,
+    )
+    try:
+        monitor.start()
+        assert read_entered.wait(_TASK_18_2_TIMEOUT_S)
+        stopper.start()
+        assert stop_returned.wait(0.25)
+        release_read.set()
+        stopper.join(_TASK_18_2_TIMEOUT_S)
+        monitor.join(_TASK_18_2_TIMEOUT_S)
+        assert not stopper.is_alive()
+        assert not monitor.is_alive()
+    finally:
+        release_read.set()
+        if stopper.ident is not None:
+            stopper.join(_TASK_18_2_TIMEOUT_S)
+        if monitor.ident is not None:
+            monitor.join(_TASK_18_2_TIMEOUT_S)
+
+    assert len(stop_results) == 1
+    outcome = wrapper._fatal_monitor_handoff.observe_outcome()
+    assert outcome.kind == "stopped_clean"
+    assert outcome.generation == stop_results[0]
+    assert publisher_calls == []
+
+
+@pytest.mark.parametrize("start_mode", ("before_real", "after_real"))
+def test_fatal_abort_thread_start_is_transactional(monkeypatch, start_mode):
+    class AbortStartFailure(BaseException):
+        pass
+
+    _, wrapper, _, _, raw_comm = _single_rank_task_18_2_runtime(monkeypatch)
+    start_failure = AbortStartFailure("abort {} start".format(start_mode))
+    abort_entered = threading.Event()
+    release_abort = threading.Event()
+    original_start = threading.Thread.start
+    original_abort = raw_comm.abort
+
+    def hold_abort():
+        abort_entered.set()
+        assert release_abort.wait(_TASK_18_2_TIMEOUT_S)
+        return original_abort()
+
+    def fail_start(thread):
+        if not thread.name.startswith("renormalizer-nccl-abort-rank-"):
+            return original_start(thread)
+        if start_mode == "before_real":
+            raise start_failure
+        original_start(thread)
+        assert abort_entered.wait(_TASK_18_2_TIMEOUT_S)
+        raise start_failure
+
+    monkeypatch.setattr(raw_comm, "abort", hold_abort)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    event = wrapper._abort_local_communicator()
+    worker = wrapper._fatal_abort_thread
+    try:
+        if start_mode == "before_real":
+            assert event.is_set()
+            assert worker is None
+            assert wrapper._fatal_abort_state == "start_failed"
+            assert wrapper._fatal_abort_error is start_failure
+        else:
+            assert worker is not None
+            assert wrapper._fatal_abort_state == "started"
+            release_abort.set()
+            assert event.wait(_TASK_18_2_TIMEOUT_S)
+            worker.join(_TASK_18_2_TIMEOUT_S)
+            assert not worker.is_alive()
+            assert wrapper._fatal_abort_state == "completed"
+            assert wrapper._fatal_abort_completed is True
+            assert start_failure in wrapper._fatal_secondary_errors
+    finally:
+        release_abort.set()
+        if worker is not None and worker.ident is not None:
+            worker.join(_TASK_18_2_TIMEOUT_S)
+
+
+@pytest.mark.parametrize("start_mode", ("before_real", "after_real"))
+def test_fatal_monitor_thread_start_is_transactional(monkeypatch, start_mode):
+    class MonitorStartFailure(BaseException):
+        pass
+
+    _, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    start_failure = MonitorStartFailure("monitor {} start".format(start_mode))
+    monitor_entered = threading.Event()
+    release_monitor = threading.Event()
+    original_start = threading.Thread.start
+
+    def hold_monitor():
+        monitor_entered.set()
+        assert release_monitor.wait(_TASK_18_2_TIMEOUT_S)
+
+    def fail_start(thread):
+        if not thread.name.startswith("renormalizer-fatal-monitor-rank-"):
+            return original_start(thread)
+        if start_mode == "before_real":
+            raise start_failure
+        original_start(thread)
+        assert monitor_entered.wait(_TASK_18_2_TIMEOUT_S)
+        raise start_failure
+
+    monkeypatch.setattr(wrapper, "_monitor_fatal_records", hold_monitor)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    worker = None
+    try:
+        if start_mode == "before_real":
+            with pytest.raises(MonitorStartFailure) as caught:
+                wrapper._start_fatal_monitor()
+            assert caught.value is start_failure
+            assert wrapper._fatal_monitor_thread is None
+            assert wrapper._fatal_monitor_state == "start_failed"
+        else:
+            worker = wrapper._start_fatal_monitor()
+            assert worker is wrapper._fatal_monitor_thread
+            assert wrapper._fatal_monitor_state == "started"
+            release_monitor.set()
+            worker.join(_TASK_18_2_TIMEOUT_S)
+            assert not worker.is_alive()
+            assert wrapper._fatal_monitor_state == "completed"
+            assert start_failure in wrapper._fatal_secondary_errors
+    finally:
+        release_monitor.set()
+        if worker is not None and worker.ident is not None:
+            worker.join(_TASK_18_2_TIMEOUT_S)

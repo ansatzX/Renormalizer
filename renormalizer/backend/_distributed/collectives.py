@@ -346,15 +346,22 @@ class CupyNcclCollective:
         self._fatal_abort_completed = False
         self._fatal_abort_event = threading.Event()
         self._fatal_abort_error = None
+        self._fatal_abort_thread = None
+        self._fatal_abort_state = "none"
         self._fatal_protocol_completed = False
         self._fatal_handler = None
         self._fatal_transition_handler = None
         self._fatal_monitor_stop = threading.Event()
         self._fatal_monitor_thread = None
+        self._fatal_monitor_state = "none"
         self._fatal_monitor_handoff = _FatalMonitorHandoff()
         self._fatal_monitor_outcome = None
         self._fatal_monitor_outcome_confirmed = False
         self._fatal_monitor_publisher_thread = None
+        self._fatal_monitor_publisher_state = "none"
+        self._fatal_monitor_publisher_diagnostics = ()
+        self._fatal_hard_exit_primary = None
+        self._fatal_hard_exit_claimant = None
         self._fatal_control_initialized = False
         self._active_broadcast_sequence = 1
 
@@ -546,13 +553,67 @@ class CupyNcclCollective:
             except BaseException as diagnostic_error:
                 self._retain_fatal_secondary_direct(diagnostic_error)
 
+    def _claim_fatal_hard_exit(self, error):
+        if not isinstance(error, BaseException):
+            raise TypeError("fatal hard-exit primary must be an exception")
+        with self._fatal_condition:
+            owner = self._fatal_publication_owner_reservation
+            canonical = self._fatal_publication_failure
+            if canonical is None and owner is not None:
+                canonical = owner.primary
+            if canonical is None:
+                canonical = self._fatal_pending_primary
+            if canonical is None:
+                canonical = self._fatal_error
+            if canonical is None:
+                canonical = error
+            if self._fatal_hard_exit_primary is None:
+                self._fatal_hard_exit_primary = canonical
+            else:
+                canonical = self._fatal_hard_exit_primary
+            winner = self._fatal_hard_exit_claimant is None
+            if winner:
+                self._fatal_hard_exit_claimant = threading.current_thread()
+            self._fatal_condition.notify_all()
+        if error is not canonical:
+            self._retain_fatal_secondary_direct(error)
+        return winner, canonical
+
+    def _hard_exit_once(self, error):
+        winner, primary = self._claim_fatal_hard_exit(error)
+        if not winner:
+            raise primary
+        self._fatal_hard_exit()
+        raise primary
+
     def _diagnose_and_hard_exit(self, error):
         """Retain one fail-stop diagnostic without delaying the hard exit."""
         try:
             self._dispatch_fatal_secondaries((error,))
         finally:
-            self._fatal_hard_exit()
-        raise error
+            self._hard_exit_once(error)
+
+    def _terminalize_pre_owner_fatal_failure(self, error, diagnostics=()):
+        """Elect one structured owner before marker-first fail-stop publication."""
+        transition_handler = self._fatal_transition_handler_callback()
+        begin = (
+            None
+            if transition_handler is None
+            else getattr(transition_handler, "begin", None)
+        )
+        if not callable(begin):
+            self._diagnose_and_hard_exit(error)
+        transition = begin(error)
+        primary = transition.primary
+        retained = tuple(diagnostics)
+        if error is not primary:
+            retained = (*retained, error)
+        return self._terminalize_structured_fatal_failure(
+            primary,
+            transition_handler=transition_handler,
+            transition=transition,
+            diagnostics=retained,
+        )
 
     def _fail_stop_fatal_path(self, error):
         """Use structured ownership when present, otherwise exit directly."""
@@ -566,7 +627,27 @@ class CupyNcclCollective:
         if owned:
             primary = self._terminalize_structured_fatal_failure(error)
             raise primary
-        self._diagnose_and_hard_exit(error)
+        if owner is None:
+            return self._terminalize_pre_owner_fatal_failure(error)
+
+        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        with self._fatal_condition:
+            while (
+                self._fatal_publication_failure is None
+                and self._fatal_error is None
+                and owner.owner_thread.is_alive()
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._fatal_condition.wait(remaining)
+            primary = owner.primary
+            marker_installed = self._fatal_publication_failure is primary
+        if marker_installed:
+            self._dispatch_fatal_secondaries((error,))
+        else:
+            self._retain_fatal_secondary_direct(error)
+        self._hard_exit_once(primary)
 
     def _install_fatal(self, error, origin_rank):
         if not isinstance(error, BaseException):
@@ -1464,12 +1545,10 @@ class CupyNcclCollective:
                 try:
                     self._dispatch_fatal_secondaries(terminalization_errors)
                 finally:
-                    self._fatal_hard_exit()
-                raise primary
+                    self._hard_exit_once(primary)
             self._dispatch_fatal_secondaries(terminalization_errors)
         elif must_exit:
-            self._fatal_hard_exit()
-            raise primary
+            self._hard_exit_once(primary)
         return primary
 
     def _fail_fatal_publication(self, reservation, error):
@@ -1567,35 +1646,69 @@ class CupyNcclCollective:
             self._fail_stop_fatal_path(error)
 
     def _abort_local_communicator(self):
-        with self._fatal_lock:
-            if not self._fatal_abort_started:
-                self._fatal_abort_started = True
+        def abort():
+            current = threading.current_thread()
+            with self._fatal_condition:
+                if (
+                    self._fatal_abort_thread is not current
+                    or self._fatal_abort_state != "starting"
+                ):
+                    return
+                self._fatal_abort_state = "started"
+                self._fatal_condition.notify_all()
+            try:
+                backend = self._backend
+                raw_comm = getattr(backend, "_comm", None)
+                abort_comm = getattr(raw_comm, "abort", None)
+                if not callable(abort_comm):
+                    raise RuntimeError(
+                        "CuPy NCCL raw communicator abort is unavailable"
+                    )
+                abort_comm()
+            except BaseException as error:
+                with self._fatal_condition:
+                    self._fatal_abort_error = error
+            else:
+                with self._fatal_condition:
+                    self._fatal_abort_completed = True
+            finally:
+                with self._fatal_condition:
+                    if self._fatal_abort_thread is current:
+                        self._fatal_abort_state = "completed"
+                    self._fatal_abort_event.set()
+                    self._fatal_condition.notify_all()
 
-                def abort():
-                    try:
-                        backend = self._backend
-                        raw_comm = getattr(backend, "_comm", None)
-                        abort_comm = getattr(raw_comm, "abort", None)
-                        if not callable(abort_comm):
-                            raise RuntimeError(
-                                "CuPy NCCL raw communicator abort is unavailable"
-                            )
-                        abort_comm()
-                    except BaseException as error:
-                        with self._fatal_lock:
-                            self._fatal_abort_error = error
-                    else:
-                        with self._fatal_lock:
-                            self._fatal_abort_completed = True
-                    finally:
-                        self._fatal_abort_event.set()
-
-                threading.Thread(
-                    target=abort,
-                    name="renormalizer-nccl-abort-rank-{}".format(self.rank),
-                    daemon=True,
-                ).start()
-            return self._fatal_abort_event
+        with self._fatal_condition:
+            if self._fatal_abort_started:
+                return self._fatal_abort_event
+            self._fatal_abort_started = True
+            thread = threading.Thread(
+                target=abort,
+                name="renormalizer-nccl-abort-rank-{}".format(self.rank),
+                daemon=True,
+            )
+            self._fatal_abort_thread = thread
+            self._fatal_abort_state = "starting"
+            self._fatal_condition.notify_all()
+        try:
+            thread.start()
+        except BaseException as start_error:
+            with self._fatal_condition:
+                claimed = (
+                    self._fatal_abort_thread is thread
+                    and self._fatal_abort_state in {"started", "completed"}
+                )
+                if not claimed and self._fatal_abort_thread is thread:
+                    self._fatal_abort_thread = None
+                    self._fatal_abort_state = "start_failed"
+                    self._fatal_abort_error = start_error
+                    self._fatal_abort_event.set()
+                self._fatal_condition.notify_all()
+            if claimed:
+                self._retain_fatal_secondary_direct(start_error)
+            elif thread.ident is not None:
+                thread.join(_FATAL_TIMEOUT_S)
+        return self._fatal_abort_event
 
     def _wait_for_local_communicator_abort(self):
         event = self._fatal_abort_event
@@ -1944,6 +2057,16 @@ class CupyNcclCollective:
 
     def _start_fatal_monitor_publication(self, error, origin_rank):
         def publish():
+            current = threading.current_thread()
+            diagnostics = ()
+            with self._fatal_condition:
+                if (
+                    self._fatal_monitor_publisher_thread is not current
+                    or self._fatal_monitor_publisher_state != "starting"
+                ):
+                    return
+                self._fatal_monitor_publisher_state = "started"
+                self._fatal_condition.notify_all()
             try:
                 self._enter_observed_fatal(
                     error,
@@ -1953,15 +2076,66 @@ class CupyNcclCollective:
                 )
             except BaseException as publication_error:
                 self._fail_stop_fatal_path(publication_error)
+            finally:
+                with self._fatal_condition:
+                    diagnostics = self._fatal_monitor_publisher_diagnostics
+                    self._fatal_monitor_publisher_diagnostics = ()
+                    if self._fatal_monitor_publisher_thread is current:
+                        self._fatal_monitor_publisher_state = "completed"
+                    self._fatal_condition.notify_all()
+                self._dispatch_fatal_secondaries(diagnostics)
 
         thread = threading.Thread(
             target=publish,
             name="renormalizer-fatal-publisher-rank-{}".format(self.rank),
             daemon=True,
         )
-        with self._fatal_lock:
+        with self._fatal_condition:
+            existing = self._fatal_monitor_publisher_thread
+            if existing is not None and self._fatal_monitor_publisher_state in {
+                "starting",
+                "started",
+                "completed",
+            }:
+                return existing
             self._fatal_monitor_publisher_thread = thread
-        thread.start()
+            self._fatal_monitor_publisher_state = "starting"
+            self._fatal_condition.notify_all()
+        try:
+            thread.start()
+        except BaseException as start_error:
+            dispatch_directly = False
+            with self._fatal_condition:
+                claimed = (
+                    self._fatal_monitor_publisher_thread is thread
+                    and self._fatal_monitor_publisher_state
+                    in {"started", "completed"}
+                )
+                if claimed:
+                    if self._fatal_monitor_publisher_state == "completed":
+                        dispatch_directly = True
+                    elif all(
+                        retained is not start_error
+                        for retained in self._fatal_monitor_publisher_diagnostics
+                    ):
+                        self._fatal_monitor_publisher_diagnostics = (
+                            *self._fatal_monitor_publisher_diagnostics,
+                            start_error,
+                        )
+                elif self._fatal_monitor_publisher_thread is thread:
+                    self._fatal_monitor_publisher_thread = None
+                    self._fatal_monitor_publisher_state = "start_failed"
+                self._fatal_condition.notify_all()
+            if claimed:
+                if dispatch_directly:
+                    self._dispatch_fatal_secondaries((start_error,))
+                return thread
+            if thread.ident is not None:
+                thread.join(_FATAL_TIMEOUT_S)
+            self._terminalize_pre_owner_fatal_failure(
+                error,
+                diagnostics=(start_error,),
+            )
         return thread
 
     def _monitor_fatal_records(self):
@@ -2032,18 +2206,59 @@ class CupyNcclCollective:
                 self._acknowledge_fatal_monitor_exit(outcome)
 
     def _start_fatal_monitor(self):
-        with self._fatal_lock:
-            thread = self._fatal_monitor_thread
-            if thread is not None and thread.is_alive():
-                return
+        def monitor():
+            current = threading.current_thread()
+            with self._fatal_condition:
+                if (
+                    self._fatal_monitor_thread is not current
+                    or self._fatal_monitor_state != "starting"
+                ):
+                    return
+                self._fatal_monitor_state = "started"
+                self._fatal_condition.notify_all()
+            try:
+                self._monitor_fatal_records()
+            finally:
+                with self._fatal_condition:
+                    if self._fatal_monitor_thread is current:
+                        self._fatal_monitor_state = "completed"
+                    self._fatal_condition.notify_all()
+
+        with self._fatal_condition:
+            existing = self._fatal_monitor_thread
+            if existing is not None and self._fatal_monitor_state in {
+                "starting",
+                "started",
+            }:
+                return existing
             self._fatal_monitor_stop.clear()
             thread = threading.Thread(
-                target=self._monitor_fatal_records,
+                target=monitor,
                 name="renormalizer-fatal-monitor-rank-{}".format(self.rank),
                 daemon=True,
             )
             self._fatal_monitor_thread = thread
+            self._fatal_monitor_state = "starting"
+            self._fatal_condition.notify_all()
+        try:
             thread.start()
+        except BaseException as start_error:
+            with self._fatal_condition:
+                claimed = (
+                    self._fatal_monitor_thread is thread
+                    and self._fatal_monitor_state in {"started", "completed"}
+                )
+                if not claimed and self._fatal_monitor_thread is thread:
+                    self._fatal_monitor_thread = None
+                    self._fatal_monitor_state = "start_failed"
+                self._fatal_condition.notify_all()
+            if claimed:
+                self._retain_fatal_secondary_direct(start_error)
+                return thread
+            if thread.ident is not None:
+                thread.join(_FATAL_TIMEOUT_S)
+            raise
+        return thread
 
     def _validate_array(self, array, *, op=None):
         if not isinstance(array, self._cupy.ndarray):

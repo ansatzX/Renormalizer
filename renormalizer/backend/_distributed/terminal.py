@@ -74,6 +74,8 @@ class _FatalMonitorHandoff:
         self._condition = threading.Condition()
         self._next_generation = 1
         self._requested_generation: int | None = None
+        self._next_read_generation = 1
+        self._inflight_read = None
         self._fatal_reservation: _MonitorOutcome | None = None
         self._outcome: _MonitorOutcome | None = None
         self._exited_outcome: _MonitorOutcome | None = None
@@ -102,7 +104,36 @@ class _FatalMonitorHandoff:
                 return self._outcome, None
             if self._fatal_reservation is not None:
                 return self._complete_fatal_reservation_locked(), None
-            return None, read()
+            if self._inflight_read is not None:
+                raise RuntimeError("fatal monitor store read is already in flight")
+            read_generation = self._next_read_generation
+            self._next_read_generation += 1
+            owner = threading.current_thread()
+            stop_generation = self._requested_generation
+            claim = (read_generation, owner)
+            self._inflight_read = claim
+
+        value = None
+        read_error = None
+        try:
+            value = read()
+        except BaseException as error:
+            read_error = error
+
+        with self._condition:
+            if self._inflight_read != claim:
+                raise RuntimeError("fatal monitor store read ownership changed")
+            self._inflight_read = None
+            self._condition.notify_all()
+            if self._outcome is not None:
+                return self._outcome, None
+            if self._fatal_reservation is not None:
+                return self._complete_fatal_reservation_locked(), None
+            if self._requested_generation != stop_generation:
+                return None, None
+        if read_error is not None:
+            raise read_error
+        return None, value
 
     def _complete_fatal_reservation_locked(self):
         reservation = self._fatal_reservation
@@ -820,6 +851,18 @@ class _TerminalLifecycleGate:
             self._condition.notify_all()
             return transition, True
 
+    def _recover_lease_close_entry(self, epoch):
+        """Return an installed lease-close election without adopting its owner."""
+        with self._condition:
+            lease = self._lease_state(epoch)
+            transition = lease.transition
+            if transition is None:
+                return None, False
+            return (
+                transition,
+                transition.owner_thread_id == threading.get_ident(),
+            )
+
     def wait_for_lease_admissions(self, transition, timeout_s) -> None:
         with self._condition:
             self._require_lease_transition(transition)
@@ -1056,6 +1099,48 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("resource admission thread state is inconsistent")
             return state.token
 
+    def _recover_current_thread_admission(
+        self,
+        *,
+        scope,
+        operation,
+        epoch=None,
+        transition=None,
+    ):
+        """Recover only an exact active token installed by the current thread."""
+        with self._condition:
+            self._require_operation(operation)
+            sequence = self._thread_tokens.get(threading.get_ident())
+            if sequence is None:
+                return None
+            state = self._tokens.get(sequence)
+            if state is None or state.status != "active":
+                raise RuntimeError("resource admission thread state is inconsistent")
+            token = state.token
+            expected_transition = None
+            if transition is not None:
+                if scope == "lease_close":
+                    self._require_lease_transition(transition)
+                elif scope == "runtime_close":
+                    self._require_runtime_transition(transition)
+                else:
+                    raise RuntimeError(
+                        "only close admissions may bind a transition"
+                    )
+                expected_transition = transition.sequence
+            if (
+                token.scope != scope
+                or token.epoch != epoch
+                or token.operation != operation
+                or token.transition_sequence != expected_transition
+                or token.parent_sequence is not None
+            ):
+                raise RuntimeError(
+                    "current resource admission does not match close recovery"
+                )
+            self._require_token_thread(state)
+            return token
+
     def _begin_fatal_locked(
         self,
         primary,
@@ -1247,6 +1332,19 @@ class _TerminalLifecycleGate:
             self._condition.notify_all()
             return self._runtime_close_transition, elected
 
+    def _recover_runtime_close_entry(self):
+        """Recover the current runtime/fatal transition without owner adoption."""
+        with self._condition:
+            if self._fatal_transition is not None:
+                return self._fatal_transition, False
+            transition = self._runtime_close_transition
+            if transition is None:
+                return None, False
+            return (
+                transition,
+                transition.owner_thread_id == threading.get_ident(),
+            )
+
     def _drain_runtime_close(self, transition):
         with self._condition:
             thread_id = threading.get_ident()
@@ -1323,6 +1421,38 @@ class _TerminalLifecycleGate:
                 operation,
                 transition_sequence=transition.sequence,
             )
+
+    def _require_runtime_close_admission(self, token, operation):
+        """Prove one exact elected-owner token for a destructive close step."""
+        with self._condition:
+            self._require_operation(operation)
+            if self._fatal_transition is not None and self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+                _TerminalPhase.RUNTIME_CLOSED,
+            ):
+                raise self._fatal_transition.primary
+            transition = self._runtime_close_transition
+            self._require_runtime_transition(transition)
+            if transition.owner_thread_id != threading.get_ident():
+                raise RuntimeError(
+                    "only the elected runtime close owner may run close steps"
+                )
+            if self._phase is not _TerminalPhase.RUNTIME_CLOSING:
+                raise RuntimeError("runtime is not closing")
+            state = self._token_state(token)
+            self._require_token_thread(state)
+            if (
+                token.scope != "runtime_close"
+                or token.epoch is not None
+                or token.operation != operation
+                or token.parent_sequence is not None
+                or token.transition_sequence != transition.sequence
+            ):
+                raise RuntimeError(
+                    "runtime close admission does not match the elected step"
+                )
+            return token
 
     def select_runtime_close_commit(self, transition):
         """Make healthy runtime close irrevocable before destructive close work."""

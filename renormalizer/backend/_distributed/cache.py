@@ -383,10 +383,13 @@ class DeviceTensorCache:
         allowlist,
         required_bytes,
         *,
+        _resource_recorder=None,
         _admission_token=None,
         _admission_validator=None,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
+        if _resource_recorder is not None and not callable(_resource_recorder):
+            raise TypeError("resource recorder must be callable")
         self._require_usable()
         if self._reservation is not None:
             raise RuntimeError("device tensor cache already has an active reservation")
@@ -436,6 +439,8 @@ class DeviceTensorCache:
             self, normalized, required_bytes, self._allocated_bytes
         )
         self._reservation = reservation
+        if _resource_recorder is not None:
+            _resource_recorder(resource=reservation)
         return reservation
 
     def _release_reservation(self, reservation):
