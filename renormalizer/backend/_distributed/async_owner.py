@@ -174,7 +174,9 @@ class _CountedAsyncAdmission:
             state = self._gate._token_state(claimed)
             self._gate._require_token_thread(state)
             if (
-                claimed.scope != parent.scope
+                claimed.sequence != self._token.sequence
+                or state.async_capability is not self._capability
+                or claimed.scope != parent.scope
                 or claimed.epoch != parent.epoch
                 or claimed.parent_sequence != parent.sequence
                 or claimed.transition_sequence != parent.transition_sequence
@@ -334,6 +336,7 @@ class AsyncResourceOwner:
         self._async_admission = _async_admission
         self._resource_recorder = _resource_recorder
         self._resource_releaser = _resource_releaser
+        self._async_lock = threading.RLock()
         self._async_worker = None
         self._async_done = threading.Event()
         self._async_requested = threading.Event()
@@ -434,47 +437,62 @@ class AsyncResourceOwner:
         self._watch_counted_completion()
 
     def _watch_counted_completion(self):
-        if (
-            self._async_admission is None
-            or self._async_worker is not None
-            or not self._completion_armed
-            or self._completion_event is None
-            or self.state != "enqueued"
-        ):
-            return
-        worker = threading.Thread(
-            target=self._run_counted_completion,
-            name="renormalizer-async-completion",
-            daemon=True,
-        )
-        self._async_worker = worker
-        worker.start()
-        if self._async_admission.close_owned:
-            self._start_counted_completion()
-
-    def _start_counted_completion(self):
-        self._watch_counted_completion()
-        if self._async_worker is not None:
-            if self._async_completion_deferred:
-                self._async_start_pending = True
+        worker = None
+        with self._async_lock:
+            if (
+                self._async_admission is None
+                or self._async_worker is not None
+                or not self._completion_armed
+                or self._completion_event is None
+                or self.state != "enqueued"
+            ):
                 return
-            self._async_requested.set()
-            self._async_admission.wake()
+            worker = threading.Thread(
+                target=self._run_counted_completion,
+                name="renormalizer-async-completion",
+                daemon=True,
+            )
+            self._async_worker = worker
+            if self._async_admission.close_owned:
+                self._async_start_pending = True
+        worker.start()
+        self._publish_counted_start_request()
 
-    def publish_counted_completion(self):
-        self._async_completion_deferred = False
-        self._watch_counted_completion()
-        if self._async_start_pending and self._async_worker is not None:
+    def _publish_counted_start_request(self):
+        admission = None
+        with self._async_lock:
+            if (
+                not self._async_start_pending
+                or self._async_worker is None
+                or self._async_completion_deferred
+                or self._async_requested.is_set()
+            ):
+                return
             self._async_start_pending = False
             self._async_requested.set()
-            self._async_admission.wake()
+            admission = self._async_admission
+        admission.wake()
+
+    def _start_counted_completion(self):
+        with self._async_lock:
+            if not self._async_requested.is_set():
+                self._async_start_pending = True
+        self._watch_counted_completion()
+        self._publish_counted_start_request()
+
+    def publish_counted_completion(self):
+        with self._async_lock:
+            self._async_completion_deferred = False
+        self._watch_counted_completion()
+        self._publish_counted_start_request()
 
     def install_counted_admission(self, admission):
-        if self._async_admission is not None or self._async_worker is not None:
-            raise RuntimeError("async owner already has a counted admission")
-        if self.state not in {"new", "enqueued"}:
-            raise RuntimeError("async owner can no longer install an admission")
-        self._async_admission = admission
+        with self._async_lock:
+            if self._async_admission is not None or self._async_worker is not None:
+                raise RuntimeError("async owner already has a counted admission")
+            if self.state not in {"new", "enqueued"}:
+                raise RuntimeError("async owner can no longer install an admission")
+            self._async_admission = admission
 
     def watch_counted_completion(self):
         self._watch_counted_completion()

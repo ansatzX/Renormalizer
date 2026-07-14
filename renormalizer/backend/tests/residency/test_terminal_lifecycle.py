@@ -17,6 +17,7 @@ from renormalizer.backend._distributed.cache import (
     DeviceTensorCache,
 )
 from renormalizer.backend._distributed.pinned import PinnedBufferPool
+from renormalizer.backend._distributed.residency import ResidencyPlanner
 from renormalizer.backend._distributed.providers import (
     ActiveWorkingSetProvider,
     WorkingSetLease,
@@ -900,6 +901,84 @@ def test_every_matrix_row_enforces_exact_lower_admission_before_sentinel(
             gate.release(retained_token)
 
 
+@pytest.mark.parametrize("async_kind", ("ordinary", "dirty_writeback"))
+def test_counted_async_admission_rejects_real_sibling_before_lower_mutation(
+    async_kind,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    epoch, construction = gate.begin_lease(
+        "{}_async_construction".format(async_kind)
+    )
+    gate.activate_lease(epoch, construction)
+    gate.release(construction)
+    transition = None
+    if async_kind == "ordinary":
+        parent = gate.admit_lease(epoch, "ordinary_async_parent")
+    else:
+        transition, elected = gate.begin_lease_close(epoch)
+        assert elected is True
+        parent = gate.admit_lease_close(
+            transition,
+            "dirty_writeback_async_parent",
+        )
+    expected = _CountedAsyncAdmission(gate, parent, object())
+    sibling = _CountedAsyncAdmission(gate, parent, object())
+    gate.release(parent)
+    mutations = []
+
+    class Reservation:
+        def __init__(self, label):
+            self.label = label
+
+        def commit(self, destination_ref, staging):
+            mutations.append(self.label)
+            return self.label
+
+    def invoke_lower(label, token, validator):
+        if async_kind == "ordinary":
+            return _CountedAsyncAdmission._run_admitted_callback(
+                lambda **kwargs: mutations.append(label),
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+        return TransferScheduler._commit_writeback(
+            Reservation(label),
+            None,
+            None,
+            None,
+            _admission_token=token,
+            _admission_validator=validator,
+        )
+
+    expected.run(
+        "{}_positive".format(async_kind),
+        lambda **admitted: invoke_lower(
+            "positive",
+            admitted["_admission_token"],
+            admitted["_admission_validator"],
+        ),
+    )
+    assert mutations == ["positive"]
+
+    with pytest.raises(RuntimeError, match="async admission"):
+        sibling.run(
+            "{}_sibling".format(async_kind),
+            lambda **admitted: invoke_lower(
+                "sibling",
+                admitted["_admission_token"],
+                expected._validate_claimed,
+            ),
+        )
+    assert mutations == ["positive"]
+    with gate._condition:
+        assert gate._tokens[expected.token.sequence].status == "released"
+        assert gate._tokens[sibling.token.sequence].status == "released"
+        assert not any(state.status == "active" for state in gate._tokens.values())
+    if transition is not None:
+        gate.commit_lease_close(transition, lambda: None)
+
+
 def test_barrier_collective_uses_one_runtime_admission(monkeypatch):
     runtime = _runtime()
     observed = []
@@ -1123,9 +1202,6 @@ def test_execution_config_setup_row_drains_before_terminal_transition(
 
         def _retain_transition_resources(self, lease):
             assert lease is None
-
-        def _finalize_terminal_runtime_close(self, error):
-            self._terminal_error = error
 
         def close(self, **kwargs):
             self.closed = True
@@ -2259,6 +2335,89 @@ def test_async_descendant_is_counted_from_enqueue_through_callback(monkeypatch):
     assert close_errors == []
 
 
+def test_lease_close_latches_start_before_completion_worker_publication(
+    monkeypatch,
+):
+    runtime, _, _, store, _, lease = _open_active_case(
+        store_id="terminal-counted-start-before-worker"
+    )
+    scheduler = lease.scheduler
+    event = _BlockingEvent()
+    factory_entered = threading.Event()
+    release_factory = threading.Event()
+    child = lease.acquire(_block_request(lease))
+
+    def event_factory():
+        factory_entered.set()
+        assert release_factory.wait(_TIMEOUT_S)
+        return event
+
+    scheduler._event_factory = event_factory
+    child_closer, _, child_errors, child_done = _start(child.close)
+    assert factory_entered.wait(_TIMEOUT_S)
+
+    owner = next(iter(scheduler._owners.values()))
+    gate = runtime._terminal_gate
+    with gate._condition:
+        descendants = [
+            state.token
+            for state in gate._tokens.values()
+            if state.status == "active" and state.token.parent_sequence is not None
+        ]
+    assert len(descendants) == 1
+    descendant = descendants[0]
+    assert owner._async_admission.token is descendant
+    assert owner._async_worker is None
+
+    start_requested = threading.Event()
+    start_calls = []
+    original_start = scheduler._start_counted_completions
+
+    def start_counted_completions():
+        start_calls.append(threading.get_ident())
+        result = original_start()
+        start_requested.set()
+        return result
+
+    monkeypatch.setattr(
+        scheduler,
+        "_start_counted_completions",
+        start_counted_completions,
+    )
+    closer, _, close_errors, close_done = _start(lease.close)
+    assert start_requested.wait(_TIMEOUT_S)
+    assert start_calls == [closer.ident]
+    assert not close_done.is_set()
+
+    try:
+        release_factory.set()
+        _join(child_closer, child_done)
+        assert child_errors == []
+        assert event.recorded.wait(_TIMEOUT_S)
+        assert event.waiting.wait(_TIMEOUT_S)
+        event.release.set()
+        _join(closer, close_done)
+
+        assert close_errors == []
+        assert start_calls == [closer.ident]
+        assert owner.state == "detached"
+        assert owner._async_done.is_set()
+        with gate._condition:
+            assert gate._tokens[descendant.sequence].status == "released"
+            assert not any(
+                state.status == "active" for state in gate._tokens.values()
+            )
+    finally:
+        release_factory.set()
+        owner.start_counted_completion()
+        event.release.set()
+        if child_closer.is_alive():
+            _join(child_closer, child_done)
+        if closer.is_alive():
+            _join(closer, close_done)
+        _close_case(runtime, store)
+
+
 def test_runtime_close_starts_preexisting_counted_descendant_before_gate_drain():
     runtime, _, _, store, _, lease = _open_active_case(
         store_id="terminal-runtime-close-counted-async"
@@ -2830,6 +2989,146 @@ def test_second_lease_close_and_runtime_close_join_elected_owner(monkeypatch):
     assert all(transition == begin_calls[0][0] for transition, _ in begin_calls)
 
 
+def test_runtime_close_scheduler_start_baseexception_finishes_owner_and_joiner(
+    monkeypatch,
+):
+    runtime, _, _, store, provider, lease = _open_active_case(
+        store_id="terminal-runtime-close-start-baseexception"
+    )
+    gate = runtime._terminal_gate
+    scheduler = lease.scheduler
+    pool = lease.pool
+    cache = provider.cache
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    joiner_waiting = threading.Event()
+
+    class SchedulerStartFailure(BaseException):
+        pass
+
+    primary = SchedulerStartFailure("runtime close scheduler start failed")
+
+    def fail_start():
+        start_entered.set()
+        assert release_start.wait(_TIMEOUT_S)
+        raise primary
+
+    original_commit = gate.commit_runtime_close
+
+    def commit(transition, finalizer):
+        if (
+            not isinstance(transition, _FatalTransition)
+            and transition.owner_thread_id != threading.get_ident()
+        ):
+            joiner_waiting.set()
+        return original_commit(transition, finalizer)
+
+    monkeypatch.setattr(scheduler, "_start_counted_completions", fail_start)
+    monkeypatch.setattr(gate, "commit_runtime_close", commit)
+    owner, _, owner_errors, owner_done = _start(runtime.close)
+    assert start_entered.wait(_TIMEOUT_S)
+    joiner, _, joiner_errors, joiner_done = _start(runtime.close)
+    assert joiner_waiting.wait(_TIMEOUT_S)
+
+    try:
+        release_start.set()
+        _join(owner, owner_done)
+        assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
+        _join(joiner, joiner_done)
+
+        assert owner_errors == [primary]
+        assert joiner_errors == [primary]
+        assert gate._fatal_transition.primary is primary
+        assert provider._active_lease is lease
+        assert lease._closed is False
+        assert lease.scheduler is scheduler
+        assert lease.pool is pool
+        assert provider.cache is cache
+        retained = runtime._terminal_quarantine._resources
+        assert all(
+            any(resource is expected for resource in retained)
+            for expected in (lease, scheduler, pool, cache)
+        )
+    finally:
+        release_start.set()
+        if gate.phase is _TerminalPhase.RUNTIME_CLOSING:
+            runtime._enter_communicator_fatal(primary)
+        for thread, done in ((owner, owner_done), (joiner, joiner_done)):
+            if thread.is_alive():
+                _join(thread, done)
+        _close_case(runtime, store)
+
+
+def test_lease_close_scheduler_start_baseexception_finishes_owner_and_joiner(
+    monkeypatch,
+):
+    runtime, _, _, store, provider, lease = _open_active_case(
+        store_id="terminal-lease-close-start-baseexception"
+    )
+    gate = runtime._terminal_gate
+    scheduler = lease.scheduler
+    pool = lease.pool
+    cache = provider.cache
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    joiner_waiting = threading.Event()
+
+    class SchedulerStartFailure(BaseException):
+        pass
+
+    primary = SchedulerStartFailure("lease close scheduler start failed")
+
+    def fail_start():
+        start_entered.set()
+        assert release_start.wait(_TIMEOUT_S)
+        raise primary
+
+    original_wait = gate.wait_for_lease_closed
+
+    def wait_for_close(*args, **kwargs):
+        joiner_waiting.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_start_counted_completions", fail_start)
+    monkeypatch.setattr(gate, "wait_for_lease_closed", wait_for_close)
+    owner, _, owner_errors, owner_done = _start(lease.close)
+    assert start_entered.wait(_TIMEOUT_S)
+    joiner, _, joiner_errors, joiner_done = _start(lease.close)
+    assert joiner_waiting.wait(_TIMEOUT_S)
+
+    try:
+        release_start.set()
+        _join(owner, owner_done)
+        with gate._condition:
+            assert gate._leases[lease._epoch].phase == "fatal_retained"
+        _join(joiner, joiner_done)
+
+        assert owner_errors == [primary]
+        assert joiner_errors == [primary]
+        assert gate.phase is _TerminalPhase.FATAL_PUBLISHED
+        assert gate._fatal_transition.primary is primary
+        assert provider._active_lease is lease
+        assert lease._closed is False
+        assert lease.scheduler is scheduler
+        assert lease.pool is pool
+        assert provider.cache is cache
+        retained = runtime._terminal_quarantine._resources
+        assert all(
+            any(resource is expected for resource in retained)
+            for expected in (lease, scheduler, pool, cache)
+        )
+    finally:
+        release_start.set()
+        with gate._condition:
+            phase = gate._leases[lease._epoch].phase
+        if phase == "closing":
+            runtime._enter_communicator_fatal(primary)
+        for thread, done in ((owner, owner_done), (joiner, joiner_done)):
+            if thread.is_alive():
+                _join(thread, done)
+        _close_case(runtime, store)
+
+
 def test_fatal_preempts_lease_close_owner_and_joiner_with_same_primary(monkeypatch):
     runtime, _, _, store, provider, lease = _open_active_case(
         store_id="terminal-fatal-close-joiner"
@@ -2888,6 +3187,160 @@ def test_fatal_preempts_lease_close_owner_and_joiner_with_same_primary(monkeypat
     assert provider._active_lease is lease
     assert lease._closed is False
     assert lease._provider is provider
+
+
+@pytest.mark.parametrize("lease_count", (1, 2))
+def test_fatal_between_healthy_leases_retains_exact_cache_snapshot(
+    monkeypatch,
+    lease_count,
+):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-between-leases-cache-{}".format(lease_count),
+    )
+    provider = _provider(runtime, request)
+    pointers = []
+
+    try:
+        for _ in range(lease_count):
+            receipt = runtime.preflight_residency(request, plan)
+            with provider.open_working_set(
+                request,
+                plan,
+                store,
+                receipt,
+            ) as lease:
+                with lease.acquire(_block_request(lease)) as child:
+                    pointers.append(
+                        child.bindings.arrays["input_0"].__array_interface__["data"][
+                            0
+                        ]
+                    )
+            assert provider._active_lease is None
+
+        if lease_count == 2:
+            assert pointers[1] == pointers[0]
+            assert provider.metrics.cache_hits == 1
+
+        cache = provider.cache
+        allocations = cache.allocation_records
+        assert sum(record.capacity_bytes for record in allocations) == 128
+        expected = {record.identity: record for record in allocations}
+        assert len(expected) == len(allocations)
+
+        queries = []
+
+        def allocation_records_query(_cache):
+            queries.append(True)
+            raise AssertionError("fatal retention queried the live cache")
+
+        monkeypatch.setattr(
+            DeviceTensorCache,
+            "allocation_records",
+            property(allocation_records_query),
+        )
+        primary = RuntimeError("fatal between healthy leases")
+        assert runtime._enter_communicator_fatal(primary) is primary
+        assert queries == []
+
+        retained = runtime._terminal_quarantine._cache_allocations
+        assert set(retained) == set(expected)
+        assert all(retained[identity] is record for identity, record in expected.items())
+        state = runtime.resource_state()
+        assert state["cache_bytes"] == 128
+        assert state["quarantined_bytes"] == 128
+
+        with pytest.raises(RuntimeError) as caught:
+            runtime.close()
+        assert caught.value is primary
+        assert queries == []
+        assert runtime._terminal_quarantine._cache_allocations == retained
+        assert runtime.resource_state() == state
+    finally:
+        _close_case(runtime, store)
+
+
+def test_second_lease_eviction_reconciles_persistent_cache_identity(monkeypatch):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-between-leases-cache-eviction",
+    )
+    provider = _provider(runtime, request)
+    allocated = []
+    original_allocator = provider._cache_allocator
+
+    def retain_allocations(spec):
+        allocation = original_allocator(spec)
+        allocated.append(allocation)
+        return allocation
+
+    monkeypatch.setattr(provider, "_cache_allocator", retain_allocations)
+    try:
+        first_receipt = runtime.preflight_residency(request, plan)
+        with provider.open_working_set(
+            request,
+            plan,
+            store,
+            first_receipt,
+        ) as first:
+            with first.acquire(_block_request(first)):
+                pass
+        first_records = {
+            record.identity: record for record in provider.cache.allocation_records
+        }
+        assert sum(record.capacity_bytes for record in first_records.values()) == 128
+
+        refs = dict(request.host_refs)
+        updated_input = store.update(
+            "input_0",
+            np.arange(16, dtype=np.float64).reshape(4, 4) + 100,
+            expected_version=refs["input_0"].version,
+        )
+        second_request = replace(
+            request,
+            host_refs={"input_0": updated_input, "output": refs["output"]},
+            store_snapshots=(store.snapshot(),) * runtime.world_size,
+        )
+        second_plan = ResidencyPlanner().plan(second_request)
+        second_receipt = runtime.preflight_residency(second_request, second_plan)
+        with provider.open_working_set(
+            second_request,
+            second_plan,
+            store,
+            second_receipt,
+        ) as second:
+            with second.acquire(_block_request(second)):
+                pass
+
+        current_records = {
+            record.identity: record for record in provider.cache.allocation_records
+        }
+        assert sum(record.capacity_bytes for record in current_records.values()) == 128
+        assert set(first_records).isdisjoint(current_records)
+        persistent = {
+            record.identity: record
+            for record in provider._persistent_resources.cache_allocations
+        }
+        assert persistent == current_records
+
+        def allocation_records_query(_cache):
+            raise AssertionError("fatal retention queried an evicted cache")
+
+        monkeypatch.setattr(
+            DeviceTensorCache,
+            "allocation_records",
+            property(allocation_records_query),
+        )
+        primary = RuntimeError("fatal after sequential cache eviction")
+        assert runtime._enter_communicator_fatal(primary) is primary
+        retained = runtime._terminal_quarantine._cache_allocations
+        assert retained == current_records
+        assert set(retained).isdisjoint(first_records)
+        assert runtime.resource_state()["cache_bytes"] == 128
+    finally:
+        _close_case(runtime, store)
 
 
 def test_pending_resource_state_waits_query_free_for_published_snapshot(monkeypatch):
@@ -3042,12 +3495,6 @@ def test_fatal_runtime_close_retains_intact_resources_without_callbacks(
 
     try:
         with monkeypatch.context() as sentinels:
-            guard(
-                sentinels,
-                provider,
-                "_finalize_terminal_runtime_close",
-                "provider_terminal_finalize",
-            )
             guard(sentinels, provider, "close", "provider_close")
             guard(sentinels, lease, "close", "lease_close")
             guard(sentinels, reservation, "close", "reservation_close")
@@ -3163,17 +3610,12 @@ def test_fatal_preempts_runtime_provider_close_admission(monkeypatch):
     provider_admit_entered = threading.Event()
     release_provider_admit = threading.Event()
     provider_close_calls = []
-    terminal_finalizers = []
-
     class Provider:
         _active_lease = None
         _terminal_error = None
 
         def _retain_transition_resources(self, lease):
             assert lease is None
-
-        def _finalize_terminal_runtime_close(self, error):
-            terminal_finalizers.append(error)
 
         def close(self, **kwargs):
             provider_close_calls.append(True)
@@ -3211,7 +3653,6 @@ def test_fatal_preempts_runtime_provider_close_admission(monkeypatch):
     assert fatal_results == [primary]
     assert fatal_errors == []
     assert provider_close_calls == []
-    assert terminal_finalizers == []
     assert runtime._closed is True
     assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
 

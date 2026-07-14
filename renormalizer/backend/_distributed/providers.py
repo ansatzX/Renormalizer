@@ -415,7 +415,10 @@ class _LeaseResourceRecord:
 
     @property
     def allocations(self):
-        return tuple(self._allocations.values())
+        records = dict(self._allocations)
+        self._merge(records, self._cache_allocations.values())
+        self._merge(records, self._pinned_allocations.values())
+        return tuple(records.values())
 
     @property
     def cache_allocations(self):
@@ -452,21 +455,27 @@ class _LeaseResourceRecord:
         records=(),
         events=(),
         streams=(),
+        _replace_kind=False,
     ):
         if resource is not None and all(
             retained is not resource for retained in self._resources
         ):
             self._resources.append(resource)
         records = tuple(records)
-        if resource is not None:
+        if resource is not None and not _replace_kind:
             records = (*records, *getattr(resource, "allocation_records", ()))
             events = (*tuple(events), *getattr(resource, "retained_events", ()))
             streams = (*tuple(streams), *getattr(resource, "retained_streams", ()))
-        self._merge(self._allocations, records)
         if kind == "cache":
+            if _replace_kind:
+                self._cache_allocations.clear()
             self._merge(self._cache_allocations, records)
         elif kind == "pinned":
+            if _replace_kind:
+                self._pinned_allocations.clear()
             self._merge(self._pinned_allocations, records)
+        else:
+            self._merge(self._allocations, records)
         for event in events:
             if event is not None:
                 self._events[id(event)] = event
@@ -1651,6 +1660,22 @@ class WorkingSetLease:
         provider._retain_terminal_lease(self, primary)
         raise primary
 
+    def _fail_stop_elected_close(self, error):
+        provider = self._provider
+        runtime = provider.runtime
+        gate = runtime._terminal_gate
+        with gate._condition:
+            fatal_transition = gate._fatal_transition
+            lease_phase = gate._leases[self._epoch].phase
+        if fatal_transition is None and lease_phase == "closed":
+            raise error
+        primary = (
+            error if fatal_transition is None else fatal_transition.primary
+        )
+        primary = runtime._enter_communicator_fatal(primary)
+        provider._retain_terminal_lease(self, primary)
+        raise primary
+
     def _commit_close_references(self, provider, error):
         provider._lease_closed(self)
         provider.last_compute_event = None
@@ -1730,15 +1755,18 @@ class WorkingSetLease:
                 raise result
             return result
 
-        self.scheduler._start_counted_completions()
-        error = self._poisoned_error
-        old_ref = None if self._dirty is None else self._dirty[0]
-        planned_cache_bytes = self._cache_reservation.required_bytes
-        pool = self.pool
-        scheduler = self.scheduler
-        status_workspace = self._status_workspace
-        cache_reservation = self._cache_reservation
-        store_reservation = self._store_reservation
+        try:
+            scheduler = self.scheduler
+            scheduler._start_counted_completions()
+            error = self._poisoned_error
+            old_ref = None if self._dirty is None else self._dirty[0]
+            planned_cache_bytes = self._cache_reservation.required_bytes
+            pool = self.pool
+            status_workspace = self._status_workspace
+            cache_reservation = self._cache_reservation
+            store_reservation = self._store_reservation
+        except BaseException as caught:
+            self._fail_stop_elected_close(caught)
 
         def remember(caught):
             nonlocal error
@@ -1882,6 +1910,14 @@ class WorkingSetLease:
             ),
         )
         run_step(
+            "cache_lifetime_reconcile",
+            lambda token, validator: provider._reconcile_lease_cache(
+                self._resource_record,
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
+        run_step(
             "store_reservation_close",
             lambda token, validator: self._close_store_reservation(
                 store_reservation,
@@ -1896,9 +1932,9 @@ class WorkingSetLease:
                 transition,
                 lambda: self._commit_close_references(provider, error),
             )
-        except BaseException:
+        except BaseException as caught:
             self._raise_terminal_close_preemption()
-            raise
+            self._fail_stop_elected_close(caught)
         if isinstance(result, BaseException):
             raise result
         return result
@@ -1951,6 +1987,7 @@ class ActiveWorkingSetProvider:
         self._event_factory = event_factory
         self._cache = None
         self._provisional_resources = None
+        self._persistent_resources = _LeaseResourceRecord(None)
         self._active_lease = None
         self._terminal_resources = ()
         self._terminal_error = None
@@ -2184,6 +2221,35 @@ class ActiveWorkingSetProvider:
             pointer = cupy.cuda.PinnedMemoryPointer(memory, 0)
         return np.frombuffer(pointer, dtype=np.uint8, count=nbytes)
 
+    def _lease_cache_recorder(self, record):
+        def capture(**captured):
+            record.capture(**captured)
+            self._persistent_resources.capture(**captured)
+
+        return capture
+
+    def _reconcile_lease_cache(
+        self,
+        record,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
+        cache = self._cache
+        if cache is None:
+            return
+        cache._set_resource_recorder(self._persistent_resources.capture)
+        record.capture(
+            resource=cache,
+            kind="cache",
+            records=cache.allocation_records,
+            _replace_kind=True,
+        )
+
     def _entries(self, request, plan):
         rank = self.runtime.rank
         device = str(self.runtime.backend.current_device())
@@ -2303,6 +2369,14 @@ class ActiveWorkingSetProvider:
             except BaseException as caught:
                 if error is None:
                     error = caught
+        if self._cache is not None:
+            try:
+                self._cache._set_resource_recorder(
+                    self._persistent_resources.capture
+                )
+            except BaseException as caught:
+                if error is None:
+                    error = caught
         return error
 
     def _raise_construction_transition_preemption(self):
@@ -2394,6 +2468,7 @@ class ActiveWorkingSetProvider:
         profile_enabled = False
         timer = None
         peak_sampler = None
+        cache_recorder = self._lease_cache_recorder(record)
         try:
             self.runtime.consume_residency_receipt(
                 receipt,
@@ -2426,13 +2501,13 @@ class ActiveWorkingSetProvider:
                 self._cache = self._cache_factory(
                     self.device_budget_resolution.resolved_bytes,
                     allocator=self._cache_allocator,
-                    _resource_recorder=record.capture,
+                    _resource_recorder=cache_recorder,
                     _admission_token=construction_token,
                     _admission_validator=construction_validator,
                 )
             set_recorder = getattr(self._cache, "_set_resource_recorder", None)
             if callable(set_recorder):
-                set_recorder(record.capture)
+                set_recorder(cache_recorder)
             record.capture(self._cache, kind="cache")
             cache_reservation = self._cache.reserve(
                 allowlist,
@@ -2597,6 +2672,7 @@ class ActiveWorkingSetProvider:
         )
 
     def _retain_transition_resources(self, lease):
+        self._retain_terminal_snapshot(self._persistent_resources)
         record = (
             self._provisional_resources
             if lease is None
@@ -2615,19 +2691,11 @@ class ActiveWorkingSetProvider:
 
     def _retain_terminal_lease(self, lease, error):
         record = getattr(lease, "_resource_record", None)
+        self._retain_terminal_snapshot(self._persistent_resources)
         self._retain_terminal_record(record, error)
         runtime = self.runtime
         if runtime is not None and runtime._terminal_error is None:
             runtime._terminal_error = error
-
-    def _finalize_terminal_runtime_close(self, error):
-        lease = self._active_lease
-        if not isinstance(lease, WorkingSetLease):
-            return
-        self._retain_terminal_lease(lease, error)
-        reservation = lease._store_reservation
-        if reservation is not None:
-            reservation.close()
 
     def _retain_terminal_resources(self, *resources):
         retained = list(self._terminal_resources)

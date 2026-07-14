@@ -2487,6 +2487,23 @@ class CupyDistributedRuntime:
             )
         return result
 
+    def _fail_stop_elected_runtime_close(self, transition, error):
+        gate = self._terminal_gate
+        with gate._condition:
+            fatal_transition = gate._fatal_transition
+            phase = gate._phase
+        if fatal_transition is None and phase is _TerminalPhase.RUNTIME_CLOSED:
+            raise error
+        primary = (
+            error if fatal_transition is None else fatal_transition.primary
+        )
+        primary = self._enter_communicator_fatal(primary)
+        fatal_transition = gate._fatal_transition
+        if fatal_transition is None or fatal_transition.primary is not primary:
+            raise RuntimeError("runtime close fatal transition changed") from primary
+        self._commit_fatal_runtime_close(fatal_transition, primary)
+        raise primary
+
     def _runtime_close_snapshot(self):
         with self._terminal_gate._condition:
             with self._terminal_state_lock:
@@ -2530,12 +2547,16 @@ class CupyDistributedRuntime:
             self._commit_fatal_runtime_close(transition, error)
             raise error
 
-        frozen_scheduler = None
         if elected:
-            _, _, frozen_scheduler = self._runtime_close_snapshot()
-            if frozen_scheduler is not None:
-                frozen_scheduler._start_counted_completions()
-        transition = self._terminal_gate._drain_runtime_close(transition)
+            try:
+                _, _, frozen_scheduler = self._runtime_close_snapshot()
+                if frozen_scheduler is not None:
+                    frozen_scheduler._start_counted_completions()
+                transition = self._terminal_gate._drain_runtime_close(transition)
+            except BaseException as caught:
+                self._fail_stop_elected_runtime_close(transition, caught)
+        else:
+            transition = self._terminal_gate._drain_runtime_close(transition)
         if isinstance(transition, _FatalTransition):
             error = transition.primary
             self._commit_fatal_runtime_close(transition, error)
@@ -2548,7 +2569,10 @@ class CupyDistributedRuntime:
                 raise result
             return result
 
-        provider, lease, _ = self._runtime_close_snapshot()
+        try:
+            provider, lease, _ = self._runtime_close_snapshot()
+        except BaseException as caught:
+            self._fail_stop_elected_runtime_close(transition, caught)
         collective = self.collective
         if lease is not None:
             try:
@@ -2637,9 +2661,12 @@ class CupyDistributedRuntime:
             raise error
         if self._terminal_error is not None:
             error = self._terminal_error
-        result = self._terminal_gate.commit_runtime_close(
-            transition, lambda: self._clear_runtime_references(error)
-        )
+        try:
+            result = self._terminal_gate.commit_runtime_close(
+                transition, lambda: self._clear_runtime_references(error)
+            )
+        except BaseException as caught:
+            self._fail_stop_elected_runtime_close(transition, caught)
         if isinstance(result, BaseException):
             fatal_transition = self._terminal_gate._fatal_transition
             if (

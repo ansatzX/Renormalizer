@@ -315,11 +315,15 @@ class DeviceTensorCache:
         if recorder is not None and not callable(recorder):
             raise TypeError("resource recorder must be callable")
         self._resource_recorder = recorder
-        if recorder is not None:
-            recorder(
+        self._record_allocation_snapshot()
+
+    def _record_allocation_snapshot(self):
+        if self._resource_recorder is not None:
+            self._resource_recorder(
                 resource=self,
                 kind="cache",
                 records=self.allocation_records,
+                _replace_kind=True,
             )
 
     @property
@@ -481,6 +485,7 @@ class DeviceTensorCache:
                 retained[0] = record
             retained[1] += 1
         self._allocated_bytes += additional
+        self._record_allocation_snapshot()
 
     def _release_allocations(self, entry):
         for record in entry.allocation_records:
@@ -492,6 +497,7 @@ class DeviceTensorCache:
                 self._allocated_bytes -= retained[0].capacity_bytes
                 del self._allocation_refcounts[record.identity]
         entry.allocation_records = ()
+        self._record_allocation_snapshot()
 
     def acquire(
         self,
@@ -535,8 +541,6 @@ class DeviceTensorCache:
                 raise ValueError("contiguous cache allocation has a reverse axis")
             records = allocation_records((allocation.array, allocation.transfer_array))
             self._register_allocations(records)
-            if self._resource_recorder is not None:
-                self._resource_recorder(kind="cache", records=records)
             entry = _CacheEntry(spec, allocation, records)
             self._entries[identity] = entry
             self._peak_allocated_bytes = max(
