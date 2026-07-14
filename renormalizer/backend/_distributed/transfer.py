@@ -9,6 +9,7 @@ import numpy as np
 
 from renormalizer.backend._distributed.async_owner import (
     AsyncResourceOwner,
+    _require_resource_admission,
     event_complete as _event_complete,
     require_async_owner,
     wait_event as _wait_event,
@@ -228,7 +229,10 @@ class TransferScheduler:
         _async_admission_factory=None,
         _resource_recorder=None,
         _resource_releaser=None,
+        _admission_token=None,
+        _admission_validator=None,
     ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if not callable(getattr(store, "copy_into", None)):
             raise TypeError("transfer scheduler requires HostTensorStore.copy_into")
         if getattr(backend, "name", None) not in {"numpy", "cupy"}:
@@ -378,6 +382,7 @@ class TransferScheduler:
         resources=(),
         streams=(),
         callback=None,
+        callback_requires_admission=False,
         nbytes=0,
         timer=None,
         started_at=None,
@@ -450,6 +455,7 @@ class TransferScheduler:
                 _resource_recorder=self._resource_recorder,
                 _resource_releaser=self._resource_releaser,
                 _defer_async_completion=defer_counted_completion,
+                _callback_requires_admission=callback_requires_admission,
             )
         except BaseException:
             if async_admission is not None:
@@ -573,7 +579,17 @@ class TransferScheduler:
             )
         return source_ref, None, None
 
-    def stage_h2d(self, source_ref, destination, slot, *, cache_lease=None):
+    def stage_h2d(
+        self,
+        source_ref,
+        destination,
+        slot,
+        *,
+        cache_lease=None,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         ref, local_slice, reverse_axis = self._source(source_ref)
         staging = self._host_view(
@@ -642,7 +658,14 @@ class TransferScheduler:
                     self._tickets.remove(ticket)
         return ticket
 
-    def wait_for_h2d(self, event):
+    def wait_for_h2d(
+        self,
+        event,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         owner = self._event_owners.get(id(event))
         if owner is not None:
@@ -690,7 +713,17 @@ class TransferScheduler:
                 captured_arrays.append(array)
         return tuple(captured_arrays)
 
-    def begin_compute(self, *, cache_leases=(), bindings=None, arrays=(), resources=()):
+    def begin_compute(
+        self,
+        *,
+        cache_leases=(),
+        bindings=None,
+        arrays=(),
+        resources=(),
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         cache_leases = tuple(cache_leases)
         resources = tuple(resources)
@@ -724,7 +757,10 @@ class TransferScheduler:
         cache_leases=(),
         bindings=None,
         arrays=(),
+        _admission_token=None,
+        _admission_validator=None,
     ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         if handle is None:
             handle = self.begin_compute(
@@ -765,7 +801,16 @@ class TransferScheduler:
         self.last_compute_event = handle
         return handle
 
-    def writeback_d2h(self, source, destination_ref, slot):
+    def writeback_d2h(
+        self,
+        source,
+        destination_ref,
+        slot,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         staging = self._host_view(slot, source.shape, source.dtype)
         if tuple(source.shape) != tuple(destination_ref.shape):
@@ -775,13 +820,14 @@ class TransferScheduler:
         reservation = self.reservation
         store = self.store
 
-        def commit():
-            if reservation is not None:
-                return reservation.commit(destination_ref, staging)
-            return store.update(
-                destination_ref.key,
+        def commit(*, _admission_token=None, _admission_validator=None):
+            return self._commit_writeback(
+                reservation,
+                store,
+                destination_ref,
                 staging,
-                expected_version=destination_ref.version,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
             )
 
         timing = {}
@@ -796,6 +842,7 @@ class TransferScheduler:
             resources=(destination_ref, slot),
             streams=(self._stream,),
             callback=commit,
+            callback_requires_admission=True,
             nbytes=int(source.nbytes),
             timer=self._timer if self._profile_enabled and self._cupy is None else None,
             started_at=start,
@@ -845,7 +892,35 @@ class TransferScheduler:
                     self._tickets.remove(ticket)
         return ticket
 
-    def reap_completed(self):
+    @staticmethod
+    def _commit_writeback(
+        reservation,
+        store,
+        destination_ref,
+        staging,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
+        if reservation is not None:
+            return reservation.commit(destination_ref, staging)
+        return store.update(
+            destination_ref.key,
+            staging,
+            expected_version=destination_ref.version,
+        )
+
+    def reap_completed(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         errors = []
         for owner in tuple(self._owners.values()):
@@ -865,7 +940,13 @@ class TransferScheduler:
             self.d2h_bytes += owner.nbytes
             self.d2h_s += owner.elapsed_s
 
-    def complete_all(self):
+    def complete_all(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         errors = []
         for owner in tuple(self._owners.values()):
@@ -884,7 +965,13 @@ class TransferScheduler:
         for owner in tuple(self._owners.values()):
             owner.start_counted_completion()
 
-    def close(self):
+    def close(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if self._closed:
             if self._poisoned_error is not None:
                 raise self._poisoned_error

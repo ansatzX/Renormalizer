@@ -487,6 +487,8 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("a lease epoch is already live")
             if self._has_active_scope("runtime_setup"):
                 raise RuntimeError("runtime setup is active")
+            if self._has_active_scope("runtime"):
+                raise RuntimeError("runtime admission is active")
             self._require_no_nested_token(threading.get_ident())
             epoch = self._next_epoch
             self._next_epoch += 1
@@ -887,7 +889,7 @@ class _TerminalLifecycleGate:
                 raise self._fatal_publication_failure
             return self._fatal_snapshot
 
-    def begin_runtime_close(
+    def _freeze_runtime_close(
         self, discovering_token: _ResourceAdmission | None
     ):
         with self._condition:
@@ -904,15 +906,16 @@ class _TerminalLifecycleGate:
 
             if self._phase is _TerminalPhase.RUNTIME_CLOSED:
                 if self._fatal_transition is not None:
-                    return self._fatal_transition
-                return self._runtime_close_transition
+                    return self._fatal_transition, False
+                return self._runtime_close_transition, False
             if self._phase in (
                 _TerminalPhase.FATAL_PENDING,
                 _TerminalPhase.FATAL_PUBLISHED,
             ):
                 if discovering_state is not None:
                     self._convert_token_state(discovering_state)
-                return self._fatal_transition
+                return self._fatal_transition, False
+            elected = False
             if self._phase is _TerminalPhase.HEALTHY:
                 self._runtime_close_transition = _RuntimeCloseTransition(
                     gate_id=self._gate_id,
@@ -920,9 +923,29 @@ class _TerminalLifecycleGate:
                     sequence=self._sequence(),
                 )
                 self._phase = _TerminalPhase.RUNTIME_CLOSING
+                elected = True
             if discovering_state is not None:
                 self._convert_token_state(discovering_state)
             self._condition.notify_all()
+            return self._runtime_close_transition, elected
+
+    def _drain_runtime_close(self, transition):
+        with self._condition:
+            thread_id = threading.get_ident()
+            self._require_no_held_admission("drain runtime close")
+            if isinstance(transition, _FatalTransition):
+                self._require_fatal_transition(transition)
+                return transition
+            if self._phase in (
+                _TerminalPhase.FATAL_PENDING,
+                _TerminalPhase.FATAL_PUBLISHED,
+            ):
+                return self._fatal_transition
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                if self._fatal_transition is not None:
+                    return self._fatal_transition
+                return self._runtime_close_transition
+            self._require_runtime_transition(transition)
 
             while self._has_active_tokens():
                 self._condition.wait()
@@ -945,6 +968,12 @@ class _TerminalLifecycleGate:
             if self._fatal_transition is not None:
                 return self._fatal_transition
             return self._runtime_close_transition
+
+    def begin_runtime_close(
+        self, discovering_token: _ResourceAdmission | None
+    ):
+        transition, _ = self._freeze_runtime_close(discovering_token)
+        return self._drain_runtime_close(transition)
 
     def admit_runtime_close(self, transition, operation: str):
         with self._condition:

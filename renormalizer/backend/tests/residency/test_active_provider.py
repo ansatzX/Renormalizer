@@ -1097,9 +1097,14 @@ def _close_two_rank_cases(states):
     assert close_errors == [None, None]
     for group in groups:
         if all(endpoint._fatal_control_initialized for endpoint in group.endpoints):
-            assert group.monitor_stopped == [True, True]
-            assert group.close_consumed == [True, True]
-            assert group.store_stop_rank == 0
+            if group.fatal is None:
+                assert group.monitor_stopped == [True, True]
+                assert group.close_consumed == [True, True]
+                assert group.store_stop_rank == 0
+            else:
+                assert group.monitor_stopped == [False, False]
+                assert group.close_consumed == [False, False]
+                assert group.store_stop_rank is None
     for state in states:
         runtime = state["runtime"]
         store = state["store"]
@@ -1970,7 +1975,10 @@ def test_profiled_cupy_terminal_context_exit_avoids_peak_query(monkeypatch):
             except BaseException:
                 pass
         if not store.closed:
-            store.close()
+            if runtime._terminal_error is None:
+                store.close()
+            else:
+                assert store._reservations
 
 
 def test_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e():
@@ -2780,7 +2788,7 @@ def test_prefetch_inserts_compute_wait_only_when_loading_entry_is_consumed(
     monkeypatch.setattr(
         working_set.scheduler,
         "wait_for_h2d",
-        waits.append,
+        lambda event, **_kwargs: waits.append(event),
         raising=False,
     )
 
@@ -3350,15 +3358,16 @@ def test_compute_post_enqueue_drain_failure_reaches_runtime_quarantine():
 
     with pytest.raises(RuntimeError, match="post-enqueue event failure"):
         runtime.close()
-    assert collective.close_calls == 1
+    assert collective.close_calls == 0
     runtime.close()
-    assert collective.close_calls == 1
+    assert collective.close_calls == 0
     for key, value in expected_state.items():
         assert provider.resource_state()[key] == value
         assert runtime.resource_state()[key] == value
     gc.collect()
     assert retained_ref() is not None
-    store.close()
+    assert store.closed is False
+    assert store._reservations
 
 
 def test_repeated_completed_events_do_not_grow_owner_mapping():
@@ -3552,7 +3561,7 @@ def test_staging_failure_after_cache_allocation_evicts_and_poisons(monkeypatch):
     provider = _provider(runtime, request)
     working_set = provider.open_working_set(request, plan, store, receipt).__enter__()
 
-    def fail_staging():
+    def fail_staging(**_kwargs):
         raise RuntimeError("injected staging availability failure")
 
     monkeypatch.setattr(working_set, "_wait_for_staging", fail_staging)
@@ -3926,7 +3935,10 @@ def test_terminal_dirty_allocation_is_accounted_after_explicit_owner_reap(
             except BaseException:
                 pass
         if not store.closed:
-            store.close()
+            if runtime._terminal_error is None:
+                store.close()
+            else:
+                assert store._reservations
 
 
 def test_working_set_close_releases_dirty_array_ticket_and_staging_storage():
@@ -4011,9 +4023,9 @@ def test_writeback_ticket_is_consumed_when_checkout_release_raises(monkeypatch):
         release(slot)
         raise RuntimeError("injected checkout release failure")
 
-    def record_invalidation(ref):
+    def record_invalidation(ref, **kwargs):
         invalidations.append(ref)
-        return invalidate(ref)
+        return invalidate(ref, **kwargs)
 
     monkeypatch.setattr(working_set._store_reservation, "commit", record_commit)
     monkeypatch.setattr(working_set.pool, "_release", fail_after_release)
@@ -4056,7 +4068,7 @@ def test_successful_dirty_cas_is_accounted_once_before_invalidation_failure(
         commits.append(ref)
         return commit(ref, value)
 
-    def fail_invalidation(ref):
+    def fail_invalidation(ref, **_kwargs):
         invalidations.append(ref)
         raise RuntimeError("injected cache invalidation failure")
 
@@ -4183,7 +4195,7 @@ def test_runtime_close_preserves_provider_error_but_still_closes_collective():
         def __init__(self):
             self.close_calls = 0
 
-        def close(self):
+        def close(self, **_kwargs):
             self.close_calls += 1
             if self.close_calls == 1:
                 raise RuntimeError("injected provider close failure")
@@ -4431,7 +4443,8 @@ def test_terminal_cupy_execution_entries_reject_before_any_backend_access():
     with pytest.raises(RuntimeError) as caught:
         runtime.close()
     assert caught.value is primary_error
-    store.close()
+    assert store.closed is False
+    assert store._reservations
 
 
 def test_terminal_close_merges_cache_and_owner_physical_backings_once():
@@ -4616,7 +4629,8 @@ def test_terminal_close_accounts_completed_h2d_pool_cache_and_broadcast_streams(
     assert {
         record.identity for record in runtime._terminal_quarantine.allocations
     } == set(expected_records)
-    store.close()
+    assert store.closed is False
+    assert store._reservations
 
 
 def test_runtime_close_keeps_first_terminal_error_over_provider_cleanup_error():

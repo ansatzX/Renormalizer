@@ -6,6 +6,7 @@
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -15,7 +16,10 @@ import weakref
 
 import numpy as np
 
-from renormalizer.backend._distributed.async_owner import RuntimeTerminalQuarantine
+from renormalizer.backend._distributed.async_owner import (
+    RuntimeTerminalQuarantine,
+    _require_resource_admission,
+)
 from renormalizer.backend._distributed.context import (
     DistributedContext,
     DistributedRendezvous,
@@ -42,6 +46,64 @@ from renormalizer.backend._distributed.terminal import (
 )
 from renormalizer.backend.config import BackendConfig, DistributedExecutionConfig
 from renormalizer.backend.factory import create_backend
+
+
+_ADMISSION_UNSET = object()
+
+
+def _call_admitted_private(
+    callback,
+    *args,
+    _admission_token,
+    _admission_validator,
+    **kwargs,
+):
+    _require_resource_admission(
+        _admission_token,
+        _admission_validator,
+    )
+    parameters = inspect.signature(callback).parameters.values()
+    accepts_keywords = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    names = {parameter.name for parameter in parameters}
+    if accepts_keywords or "_admission_token" in names:
+        kwargs["_admission_token"] = _admission_token
+    if accepts_keywords or "_admission_validator" in names:
+        kwargs["_admission_validator"] = _admission_validator
+    return callback(*args, **kwargs)
+
+
+class _ExactAdmissionValidator:
+    """Revalidate one canonical admission immediately before resource access."""
+
+    def __init__(
+        self,
+        runtime,
+        token,
+        *,
+        scope,
+        epoch,
+        parent_sequence,
+        transition_sequence,
+    ):
+        self._runtime = runtime
+        self._sequence = token.sequence
+        self._scope = scope
+        self._epoch = epoch
+        self._parent_sequence = parent_sequence
+        self._transition_sequence = transition_sequence
+
+    def __call__(self, token):
+        return self._runtime._require_admission(
+            token,
+            scope=self._scope,
+            epoch=self._epoch,
+            sequence=self._sequence,
+            parent_sequence=self._parent_sequence,
+            transition_sequence=self._transition_sequence,
+        )
 
 
 def _device_available_bytes(backend):
@@ -560,7 +622,6 @@ class CupyDistributedRuntime:
     _legacy_fatal_publication_owner: int | None = field(
         default=None, init=False, repr=False
     )
-    _fatal_provider_finalized: bool = field(default=False, init=False, repr=False)
     _deferred_async_quarantines: list = field(
         default_factory=list, init=False, repr=False
     )
@@ -587,6 +648,8 @@ class CupyDistributedRuntime:
         *,
         scope,
         epoch,
+        sequence=_ADMISSION_UNSET,
+        parent_sequence=_ADMISSION_UNSET,
         transition_sequence=None,
     ):
         gate = self._terminal_gate
@@ -597,11 +660,69 @@ class CupyDistributedRuntime:
                 raise RuntimeError(
                     "resource admission does not match the required runtime scope"
                 )
+            if sequence is not _ADMISSION_UNSET and token.sequence != sequence:
+                raise RuntimeError(
+                    "resource admission does not match the required sequence"
+                )
+            if (
+                parent_sequence is not _ADMISSION_UNSET
+                and token.parent_sequence != parent_sequence
+            ):
+                raise RuntimeError(
+                    "resource admission does not match the required parent"
+                )
             if token.transition_sequence != transition_sequence:
                 raise RuntimeError(
                     "resource admission does not match the required transition"
                 )
             return token
+
+    def _exact_admission_validator(
+        self,
+        token,
+        *,
+        scope,
+        epoch,
+        parent_sequence=None,
+        transition_sequence=None,
+    ):
+        self._require_admission(
+            token,
+            scope=scope,
+            epoch=epoch,
+            sequence=token.sequence,
+            parent_sequence=parent_sequence,
+            transition_sequence=transition_sequence,
+        )
+        return _ExactAdmissionValidator(
+            self,
+            token,
+            scope=scope,
+            epoch=epoch,
+            parent_sequence=parent_sequence,
+            transition_sequence=transition_sequence,
+        )
+
+    def _resolve_admission_validator(
+        self,
+        token,
+        validator,
+        *,
+        scope,
+        epoch,
+        parent_sequence=None,
+        transition_sequence=None,
+    ):
+        if validator is None:
+            validator = self._exact_admission_validator(
+                token,
+                scope=scope,
+                epoch=epoch,
+                parent_sequence=parent_sequence,
+                transition_sequence=transition_sequence,
+            )
+        _require_resource_admission(token, validator)
+        return validator
 
     def _release_admission(self, token):
         if token is None:
@@ -612,9 +733,16 @@ class CupyDistributedRuntime:
             if "converted" not in str(error):
                 raise
 
-    def _install_active_provider(self, provider, *, _admission_token):
-        self._require_admission(
+    def _install_active_provider(
+        self,
+        provider,
+        *,
+        _admission_token,
+        _admission_validator=None,
+    ):
+        self._resolve_admission_validator(
             _admission_token,
+            _admission_validator,
             scope="runtime_setup",
             epoch=None,
         )
@@ -624,9 +752,16 @@ class CupyDistributedRuntime:
         self._active_provider = provider
         return provider
 
-    def _publish_residency_receipt(self, receipt, *, _admission_token):
-        self._require_admission(
+    def _publish_residency_receipt(
+        self,
+        receipt,
+        *,
+        _admission_token,
+        _admission_validator=None,
+    ):
+        self._resolve_admission_validator(
             _admission_token,
+            _admission_validator,
             scope="runtime_setup",
             epoch=None,
         )
@@ -1350,9 +1485,31 @@ class CupyDistributedRuntime:
         self._require_usable()
         token = self._terminal_gate.admit_runtime("barrier_collective")
         try:
-            return self.collective.barrier()
+            validator = self._exact_admission_validator(
+                token,
+                scope="runtime",
+                epoch=None,
+            )
+            return self._barrier_collective(
+                _admission_token=token,
+                _admission_validator=validator,
+            )
         finally:
             self._release_admission(token)
+
+    def _barrier_collective(
+        self,
+        *,
+        _admission_token,
+        _admission_validator=None,
+    ):
+        self._resolve_admission_validator(
+            _admission_token,
+            _admission_validator,
+            scope="runtime",
+            epoch=None,
+        )
+        return self.collective.barrier()
 
     def execution_config(
         self,
@@ -1384,19 +1541,27 @@ class CupyDistributedRuntime:
         prefetch_depth,
         _admission_token,
     ):
-        self._require_admission(
+        validator = self._exact_admission_validator(
             _admission_token,
             scope="runtime_setup",
             epoch=None,
         )
-        backend_metadata = self._synchronize_active_backend()
+        backend_metadata = _call_admitted_private(
+            self._synchronize_active_backend,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
+        )
         device_resolution = self._resolve_budget(
             "device",
             device_memory_budget_bytes,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
         )
         host_resolution = self._resolve_budget(
             "host",
             host_memory_budget_bytes,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
         )
         if residency_policy == "active_working_set":
             config = getattr(self.backend, "config", None)
@@ -1418,16 +1583,20 @@ class CupyDistributedRuntime:
                     host_budget_resolution=host_resolution,
                     prefetch_depth=prefetch_depth,
                     _admission_token=_admission_token,
+                    _admission_validator=validator,
                 )
                 self._install_active_provider(
-                    provider, _admission_token=_admission_token
+                    provider,
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
                 )
             elif not self._active_provider.matches_config(
                 device_resolution,
                 host_resolution,
-                prefetch_depth,
-                _admission_token=_admission_token,
-            ):
+                    prefetch_depth,
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
+                ):
                 raise ValueError(
                     "active provider already has different frozen budget metadata"
                 )
@@ -1468,7 +1637,7 @@ class CupyDistributedRuntime:
             self._release_admission(token)
 
     def _preflight_residency(self, request, plan, *, _admission_token):
-        self._require_admission(
+        validator = self._exact_admission_validator(
             _admission_token,
             scope="runtime_setup",
             epoch=None,
@@ -1499,6 +1668,7 @@ class CupyDistributedRuntime:
                     request.host_budget,
                     request.prefetch_depth,
                     _admission_token=_admission_token,
+                    _admission_validator=validator,
                 )
             ):
                 raise ValueError("residency request budgets do not match the runtime")
@@ -1523,14 +1693,26 @@ class CupyDistributedRuntime:
                 host_budget_hash=host_budget_hash,
             )
             return self._publish_residency_receipt(
-                receipt, _admission_token=_admission_token
+                receipt,
+                _admission_token=_admission_token,
+                _admission_validator=validator,
             )
 
-        status = self._control_array([int(local_error is not None)], np.int32)
+        status = self._control_array(
+            [int(local_error is not None)],
+            np.int32,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
+        )
         failed = int(
-            self._host_control(self.collective.allreduce(status, op="max")).reshape(-1)[
-                0
-            ]
+            self._host_control(
+                self._runtime_setup_allreduce(
+                    status,
+                    op="max",
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
+                )
+            ).reshape(-1)[0]
         )
         del status
 
@@ -1553,9 +1735,25 @@ class CupyDistributedRuntime:
                 self.context.local_world_size,
             ],
             np.int32,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
         )
-        policy_minimum = self._host_control(self.collective.allreduce(policy, op="min"))
-        policy_maximum = self._host_control(self.collective.allreduce(policy, op="max"))
+        policy_minimum = self._host_control(
+            self._runtime_setup_allreduce(
+                policy,
+                op="min",
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
+        )
+        policy_maximum = self._host_control(
+            self._runtime_setup_allreduce(
+                policy,
+                op="max",
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
+        )
         policy_disagreement = not np.array_equal(policy_minimum, policy_maximum)
         del policy, policy_minimum, policy_maximum
 
@@ -1580,12 +1778,24 @@ class CupyDistributedRuntime:
                 for index in range(0, 64, 16)
             ],
             np.uint64,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
         )
         hash_minimum = self._host_control(
-            self.collective.allreduce(hash_control, op="min")
+            self._runtime_setup_allreduce(
+                hash_control,
+                op="min",
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
         )
         hash_maximum = self._host_control(
-            self.collective.allreduce(hash_control, op="max")
+            self._runtime_setup_allreduce(
+                hash_control,
+                op="max",
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
         )
         local_hashes = self._host_control(hash_control).reshape(4, 4)
         minimum_hashes = np.asarray(hash_minimum).reshape(4, 4)
@@ -1610,12 +1820,27 @@ class CupyDistributedRuntime:
             )
         else:
             requirement_values = (0,) * (2 * world_size + 3)
-        requirements = self._control_array(requirement_values, np.int64)
+        requirements = self._control_array(
+            requirement_values,
+            np.int64,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
+        )
         requirement_minimum = self._host_control(
-            self.collective.allreduce(requirements, op="min")
+            self._runtime_setup_allreduce(
+                requirements,
+                op="min",
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
         )
         requirement_maximum = self._host_control(
-            self.collective.allreduce(requirements, op="max")
+            self._runtime_setup_allreduce(
+                requirements,
+                op="max",
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
         )
         local_requirements = self._host_control(requirements)
         requirement_count = 2 * world_size + 1
@@ -1651,11 +1876,21 @@ class CupyDistributedRuntime:
                 capacity_code = 1
             elif plan.host_required_bytes > plan.host_budget.resolved_bytes:
                 capacity_code = 2
-        capacity = self._control_array([capacity_code], np.int32)
+        capacity = self._control_array(
+            [capacity_code],
+            np.int32,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
+        )
         capacity_failed = int(
-            self._host_control(self.collective.allreduce(capacity, op="max")).reshape(
-                -1
-            )[0]
+            self._host_control(
+                self._runtime_setup_allreduce(
+                    capacity,
+                    op="max",
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
+                )
+            ).reshape(-1)[0]
         )
         del capacity
 
@@ -1686,7 +1921,9 @@ class CupyDistributedRuntime:
             host_budget_hash=hashes[3],
         )
         return self._publish_residency_receipt(
-            receipt, _admission_token=_admission_token
+            receipt,
+            _admission_token=_admission_token,
+            _admission_validator=validator,
         )
 
     def consume_residency_receipt(
@@ -1696,13 +1933,17 @@ class CupyDistributedRuntime:
         plan,
         *,
         _admission_token,
+        _admission_validator=None,
+        _resource_recorder=None,
     ):
-        self._require_usable()
-        token = self._require_admission(
+        _admission_validator = self._resolve_admission_validator(
             _admission_token,
+            _admission_validator,
             scope="construction",
             epoch=_admission_token.epoch,
         )
+        self._require_usable()
+        token = _admission_token
         with self._terminal_gate._condition:
             lease = self._terminal_gate._lease_state(token.epoch)
             if (
@@ -1714,11 +1955,19 @@ class CupyDistributedRuntime:
                 )
         if not isinstance(receipt, ResidencyPreflightReceipt):
             raise TypeError("receipt must be a ResidencyPreflightReceipt")
+        if _resource_recorder is not None and not callable(_resource_recorder):
+            raise TypeError("receipt resource recorder must be callable")
         issued = self._issued_receipts.pop(id(receipt), None)
         if issued is not receipt:
             raise ValueError(
                 "residency preflight receipt was not issued by this runtime"
             )
+        if _resource_recorder is not None:
+            try:
+                _resource_recorder(issued)
+            except BaseException:
+                self._issued_receipts[id(issued)] = issued
+                raise
         expected = (
             self._runtime_id,
             self.rank,
@@ -1742,11 +1991,40 @@ class CupyDistributedRuntime:
                 "residency preflight receipt does not match the runtime tuple"
             )
 
-    def _control_array(self, values, dtype):
+    def _control_array(
+        self,
+        values,
+        dtype,
+        *,
+        _admission_token,
+        _admission_validator=None,
+    ):
+        self._resolve_admission_validator(
+            _admission_token,
+            _admission_validator,
+            scope="runtime_setup",
+            epoch=None,
+        )
         converter = getattr(self.backend, "asarray", None)
         if callable(converter):
             return converter(values, dtype=dtype)
         return np.asarray(values, dtype=dtype)
+
+    def _runtime_setup_allreduce(
+        self,
+        value,
+        *,
+        op,
+        _admission_token,
+        _admission_validator=None,
+    ):
+        self._resolve_admission_validator(
+            _admission_token,
+            _admission_validator,
+            scope="runtime_setup",
+            epoch=None,
+        )
+        return self.collective.allreduce(value, op=op)
 
     @staticmethod
     def _host_control(value):
@@ -1756,7 +2034,12 @@ class CupyDistributedRuntime:
         return np.asarray(value)
 
     def _requested_budget_agrees(
-        self, requested, resource, *, _admission_token=None
+        self,
+        requested,
+        resource,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
     ):
         if _admission_token is None:
             _admission_token = self._terminal_gate._current_thread_admission()
@@ -1770,8 +2053,9 @@ class CupyDistributedRuntime:
                     )
                 finally:
                     self._release_admission(token)
-        self._require_admission(
+        _admission_validator = self._resolve_admission_validator(
             _admission_token,
+            _admission_validator,
             scope="runtime_setup",
             epoch=None,
         )
@@ -1797,18 +2081,43 @@ class CupyDistributedRuntime:
             if local_error is not None:
                 raise local_error
             return
-        status = self._control_array([int(local_error is not None)], np.int32)
-        failed = int(
-            self._host_control(self.collective.allreduce(status, op="max")).reshape(-1)[
-                0
-            ]
+        status = self._control_array(
+            [int(local_error is not None)],
+            np.int32,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
         )
-        control = self._control_array([encoded], np.int64)
+        failed = int(
+            self._host_control(
+                self._runtime_setup_allreduce(
+                    status,
+                    op="max",
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
+            ).reshape(-1)[0]
+        )
+        control = self._control_array(
+            [encoded],
+            np.int64,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         minimum = self._host_control(
-            self.collective.allreduce(control, op="min")
+            self._runtime_setup_allreduce(
+                control,
+                op="min",
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
         ).reshape(-1)[0]
         maximum = self._host_control(
-            self.collective.allreduce(control, op="max")
+            self._runtime_setup_allreduce(
+                control,
+                op="max",
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
         ).reshape(-1)[0]
         if failed:
             raise ValueError(
@@ -1817,7 +2126,13 @@ class CupyDistributedRuntime:
         if int(minimum) != int(maximum):
             raise RuntimeError("{} memory budget request disagreement".format(resource))
 
-    def _auto_available_snapshot(self, resource, *, _admission_token=None):
+    def _auto_available_snapshot(
+        self,
+        resource,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         if _admission_token is None:
             _admission_token = self._terminal_gate._current_thread_admission()
             if _admission_token is None:
@@ -1829,8 +2144,9 @@ class CupyDistributedRuntime:
                     )
                 finally:
                     self._release_admission(token)
-        self._require_admission(
+        _admission_validator = self._resolve_admission_validator(
             _admission_token,
+            _admission_validator,
             scope="runtime_setup",
             epoch=None,
         )
@@ -1856,21 +2172,41 @@ class CupyDistributedRuntime:
         if self.world_size == 1:
             failed = int(local_error is not None)
         else:
-            status = self._control_array([int(local_error is not None)], np.int32)
+            status = self._control_array(
+                [int(local_error is not None)],
+                np.int32,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
             failed = int(
-                self._host_control(self.collective.allreduce(status, op="max")).reshape(
-                    -1
-                )[0]
+                self._host_control(
+                    self._runtime_setup_allreduce(
+                        status,
+                        op="max",
+                        _admission_token=_admission_token,
+                        _admission_validator=_admission_validator,
+                    )
+                ).reshape(-1)[0]
             )
         if failed:
             raise RuntimeError(
                 "{} memory availability preflight failed".format(resource)
             ) from local_error
         if self.world_size > 1:
-            control = self._control_array([available], np.int64)
+            control = self._control_array(
+                [available],
+                np.int64,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
             available = int(
                 self._host_control(
-                    self.collective.allreduce(control, op="min")
+                    self._runtime_setup_allreduce(
+                        control,
+                        op="min",
+                        _admission_token=_admission_token,
+                        _admission_validator=_admission_validator,
+                    )
                 ).reshape(-1)[0]
             )
         ratio = 85 if resource == "device" else 80
@@ -1891,7 +2227,14 @@ class CupyDistributedRuntime:
         setattr(self, cached_name, resolution)
         return resolution
 
-    def _resolve_budget(self, resource, requested, *, _admission_token=None):
+    def _resolve_budget(
+        self,
+        resource,
+        requested,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         if _admission_token is None:
             _admission_token = self._terminal_gate._current_thread_admission()
             if _admission_token is None:
@@ -1904,8 +2247,9 @@ class CupyDistributedRuntime:
                     )
                 finally:
                     self._release_admission(token)
-        self._require_admission(
+        _admission_validator = self._resolve_admission_validator(
             _admission_token,
+            _admission_validator,
             scope="runtime_setup",
             epoch=None,
         )
@@ -1913,6 +2257,7 @@ class CupyDistributedRuntime:
             requested,
             resource,
             _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
         )
         if requested is not None:
             return MemoryBudgetResolution(
@@ -1923,10 +2268,17 @@ class CupyDistributedRuntime:
                 resource=resource,
             )
         return self._auto_available_snapshot(
-            resource, _admission_token=_admission_token
+            resource,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
         )
 
-    def _synchronize_active_backend(self, *, _admission_token=None):
+    def _synchronize_active_backend(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         if _admission_token is None:
             _admission_token = self._terminal_gate._current_thread_admission()
             if _admission_token is None:
@@ -1939,8 +2291,9 @@ class CupyDistributedRuntime:
                     )
                 finally:
                     self._release_admission(token)
-        self._require_admission(
+        _admission_validator = self._resolve_admission_validator(
             _admission_token,
+            _admission_validator,
             scope="runtime_setup",
             epoch=None,
         )
@@ -1979,8 +2332,18 @@ class CupyDistributedRuntime:
         except BaseException as error:
             local_error = error
 
-        status = self.backend.asarray([int(local_error is not None)], dtype=np.int32)
-        failed = self.collective.allreduce(status, op="max")
+        status = self._control_array(
+            [int(local_error is not None)],
+            np.int32,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
+        failed = self._runtime_setup_allreduce(
+            status,
+            op="max",
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         digest_payload = {
             "active": normalize_distributed_backend_metadata(
                 active_metadata, local_rank=self.local_rank
@@ -1999,9 +2362,24 @@ class CupyDistributedRuntime:
             [int(hexdigest[index : index + 16], 16) for index in range(0, 64, 16)],
             dtype=np.uint64,
         )
-        control = self.backend.asarray(words, dtype=np.uint64)
-        minimum = self.collective.allreduce(control, op="min")
-        maximum = self.collective.allreduce(control, op="max")
+        control = self._control_array(
+            words,
+            np.uint64,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
+        minimum = self._runtime_setup_allreduce(
+            control,
+            op="min",
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
+        maximum = self._runtime_setup_allreduce(
+            control,
+            op="max",
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         host = lambda value: np.asarray(
             value.get() if callable(getattr(value, "get", None)) else value
         )
@@ -2066,33 +2444,7 @@ class CupyDistributedRuntime:
                 raise
 
     def _commit_fatal_runtime_close(self, transition, error):
-        collective = self.collective
-        provider = self._active_provider
-
-        def finalize_provider_once():
-            with self._terminal_state_lock:
-                if self._fatal_provider_finalized:
-                    return
-                try:
-                    finalize_provider = (
-                        None
-                        if provider is None
-                        else getattr(
-                            provider, "_finalize_terminal_runtime_close", None
-                        )
-                    )
-                    if callable(finalize_provider):
-                        finalize_provider(error)
-                except BaseException as close_error:
-                    self._remember_terminal_secondary_locked(
-                        close_error,
-                        error,
-                    )
-                finally:
-                    self._fatal_provider_finalized = True
-
         def finalize_pending():
-            finalize_provider_once()
             return self._clear_runtime_references(
                 error,
                 publish_error=False,
@@ -2100,12 +2452,6 @@ class CupyDistributedRuntime:
                 clear_collective=False,
             )
 
-        with self._terminal_gate._condition:
-            already_published = (
-                self._terminal_gate._phase is _TerminalPhase.FATAL_PUBLISHED
-            )
-        if already_published:
-            finalize_provider_once()
         try:
             result = self._terminal_gate.commit_runtime_close(
                 transition,
@@ -2133,19 +2479,38 @@ class CupyDistributedRuntime:
                 if callable(join_publication):
                     join_publication()
             raise
-        finalize_provider_once()
-        if collective is not None:
-            try:
-                collective.close()
-            except BaseException as close_error:
-                with self._terminal_state_lock:
-                    self._remember_terminal_secondary_locked(
-                        close_error,
-                        error,
-                    )
         if not self._closed:
-            self._clear_runtime_references(error)
+            self._clear_runtime_references(
+                error,
+                publish_error=False,
+                clear_collective=False,
+            )
         return result
+
+    def _runtime_close_snapshot(self):
+        with self._terminal_gate._condition:
+            with self._terminal_state_lock:
+                provider = self._active_provider
+                lease = (
+                    None
+                    if provider is None
+                    else getattr(provider, "_active_lease", None)
+                )
+                scheduler = None if lease is None else lease.scheduler
+                return provider, lease, scheduler
+
+    @staticmethod
+    def _close_collective(
+        collective,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
+        return collective.close()
 
     def close(self):
         if self._closed:
@@ -2153,30 +2518,29 @@ class CupyDistributedRuntime:
         error = self._terminal_error
         if error is None:
             error = getattr(self.backend, "_execution_terminal_error", None)
-        preclose_provider = self._active_provider
-        preclose_scheduler = (
-            None
-            if preclose_provider is None
-            else getattr(
-                getattr(preclose_provider, "_active_lease", None),
-                "scheduler",
-                None,
-            )
-        )
         request = None
         try:
             request = self._terminal_gate.admit_runtime("begin_runtime_close")
         except RuntimeError:
-            transition = self._terminal_gate.begin_runtime_close(None)
+            transition, elected = self._terminal_gate._freeze_runtime_close(None)
         else:
-            if preclose_scheduler is not None:
-                preclose_scheduler._start_counted_completions()
-            transition = self._terminal_gate.begin_runtime_close(request)
+            transition, elected = self._terminal_gate._freeze_runtime_close(request)
         if isinstance(transition, _FatalTransition):
             error = transition.primary
             self._commit_fatal_runtime_close(transition, error)
             raise error
-        if transition.owner_thread_id != threading.get_ident():
+
+        frozen_scheduler = None
+        if elected:
+            _, _, frozen_scheduler = self._runtime_close_snapshot()
+            if frozen_scheduler is not None:
+                frozen_scheduler._start_counted_completions()
+        transition = self._terminal_gate._drain_runtime_close(transition)
+        if isinstance(transition, _FatalTransition):
+            error = transition.primary
+            self._commit_fatal_runtime_close(transition, error)
+            raise error
+        if not elected:
             result = self._terminal_gate.commit_runtime_close(
                 transition, lambda: None
             )
@@ -2184,9 +2548,8 @@ class CupyDistributedRuntime:
                 raise result
             return result
 
-        provider = self._active_provider
+        provider, lease, _ = self._runtime_close_snapshot()
         collective = self.collective
-        lease = None if provider is None else getattr(provider, "_active_lease", None)
         if lease is not None:
             try:
                 lease.close()
@@ -2219,7 +2582,16 @@ class CupyDistributedRuntime:
                     error = caught
             else:
                 try:
-                    provider.close()
+                    provider_validator = self._exact_admission_validator(
+                        provider_token,
+                        scope="runtime_close",
+                        epoch=None,
+                        transition_sequence=transition.sequence,
+                    )
+                    provider.close(
+                        _admission_token=provider_token,
+                        _admission_validator=provider_validator,
+                    )
                 except BaseException as caught:
                     if error is None:
                         error = caught
@@ -2238,7 +2610,17 @@ class CupyDistributedRuntime:
                         transition, "collective_close"
                     )
                     try:
-                        collective.close()
+                        collective_validator = self._exact_admission_validator(
+                            collective_token,
+                            scope="runtime_close",
+                            epoch=None,
+                            transition_sequence=transition.sequence,
+                        )
+                        self._close_collective(
+                            collective,
+                            _admission_token=collective_token,
+                            _admission_validator=collective_validator,
+                        )
                     finally:
                         self._release_runtime_close_step(collective_token)
         except BaseException as caught:
@@ -2310,19 +2692,47 @@ class CupyDistributedRuntime:
                     scope = "lease"
             except RuntimeError:
                 continue
+            retry = False
             try:
-                self._require_admission(
+                validator = self._exact_admission_validator(
                     token,
                     scope=scope,
                     epoch=live_epoch if scope == "lease" else None,
                 )
+                with gate._condition:
+                    current_epoch = gate._live_epoch
+                    current_phase = gate._phase
+                    current_lease_phase = (
+                        None
+                        if current_epoch is None
+                        else gate._leases[current_epoch].phase
+                    )
+                    retry = (
+                        current_phase is not _TerminalPhase.HEALTHY
+                        or current_epoch != live_epoch
+                        or (
+                            scope == "runtime"
+                            and current_epoch is not None
+                        )
+                        or (
+                            scope == "lease"
+                            and current_lease_phase != "open"
+                        )
+                    )
+                if retry:
+                    continue
                 provider = self._active_provider
                 if provider is None:
                     state = self._empty_resource_state()
                 else:
-                    state = provider.runtime_resource_state()
+                    state = provider.runtime_resource_state(
+                        _admission_token=token,
+                        _admission_validator=validator,
+                    )
             finally:
                 self._release_admission(token)
+            if retry:
+                continue
             break
 
         if self._terminal_quarantine.poisoned:

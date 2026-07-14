@@ -7,9 +7,22 @@ import traceback
 import numpy as np
 import pytest
 
-from renormalizer.backend._distributed.async_owner import AsyncAllocationRecord
-from renormalizer.backend._distributed.cache import DeviceTensorCache
+from renormalizer.backend._distributed.async_owner import (
+    AsyncAllocationRecord,
+    _CountedAsyncAdmission,
+    allocation_record,
+)
+from renormalizer.backend._distributed.cache import (
+    CacheReservation,
+    DeviceTensorCache,
+)
 from renormalizer.backend._distributed.pinned import PinnedBufferPool
+from renormalizer.backend._distributed.providers import (
+    ActiveWorkingSetProvider,
+    WorkingSetLease,
+    _ActiveOperandLease,
+    _LeaseStatusWorkspace,
+)
 from renormalizer.backend._distributed.terminal import (
     _FatalTransition,
     _TerminalPhase,
@@ -569,6 +582,324 @@ def test_admission_sentinel_matrix_covers_every_approved_boundary():
     )
 
 
+def _matrix_admission_token(runtime, row):
+    gate = runtime._terminal_gate
+    specification = ADMISSION_SENTINEL_MATRIX[row]
+    scope = specification["scope"]
+    retained = []
+    transition = None
+
+    if scope == "runtime":
+        token = gate.admit_runtime(row)
+    elif scope == "runtime_setup":
+        token = gate.admit_runtime_setup(row)
+    elif scope == "construction":
+        _, token = gate.begin_lease(row)
+    elif scope == "lease":
+        epoch, construction = gate.begin_lease("{}_construction".format(row))
+        gate.activate_lease(epoch, construction)
+        gate.release(construction)
+        parent = gate.admit_lease(epoch, row)
+        if "parent_sequence" in specification:
+            capability = object()
+            token = gate.spawn_async(parent, capability)
+            retained.append(parent)
+        else:
+            token = parent
+    elif scope == "lease_close":
+        epoch, construction = gate.begin_lease("{}_construction".format(row))
+        gate.activate_lease(epoch, construction)
+        gate.release(construction)
+        transition, elected = gate.begin_lease_close(epoch)
+        assert elected is True
+        parent = gate.admit_lease_close(transition, row)
+        if "parent_sequence" in specification:
+            capability = object()
+            token = gate.spawn_async(parent, capability)
+            retained.append(parent)
+        else:
+            token = parent
+    elif scope == "runtime_close":
+        transition = gate.begin_runtime_close(None)
+        token = gate.admit_runtime_close(transition, row)
+    else:
+        raise AssertionError("unknown matrix scope {!r}".format(scope))
+    return token, transition, retained
+
+
+class _LowerAdmissionSentinel(Exception):
+    pass
+
+
+def _invoke_matrix_lower_helper(runtime, row, token, validator):
+    provider = object.__new__(ActiveWorkingSetProvider)
+    lease = object.__new__(WorkingSetLease)
+    child = object.__new__(_ActiveOperandLease)
+    cache = object.__new__(DeviceTensorCache)
+    pool = object.__new__(PinnedBufferPool)
+    scheduler = object.__new__(TransferScheduler)
+    status = object.__new__(_LeaseStatusWorkspace)
+    cache_reservation = object.__new__(CacheReservation)
+    admitted = {
+        "_admission_token": token,
+        "_admission_validator": validator,
+    }
+
+    if row == "barrier_collective":
+        return runtime._barrier_collective(**admitted)
+    if row == "execution_config_backend_sync":
+        return runtime._synchronize_active_backend(**admitted)
+    if row == "budget_probe":
+        return runtime._resolve_budget("device", 1, **admitted)
+    if row == "provider_construct":
+        return ActiveWorkingSetProvider(
+            runtime,
+            device_budget_resolution=None,
+            host_budget_resolution=None,
+            **admitted,
+        )
+    if row == "provider_install":
+        return runtime._install_active_provider(provider, **admitted)
+    if row == "provider_config_match":
+        return ActiveWorkingSetProvider.matches_config(
+            provider,
+            None,
+            None,
+            1,
+            **admitted,
+        )
+    if row == "preflight_control_allocation":
+        return runtime._control_array([], np.int32, **admitted)
+    if row == "preflight_collective":
+        return runtime._runtime_setup_allreduce(
+            np.zeros(1, dtype=np.int32),
+            op="max",
+            **admitted,
+        )
+    if row == "receipt_publish":
+        return runtime._publish_residency_receipt(object(), **admitted)
+    if row == "receipt_consume":
+        return runtime.consume_residency_receipt(None, None, None, **admitted)
+    if row == "construct_status":
+        return ActiveWorkingSetProvider._provision_status_workspace(
+            provider,
+            _resource_recorder=None,
+            **admitted,
+        )
+    if row == "construct_store_reservation":
+        return ActiveWorkingSetProvider._reserve_store(
+            None,
+            None,
+            dirty_ref=None,
+            **admitted,
+        )
+    if row == "construct_cache_reservation":
+        return DeviceTensorCache.reserve(cache, None, 0, **admitted)
+    if row == "construct_pool":
+        return PinnedBufferPool(0, **admitted)
+    if row == "construct_scheduler":
+        return TransferScheduler(None, None, None, **admitted)
+    if row == "activate_lease":
+        return ActiveWorkingSetProvider._activate_lease(
+            provider,
+            token.epoch,
+            **admitted,
+        )
+    if row == "rollback_partial":
+        return ActiveWorkingSetProvider._rollback_partial(
+            provider,
+            token,
+            RuntimeError("rollback sentinel"),
+            record=None,
+            scheduler=None,
+            pool=None,
+            cache_reservation=None,
+            store_reservation=None,
+            status_workspace=None,
+            _admission_validator=validator,
+        )
+    if row == "operator_call":
+        context = WorkingSetLease._operator_call_admitted(
+            lease,
+            None,
+            **admitted,
+        )
+        return context.__enter__()
+    if row == "acquire":
+        return WorkingSetLease._acquire_admitted(
+            lease,
+            None,
+            **admitted,
+        )
+    if row == "load":
+        return WorkingSetLease._load_identity_admitted(
+            lease,
+            None,
+            prefetch=False,
+            **admitted,
+        )
+    if row == "prefetch":
+        return WorkingSetLease._prefetch_one_admitted(lease, **admitted)
+    if row == "mark_dirty":
+        return WorkingSetLease._mark_dirty_admitted(
+            lease,
+            None,
+            None,
+            **admitted,
+        )
+    if row == "reap":
+        return WorkingSetLease._reap_completed_admitted(lease, **admitted)
+    if row in {
+        "resource_state_between_leases",
+        "resource_state_open_lease",
+    }:
+        return ActiveWorkingSetProvider.runtime_resource_state(
+            provider,
+            **admitted,
+        )
+    if row == "ordinary_async_quarantine":
+        return _CountedAsyncAdmission._run_admitted_callback(
+            lambda: None,
+            **admitted,
+        )
+    if row == "child_close":
+        return _ActiveOperandLease._close_admitted(
+            child,
+            token,
+            validator,
+        )
+    if row == "schedule_writeback":
+        return WorkingSetLease._schedule_writeback(lease, **admitted)
+    if row == "dirty_writeback_callback":
+        return TransferScheduler._commit_writeback(
+            None,
+            None,
+            None,
+            None,
+            **admitted,
+        )
+    if row == "observe_peaks":
+        return WorkingSetLease._observe_peaks(lease, **admitted)
+    if row == "scheduler_complete":
+        return TransferScheduler.complete_all(scheduler, **admitted)
+    if row == "cache_wait":
+        return DeviceTensorCache.wait_for_pending(cache, **admitted)
+    if row == "pool_reap":
+        return PinnedBufferPool.reap_completed(pool, **admitted)
+    if row == "cache_invalidate":
+        return DeviceTensorCache.invalidate_ref(cache, None, **admitted)
+    if row == "emit_profile":
+        return WorkingSetLease._emit_profile(lease, 0, pool, **admitted)
+    if row == "status_close":
+        return _LeaseStatusWorkspace.close(status, **admitted)
+    if row == "scheduler_close":
+        return TransferScheduler.close(scheduler, **admitted)
+    if row == "pool_close":
+        return PinnedBufferPool.close(pool, **admitted)
+    if row == "cache_reservation_close":
+        return CacheReservation.close(cache_reservation, **admitted)
+    if row == "store_reservation_close":
+        return WorkingSetLease._close_store_reservation(None, **admitted)
+    if row == "provider_close":
+        return ActiveWorkingSetProvider.close(provider, **admitted)
+    if row == "collective_close":
+        return runtime._close_collective(None, **admitted)
+    raise AssertionError("unknown matrix row {!r}".format(row))
+
+
+@pytest.mark.parametrize("row", tuple(ADMISSION_SENTINEL_MATRIX))
+@pytest.mark.parametrize(
+    "token_kind",
+    ("exact", "wrong_canonical", "noncanonical"),
+)
+def test_every_matrix_row_enforces_exact_lower_admission_before_sentinel(
+    row,
+    token_kind,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    token, transition, retained = _matrix_admission_token(runtime, row)
+    specification = ADMISSION_SENTINEL_MATRIX[row]
+    exact_validator = runtime._exact_admission_validator(
+        token,
+        scope=specification["scope"],
+        epoch=token.epoch,
+        parent_sequence=(
+            token.parent_sequence
+            if "parent_sequence" in specification
+            else None
+        ),
+        transition_sequence=(
+            transition.sequence
+            if "transition_sequence" in specification
+            else None
+        ),
+    )
+    sentinel_calls = []
+
+    def validator(candidate):
+        exact_validator(candidate)
+        sentinel_calls.append(row)
+        raise _LowerAdmissionSentinel(row)
+
+    candidate = token
+    if token_kind != "exact":
+        expected_epoch = token.epoch
+        gate.release(token)
+        token = None
+        for retained_token in retained:
+            gate.release(retained_token)
+        retained = []
+        candidate_scope = (
+            next(
+                scope
+                for scope in (
+                    "runtime",
+                    "runtime_setup",
+                    "construction",
+                    "lease",
+                    "lease_close",
+                    "runtime_close",
+                )
+                if scope != specification["scope"]
+            )
+            if token_kind == "wrong_canonical"
+            else "lease-close"
+        )
+        candidate_epoch = (
+            None
+            if candidate_scope in {
+                "runtime",
+                "runtime_setup",
+                "runtime_close",
+            }
+            else expected_epoch
+        )
+        with gate._condition:
+            candidate = gate._new_token(
+                candidate_scope,
+                candidate_epoch,
+                "{}_candidate".format(token_kind),
+            )
+
+    try:
+        if token_kind == "exact":
+            with pytest.raises(_LowerAdmissionSentinel):
+                _invoke_matrix_lower_helper(runtime, row, candidate, validator)
+            assert sentinel_calls == [row]
+        else:
+            with pytest.raises((TypeError, RuntimeError)):
+                _invoke_matrix_lower_helper(runtime, row, candidate, validator)
+            assert sentinel_calls == []
+    finally:
+        if token is not None:
+            gate.release(token)
+        elif candidate is not None:
+            gate.release(candidate)
+        for retained_token in retained:
+            gate.release(retained_token)
+
+
 def test_barrier_collective_uses_one_runtime_admission(monkeypatch):
     runtime = _runtime()
     observed = []
@@ -648,11 +979,19 @@ def test_execution_config_uses_one_setup_token_per_call(monkeypatch):
     def record(name):
         observed.append((name, _current_token(runtime)))
 
-    def synchronize_backend(*, _admission_token=None):
+    def synchronize_backend(
+        *, _admission_token=None, _admission_validator=None
+    ):
         record("execution_config_backend_sync")
         return "numpy", "cpu", 64
 
-    def resolve_budget(resource, requested, *, _admission_token=None):
+    def resolve_budget(
+        resource,
+        requested,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         record("budget_probe")
         return _explicit_budget(requested, resource)
 
@@ -678,7 +1017,12 @@ def test_execution_config_uses_one_setup_token_per_call(monkeypatch):
         def open_working_set(*args, **kwargs):
             raise AssertionError("fake provider does not open working sets")
 
-    def install(provider, *, _admission_token=None):
+    def install(
+        provider,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         record("provider_install")
         runtime._active_provider = provider
 
@@ -737,11 +1081,19 @@ def test_execution_config_setup_row_drains_before_terminal_transition(
             entered.set()
             assert release.wait(_TIMEOUT_S)
 
-    def synchronize_backend():
+    def synchronize_backend(
+        *, _admission_token=None, _admission_validator=None
+    ):
         block("execution_config_backend_sync")
         return "numpy", "cpu", 64
 
-    def resolve_budget(resource, requested, *, _admission_token=None):
+    def resolve_budget(
+        resource,
+        requested,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         block("budget_probe")
         return _explicit_budget(requested, resource)
 
@@ -775,14 +1127,18 @@ def test_execution_config_setup_row_drains_before_terminal_transition(
         def _finalize_terminal_runtime_close(self, error):
             self._terminal_error = error
 
-        def close(self):
+        def close(self, **kwargs):
             self.closed = True
 
     original_install = runtime._install_active_provider
 
-    def install(provider, *, _admission_token):
+    def install(provider, *, _admission_token, _admission_validator):
         block("provider_install")
-        return original_install(provider, _admission_token=_admission_token)
+        return original_install(
+            provider,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
     monkeypatch.setattr(runtime, "_synchronize_active_backend", synchronize_backend)
     monkeypatch.setattr(runtime, "_resolve_budget", resolve_budget)
@@ -856,7 +1212,12 @@ def test_preflight_control_collective_and_receipt_share_setup_token(monkeypatch)
         observed.append(("preflight_collective", _current_token(runtime)))
         return original_allreduce(*args, **kwargs)
 
-    def publish(receipt, *, _admission_token=None):
+    def publish(
+        receipt,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         observed.append(("receipt_publish", _current_token(runtime)))
         runtime._issued_receipts.clear()
         runtime._issued_receipts[id(receipt)] = receipt
@@ -913,9 +1274,13 @@ def test_preflight_setup_row_drains_before_terminal_transition(
         block("preflight_collective")
         return original_allreduce(*args, **kwargs)
 
-    def publish(receipt, *, _admission_token):
+    def publish(receipt, *, _admission_token, _admission_validator):
         block("receipt_publish")
-        return original_publish(receipt, _admission_token=_admission_token)
+        return original_publish(
+            receipt,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
     monkeypatch.setattr(runtime, "_control_array", control)
     monkeypatch.setattr(collective, "allreduce", allreduce)
@@ -969,16 +1334,20 @@ def test_fatal_imports_provider_installed_by_draining_setup(monkeypatch):
     monkeypatch.setattr(
         runtime,
         "_synchronize_active_backend",
-        lambda: ("numpy", "cpu", 64),
+        lambda **kwargs: ("numpy", "cpu", 64),
     )
     install_entered = threading.Event()
     release_install = threading.Event()
     original_install = runtime._install_active_provider
 
-    def install(provider, *, _admission_token):
+    def install(provider, *, _admission_token, _admission_validator):
         install_entered.set()
         assert release_install.wait(_TIMEOUT_S)
-        return original_install(provider, _admission_token=_admission_token)
+        return original_install(
+            provider,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
     monkeypatch.setattr(runtime, "_install_active_provider", install)
     setup, setup_results, setup_errors, setup_done = _start(
@@ -1022,10 +1391,14 @@ def test_fatal_clears_receipt_published_by_draining_setup(monkeypatch):
     release_publish = threading.Event()
     original_publish = runtime._publish_residency_receipt
 
-    def publish(receipt, *, _admission_token):
+    def publish(receipt, *, _admission_token, _admission_validator):
         publish_entered.set()
         assert release_publish.wait(_TIMEOUT_S)
-        return original_publish(receipt, _admission_token=_admission_token)
+        return original_publish(
+            receipt,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
     monkeypatch.setattr(runtime, "_publish_residency_receipt", publish)
     setup, setup_results, setup_errors, setup_done = _start(
@@ -1100,7 +1473,7 @@ def test_provisional_epoch_and_resource_record_precede_first_allocation(monkeypa
     class StopBeforeAllocation(RuntimeError):
         pass
 
-    def stop_before_allocation(*, _admission_token=None):
+    def stop_before_allocation(**kwargs):
         observed["token"] = _current_token(runtime)
         observed["epoch"] = runtime._terminal_gate._live_epoch
         observed["record"] = getattr(provider, "_provisional_resources", None)
@@ -1117,6 +1490,119 @@ def test_provisional_epoch_and_resource_record_precede_first_allocation(monkeypa
         assert observed["record"].epoch == observed["epoch"]
         assert runtime._terminal_gate._live_epoch is None
         assert provider._active_lease is None
+    finally:
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ("host_allocation", "bootstrap"),
+)
+def test_fatal_partial_status_construction_retains_allocations_and_receipt(
+    monkeypatch,
+    failure_point,
+):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-partial-status-{}".format(failure_point),
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    entered = threading.Event()
+    release = threading.Event()
+    allocated = []
+    failure = RuntimeError("injected {} failure".format(failure_point))
+    original_device = provider._allocate_status_device
+    original_host = provider._allocate_status_host
+    original_bootstrap = runtime.collective._bootstrap_status_or
+
+    def allocate_device():
+        array = original_device()
+        allocated.append(array)
+        return array
+
+    def allocate_host():
+        if failure_point == "host_allocation":
+            entered.set()
+            assert release.wait(_TIMEOUT_S)
+            raise failure
+        array = original_host()
+        allocated.append(array)
+        return array
+
+    def bootstrap(local_code):
+        if failure_point == "bootstrap":
+            entered.set()
+            assert release.wait(_TIMEOUT_S)
+            raise failure
+        return original_bootstrap(local_code)
+
+    monkeypatch.setattr(provider, "_allocate_status_device", allocate_device)
+    monkeypatch.setattr(provider, "_allocate_status_host", allocate_host)
+    monkeypatch.setattr(runtime.collective, "_bootstrap_status_or", bootstrap)
+    opener, open_results, open_errors, open_done = _start(
+        lambda: provider.open_working_set(request, plan, store, receipt)
+    )
+    assert entered.wait(_TIMEOUT_S)
+    record = provider._provisional_resources
+    primary = RuntimeError("fatal during partial status construction")
+    fatal, fatal_results, fatal_errors, fatal_done = _start(
+        lambda: runtime._enter_communicator_fatal(primary)
+    )
+    _wait_for_phase(runtime, _TerminalPhase.FATAL_PENDING)
+    try:
+        release.set()
+        _join(opener, open_done)
+        _join(fatal, fatal_done)
+
+        identities = {allocation_record(array).identity for array in allocated}
+        assert identities
+        assert identities.issubset(
+            {retained.identity for retained in record.allocations}
+        )
+        assert identities.issubset(
+            {
+                retained.identity
+                for retained in runtime._terminal_quarantine.allocations
+            }
+        )
+        assert any(resource is receipt for resource in record.resources)
+        assert any(
+            resource is receipt
+            for resource in runtime._terminal_quarantine._resources
+        )
+        assert open_results == []
+        assert open_errors == [primary]
+        assert fatal_results == [primary]
+        assert fatal_errors == []
+    finally:
+        release.set()
+        for thread, done in ((opener, open_done), (fatal, fatal_done)):
+            if thread.is_alive():
+                _join(thread, done)
+        _close_case(runtime, store)
+
+
+def test_healthy_construction_rollback_restores_consumed_receipt(monkeypatch):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-restore-consumed-receipt",
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    failure = RuntimeError("injected construction failure after receipt consumption")
+
+    def fail_status(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(provider, "_provision_status_workspace", fail_status)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is failure
+        assert runtime._issued_receipts[id(receipt)] is receipt
     finally:
         _close_case(runtime, store)
 
@@ -1471,7 +1957,11 @@ def test_live_operations_and_state_use_exact_epoch_admissions(monkeypatch):
         loaded.close()
 
         original_contains = provider.cache.contains
-        monkeypatch.setattr(provider.cache, "contains", lambda identity: False)
+        monkeypatch.setattr(
+            provider.cache,
+            "contains",
+            lambda *args, **kwargs: False,
+        )
         monkeypatch.setattr(
             lease,
             "_load_identity",
@@ -1494,18 +1984,18 @@ def test_live_operations_and_state_use_exact_epoch_admissions(monkeypatch):
         lease.mark_dirty("output", output)
         original_reap = lease.scheduler.reap_completed
 
-        def reap():
+        def reap(**kwargs):
             record("reap")
-            return original_reap()
+            return original_reap(**kwargs)
 
         monkeypatch.setattr(lease.scheduler, "reap_completed", reap)
         lease.reap_completed()
 
         runtime_state_impl = provider.runtime_resource_state
 
-        def open_state():
+        def open_state(**kwargs):
             record("resource_state_open_lease")
-            return runtime_state_impl()
+            return runtime_state_impl(**kwargs)
 
         monkeypatch.setattr(provider, "runtime_resource_state", open_state)
         runtime.resource_state()
@@ -1520,9 +2010,9 @@ def test_live_operations_and_state_use_exact_epoch_admissions(monkeypatch):
             pass
 
     between = []
-    def between_state():
+    def between_state(**kwargs):
         between.append(_current_token(runtime))
-        return runtime_state_impl()
+        return runtime_state_impl(**kwargs)
 
     monkeypatch.setattr(provider, "runtime_resource_state", between_state)
     try:
@@ -1555,7 +2045,7 @@ def test_admitted_resource_state_drains_before_terminal_transition(
     release = threading.Event()
     original_state = provider.runtime_resource_state
 
-    def state():
+    def state(**kwargs):
         token = _current_token(runtime)
         _assert_token(
             token,
@@ -1564,7 +2054,7 @@ def test_admitted_resource_state_drains_before_terminal_transition(
         )
         entered.set()
         assert release.wait(_TIMEOUT_S)
-        return original_state()
+        return original_state(**kwargs)
 
     monkeypatch.setattr(provider, "runtime_resource_state", state)
     reader, state_results, state_errors, state_done = _start(runtime.resource_state)
@@ -1836,6 +2326,64 @@ def test_runtime_close_keeps_scheduler_snapshot_if_lease_closes_before_admit(
         assert intercepted == ["begin_runtime_close"]
         assert runtime._closed is True
     finally:
+        _close_case(runtime, store)
+
+
+def test_runtime_close_freezes_before_final_active_scheduler_snapshot(monkeypatch):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-runtime-close-final-scheduler-snapshot",
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    assert provider._active_lease is None
+
+    gate = runtime._terminal_gate
+    admit_entered = threading.Event()
+    release_admit = threading.Event()
+    original_admit = gate.admit_runtime
+
+    def admit(operation):
+        admit_entered.set()
+        assert release_admit.wait(_TIMEOUT_S)
+        return original_admit(operation)
+
+    monkeypatch.setattr(gate, "admit_runtime", admit)
+    closer, close_results, close_errors, close_done = _start(runtime.close)
+    assert admit_entered.wait(_TIMEOUT_S)
+
+    lease = provider.open_working_set(request, plan, store, receipt).__enter__()
+    scheduler = lease.scheduler
+    child = lease.acquire(_block_request(lease))
+    event = _BlockingEvent()
+    scheduler._event_factory = lambda: event
+    child.close()
+    assert event.recorded.wait(_TIMEOUT_S)
+    parent = gate.admit_lease(lease._epoch, "held_before_runtime_freeze")
+
+    try:
+        release_admit.set()
+        _wait_for_phase(runtime, _TerminalPhase.RUNTIME_CLOSING)
+        with pytest.raises(RuntimeError, match="runtime is closing"):
+            gate.admit_lease(lease._epoch, "after_runtime_freeze")
+        with pytest.raises(RuntimeError, match="runtime is closing"):
+            gate.spawn_async(parent, object())
+        assert event.waiting.wait(_TIMEOUT_S)
+        gate.release(parent)
+        parent = None
+        event.release.set()
+        _join(closer, close_done)
+        assert close_results == [None]
+        assert close_errors == []
+    finally:
+        release_admit.set()
+        if parent is not None:
+            gate.release(parent)
+        scheduler._start_counted_completions()
+        event.release.set()
+        if closer.is_alive():
+            _join(closer, close_done)
         _close_case(runtime, store)
 
 
@@ -2201,6 +2749,22 @@ def test_elected_close_row_races_terminal_transition(
         for thread, done in ((closer, close_done), (terminal, terminal_done)):
             if thread.is_alive():
                 _join(thread, done)
+        with runtime._terminal_gate._condition:
+            abandoned_runtime_close = (
+                runtime._terminal_gate._phase
+                is _TerminalPhase.RUNTIME_CLOSING
+                and terminal_done.is_set()
+            )
+        if abandoned_runtime_close and terminal_errors:
+            raise terminal_errors[0]
+        assert not abandoned_runtime_close, (
+            "elected runtime close exited before commit",
+            tuple(
+                "".join(traceback.format_exception(error))
+                for error in terminal_errors
+            ),
+            calls,
+        )
         _close_case(runtime, store)
 
 
@@ -2216,11 +2780,11 @@ def test_second_lease_close_and_runtime_close_join_elected_owner(monkeypatch):
     original_observe = lease._observe_peaks
     original_begin = runtime._terminal_gate.begin_lease_close
 
-    def observe():
+    def observe(**kwargs):
         close_step_owners.append(threading.get_ident())
         close_step_entered.set()
         assert release_close_step.wait(_TIMEOUT_S)
-        return original_observe()
+        return original_observe(**kwargs)
 
     def begin(epoch):
         result = original_begin(epoch)
@@ -2276,10 +2840,10 @@ def test_fatal_preempts_lease_close_owner_and_joiner_with_same_primary(monkeypat
     original_observe = lease._observe_peaks
     original_wait = runtime._terminal_gate.wait_for_lease_closed
 
-    def observe():
+    def observe(**kwargs):
         close_step_entered.set()
         assert release_close_step.wait(_TIMEOUT_S)
-        return original_observe()
+        return original_observe(**kwargs)
 
     def wait_for_close(*args, **kwargs):
         joiner_waiting.set()
@@ -2361,26 +2925,179 @@ def test_pending_resource_state_waits_query_free_for_published_snapshot(monkeypa
     assert results[0]["quarantined_array_count"] == 1
 
 
-def test_fatal_runtime_close_releases_store_reservation_without_clearing_lease():
-    runtime, _, _, store, provider, lease = _open_active_case(
-        store_id="terminal-fatal-runtime-store-reservation"
+def test_resource_state_retries_between_lease_to_open_scope_change(monkeypatch):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-state-between-to-open",
     )
-    reservation = lease._store_reservation
-    primary = RuntimeError("fatal runtime store reservation")
-    try:
-        assert runtime._enter_communicator_fatal(primary) is primary
-        with pytest.raises(RuntimeError) as caught:
-            runtime.close()
-        assert caught.value is primary
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    gate = runtime._terminal_gate
+    original_admit = gate.admit_runtime
+    original_state = provider.runtime_resource_state
+    opened = []
+    observed = []
 
-        assert reservation._closed is True
+    def admit(operation):
+        if operation == "resource_state" and not opened:
+            opened.append(
+                provider.open_working_set(request, plan, store, receipt).__enter__()
+            )
+        return original_admit(operation)
+
+    def resource_state(**kwargs):
+        observed.append((_current_token(runtime), gate._live_epoch))
+        return original_state(**kwargs)
+
+    monkeypatch.setattr(gate, "admit_runtime", admit)
+    monkeypatch.setattr(provider, "runtime_resource_state", resource_state)
+    try:
+        state = runtime.resource_state()
+        lease = opened[0]
+        assert state["active_leases"] == 1
+        assert len(observed) == 1
+        token, live_epoch = observed[0]
+        _assert_token(token, scope="lease", epoch=lease._epoch)
+        assert live_epoch == lease._epoch
+    finally:
+        _close_case(runtime, store)
+
+
+def test_resource_state_retries_open_lease_to_between_scope_change(monkeypatch):
+    runtime, _, _, store, provider, lease = _open_active_case(
+        store_id="terminal-state-open-to-between"
+    )
+    gate = runtime._terminal_gate
+    original_admit = gate.admit_lease
+    original_state = provider.runtime_resource_state
+    closed = []
+    observed = []
+
+    def admit(epoch, operation):
+        if operation == "resource_state" and not closed:
+            lease.close()
+            closed.append(True)
+        return original_admit(epoch, operation)
+
+    def resource_state(**kwargs):
+        observed.append((_current_token(runtime), gate._live_epoch))
+        return original_state(**kwargs)
+
+    monkeypatch.setattr(gate, "admit_lease", admit)
+    monkeypatch.setattr(provider, "runtime_resource_state", resource_state)
+    try:
+        state = runtime.resource_state()
+        assert state["active_leases"] == 0
+        assert len(observed) == 1
+        token, live_epoch = observed[0]
+        _assert_token(token, scope="runtime", epoch=None)
+        assert live_epoch is None
+    finally:
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("initial_phase", ("fatal_pending", "fatal_published"))
+def test_fatal_runtime_close_retains_intact_resources_without_callbacks(
+    monkeypatch,
+    initial_phase,
+):
+    runtime, _, _, store, provider, lease = _open_active_case(
+        store_id="terminal-fatal-runtime-intact-{}".format(initial_phase)
+    )
+    gate = runtime._terminal_gate
+    reservation = lease._store_reservation
+    cache = provider.cache
+    pool = lease.pool
+    scheduler = lease.scheduler
+    status_workspace = lease._status_workspace
+    collective = runtime.collective
+    primary = RuntimeError("fatal runtime close retains intact resources")
+    held = None
+    fatal = None
+    fatal_results = []
+    fatal_errors = []
+    fatal_done = None
+    if initial_phase == "fatal_pending":
+        held = gate.admit_lease(lease._epoch, "hold_fatal_pending_close")
+        fatal, fatal_results, fatal_errors, fatal_done = _start(
+            lambda: runtime._enter_communicator_fatal(primary)
+        )
+        _wait_for_phase(runtime, _TerminalPhase.FATAL_PENDING)
+    else:
+        assert runtime._enter_communicator_fatal(primary) is primary
+        assert gate.phase is _TerminalPhase.FATAL_PUBLISHED
+
+    callbacks = []
+    close_entered = threading.Event()
+
+    def guard(context, obj, attribute, name):
+        original = getattr(obj, attribute)
+
+        def call(*args, **kwargs):
+            callbacks.append((name, gate.phase))
+            return original(*args, **kwargs)
+
+        context.setattr(obj, attribute, call)
+
+    try:
+        with monkeypatch.context() as sentinels:
+            guard(
+                sentinels,
+                provider,
+                "_finalize_terminal_runtime_close",
+                "provider_terminal_finalize",
+            )
+            guard(sentinels, provider, "close", "provider_close")
+            guard(sentinels, lease, "close", "lease_close")
+            guard(sentinels, reservation, "close", "reservation_close")
+            guard(sentinels, cache, "close", "cache_close")
+            guard(sentinels, pool, "close", "pool_close")
+            guard(sentinels, scheduler, "close", "scheduler_close")
+            guard(sentinels, status_workspace, "close", "status_close")
+            guard(sentinels, collective, "close", "collective_close")
+            original_commit = runtime._commit_fatal_runtime_close
+
+            def commit(*args, **kwargs):
+                close_entered.set()
+                return original_commit(*args, **kwargs)
+
+            sentinels.setattr(runtime, "_commit_fatal_runtime_close", commit)
+            closer, close_results, close_errors, close_done = _start(runtime.close)
+            assert close_entered.wait(_TIMEOUT_S)
+            if held is not None:
+                gate.release(held)
+                held = None
+            _join(closer, close_done)
+            if fatal is not None:
+                _join(fatal, fatal_done)
+
+            assert close_results == []
+            assert close_errors == [primary]
+            assert callbacks == []
+            assert runtime.collective is collective
+
+        assert reservation._closed is False
         assert lease._store_reservation is reservation
         assert provider._active_lease is lease
         assert lease._closed is False
         assert lease._provider is provider
-        store.close()
-        assert store.closed is True
+        assert provider.cache is cache
+        assert lease.pool is pool
+        assert lease.scheduler is scheduler
+        assert lease._status_workspace is status_workspace
+        assert cache._closed is False
+        assert pool._closed is False
+        assert scheduler._closed is False
+        assert status_workspace._closed is False
+        if fatal is not None:
+            assert fatal_results == [primary]
+            assert fatal_errors == []
     finally:
+        if held is not None:
+            gate.release(held)
+        if fatal is not None and fatal.is_alive():
+            _join(fatal, fatal_done)
         if not reservation._closed:
             reservation.close()
         if not store.closed:
@@ -2402,24 +3119,24 @@ def test_runtime_close_provider_and_collective_bind_elected_transition(monkeypat
     provider = Provider()
     runtime._active_provider = provider
     original_close = runtime.collective.close
-    original_begin = runtime._terminal_gate.begin_runtime_close
+    original_freeze = runtime._terminal_gate._freeze_runtime_close
     original_commit = runtime._terminal_gate.commit_runtime_close
 
     def collective_close():
         observed.append(("collective_close", _current_token(runtime)))
         return original_close()
 
-    def begin(token):
-        transition = original_begin(token)
+    def freeze(token):
+        transition, elected = original_freeze(token)
         transitions.append(transition)
-        return transition
+        return transition, elected
 
     def commit(transition, finalizer):
         assert _current_token(runtime) is None
         return original_commit(transition, finalizer)
 
     monkeypatch.setattr(runtime.collective, "close", collective_close)
-    monkeypatch.setattr(runtime._terminal_gate, "begin_runtime_close", begin)
+    monkeypatch.setattr(runtime._terminal_gate, "_freeze_runtime_close", freeze)
     monkeypatch.setattr(runtime._terminal_gate, "commit_runtime_close", commit)
 
     runtime.close()
@@ -2458,7 +3175,7 @@ def test_fatal_preempts_runtime_provider_close_admission(monkeypatch):
         def _finalize_terminal_runtime_close(self, error):
             terminal_finalizers.append(error)
 
-        def close(self):
+        def close(self, **kwargs):
             provider_close_calls.append(True)
 
     runtime._active_provider = Provider()
@@ -2494,7 +3211,7 @@ def test_fatal_preempts_runtime_provider_close_admission(monkeypatch):
     assert fatal_results == [primary]
     assert fatal_errors == []
     assert provider_close_calls == []
-    assert terminal_finalizers == [primary]
+    assert terminal_finalizers == []
     assert runtime._closed is True
     assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
 
@@ -2504,14 +3221,14 @@ def test_fatal_preempts_runtime_close_begin_and_joins_commit(monkeypatch):
     begin_entered = threading.Event()
     release_begin = threading.Event()
     gate = runtime._terminal_gate
-    original_begin = gate.begin_runtime_close
+    original_freeze = gate._freeze_runtime_close
 
-    def begin(token):
+    def freeze(token):
         begin_entered.set()
         assert release_begin.wait(_TIMEOUT_S)
-        return original_begin(token)
+        return original_freeze(token)
 
-    monkeypatch.setattr(gate, "begin_runtime_close", begin)
+    monkeypatch.setattr(gate, "_freeze_runtime_close", freeze)
     closer, close_results, close_errors, close_done = _start(runtime.close)
     assert begin_entered.wait(_TIMEOUT_S)
     primary = RuntimeError("fatal during runtime close begin")
@@ -2580,7 +3297,7 @@ def test_fatal_preempts_runtime_collective_close_admission(monkeypatch):
     assert close_errors == [primary]
     assert fatal_results == [primary]
     assert fatal_errors == []
-    assert collective_close_calls == [True]
+    assert collective_close_calls == []
     assert runtime._closed is True
     assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
 

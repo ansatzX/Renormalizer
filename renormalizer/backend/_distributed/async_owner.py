@@ -6,6 +6,16 @@ import threading
 import numpy as np
 
 
+def _require_resource_admission(token, validator):
+    if token is None and validator is None:
+        return None
+    if token is None:
+        raise TypeError("resource admission token is required")
+    if not callable(validator):
+        raise TypeError("resource admission validator is required")
+    return validator(token)
+
+
 def event_complete(event):
     query = getattr(event, "query", None)
     if callable(query):
@@ -152,10 +162,43 @@ class _CountedAsyncAdmission:
 
     def __init__(self, gate, parent, capability):
         self._gate = gate
+        self._parent = parent
         self._capability = capability
         self._token = gate.spawn_async(parent, capability)
         self._claimed = None
         self._released = False
+
+    def _validate_claimed(self, claimed):
+        parent = self._parent
+        with self._gate._condition:
+            state = self._gate._token_state(claimed)
+            self._gate._require_token_thread(state)
+            if (
+                claimed.scope != parent.scope
+                or claimed.epoch != parent.epoch
+                or claimed.parent_sequence != parent.sequence
+                or claimed.transition_sequence != parent.transition_sequence
+            ):
+                raise RuntimeError(
+                    "async admission does not match its canonical parent"
+                )
+        return claimed
+
+    @staticmethod
+    def _run_admitted_callback(
+        callback,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
+        return callback(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
     @property
     def token(self):
@@ -175,7 +218,11 @@ class _CountedAsyncAdmission:
         )
         self._claimed = claimed
         try:
-            return callback()
+            return self._run_admitted_callback(
+                callback,
+                _admission_token=claimed,
+                _admission_validator=self._validate_claimed,
+            )
         finally:
             try:
                 self._gate.release(claimed)
@@ -233,6 +280,7 @@ class AsyncResourceOwner:
         _resource_recorder=None,
         _resource_releaser=None,
         _defer_async_completion=False,
+        _callback_requires_admission=False,
     ):
         if not isinstance(kind, str) or not kind:
             raise ValueError("async owner kind must be a non-empty string")
@@ -269,6 +317,9 @@ class AsyncResourceOwner:
         self._events = []
         self._completion_event = None
         self._callback = callback
+        self._callback_requires_admission = bool(
+            _callback_requires_admission
+        )
         self._accounting = accounting
         self._timer = timer
         self._started_at = (
@@ -432,7 +483,7 @@ class AsyncResourceOwner:
         admission = self._async_admission
         execution_requested = admission.wait_for_execution(self._async_requested)
 
-        def complete():
+        def complete(*, _admission_token, _admission_validator):
             if self.state in {"detached", "quarantined"}:
                 return
             if not execution_requested:
@@ -446,7 +497,11 @@ class AsyncResourceOwner:
             if self.state in {"detached", "quarantined"}:
                 return
             try:
-                self._detach("completed")
+                self._detach(
+                    "completed",
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
             except BaseException:
                 # _detach records callback/accounting failures before raising them.
                 return
@@ -584,7 +639,12 @@ class AsyncResourceOwner:
         if self._completion_event is not None:
             wait_event(self._completion_event)
 
-    def _run_completion(self):
+    def _run_completion(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         first_error = self.error
         try:
             if self._elapsed_reader is not None:
@@ -599,7 +659,13 @@ class AsyncResourceOwner:
                 self._remember_secondary(error)
         try:
             if self._callback is not None:
-                self.result = self._callback()
+                if self._callback_requires_admission:
+                    self.result = self._callback(
+                        _admission_token=_admission_token,
+                        _admission_validator=_admission_validator,
+                    )
+                else:
+                    self.result = self._callback()
         except BaseException as error:
             if first_error is None:
                 first_error = error
@@ -619,14 +685,23 @@ class AsyncResourceOwner:
         if first_error is not None:
             raise first_error
 
-    def _detach(self, terminal_state):
+    def _detach(
+        self,
+        terminal_state,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
         if terminal_state not in {"completed", "drained"}:
             raise ValueError("async owner terminal state is invalid")
         self.state = terminal_state
         first_error = self.error
         if self._completion_armed:
             try:
-                self._run_completion()
+                self._run_completion(
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
             except BaseException as error:
                 if first_error is None:
                     first_error = error

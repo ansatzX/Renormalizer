@@ -8,6 +8,7 @@ import numpy as np
 
 from renormalizer.backend._distributed.async_owner import (
     AsyncResourceOwner,
+    _require_resource_admission,
     allocation_records,
     require_async_owner,
 )
@@ -242,7 +243,13 @@ class CacheReservation:
     def allowlist(self):
         return self._allowlist
 
-    def close(self):
+    def close(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if self._closed:
             return
         cache = self._cache
@@ -274,7 +281,16 @@ class DeviceTensorCache:
 
     _terminal_resource_kind = "cache"
 
-    def __init__(self, capacity_bytes, *, allocator, _resource_recorder=None):
+    def __init__(
+        self,
+        capacity_bytes,
+        *,
+        allocator,
+        _resource_recorder=None,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if type(capacity_bytes) is not int or capacity_bytes < 0:
             raise ValueError("capacity_bytes must be a non-negative integer")
         if not callable(allocator):
@@ -358,7 +374,15 @@ class DeviceTensorCache:
         if self._poisoned_error is None:
             self._poisoned_error = error
 
-    def reserve(self, allowlist, required_bytes):
+    def reserve(
+        self,
+        allowlist,
+        required_bytes,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         if self._reservation is not None:
             raise RuntimeError("device tensor cache already has an active reservation")
@@ -469,7 +493,14 @@ class DeviceTensorCache:
                 del self._allocation_refcounts[record.identity]
         entry.allocation_records = ()
 
-    def acquire(self, identity):
+    def acquire(
+        self,
+        identity,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         _validate_identity(identity)
         reservation = self._reservation
@@ -619,7 +650,13 @@ class DeviceTensorCache:
 
         owner.add_release_callback(release)
 
-    def reap_completed(self):
+    def reap_completed(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if self._closed and not self.poisoned:
             return
         self._require_usable()
@@ -641,7 +678,13 @@ class DeviceTensorCache:
         if errors:
             raise errors[0]
 
-    def wait_for_pending(self):
+    def wait_for_pending(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         errors = []
         for owner in tuple(
             dict.fromkeys(retained[0] for retained in self._owner_pending)
@@ -673,7 +716,14 @@ class DeviceTensorCache:
         if errors:
             raise errors[0]
 
-    def contains(self, identity):
+    def contains(
+        self,
+        identity,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         return identity in self._entries
 
     def refcount(self, identity):
@@ -707,7 +757,14 @@ class DeviceTensorCache:
             raise RuntimeError("cache entry is still referenced")
         self._evict(identity, entry)
 
-    def invalidate_ref(self, ref):
+    def invalidate_ref(
+        self,
+        ref,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         identities = [
             identity
             for identity in self._entries
@@ -716,7 +773,13 @@ class DeviceTensorCache:
         for identity in identities:
             self.invalidate(identity)
 
-    def close(self):
+    def close(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if self._closed:
             return
         error = self._poisoned_error

@@ -9,6 +9,7 @@ import numpy as np
 
 from renormalizer.backend._distributed.async_owner import (
     _CountedAsyncAdmission,
+    _require_resource_admission,
     allocation_records,
     merge_allocation_records,
 )
@@ -401,6 +402,7 @@ class _LeaseResourceRecord:
     def __init__(self, epoch):
         self.epoch = epoch
         self._resources = []
+        self._consumed_receipts = {}
         self._allocations = {}
         self._cache_allocations = {}
         self._pinned_allocations = {}
@@ -430,6 +432,10 @@ class _LeaseResourceRecord:
     @property
     def streams(self):
         return tuple(self._streams.values())
+
+    @property
+    def consumed_receipts(self):
+        return tuple(self._consumed_receipts.values())
 
     @staticmethod
     def _merge(target, records):
@@ -468,8 +474,24 @@ class _LeaseResourceRecord:
             if stream is not None:
                 self._streams[id(stream)] = stream
 
+    def capture_consumed_receipt(self, receipt):
+        self._consumed_receipts[id(receipt)] = receipt
+        self.capture(receipt)
+
+    def restore_consumed_receipts(self, runtime):
+        for identity, receipt in tuple(self._consumed_receipts.items()):
+            issued = runtime._issued_receipts.get(identity)
+            if issued is not None and issued is not receipt:
+                raise RuntimeError("consumed residency receipt identity changed")
+            runtime._issued_receipts[identity] = receipt
+            self._resources = [
+                resource for resource in self._resources if resource is not receipt
+            ]
+        self._consumed_receipts.clear()
+
     def clear(self):
         self._resources.clear()
+        self._consumed_receipts.clear()
         self._allocations.clear()
         self._cache_allocations.clear()
         self._pinned_allocations.clear()
@@ -533,19 +555,34 @@ class _ActiveOperandLease:
         working_set = self._working_set
         working_set._raise_terminal_close_preemption()
         try:
-            with working_set._child_close_admission(_admission_token):
-                return self._close_admitted()
+            with working_set._child_close_admission(
+                _admission_token
+            ) as admitted_token:
+                validator = working_set._exact_admission_validator(
+                    admitted_token
+                )
+                return self._close_admitted(
+                    admitted_token,
+                    validator,
+                )
         except BaseException:
             working_set._raise_terminal_close_preemption()
             raise
 
-    def _close_admitted(self):
+    def _close_admitted(self, admission_token, admission_validator):
+        _require_resource_admission(
+            admission_token,
+            admission_validator,
+        )
         working_set = self._working_set
         leases = self._cache_leases
         event = None
         error = None
         try:
-            working_set._observe_peaks()
+            working_set._observe_peaks(
+                _admission_token=admission_token,
+                _admission_validator=admission_validator,
+            )
         except BaseException as caught:
             error = caught
         if not self._shared_call:
@@ -556,6 +593,8 @@ class _ActiveOperandLease:
                 event = working_set.scheduler.record_compute_completion(
                     handle=self._compute_handle,
                     arrays=dirty_arrays,
+                    _admission_token=admission_token,
+                    _admission_validator=admission_validator,
                 )
             except BaseException as caught:
                 if error is None:
@@ -635,7 +674,16 @@ class _LeaseStatusWorkspace:
 
         owner.add_release_callback(release)
 
-    def close(self):
+    def close(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
         if self._closed:
             return
         borrower = self._borrower
@@ -829,6 +877,25 @@ class WorkingSetLease:
 
     def _record_resource(self, **captured):
         self._resource_record.capture(**captured)
+
+    def _exact_admission_validator(self, token):
+        runtime = self._provider.runtime
+        if token.scope == "lease":
+            transition_sequence = None
+        elif token.scope == "lease_close":
+            transition_sequence = token.transition_sequence
+        else:
+            raise RuntimeError(
+                "working-set resource requires lease ownership"
+            )
+        return runtime._exact_admission_validator(
+            token,
+            scope=token.scope,
+            epoch=self._epoch,
+            parent_sequence=token.parent_sequence,
+            transition_sequence=transition_sequence,
+        )
+
     def _handoff_published_terminal(self):
         provider = self._provider
         if provider is None:
@@ -900,11 +967,17 @@ class WorkingSetLease:
             if lookup not in self._current_lookup:
                 raise ValueError("operand placement is outside the working-set plan")
 
-    def _wait_for_staging(self):
+    def _wait_for_staging(self, *, _admission_token, _admission_validator):
         if self.pool.pending_bytes:
             started = self._timer() if self._profile_enabled else None
-            self.pool.wait_for_slot()
-            self.scheduler.reap_completed()
+            self.pool.wait_for_slot(
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
+            self.scheduler.reap_completed(
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
             if started is not None:
                 self.metrics.prefetch_wait_s += self._timer() - started
 
@@ -927,7 +1000,16 @@ class WorkingSetLease:
             if lease.phase != "open":
                 raise RuntimeError("lease is closing")
 
-    def _observe_peaks(self):
+    def _observe_peaks(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
         if not self._profile_enabled:
             return
         device_bytes, host_bytes = self._peak_sampler()
@@ -948,18 +1030,27 @@ class WorkingSetLease:
         with self._lease_admission(
             "operator_call", _admission_token
         ) as admission_token:
+            validator = self._exact_admission_validator(admission_token)
             with self._operator_call_admitted(
-                local_vector, _admission_token=admission_token
+                local_vector,
+                _admission_token=admission_token,
+                _admission_validator=validator,
             ) as call:
                 yield call
 
     @contextmanager
-    def _operator_call_admitted(self, local_vector, *, _admission_token):
-        self._provider.runtime._require_admission(
+    def _operator_call_admitted(
+        self,
+        local_vector,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
             _admission_token,
-            scope="lease",
-            epoch=self._epoch,
+            _admission_validator,
         )
+        validator = _admission_validator
         self._raise_if_admitted_transition_preempted()
         if self._closed or self._closing:
             raise RuntimeError("working-set lease is closing")
@@ -988,6 +1079,8 @@ class WorkingSetLease:
                     self._status_workspace.host_status,
                 ),
                 resources=(local_vector,),
+                _admission_token=_admission_token,
+                _admission_validator=validator,
             )
             owner = handle.owner
             self._status_workspace.attach(owner)
@@ -1025,7 +1118,11 @@ class WorkingSetLease:
             raise primary
         else:
             try:
-                self.scheduler.record_compute_completion(handle=handle)
+                self.scheduler.record_compute_completion(
+                    handle=handle,
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
+                )
             except BaseException as error:
                 call.record_primary(error)
                 if owner.state not in {"detached", "quarantined"}:
@@ -1046,24 +1143,35 @@ class WorkingSetLease:
     ):
         operation = "prefetch" if prefetch else "load"
         with self._lease_admission(operation, _admission_token) as admission_token:
+            validator = self._exact_admission_validator(admission_token)
             return self._load_identity_admitted(
                 identity,
                 prefetch=prefetch,
                 _admission_token=admission_token,
+                _admission_validator=validator,
             )
 
     def _load_identity_admitted(
-        self, identity, *, prefetch, _admission_token
+        self,
+        identity,
+        *,
+        prefetch,
+        _admission_token,
+        _admission_validator,
     ):
-        self._provider.runtime._require_admission(
+        _require_resource_admission(
             _admission_token,
-            scope="lease",
-            epoch=self._epoch,
+            _admission_validator,
         )
+        validator = _admission_validator
         self._raise_if_admitted_transition_preempted()
         self._raise_if_poisoned()
         try:
-            lease = self._provider.cache.acquire(identity)
+            lease = self._provider.cache.acquire(
+                identity,
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
         except BaseException as error:
             self._poison(error)
             raise
@@ -1073,7 +1181,13 @@ class WorkingSetLease:
                 lease.close()
                 return None
             try:
-                lease.wait_for_ready(self.scheduler.wait_for_h2d)
+                lease.wait_for_ready(
+                    lambda event: self.scheduler.wait_for_h2d(
+                        event,
+                        _admission_token=_admission_token,
+                        _admission_validator=validator,
+                    )
+                )
             except BaseException as error:
                 lease.close()
                 self._poison(error)
@@ -1083,17 +1197,32 @@ class WorkingSetLease:
         spec, ref, local_slice = self._entries[identity]
         ticket = None
         try:
-            self._wait_for_staging()
-            with self.pool.checkout(spec.nbytes) as slot:
+            self._wait_for_staging(
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
+            with self.pool.checkout(
+                spec.nbytes,
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            ) as slot:
                 ticket = self.scheduler.stage_h2d(
                     TransferSource(ref, local_slice, lease.reverse_axis),
                     lease.transfer_array,
                     slot,
                     cache_lease=lease,
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
                 )
             lease.install_readiness(ticket)
             if not prefetch:
-                lease.wait_for_ready(self.scheduler.wait_for_h2d)
+                lease.wait_for_ready(
+                    lambda event: self.scheduler.wait_for_h2d(
+                        event,
+                        _admission_token=_admission_token,
+                        _admission_validator=validator,
+                    )
+                )
         except BaseException as error:
             first_error = error
             terminal = self.scheduler.poisoned or (
@@ -1148,32 +1277,61 @@ class WorkingSetLease:
         with self._lease_admission(
             "prefetch", _admission_token
         ) as admission_token:
-            self._raise_if_admitted_transition_preempted()
-            while self._future_queue:
-                identity = self._future_queue.pop(0)
-                if self._provider.cache.contains(identity):
-                    continue
-                self._load_identity(
-                    identity,
-                    prefetch=True,
-                    _admission_token=admission_token,
-                )
-                break
+            validator = self._exact_admission_validator(admission_token)
+            return self._prefetch_one_admitted(
+                _admission_token=admission_token,
+                _admission_validator=validator,
+            )
+
+    def _prefetch_one_admitted(
+        self,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
+        self._raise_if_admitted_transition_preempted()
+        while self._future_queue:
+            identity = self._future_queue.pop(0)
+            if self._provider.cache.contains(
+                identity,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            ):
+                continue
+            self._load_identity(
+                identity,
+                prefetch=True,
+                _admission_token=_admission_token,
+            )
+            break
 
     def acquire(self, request, *, _admission_token=None):
         with self._lease_admission(
             "acquire", _admission_token
         ) as admission_token:
+            validator = self._exact_admission_validator(admission_token)
             return self._acquire_admitted(
-                request, _admission_token=admission_token
+                request,
+                _admission_token=admission_token,
+                _admission_validator=validator,
             )
 
-    def _acquire_admitted(self, request, *, _admission_token):
-        self._provider.runtime._require_admission(
+    def _acquire_admitted(
+        self,
+        request,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
             _admission_token,
-            scope="lease",
-            epoch=self._epoch,
+            _admission_validator,
         )
+        validator = _admission_validator
         self._raise_if_admitted_transition_preempted()
         self.validate_request(request, self.plan)
         arrays = {}
@@ -1215,12 +1373,17 @@ class WorkingSetLease:
                 call_owner.capture_resources(bindings)
                 call_owner.capture_arrays(*bindings.arrays.values())
             self._prefetch_one(_admission_token=_admission_token)
-            self._observe_peaks()
+            self._observe_peaks(
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
             compute_handle = None
             if call_owner is None:
                 compute_handle = self.scheduler.begin_compute(
                     cache_leases=leases,
                     bindings=bindings,
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
                 )
             child = _ActiveOperandLease(
                 self,
@@ -1249,18 +1412,27 @@ class WorkingSetLease:
         with self._lease_admission(
             "mark_dirty", _admission_token
         ) as admission_token:
+            validator = self._exact_admission_validator(admission_token)
             return self._mark_dirty_admitted(
                 key,
                 local_array,
                 _admission_token=admission_token,
+                _admission_validator=validator,
             )
 
-    def _mark_dirty_admitted(self, key, local_array, *, _admission_token):
-        self._provider.runtime._require_admission(
+    def _mark_dirty_admitted(
+        self,
+        key,
+        local_array,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
             _admission_token,
-            scope="lease",
-            epoch=self._epoch,
+            _admission_validator,
         )
+        validator = _admission_validator
         self._raise_if_admitted_transition_preempted()
         if self._closed or self._closing:
             raise RuntimeError("working-set lease is closing")
@@ -1281,35 +1453,54 @@ class WorkingSetLease:
             self._dirty_allocation_records = allocation_records((local_array,))
             self._resource_record.capture(records=self._dirty_allocation_records)
             self._dirty = (ref, local_array)
-        self._observe_peaks()
+        self._observe_peaks(
+            _admission_token=_admission_token,
+            _admission_validator=validator,
+        )
 
     def reap_completed(self, *, _admission_token=None):
         with self._lease_admission(
             "reap", _admission_token
         ) as admission_token:
+            validator = self._exact_admission_validator(admission_token)
             return self._reap_completed_admitted(
-                _admission_token=admission_token
+                _admission_token=admission_token,
+                _admission_validator=validator,
             )
 
-    def _reap_completed_admitted(self, *, _admission_token):
-        self._provider.runtime._require_admission(
+    def _reap_completed_admitted(
+        self,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
             _admission_token,
-            scope="lease",
-            epoch=self._epoch,
+            _admission_validator,
         )
+        validator = _admission_validator
         self._raise_if_admitted_transition_preempted()
         error = None
         try:
-            self.scheduler.reap_completed()
+            self.scheduler.reap_completed(
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
         except BaseException as caught:
             error = caught
         try:
-            self.pool.reap_completed()
+            self.pool.reap_completed(
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
         except BaseException as caught:
             if error is None:
                 error = caught
         try:
-            self._provider.cache.reap_completed()
+            self._provider.cache.reap_completed(
+                _admission_token=_admission_token,
+                _admission_validator=validator,
+            )
         except BaseException as caught:
             if error is None:
                 error = caught
@@ -1317,15 +1508,61 @@ class WorkingSetLease:
             self._poison(error)
             raise error
 
-    def _schedule_writeback(self):
+    def _schedule_writeback(
+        self,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
         if self._dirty is None or self._writeback_ticket is not None:
             return
         ref, array = self._dirty
-        self._wait_for_staging()
-        with self.pool.checkout(int(array.nbytes)) as slot:
-            self._writeback_ticket = self.scheduler.writeback_d2h(array, ref, slot)
+        self._wait_for_staging(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
+        with self.pool.checkout(
+            int(array.nbytes),
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        ) as slot:
+            self._writeback_ticket = self.scheduler.writeback_d2h(
+                array,
+                ref,
+                slot,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
 
-    def _emit_profile(self, planned_cache_bytes, pool):
+    @staticmethod
+    def _close_store_reservation(
+        reservation,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
+        return reservation.close()
+
+    def _emit_profile(
+        self,
+        planned_cache_bytes,
+        pool,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
         if not self._profile_enabled:
             return
         from renormalizer.utils import profiling
@@ -1375,7 +1612,13 @@ class WorkingSetLease:
         gate.wait_for_lease_admissions(transition, _TERMINAL_TIMEOUT_S)
         token = gate.admit_lease_close(transition, operation)
         try:
-            return callback(token)
+            validator = runtime._exact_admission_validator(
+                token,
+                scope="lease_close",
+                epoch=transition.epoch,
+                transition_sequence=transition.sequence,
+            )
+            return callback(token, validator)
         finally:
             runtime._release_admission(token)
 
@@ -1453,7 +1696,11 @@ class WorkingSetLease:
         if not wait:
             try:
                 with self._lease_admission("close_progress") as token:
-                    self._schedule_writeback()
+                    validator = self._exact_admission_validator(token)
+                    self._schedule_writeback(
+                        _admission_token=token,
+                        _admission_validator=validator,
+                    )
                     self.reap_completed(_admission_token=token)
                 return
             except BaseException as caught:
@@ -1517,7 +1764,7 @@ class WorkingSetLease:
                 remember(caught)
                 return None
 
-        def close_children(token):
+        def close_children(token, validator):
             child_error = None
             for child in tuple(self._children):
                 try:
@@ -1530,11 +1777,26 @@ class WorkingSetLease:
 
         run_step("child_close", close_children)
         if error is None:
-            run_step("schedule_writeback", lambda token: self._schedule_writeback())
-        run_step("observe_peaks", lambda token: self._observe_peaks())
+            run_step(
+                "schedule_writeback",
+                lambda token, validator: self._schedule_writeback(
+                    _admission_token=token,
+                    _admission_validator=validator,
+                ),
+            )
+        run_step(
+            "observe_peaks",
+            lambda token, validator: self._observe_peaks(
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
 
-        def complete_scheduler(token):
-            scheduler.complete_all()
+        def complete_scheduler(token, validator):
+            scheduler.complete_all(
+                _admission_token=token,
+                _admission_validator=validator,
+            )
             self.metrics.prefetch_overlap_s += sum(
                 ticket.elapsed_s
                 for ticket in self._prefetch_tickets
@@ -1558,23 +1820,75 @@ class WorkingSetLease:
                 self._writeback_accounted = True
 
         run_step("scheduler_complete", complete_scheduler)
-        run_step("cache_wait", lambda token: provider.cache.wait_for_pending())
-        run_step("pool_reap", lambda token: pool.reap_completed())
+        run_step(
+            "cache_wait",
+            lambda token, validator: provider.cache.wait_for_pending(
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
+        run_step(
+            "pool_reap",
+            lambda token, validator: pool.reap_completed(
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
         if self._writeback_accounted and not self._writeback_invalidated:
-            def invalidate(token):
-                provider.cache.invalidate_ref(old_ref)
+            def invalidate(token, validator):
+                provider.cache.invalidate_ref(
+                    old_ref,
+                    _admission_token=token,
+                    _admission_validator=validator,
+                )
                 self._writeback_invalidated = True
 
             run_step("cache_invalidate", invalidate)
         run_step(
             "emit_profile",
-            lambda token: self._emit_profile(planned_cache_bytes, pool),
+            lambda token, validator: self._emit_profile(
+                planned_cache_bytes,
+                pool,
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
         )
-        run_step("status_close", lambda token: status_workspace.close())
-        run_step("scheduler_close", lambda token: scheduler.close())
-        run_step("pool_close", lambda token: pool.close())
-        run_step("cache_reservation_close", lambda token: cache_reservation.close())
-        run_step("store_reservation_close", lambda token: store_reservation.close())
+        run_step(
+            "status_close",
+            lambda token, validator: status_workspace.close(
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
+        run_step(
+            "scheduler_close",
+            lambda token, validator: scheduler.close(
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
+        run_step(
+            "pool_close",
+            lambda token, validator: pool.close(
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
+        run_step(
+            "cache_reservation_close",
+            lambda token, validator: cache_reservation.close(
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
+        run_step(
+            "store_reservation_close",
+            lambda token, validator: self._close_store_reservation(
+                store_reservation,
+                _admission_token=token,
+                _admission_validator=validator,
+            ),
+        )
 
         try:
             gate.wait_for_lease_admissions(transition, _TERMINAL_TIMEOUT_S)
@@ -1608,15 +1922,23 @@ class ActiveWorkingSetProvider:
         scheduler_factory=TransferScheduler,
         event_factory=None,
         _admission_token=None,
+        _admission_validator=None,
     ):
+        if _admission_token is not None:
+            if _admission_validator is None:
+                _admission_validator = runtime._exact_admission_validator(
+                    _admission_token,
+                    scope="runtime_setup",
+                    epoch=None,
+                )
+            _require_resource_admission(
+                _admission_token,
+                _admission_validator,
+            )
+        elif _admission_validator is not None:
+            raise TypeError("provider construction admission token is required")
         if getattr(runtime, "_closed", True):
             raise RuntimeError("active provider requires an open runtime")
-        if _admission_token is not None:
-            runtime._require_admission(
-                _admission_token,
-                scope="runtime_setup",
-                epoch=None,
-            )
         if type(prefetch_depth) is not int or prefetch_depth <= 0:
             raise ValueError("prefetch_depth must be a positive integer")
         self.runtime = runtime
@@ -1671,13 +1993,21 @@ class ActiveWorkingSetProvider:
         prefetch_depth,
         *,
         _admission_token=None,
+        _admission_validator=None,
     ):
         if _admission_token is not None:
-            self.runtime._require_admission(
+            if _admission_validator is None:
+                _admission_validator = self.runtime._exact_admission_validator(
+                    _admission_token,
+                    scope="runtime_setup",
+                    epoch=None,
+                )
+            _require_resource_admission(
                 _admission_token,
-                scope="runtime_setup",
-                epoch=None,
+                _admission_validator,
             )
+        elif _admission_validator is not None:
+            raise TypeError("provider config admission token is required")
         return (
             device_budget == self.device_budget_resolution
             and host_budget == self.host_budget_resolution
@@ -1727,12 +2057,19 @@ class ActiveWorkingSetProvider:
     def _allocate_status_host():
         return np.empty((1,), dtype=np.int32, order="C")
 
-    def _provision_status_workspace(self, *, _admission_token):
-        self.runtime._require_admission(
+    def _provision_status_workspace(
+        self,
+        *,
+        _admission_token,
+        _admission_validator,
+        _resource_recorder,
+    ):
+        _require_resource_admission(
             _admission_token,
-            scope="construction",
-            epoch=_admission_token.epoch,
+            _admission_validator,
         )
+        if not callable(_resource_recorder):
+            raise TypeError("status resource recorder must be callable")
         collective = self.runtime.collective
         self.runtime._arm_communicator_fatal()
         bootstrap_fatal = getattr(collective, "_bootstrap_fatal_control", None)
@@ -1767,11 +2104,17 @@ class ActiveWorkingSetProvider:
         local_code = 0
         try:
             device_status = self._allocate_status_device()
+            _resource_recorder(
+                records=allocation_records((device_status,)),
+            )
         except BaseException as error:
             local_error = error
             local_code |= 1
         try:
             host_status = self._allocate_status_host()
+            _resource_recorder(
+                records=allocation_records((host_status,)),
+            )
         except BaseException as error:
             if local_error is None:
                 local_error = error
@@ -1886,23 +2229,60 @@ class ActiveWorkingSetProvider:
             add(future.required_refs, future.local_slices, current=False)
         return entries, current_lookup, future_identities
 
+    @staticmethod
+    def _reserve_store(
+        store,
+        snapshot,
+        *,
+        dirty_ref,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
+        return store.reserve(snapshot, dirty_ref=dirty_ref)
+
+    def _activate_lease(
+        self,
+        epoch,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
+        return self.runtime._terminal_gate.activate_lease(
+            epoch,
+            _admission_token,
+        )
+
     def _rollback_partial(
         self,
         token,
         first_error,
         *,
+        record,
+        _admission_validator,
         scheduler,
         pool,
         cache_reservation,
         store_reservation,
         status_workspace,
     ):
-        self.runtime._require_admission(
+        _require_resource_admission(
             token,
-            scope="construction",
-            epoch=token.epoch,
+            _admission_validator,
         )
         error = first_error
+        try:
+            record.restore_consumed_receipts(self.runtime)
+        except BaseException as caught:
+            if error is None:
+                error = caught
         for resource in (
             scheduler,
             pool,
@@ -1913,7 +2293,13 @@ class ActiveWorkingSetProvider:
             if resource is None:
                 continue
             try:
-                resource.close()
+                if resource is store_reservation:
+                    resource.close()
+                else:
+                    resource.close(
+                        _admission_token=token,
+                        _admission_validator=_admission_validator,
+                    )
             except BaseException as caught:
                 if error is None:
                     error = caught
@@ -1948,6 +2334,7 @@ class ActiveWorkingSetProvider:
                 self._active_lease = None
             if self._provisional_resources is record:
                 self._provisional_resources = None
+            record.clear()
 
         return gate.commit_lease_close(transition, finalize)
 
@@ -1991,6 +2378,11 @@ class ActiveWorkingSetProvider:
 
         gate = self.runtime._terminal_gate
         epoch, construction_token = gate.begin_lease("lease_construction")
+        construction_validator = self.runtime._exact_admission_validator(
+            construction_token,
+            scope="construction",
+            epoch=epoch,
+        )
         record = _LeaseResourceRecord(epoch)
         self._provisional_resources = record
         status_workspace = None
@@ -2008,18 +2400,25 @@ class ActiveWorkingSetProvider:
                 request,
                 plan,
                 _admission_token=construction_token,
+                _admission_validator=construction_validator,
+                _resource_recorder=record.capture_consumed_receipt,
             )
             self._raise_construction_transition_preemption()
             status_workspace = self._provision_status_workspace(
-                _admission_token=construction_token
+                _admission_token=construction_token,
+                _admission_validator=construction_validator,
+                _resource_recorder=record.capture,
             )
             record.capture(status_workspace)
             self._raise_construction_transition_preemption()
             dirty_key = request.distributed_plan.execution_plan.output.key
             dirty_ref = dict(request.host_refs)[dirty_key]
-            store_reservation = store.reserve(
+            store_reservation = self._reserve_store(
+                store,
                 request.store_snapshots[self.runtime.rank],
                 dirty_ref=dirty_ref,
+                _admission_token=construction_token,
+                _admission_validator=construction_validator,
             )
             record.capture(store_reservation)
             self._raise_construction_transition_preemption()
@@ -2028,18 +2427,27 @@ class ActiveWorkingSetProvider:
                     self.device_budget_resolution.resolved_bytes,
                     allocator=self._cache_allocator,
                     _resource_recorder=record.capture,
+                    _admission_token=construction_token,
+                    _admission_validator=construction_validator,
                 )
             set_recorder = getattr(self._cache, "_set_resource_recorder", None)
             if callable(set_recorder):
                 set_recorder(record.capture)
             record.capture(self._cache, kind="cache")
-            cache_reservation = self._cache.reserve(allowlist, required_bytes)
+            cache_reservation = self._cache.reserve(
+                allowlist,
+                required_bytes,
+                _admission_token=construction_token,
+                _admission_validator=construction_validator,
+            )
             record.capture(cache_reservation)
             self._raise_construction_transition_preemption()
             pool = self._pool_factory(
                 request.transfer_profile.rank_staging_bytes[self.runtime.rank],
                 pinned_allocator=self._pinned_allocator,
                 _resource_recorder=record.capture,
+                _admission_token=construction_token,
+                _admission_validator=construction_validator,
             )
             record.capture(pool, kind="pinned")
             self._raise_construction_transition_preemption()
@@ -2067,6 +2475,8 @@ class ActiveWorkingSetProvider:
                 ),
                 _resource_recorder=record.capture,
                 _resource_releaser=record.release,
+                _admission_token=construction_token,
+                _admission_validator=construction_validator,
             )
             record.capture(scheduler)
             self._raise_construction_transition_preemption()
@@ -2118,7 +2528,11 @@ class ActiveWorkingSetProvider:
             lease.metrics.pageable_fallback_count = pool.pageable_fallback_count
             lease.metrics.pageable_fallback_bytes = pool.pageable_fallback_bytes
             self.metrics = lease.metrics
-            gate.activate_lease(epoch, construction_token)
+            self._activate_lease(
+                epoch,
+                _admission_token=construction_token,
+                _admission_validator=construction_validator,
+            )
             self._raise_construction_transition_preemption()
         except BaseException as error:
             first_error = error
@@ -2133,6 +2547,8 @@ class ActiveWorkingSetProvider:
                 first_error = self._rollback_partial(
                     construction_token,
                     first_error,
+                    record=record,
+                    _admission_validator=construction_validator,
                     scheduler=scheduler,
                     pool=pool,
                     cache_reservation=cache_reservation,
@@ -2287,7 +2703,16 @@ class ActiveWorkingSetProvider:
             state.update(self._terminal_quarantine.resource_state())
         return state
 
-    def runtime_resource_state(self):
+    def runtime_resource_state(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
         cache = self._cache
         lease = self._active_lease
         scheduler = None if lease is None else lease.scheduler
@@ -2315,7 +2740,16 @@ class ActiveWorkingSetProvider:
             state.update(self._terminal_quarantine.resource_state())
         return state
 
-    def close(self):
+    def close(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
         if self._closed:
             return
         error = self._terminal_error

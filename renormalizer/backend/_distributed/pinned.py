@@ -5,6 +5,7 @@ from contextlib import AbstractContextManager
 import numpy as np
 
 from renormalizer.backend._distributed.async_owner import (
+    _require_resource_admission,
     allocation_record,
     require_async_owner,
 )
@@ -138,7 +139,10 @@ class PinnedBufferPool:
         pinned_allocator=None,
         pageable_allocator=None,
         _resource_recorder=None,
+        _admission_token=None,
+        _admission_validator=None,
     ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if type(capacity_bytes) is not int or capacity_bytes < 0:
             raise ValueError("capacity_bytes must be a non-negative integer")
         if lanes != 1:
@@ -253,7 +257,14 @@ class PinnedBufferPool:
         if self._slot._owner is owner:
             self._pending_bytes = self._slot._nbytes
 
-    def checkout(self, nbytes):
+    def checkout(
+        self,
+        nbytes,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         if type(nbytes) is not int or nbytes <= 0:
             raise ValueError("checkout nbytes must be a positive integer")
@@ -302,7 +313,13 @@ class PinnedBufferPool:
         if owner.completed:
             self._finalize_slot()
 
-    def reap_completed(self):
+    def reap_completed(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if self._closed and not self.poisoned:
             return
         self._require_usable()
@@ -319,7 +336,13 @@ class PinnedBufferPool:
         if owner.completed:
             self._finalize_slot()
 
-    def wait_for_slot(self):
+    def wait_for_slot(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         self._require_usable()
         owner = self._slot._owner
         if owner is not None:
@@ -331,7 +354,13 @@ class PinnedBufferPool:
                 raise
             self._finalize_slot()
 
-    def close(self):
+    def close(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_resource_admission(_admission_token, _admission_validator)
         if self._closed:
             return
         if self._slot._checked_out:
