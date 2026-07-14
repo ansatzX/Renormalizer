@@ -193,7 +193,7 @@ def _cpu_collective(rank, size, store, raw_comm):
     )
     wrapper._bootstrap_store_proxy = store.open_handle()
 
-    def local_fatal_capability_code():
+    def local_fatal_capability_code(*, _deadline=None):
         local_code = 0
         try:
             backend_store = getattr(backend, "_store_proxy")
@@ -644,7 +644,7 @@ def _single_rank_task_18_2_runtime(monkeypatch, *, start_monitor=False):
     monkeypatch.setattr(
         wrapper,
         "_start_fatal_monitor",
-        lambda: _completed_test_monitor(wrapper),
+        lambda **_kwargs: _completed_test_monitor(wrapper),
     )
     assert wrapper._bootstrap_fatal_control() == 0
     monkeypatch.setattr(wrapper, "_start_fatal_monitor", start_fatal_monitor)
@@ -734,7 +734,7 @@ def test_fatal_waits_for_runtime_admission_outside_publication_lock(monkeypatch)
     )
     original_store_set = wrapper._fatal_store_set
 
-    def record_store_set(key, value):
+    def record_store_set(key, value, **kwargs):
         if key == wrapper._fatal_ack_key(wrapper.rank):
             order.append(
                 (
@@ -745,7 +745,7 @@ def test_fatal_waits_for_runtime_admission_outside_publication_lock(monkeypatch)
                     wrapper._fatal_error,
                 )
             )
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", record_store_set)
     publisher, results, errors, done = _start_task_18_2_call(
@@ -846,7 +846,7 @@ def test_remote_monitor_and_local_failure_join_one_transition(monkeypatch):
         monkeypatch.setattr(
             wrapper,
             "_start_fatal_monitor",
-            lambda retained=wrapper: _completed_test_monitor(retained),
+            lambda retained=wrapper, **_kwargs: _completed_test_monitor(retained),
         )
     _bootstrap_cpu_wrappers(wrappers)
     runtime = _task_18_2_runtime(wrappers[1], backends[1])
@@ -962,12 +962,12 @@ def test_abort_ack_and_first_primary_are_exactly_once(monkeypatch):
     monkeypatch.setattr(gate, "_recover_fatal", record_begin_fatal)
     original_store_set = wrapper._fatal_store_set
 
-    def record_store_set(key, value):
+    def record_store_set(key, value, **kwargs):
         if int(value) == 1:
             writes.append(key)
         if key == wrapper._fatal_ack_key(wrapper.rank):
             monitor_stopped_before_ack.append(wrapper._fatal_monitor_stop.is_set())
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", record_store_set)
     later_thread_name = "task-18.2-later-primary"
@@ -1047,22 +1047,22 @@ def test_monitor_detected_fatal_retires_before_every_publication_sentinel(
 
     original_store_set = wrapper._fatal_store_set
 
-    def record_store_set(key, value):
+    def record_store_set(key, value, **kwargs):
         with gate._condition:
             store_access_phases.append(("set", key, gate._phase))
         if key == wrapper._fatal_key(wrapper.rank):
             record_sentinel("fatal_key")
         elif key == wrapper._fatal_ack_key(wrapper.rank):
             record_sentinel("ack")
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", record_store_set)
     original_store_get = wrapper._fatal_store_get
 
-    def record_store_get(key):
+    def record_store_get(key, **kwargs):
         with gate._condition:
             store_access_phases.append(("get", key, gate._phase))
-        return original_store_get(key)
+        return original_store_get(key, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_get", record_store_get)
     original_read = wrapper._read_fatal_origin
@@ -1183,8 +1183,8 @@ def test_close_joins_local_fatal_publication_before_clearing_collective(
     )
     original_join = wrapper._join_fatal_monitor
 
-    def block_owner_after_monitor_join(thread):
-        result = original_join(thread)
+    def block_owner_after_monitor_join(thread, **kwargs):
+        result = original_join(thread, **kwargs)
         if threading.current_thread().name == owner_name:
             owner_after_monitor_exit.set()
             assert release_owner.wait(_TASK_18_2_TIMEOUT_S * 2)
@@ -1193,10 +1193,10 @@ def test_close_joins_local_fatal_publication_before_clearing_collective(
     monkeypatch.setattr(wrapper, "_join_fatal_monitor", block_owner_after_monitor_join)
     original_wait_for_publication = wrapper._wait_for_joined_fatal_publication
 
-    def record_publication_join():
+    def record_publication_join(**kwargs):
         if threading.current_thread().name == close_name:
             close_waiting_for_publication.set()
-        return original_wait_for_publication()
+        return original_wait_for_publication(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_publication_join
@@ -1206,9 +1206,13 @@ def test_close_joins_local_fatal_publication_before_clearing_collective(
     monkeypatch.setattr(
         wrapper,
         "_fatal_store_set",
-        lambda key, value: retained_store.__setitem__(key, value),
+        lambda key, value, **_kwargs: retained_store.__setitem__(key, value),
     )
-    monkeypatch.setattr(wrapper, "_fatal_store_get", retained_store.__getitem__)
+    monkeypatch.setattr(
+        wrapper,
+        "_fatal_store_get",
+        lambda key, **_kwargs: retained_store[key],
+    )
 
     def retained_abort():
         with wrapper._fatal_lock:
@@ -1305,7 +1309,7 @@ def test_visible_fatal_handoff_has_joinable_pre_reserved_owner(monkeypatch):
     monkeypatch.setattr(wrapper, "_begin_fatal_publication", pause_before_ordinary_begin)
     original_join = wrapper._wait_for_joined_fatal_publication
 
-    def record_close_join():
+    def record_close_join(**kwargs):
         if threading.current_thread().name == close_name:
             with wrapper._fatal_condition:
                 close_join_observations.append(
@@ -1315,7 +1319,7 @@ def test_visible_fatal_handoff_has_joinable_pre_reserved_owner(monkeypatch):
                     )
                 )
             close_join_entered.set()
-        return original_join()
+        return original_join(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_close_join
@@ -1413,7 +1417,7 @@ def test_active_operator_primary_is_canonical_before_collective_publication(
     monkeypatch.setattr(wrapper, "_select_fatal_monitor_outcome", record_selection)
     original_store_set = wrapper._fatal_store_set
 
-    def record_acknowledgment(key, value):
+    def record_acknowledgment(key, value, **kwargs):
         if key == wrapper._fatal_ack_key(wrapper.rank):
             acknowledgments.append(
                 (
@@ -1425,7 +1429,7 @@ def test_active_operator_primary_is_canonical_before_collective_publication(
                     backend._execution_terminal_error,
                 )
             )
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", record_acknowledgment)
 
@@ -1913,10 +1917,10 @@ def test_protocol_completed_reporter_joins_until_gate_publication(monkeypatch):
     monkeypatch.setattr(gate, "publish_fatal", pause_gate_publish)
     original_join = wrapper._wait_for_joined_fatal_publication
 
-    def record_reporter_join():
+    def record_reporter_join(**kwargs):
         if threading.current_thread().name == "task-18.2-protocol-reporter":
             reporter_joining.set()
-        return original_join()
+        return original_join(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_reporter_join
@@ -1987,7 +1991,7 @@ def test_legacy_callable_adopts_active_operator_primary_before_publication(
     sentinels = []
     original_store_set = wrapper._fatal_store_set
 
-    def record_store(key, value):
+    def record_store(key, value, **kwargs):
         if key == wrapper._fatal_key(wrapper.rank):
             sentinels.append(
                 (
@@ -1996,7 +2000,7 @@ def test_legacy_callable_adopts_active_operator_primary_before_publication(
                     runtime._terminal_gate._fatal_transition.primary,
                 )
             )
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", record_store)
     original_abort = wrapper._abort_local_communicator
@@ -2246,16 +2250,16 @@ def test_close_ready_fatal_joins_monitor_before_publication_and_prevents_late_st
 
     original_store_get = wrapper._fatal_store_get
 
-    def store_get(key):
+    def store_get(key, **kwargs):
         record_store_access(("get", key))
-        return original_store_get(key)
+        return original_store_get(key, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_get", store_get)
     original_store_set = wrapper._fatal_store_set
 
-    def store_set(key, value):
+    def store_set(key, value, **kwargs):
         record_store_access(("set", key))
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", store_set)
     original_read = wrapper._read_fatal_origin
@@ -2275,21 +2279,21 @@ def test_close_ready_fatal_joins_monitor_before_publication_and_prevents_late_st
 
     monkeypatch.setattr(wrapper, "_select_fatal_monitor_outcome", select_outcome)
     original_wait_for_exit = getattr(
-        wrapper, "_wait_for_fatal_monitor_exit", lambda outcome: outcome
+        wrapper, "_wait_for_fatal_monitor_exit", lambda outcome, **_kwargs: outcome
     )
 
-    def wait_for_exit(outcome):
+    def wait_for_exit(outcome, **kwargs):
         exit_waits.append(outcome)
-        return original_wait_for_exit(outcome)
+        return original_wait_for_exit(outcome, **kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_fatal_monitor_exit", wait_for_exit, raising=False
     )
     original_join = wrapper._join_fatal_monitor
 
-    def join_monitor(thread):
+    def join_monitor(thread, **kwargs):
         joins.append(thread)
-        return original_join(thread)
+        return original_join(thread, **kwargs)
 
     monkeypatch.setattr(wrapper, "_join_fatal_monitor", join_monitor)
 
@@ -2330,11 +2334,13 @@ def test_monitor_fatal_before_stop_observation_preempts_close(monkeypatch):
     gate = runtime._terminal_gate
     close_joining_monitor = threading.Event()
     closer = None
-    original_join = getattr(wrapper, "_join_fatal_monitor", lambda thread: None)
+    original_join = getattr(
+        wrapper, "_join_fatal_monitor", lambda thread, **_kwargs: None
+    )
 
-    def observe_join(thread):
+    def observe_join(thread, **kwargs):
         close_joining_monitor.set()
-        return original_join(thread)
+        return original_join(thread, **kwargs)
 
     monkeypatch.setattr(wrapper, "_join_fatal_monitor", observe_join, raising=False)
     wrapper._start_fatal_monitor()
@@ -2424,10 +2430,10 @@ def test_monitor_ack_and_join_hold_no_gate_admission_or_publication_lock(
     gate = runtime._terminal_gate
     observations = []
     original_wait = getattr(
-        wrapper, "_wait_for_fatal_monitor_exit", lambda outcome: outcome
+        wrapper, "_wait_for_fatal_monitor_exit", lambda outcome, **_kwargs: outcome
     )
 
-    def checked_wait(outcome):
+    def checked_wait(outcome, **kwargs):
         with gate._condition:
             holds_admission = threading.get_ident() in gate._thread_tokens
         observations.append(
@@ -2439,14 +2445,16 @@ def test_monitor_ack_and_join_hold_no_gate_admission_or_publication_lock(
                 wrapper._close_lock.locked(),
             )
         )
-        return original_wait(outcome)
+        return original_wait(outcome, **kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_fatal_monitor_exit", checked_wait, raising=False
     )
-    original_join = getattr(wrapper, "_join_fatal_monitor", lambda thread: None)
+    original_join = getattr(
+        wrapper, "_join_fatal_monitor", lambda thread, **_kwargs: None
+    )
 
-    def checked_join(thread):
+    def checked_join(thread, **kwargs):
         with gate._condition:
             holds_admission = threading.get_ident() in gate._thread_tokens
         observations.append(
@@ -2458,7 +2466,7 @@ def test_monitor_ack_and_join_hold_no_gate_admission_or_publication_lock(
                 wrapper._close_lock.locked(),
             )
         )
-        return original_join(thread)
+        return original_join(thread, **kwargs)
 
     monkeypatch.setattr(wrapper, "_join_fatal_monitor", checked_join, raising=False)
     wrapper._start_fatal_monitor()
@@ -2525,11 +2533,11 @@ def test_nonzero_fatal_origin_cannot_be_overtaken_by_rank_zero_close(monkeypatch
     close_waiting = threading.Event()
     original_store_set = wrappers[1]._fatal_store_set
 
-    def staggered_origin_ack(key, value):
+    def staggered_origin_ack(key, value, **kwargs):
         if key == wrappers[1]._fatal_ack_key(1):
             origin_waiting.set()
             assert release_origin.wait(3.0)
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(
         wrappers[1], "_fatal_store_set", staggered_origin_ack
@@ -3007,13 +3015,19 @@ def test_close_waits_for_complete_active_broadcast_agreement(monkeypatch, fatal)
     for rank, wrapper in enumerate(wrappers):
         original_set = wrapper._fatal_store_set
 
-        def pause_active_record(key, value, rank=rank, original_set=original_set):
+        def pause_active_record(
+            key,
+            value,
+            rank=rank,
+            original_set=original_set,
+            **kwargs,
+        ):
             if key == wrappers[rank]._active_b_key(rank):
                 sequence, _ = wrappers[rank]._decode_active_b(value)
                 if int(sequence) == 1:
                     agreement_entered[rank].set()
                     assert release_agreement.wait(3.0)
-            return original_set(key, value)
+            return original_set(key, value, **kwargs)
 
         monkeypatch.setattr(wrapper, "_fatal_store_set", pause_active_record)
 
@@ -3154,16 +3168,16 @@ def test_active_broadcast_fatal_publication_waits_for_admitted_agreement(
     original_store_set = wrapper._fatal_store_set
     original_store_get = wrapper._fatal_store_get
 
-    def trace_store_set(key, value):
+    def trace_store_set(key, value, **kwargs):
         if key == wrapper._active_b_key(wrapper.rank):
             active_store_entered.set()
             assert release_active_store.wait(_TASK_18_2_TIMEOUT_S * 2)
         store_trace.append(("set", key, gate.phase, wrapper._fatal_error))
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
-    def trace_store_get(key):
+    def trace_store_get(key, **kwargs):
         store_trace.append(("get", key, gate.phase, wrapper._fatal_error))
-        return original_store_get(key)
+        return original_store_get(key, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", trace_store_set)
     monkeypatch.setattr(wrapper, "_fatal_store_get", trace_store_get)
@@ -3350,16 +3364,16 @@ def test_active_broadcast_joiner_blocks_existing_owner_until_agreement(
     original_store_set = wrapper._fatal_store_set
     original_store_get = wrapper._fatal_store_get
 
-    def trace_store_set(key, value):
+    def trace_store_set(key, value, **kwargs):
         if key == wrapper._active_b_key(wrapper.rank):
             active_store_entered.set()
             assert release_active_store.wait(_TASK_18_2_TIMEOUT_S * 2)
         store_trace.append(("set", key, gate.phase, wrapper._fatal_error))
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
-    def trace_store_get(key):
+    def trace_store_get(key, **kwargs):
         store_trace.append(("get", key, gate.phase, wrapper._fatal_error))
-        return original_store_get(key)
+        return original_store_get(key, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", trace_store_set)
     monkeypatch.setattr(wrapper, "_fatal_store_get", trace_store_get)
@@ -3548,14 +3562,14 @@ def test_legacy_active_broadcast_defers_one_transition_publish_until_agreement(
     wrapper._install_fatal_handler(legacy_handler)
     original_store_set = wrapper._fatal_store_set
 
-    def observe_store_set(key, value):
+    def observe_store_set(key, value, **kwargs):
         if key == wrapper._active_b_key(wrapper.rank):
             active_store_entered.set()
             assert release_active_store.wait(_TASK_18_2_TIMEOUT_S * 2)
             order.append("active_b_set")
         elif key == wrapper._fatal_ack_key(wrapper.rank):
             order.append("fatal_ack")
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", observe_store_set)
     original_gate_publish = gate.publish_fatal
@@ -3703,11 +3717,11 @@ def test_deferred_quarantine_failure_retains_owner_and_fail_stops_close(
     owner.mark_enqueued()
     original_store_set = wrapper._fatal_store_set
 
-    def pause_active_store(key, value):
+    def pause_active_store(key, value, **kwargs):
         if key == wrapper._active_b_key(wrapper.rank):
             active_store_entered.set()
             assert release_active_store.wait(_TASK_18_2_TIMEOUT_S * 2)
-        return original_store_set(key, value)
+        return original_store_set(key, value, **kwargs)
 
     monkeypatch.setattr(wrapper, "_fatal_store_set", pause_active_store)
 
@@ -4092,10 +4106,16 @@ def test_failed_owner_terminal_slot_holds_fatal_reservation_against_close(monkey
                     remote_publication_started.set()
             return result
 
-        def record_set(key, value, rank=rank, original=original_set):
+        def record_set(
+            key,
+            value,
+            rank=rank,
+            original=original_set,
+            **kwargs,
+        ):
             if int(value) == 1:
                 control_writes[rank].append(key)
-            return original(key, value)
+            return original(key, value, **kwargs)
 
         monkeypatch.setattr(wrapper, "_begin_fatal_publication", record_begin)
         monkeypatch.setattr(wrapper, "_fatal_store_set", record_set)
@@ -4286,10 +4306,16 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
     for rank, wrapper in enumerate(wrappers):
         original_set = wrapper._fatal_store_set
 
-        def record_set(key, value, rank=rank, original=original_set):
+        def record_set(
+            key,
+            value,
+            rank=rank,
+            original=original_set,
+            **kwargs,
+        ):
             if int(value) == 1:
                 control_writes[rank].append(key)
-            return original(key, value)
+            return original(key, value, **kwargs)
 
         monkeypatch.setattr(wrapper, "_fatal_store_set", record_set)
 
@@ -4680,7 +4706,7 @@ collective = CupyNcclCollective(
     port=23456,
 )
 collective._bootstrap_store_proxy = Store()
-collective._local_fatal_capability_code = lambda: 0
+collective._local_fatal_capability_code = lambda **_kwargs: 0
 assert collective._bootstrap_fatal_control() == 0
 collective._publish_communicator_fatal(RuntimeError("primary"))
 raise AssertionError("abort failure returned to ordinary Python")
@@ -4729,7 +4755,7 @@ def test_runtime_close_failure_is_terminal_without_collective_retry():
         runtime.close()
 
     assert runtime._closed is True
-    assert runtime.collective is None
+    assert runtime.collective is collective
     assert collective.close_calls == 1
     assert collective.live is True
 
@@ -4737,6 +4763,7 @@ def test_runtime_close_failure_is_terminal_without_collective_retry():
     runtime.close()
 
     assert runtime._closed is True
+    assert runtime.collective is collective
     assert collective.live is True
     assert collective.close_calls == 1
     with pytest.raises(RuntimeError, match="distributed runtime is closed"):
@@ -5355,7 +5382,7 @@ def test_active_broadcast_validation_failure_joins_existing_owner(monkeypatch):
             owner_waiting.set()
         return original_barrier_wait()
 
-    def forbid_active_broadcast_self_join():
+    def forbid_active_broadcast_self_join(**kwargs):
         if (
             threading.current_thread().name == worker_name
             and wrapper._active_broadcast_agreements
@@ -5363,7 +5390,7 @@ def test_active_broadcast_validation_failure_joins_existing_owner(monkeypatch):
             error = AssertionError("active-B discoverer joined before agreement")
             self_join_errors.append(error)
             raise error
-        return original_join()
+        return original_join(**kwargs)
 
     def hard_exit():
         hard_exits.append(threading.current_thread().name)
@@ -5850,7 +5877,7 @@ def test_immediate_post_pre_reservation_failure_recovers_exact_gate_and_close(
     )
     original_wait = wrapper._wait_for_joined_fatal_publication
 
-    def record_join():
+    def record_join(**kwargs):
         with wrapper._fatal_condition:
             join_observations.append(
                 (
@@ -5859,7 +5886,7 @@ def test_immediate_post_pre_reservation_failure_recovers_exact_gate_and_close(
                     wrapper._fatal_publication_failure,
                 )
             )
-        return original_wait()
+        return original_wait(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_join
@@ -6046,7 +6073,7 @@ def test_hidden_fatal_preparation_escape_repairs_owner_before_handoff_release(
     )
     original_join = wrapper._wait_for_joined_fatal_publication
 
-    def record_join():
+    def record_join(**kwargs):
         with wrapper._fatal_condition:
             join_observations.append(
                 (
@@ -6055,7 +6082,7 @@ def test_hidden_fatal_preparation_escape_repairs_owner_before_handoff_release(
                     wrapper._fatal_publication_failure,
                 )
             )
-        return original_join()
+        return original_join(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_join
@@ -6349,7 +6376,7 @@ def test_pre_reserve_escape_backs_transition_token_and_context_before_handoff_re
     )
     original_join = wrapper._wait_for_joined_fatal_publication
 
-    def record_join():
+    def record_join(**kwargs):
         with wrapper._fatal_condition:
             join_observations.append(
                 (
@@ -6358,7 +6385,7 @@ def test_pre_reserve_escape_backs_transition_token_and_context_before_handoff_re
                     wrapper._fatal_publication_failure,
                 )
             )
-        return original_join()
+        return original_join(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_join
@@ -6645,7 +6672,7 @@ def test_hidden_fatal_reservation_preempts_clean_after_preparation_escape(
     monkeypatch.setattr(gate, "commit_runtime_close", record_close_commit)
     original_join = wrapper._wait_for_joined_fatal_publication
 
-    def record_join():
+    def record_join(**kwargs):
         with wrapper._fatal_condition:
             join_observations.append(
                 (
@@ -6654,7 +6681,7 @@ def test_hidden_fatal_reservation_preempts_clean_after_preparation_escape(
                     wrapper._fatal_publication_failure,
                 )
             )
-        return original_join()
+        return original_join(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_join
@@ -7029,7 +7056,7 @@ def test_hidden_fatal_election_recovers_every_reserved_owner_boundary(
     )
     original_wait = wrapper._wait_for_joined_fatal_publication
 
-    def record_join():
+    def record_join(**kwargs):
         with wrapper._fatal_condition:
             join_observations.append(
                 (
@@ -7038,7 +7065,7 @@ def test_hidden_fatal_election_recovers_every_reserved_owner_boundary(
                     wrapper._fatal_publication_failure,
                 )
             )
-        return original_wait()
+        return original_wait(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_join
@@ -7561,6 +7588,7 @@ def test_live_gate_failure_claim_is_not_stolen_after_deadline(monkeypatch):
     primitive_calls = []
     competing_results = []
     hard_exit_observations = []
+    hard_exit_claimed = threading.Event()
 
     monkeypatch.setattr(collectives_module, "_FATAL_TIMEOUT_S", 0.05)
     real_gate_primitive = gate._fail_fatal_publication
@@ -7606,6 +7634,7 @@ def test_live_gate_failure_claim_is_not_stolen_after_deadline(monkeypatch):
                 gate._condition._is_owned(),
             )
         )
+        hard_exit_claimed.set()
         raise FatalHardExit(threading.current_thread().name)
 
     monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
@@ -7625,7 +7654,7 @@ def test_live_gate_failure_claim_is_not_stolen_after_deadline(monkeypatch):
             transition_handler=hook,
             transition=transition,
         ) == (True, True)
-        wrapper._fatal_hard_exit()
+        wrapper._hard_exit_once(primary)
 
     owner, owner_results, owner_errors, owner_done = _start_task_18_2_call(
         reserve_and_fail_owner, name=owner_name
@@ -7657,6 +7686,8 @@ def test_live_gate_failure_claim_is_not_stolen_after_deadline(monkeypatch):
         assert competitor_entered.wait(_TASK_18_2_TIMEOUT_S)
         assert close_entered.wait(_TASK_18_2_TIMEOUT_S)
         _join_task_18_2_call(competitor, competitor_done)
+        assert hard_exit_claimed.wait(_TASK_18_2_TIMEOUT_S)
+        _join_task_18_2_call(closer, close_done)
         before_release = (
             tuple(callback_calls),
             len(primitive_calls),
@@ -7671,10 +7702,9 @@ def test_live_gate_failure_claim_is_not_stolen_after_deadline(monkeypatch):
         if closer is not None and closer.is_alive():
             _join_task_18_2_call(closer, close_done)
 
-    assert before_release == ((owner_name,), 0, False)
+    assert before_release == ((owner_name,), 0, True)
     assert owner_results == []
-    assert len(owner_errors) == 1
-    assert isinstance(owner_errors[0], FatalHardExit)
+    assert owner_errors == [primary]
     assert competitor_results == [None]
     assert competitor_errors == []
     assert competing_results == [(False, False)]
@@ -7696,7 +7726,6 @@ def test_live_gate_failure_claim_is_not_stolen_after_deadline(monkeypatch):
     with gate._condition:
         assert gate._fatal_publication_failure is primary
     assert hard_exit_observations == [
-        (owner_name, False, False, False),
         (close_name, False, False, False),
     ]
     assert raw_comm.abort_calls == 0
@@ -8485,7 +8514,7 @@ def test_pre_reserved_fatal_owner_failure_before_adoption_is_fail_stopped(
     )
     original_wait = wrapper._wait_for_joined_fatal_publication
 
-    def record_join():
+    def record_join(**kwargs):
         with wrapper._fatal_condition:
             join_observations.append(
                 (
@@ -8494,7 +8523,7 @@ def test_pre_reserved_fatal_owner_failure_before_adoption_is_fail_stopped(
                     wrapper._fatal_publication_failure,
                 )
             )
-        return original_wait()
+        return original_wait(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_join
@@ -8645,7 +8674,7 @@ def test_adopted_fatal_owner_construction_failure_is_fail_stopped(monkeypatch):
     )
     original_wait = wrapper._wait_for_joined_fatal_publication
 
-    def record_join():
+    def record_join(**kwargs):
         with wrapper._fatal_condition:
             join_observations.append(
                 (
@@ -8654,7 +8683,7 @@ def test_adopted_fatal_owner_construction_failure_is_fail_stopped(monkeypatch):
                     wrapper._fatal_publication_failure,
                 )
             )
-        return original_wait()
+        return original_wait(**kwargs)
 
     monkeypatch.setattr(
         wrapper, "_wait_for_joined_fatal_publication", record_join
@@ -9772,3 +9801,105 @@ def test_monitor_start_failure_totalizes_fatal_begin_failure(
         assert owner is None
     assert begin_failure in wrapper._fatal_secondary_errors
     assert begin_failure in runtime._terminal_secondary_errors
+
+
+def test_direct_fail_stop_installs_collective_and_gate_markers_before_exit(
+    monkeypatch,
+):
+    class FatalHardExit(BaseException):
+        pass
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("direct fail-stop primary")
+    observations = []
+
+    def hard_exit():
+        with wrapper._fatal_condition:
+            collective_marker = wrapper._fatal_publication_failure
+        with gate._condition:
+            transition = gate._fatal_transition
+            gate_marker = gate._fatal_publication_failure
+        observations.append(
+            (
+                collective_marker,
+                gate_marker,
+                None if transition is None else transition.primary,
+                wrapper._fatal_condition._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit()
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+    with pytest.raises(FatalHardExit):
+        wrapper._diagnose_and_hard_exit(primary)
+
+    assert observations == [(primary, primary, primary, False, False)]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("fatal_bootstrap", "status_bootstrap"),
+)
+def test_construction_store_barriers_reject_expired_lifecycle_deadline(
+    monkeypatch,
+    operation,
+):
+    from renormalizer.backend._distributed import collectives as collectives_module
+
+    _, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    calls = []
+
+    class Store:
+        host = "127.0.0.1"
+        port = 1
+
+        def __getitem__(self, key):
+            calls.append(("get", key))
+            raise AssertionError("expired lifecycle performed a store read")
+
+        def __setitem__(self, key, value):
+            calls.append(("set", key, value))
+            raise AssertionError("expired lifecycle performed a store write")
+
+        def barrier(self):
+            calls.append(("barrier",))
+            raise AssertionError("expired lifecycle entered a store barrier")
+
+    wrapper._bootstrap_store_proxy = Store()
+    monkeypatch.setattr(collectives_module.time, "monotonic", lambda: 10.0)
+    with pytest.raises(TimeoutError, match="lifecycle deadline"):
+        if operation == "fatal_bootstrap":
+            wrapper._bootstrap_fatal_control(_deadline=9.0)
+        else:
+            wrapper._fatal_control_initialized = True
+            wrapper._bootstrap_status_or(0, _deadline=9.0)
+    assert calls == []
+
+
+def test_fatal_monitor_start_receives_construction_lifecycle_deadline(
+    monkeypatch,
+):
+    class FatalHardExit(BaseException):
+        pass
+
+    store = _SharedStore(1)
+    wrapper, backend = _cpu_collective(0, 1, store, _RawComm())
+    _task_18_2_runtime(wrapper, backend)
+    deadline = time.monotonic() + _TASK_18_2_TIMEOUT_S
+    captured = []
+
+    def start_monitor(*, _deadline):
+        captured.append(_deadline)
+        return _completed_test_monitor(wrapper)
+
+    monkeypatch.setattr(wrapper, "_start_fatal_monitor", start_monitor)
+    monkeypatch.setattr(
+        wrapper,
+        "_fatal_hard_exit",
+        lambda: (_ for _ in ()).throw(FatalHardExit()),
+    )
+
+    assert wrapper._bootstrap_fatal_control(_deadline=deadline) == 0
+    assert captured == [deadline]

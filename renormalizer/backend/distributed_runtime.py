@@ -44,6 +44,7 @@ from renormalizer.backend._distributed.terminal import (
     _TerminalLifecycleGate,
     _TerminalPhase,
     _TERMINAL_TIMEOUT_S,
+    _remaining_lifecycle_time,
 )
 from renormalizer.backend.config import BackendConfig, DistributedExecutionConfig
 from renormalizer.backend.factory import create_backend
@@ -1066,6 +1067,11 @@ class CupyDistributedRuntime:
         install = getattr(self.collective, "_install_fatal_handler", None)
         if not callable(install):
             raise RuntimeError("collective does not provide fatal observation")
+        if hasattr(self.collective, "_terminal_gate_fallback"):
+            self.collective._terminal_gate_fallback = weakref.ref(
+                self._terminal_gate
+            )
+            self.collective._terminal_runtime_fallback = weakref.ref(self)
         hook = _RuntimeCommunicatorFatalHook(self)
         self._communicator_fatal_hook = hook
         install(hook)
@@ -1841,7 +1847,11 @@ class CupyDistributedRuntime:
         except BaseException as publication_error:
             transition = self._terminal_gate._fatal_transition
             if transition is None:
-                raise
+                transition = self._terminalize_communicator_fatal_failure(
+                    primary,
+                    diagnostics=(publication_error,),
+                )
+                raise transition.primary
             primary = transition.primary
             failure_was_recorded = (
                 self._terminal_gate._fatal_publication_failed(
@@ -2820,6 +2830,7 @@ class CupyDistributedRuntime:
         publish_error=True,
         mark_closed=True,
         clear_collective=True,
+        preserve_resources=False,
     ):
         with self._terminal_gate._condition:
             with self._terminal_state_lock:
@@ -2844,10 +2855,11 @@ class CupyDistributedRuntime:
                         lease=lease,
                         owner=owner,
                     )
-                self._issued_receipts.clear()
-                self._active_provider = None
-                if clear_collective:
-                    self.collective = None
+                if not preserve_resources:
+                    self._issued_receipts.clear()
+                    self._active_provider = None
+                    if clear_collective:
+                        self.collective = None
                 if mark_closed:
                     self._closed = True
         return error
@@ -2884,6 +2896,7 @@ class CupyDistributedRuntime:
                     publish_error=False,
                     mark_closed=False,
                     clear_collective=False,
+                    preserve_resources=True,
                 )
             except BaseException as clear_error:
                 with self._terminal_state_lock:
@@ -2918,7 +2931,7 @@ class CupyDistributedRuntime:
                     )
                 )
                 if callable(join_publication):
-                    join_publication()
+                    join_publication(_deadline=transition.deadline)
                 else:
                     self._finish_failed_fatal_runtime_close(transition)
             raise
@@ -2928,6 +2941,7 @@ class CupyDistributedRuntime:
                     error,
                     publish_error=False,
                     clear_collective=False,
+                    preserve_resources=True,
                 )
             except BaseException as clear_error:
                 with self._terminal_state_lock:
@@ -2946,6 +2960,7 @@ class CupyDistributedRuntime:
                 primary,
                 publish_error=False,
                 clear_collective=False,
+                preserve_resources=True,
             ),
         )
         if secondary is not None:
@@ -3029,6 +3044,10 @@ class CupyDistributedRuntime:
 
     def _run_elected_runtime_close(self, transition, error):
         """Run every fallible elected-owner action under the caller's guard."""
+        _remaining_lifecycle_time(
+            transition.deadline,
+            "runtime close lifecycle timed out before scheduler start",
+        )
         _, _, frozen_scheduler = self._runtime_close_snapshot()
         if frozen_scheduler is not None:
             frozen_scheduler._start_counted_completions()
@@ -3041,11 +3060,7 @@ class CupyDistributedRuntime:
         provider, lease, _ = self._runtime_close_snapshot()
         collective = self.collective
         if lease is not None:
-            try:
-                lease.close()
-            except Exception as caught:
-                if error is None:
-                    error = caught
+            lease.close(_lifecycle_deadline=transition.deadline)
         if self._terminal_gate.phase in (
             _TerminalPhase.FATAL_PENDING,
             _TerminalPhase.FATAL_PUBLISHED,
@@ -3055,67 +3070,48 @@ class CupyDistributedRuntime:
             self._commit_fatal_runtime_close(fatal_transition, error)
             raise error
         if provider is not None:
+            provider_token = self._admit_runtime_close_step(
+                transition, "provider_close"
+            )
             try:
-                provider_token = self._admit_runtime_close_step(
-                    transition, "provider_close"
+                provider_validator = self._exact_admission_validator(
+                    provider_token,
+                    scope="runtime_close",
+                    epoch=None,
+                    transition_sequence=transition.sequence,
                 )
-            except Exception as caught:
-                if self._terminal_gate.phase in (
-                    _TerminalPhase.FATAL_PENDING,
-                    _TerminalPhase.FATAL_PUBLISHED,
-                ):
-                    fatal_transition = self._terminal_gate.begin_runtime_close(None)
-                    error = fatal_transition.primary
-                    self._commit_fatal_runtime_close(fatal_transition, error)
-                    raise error
-                if error is None:
-                    error = caught
+                provider._close_for_runtime(
+                    _admission_token=provider_token,
+                    _admission_validator=provider_validator,
+                    _deadline=transition.deadline,
+                )
+            finally:
+                self._release_runtime_close_step(provider_token)
+        if collective is not None and self._terminal_gate.phase not in (
+            _TerminalPhase.FATAL_PENDING,
+            _TerminalPhase.FATAL_PUBLISHED,
+        ):
+            close_for_runtime = getattr(collective, "_close_for_runtime", None)
+            if callable(close_for_runtime):
+                close_for_runtime(self._terminal_gate, transition)
             else:
+                collective_token = self._admit_runtime_close_step(
+                    transition, "collective_close"
+                )
                 try:
-                    provider_validator = self._exact_admission_validator(
-                        provider_token,
+                    collective_validator = self._exact_admission_validator(
+                        collective_token,
                         scope="runtime_close",
                         epoch=None,
                         transition_sequence=transition.sequence,
                     )
-                    provider._close_for_runtime(
-                        _admission_token=provider_token,
-                        _admission_validator=provider_validator,
+                    self._close_collective(
+                        collective,
+                        _admission_token=collective_token,
+                        _admission_validator=collective_validator,
                     )
-                except Exception as caught:
-                    if error is None:
-                        error = caught
                 finally:
-                    self._release_runtime_close_step(provider_token)
-        try:
-            if collective is not None and self._terminal_gate.phase not in (
-                _TerminalPhase.FATAL_PENDING,
-                _TerminalPhase.FATAL_PUBLISHED,
-            ):
-                close_for_runtime = getattr(collective, "_close_for_runtime", None)
-                if callable(close_for_runtime):
-                    close_for_runtime(self._terminal_gate, transition)
-                else:
-                    collective_token = self._admit_runtime_close_step(
-                        transition, "collective_close"
-                    )
-                    try:
-                        collective_validator = self._exact_admission_validator(
-                            collective_token,
-                            scope="runtime_close",
-                            epoch=None,
-                            transition_sequence=transition.sequence,
-                        )
-                        self._close_collective(
-                            collective,
-                            _admission_token=collective_token,
-                            _admission_validator=collective_validator,
-                        )
-                    finally:
-                        self._release_runtime_close_step(collective_token)
-        except Exception as caught:
-            if error is None:
-                error = caught
+                    self._release_runtime_close_step(collective_token)
 
         if self._terminal_gate.phase in (
             _TerminalPhase.FATAL_PENDING,
@@ -3127,6 +3123,10 @@ class CupyDistributedRuntime:
             raise error
         if self._terminal_error is not None:
             error = self._terminal_error
+        _remaining_lifecycle_time(
+            transition.deadline,
+            "runtime close lifecycle timed out before commit",
+        )
         result = self._terminal_gate.commit_runtime_close(
             transition, lambda: self._clear_runtime_references(error)
         )
@@ -3148,6 +3148,35 @@ class CupyDistributedRuntime:
         error = self._terminal_error
         if error is None:
             error = getattr(self.backend, "_execution_terminal_error", None)
+        if error is not None:
+            try:
+                self._enter_communicator_fatal(error)
+            except BaseException as publication_error:
+                transition = self._terminal_gate._fatal_transition
+                if transition is None:
+                    raise
+                collective = self.collective
+                claimed = getattr(
+                    collective,
+                    "_current_thread_claimed_fatal_hard_exit",
+                    None,
+                )
+                if callable(claimed) and claimed(transition.primary):
+                    raise
+                if publication_error is not transition.primary:
+                    with self._terminal_state_lock:
+                        self._retain_terminal_secondary_locked(
+                            publication_error,
+                            transition.primary,
+                        )
+            transition = self._terminal_gate._fatal_transition
+            if transition is None:
+                raise RuntimeError(
+                    "runtime terminal error did not install a fatal transition"
+                ) from error
+            primary = transition.primary
+            self._commit_fatal_runtime_close(transition, primary)
+            raise primary
         request = None
         entry_error = None
         try:

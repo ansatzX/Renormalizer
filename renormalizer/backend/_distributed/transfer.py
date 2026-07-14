@@ -17,6 +17,8 @@ from renormalizer.backend._distributed.async_owner import (
 from renormalizer.backend._distributed.pinned import StagingSlot
 from renormalizer.backend._distributed.terminal import (
     _publish_lease_construction_resource,
+    _publish_lease_construction_resource_direct,
+    _remaining_lifecycle_time,
 )
 
 
@@ -159,8 +161,8 @@ class AsyncCompletionHandle:
     def reap(self):
         return self._owner.reap()
 
-    def wait(self):
-        return self._owner.wait()
+    def wait(self, *, _deadline=None):
+        return self._owner.wait(_deadline=_deadline)
 
     def query(self):
         return self.reap()
@@ -262,21 +264,14 @@ class TransferScheduler:
         ):
             if supplied is not None and not callable(supplied):
                 raise TypeError("{} must be callable".format(name))
+        self._managed = _construction_slot is not None
         self.store = store
         self.backend = backend
         self.pool = pool
         self.reservation = reservation
         self._cupy = getattr(backend, "_cupy", None) if backend.name == "cupy" else None
-        if self._cupy is None:
-            self._stream = None
-            default_event_factory = _ImmediateEvent
-        else:
-            with self._cupy.cuda.Device(backend._device_index):
-                self._stream = self._cupy.cuda.Stream(non_blocking=True)
-            default_event_factory = lambda: self._cupy.cuda.Event(disable_timing=True)
-        self._event_factory = (
-            default_event_factory if event_factory is None else event_factory
-        )
+        self._stream = None
+        self._event_factory = event_factory
         self._profile_enabled = profile_enabled
         self._timer = None
         self._timing_event_factory = None
@@ -313,6 +308,24 @@ class TransferScheduler:
         self.h2d_s = 0.0
         self.d2h_s = 0.0
         self.last_compute_event = None
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            self,
+        )
+        if self._cupy is None:
+            default_event_factory = _ImmediateEvent
+        else:
+            with self._cupy.cuda.Device(backend._device_index):
+                self._stream = self._cupy.cuda.Stream(non_blocking=True)
+            default_event_factory = lambda: self._cupy.cuda.Event(disable_timing=True)
+        self._event_factory = (
+            default_event_factory if event_factory is None else event_factory
+        )
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            self,
+            streams=(self._stream,),
+        )
         _publish_lease_construction_resource(
             _construction_slot,
             self,
@@ -368,7 +381,22 @@ class TransferScheduler:
 
     @property
     def event_count(self):
+        if self._managed:
+            raise TypeError("managed transfer scheduler state requires admission")
         self.reap_completed()
+        return self.retained_event_count
+
+    def _runtime_event_count(
+        self,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
+        self.reap_completed(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         return self.retained_event_count
 
     def _require_usable(self):
@@ -378,6 +406,11 @@ class TransferScheduler:
             )
         if self._closed:
             raise RuntimeError("transfer scheduler is closed")
+
+    def _require_admission(self, token, validator):
+        if getattr(self, "_managed", False) and token is None and validator is None:
+            raise TypeError("managed transfer scheduler requires admission")
+        return _require_resource_admission(token, validator)
 
     def _poison(self, error):
         if self._poisoned_error is None:
@@ -598,7 +631,7 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
         ref, local_slice, reverse_axis = self._source(source_ref)
         staging = self._host_view(
@@ -674,7 +707,7 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
         owner = self._event_owners.get(id(event))
         if owner is not None:
@@ -732,7 +765,7 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
         cache_leases = tuple(cache_leases)
         resources = tuple(resources)
@@ -769,13 +802,15 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
         if handle is None:
             handle = self.begin_compute(
                 cache_leases=cache_leases,
                 bindings=bindings,
                 arrays=arrays,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
             )
             arrays = ()
         elif cache_leases or bindings is not None:
@@ -819,7 +854,7 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
         staging = self._host_view(slot, source.shape, source.dtype)
         if tuple(source.shape) != tuple(destination_ref.shape):
@@ -929,13 +964,15 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
         errors = []
         for owner in tuple(self._owners.values()):
             try:
                 owner.reap()
             except BaseException as error:
+                if self._managed:
+                    raise
                 errors.append(error)
         self._tickets = [ticket for ticket in self._tickets if not ticket.completed]
         if errors:
@@ -954,17 +991,24 @@ class TransferScheduler:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _deadline=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
+        _remaining_lifecycle_time(
+            _deadline,
+            "transfer scheduler lifecycle timed out before completion drain",
+        )
         self._require_usable()
         errors = []
         for owner in tuple(self._owners.values()):
             try:
                 if owner.completion_event is None:
-                    owner.drain()
+                    owner.drain(_deadline=_deadline)
                 else:
-                    owner.wait()
+                    owner.wait(_deadline=_deadline)
             except BaseException as error:
+                if self._managed:
+                    raise
                 errors.append(error)
         self._tickets = [ticket for ticket in self._tickets if not ticket.completed]
         if errors:
@@ -979,8 +1023,13 @@ class TransferScheduler:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _deadline=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
+        _remaining_lifecycle_time(
+            _deadline,
+            "transfer scheduler lifecycle timed out before close",
+        )
         if self._closed:
             if self._poisoned_error is not None:
                 raise self._poisoned_error
@@ -988,11 +1037,23 @@ class TransferScheduler:
         error = None
         if self._poisoned_error is None:
             try:
-                self.complete_all()
+                self.complete_all(
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                    _deadline=_deadline,
+                )
             except BaseException as caught:
+                if self._managed:
+                    raise
                 error = caught
         else:
             error = self._poisoned_error
+            if self._managed:
+                raise error
+        _remaining_lifecycle_time(
+            _deadline,
+            "transfer scheduler lifecycle timed out before destructive close",
+        )
         self._tickets.clear()
         self._owners.clear()
         self._events.clear()

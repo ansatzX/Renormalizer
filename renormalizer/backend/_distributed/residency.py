@@ -19,6 +19,7 @@ from renormalizer.backend._distributed.solvers import (
 )
 from renormalizer.backend._distributed.terminal import (
     _publish_lease_construction_resource,
+    _publish_lease_construction_resource_direct,
 )
 from renormalizer.backend._distributed.transfer import TransferProfile
 
@@ -401,18 +402,14 @@ class HostTensorStore:
                 )
             reservation = _HostTensorReservation(self, snapshot, dirty_ref)
             self._reservations[id(reservation)] = reservation
-        try:
-            _publish_lease_construction_resource(
-                _construction_slot,
-                reservation,
-            )
-        except BaseException:
-            if _construction_slot is not None:
-                _construction_slot._gate._publish_lease_construction_resource(
-                    _construction_slot,
-                    resource=reservation,
-                )
-            raise
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            reservation,
+        )
+        _publish_lease_construction_resource(
+            _construction_slot,
+            reservation,
+        )
         return reservation
 
     def _release_reservation(self, reservation):

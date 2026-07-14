@@ -32,6 +32,8 @@ from renormalizer.backend._distributed.terminal import (
     _TerminalPhase,
     _TERMINAL_TIMEOUT_S,
     _publish_lease_construction_resource,
+    _publish_lease_construction_resource_direct,
+    _remaining_lifecycle_time,
 )
 from renormalizer.backend._distributed.transfer import (
     TransferScheduler,
@@ -60,6 +62,7 @@ def _run_total_elected_lease_close(
     join,
     elected,
     fail_stop,
+    deadline=None,
 ):
     """Own every action after one lease-close election until a terminal result."""
 
@@ -70,7 +73,10 @@ def _run_total_elected_lease_close(
             return fail_stop(transition, error)
 
     try:
-        transition, owns_close = gate.begin_lease_close(epoch)
+        transition, owns_close = gate.begin_lease_close(
+            epoch,
+            _deadline=deadline,
+        )
     except BaseException as error:
         transition, owns_close = gate._recover_lease_close_entry(epoch)
         if transition is not None and owns_close:
@@ -749,7 +755,11 @@ class _ActiveOperandLease:
             for lease in leases:
                 if not getattr(lease, "_closed", False):
                     try:
-                        lease.close(event)
+                        lease.close(
+                            event,
+                            _admission_token=admission_token,
+                            _admission_validator=admission_validator,
+                        )
                     except BaseException as caught:
                         if error is None:
                             error = caught
@@ -795,6 +805,12 @@ class _LeaseStatusWorkspace:
         self._allocation_records = allocation_records((device_status, host_status))
         self._borrower = None
         self._closed = False
+        self._managed = _construction_slot is not None
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            self,
+            records=self._allocation_records,
+        )
         _publish_lease_construction_resource(
             _construction_slot,
             self,
@@ -836,10 +852,13 @@ class _LeaseStatusWorkspace:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(
-            _admission_token,
-            _admission_validator,
-        )
+        if (
+            getattr(self, "_managed", False)
+            and _admission_token is None
+            and _admission_validator is None
+        ):
+            raise TypeError("managed status workspace requires admission")
+        _require_resource_admission(_admission_token, _admission_validator)
         if self._closed:
             return
         borrower = self._borrower
@@ -955,6 +974,10 @@ class WorkingSetLease:
         self._baseline_host_bytes = 0
         self._observed_device_peak_bytes = 0
         self._observed_host_peak_bytes = 0
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            self,
+        )
         _publish_lease_construction_resource(_construction_slot, self)
         if _resource_recorder is not None:
             if not callable(_resource_recorder):
@@ -1341,7 +1364,10 @@ class WorkingSetLease:
         if lease.cache_hit:
             self.metrics.cache_hits += 1
             if prefetch:
-                lease.close()
+                lease.close(
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
+                )
                 return None
             try:
                 lease.wait_for_ready(
@@ -1352,7 +1378,10 @@ class WorkingSetLease:
                     )
                 )
             except BaseException as error:
-                lease.close()
+                lease.close(
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
+                )
                 self._poison(error)
                 raise
             return lease
@@ -1408,7 +1437,10 @@ class WorkingSetLease:
         self.metrics.record_h2d(spec.nbytes)
         if prefetch:
             if ticket.completed:
-                lease.close()
+                lease.close(
+                    _admission_token=_admission_token,
+                    _admission_validator=validator,
+                )
             else:
                 lease.transfer_to(ticket.owner)
             self._prefetch_tickets.append(ticket)
@@ -1566,7 +1598,10 @@ class WorkingSetLease:
             else:
                 for lease in leases:
                     try:
-                        lease.close()
+                        lease.close(
+                            _admission_token=_admission_token,
+                            _admission_validator=validator,
+                        )
                     except BaseException:
                         pass
             raise
@@ -1772,6 +1807,10 @@ class WorkingSetLease:
     def _lease_close_step(self, transition, operation, callback):
         runtime = self._provider.runtime
         gate = runtime._terminal_gate
+        _remaining_lifecycle_time(
+            transition.deadline,
+            "lease close lifecycle timed out before {}".format(operation),
+        )
         gate.wait_for_lease_admissions(transition, _TERMINAL_TIMEOUT_S)
         token = gate.admit_lease_close(transition, operation)
         try:
@@ -1781,7 +1820,12 @@ class WorkingSetLease:
                 epoch=transition.epoch,
                 transition_sequence=transition.sequence,
             )
-            return callback(token, validator)
+            result = callback(token, validator)
+            _remaining_lifecycle_time(
+                transition.deadline,
+                "lease close lifecycle timed out during {}".format(operation),
+            )
+            return result
         finally:
             runtime._release_admission(token)
 
@@ -1900,6 +1944,7 @@ class WorkingSetLease:
             scheduler.complete_all(
                 _admission_token=token,
                 _admission_validator=validator,
+                _deadline=transition.deadline,
             )
             self.metrics.prefetch_overlap_s += sum(
                 ticket.elapsed_s
@@ -1929,6 +1974,7 @@ class WorkingSetLease:
             lambda token, validator: provider.cache.wait_for_pending(
                 _admission_token=token,
                 _admission_validator=validator,
+                _deadline=transition.deadline,
             ),
         )
         run_step(
@@ -1936,6 +1982,7 @@ class WorkingSetLease:
             lambda token, validator: pool.reap_completed(
                 _admission_token=token,
                 _admission_validator=validator,
+                _deadline=transition.deadline,
             ),
         )
         if self._writeback_accounted and not self._writeback_invalidated:
@@ -1969,6 +2016,7 @@ class WorkingSetLease:
             lambda token, validator: scheduler.close(
                 _admission_token=token,
                 _admission_validator=validator,
+                _deadline=transition.deadline,
             ),
         )
         run_step(
@@ -1976,6 +2024,7 @@ class WorkingSetLease:
             lambda token, validator: pool.close(
                 _admission_token=token,
                 _admission_validator=validator,
+                _deadline=transition.deadline,
             ),
         )
         run_step(
@@ -2079,7 +2128,7 @@ class WorkingSetLease:
         self._closing = False
         self._closed = True
 
-    def close(self, wait=True):
+    def close(self, wait=True, *, _lifecycle_deadline=None):
         if type(wait) is not bool:
             raise TypeError("wait must be a boolean")
         if self._closed:
@@ -2153,6 +2202,7 @@ class WorkingSetLease:
             join=join,
             elected=elected,
             fail_stop=fail_stop,
+            deadline=_lifecycle_deadline,
         )
 
 
@@ -2317,6 +2367,7 @@ class ActiveWorkingSetProvider:
         _admission_validator,
         _resource_recorder,
         _construction_slot=None,
+        _deadline=None,
     ):
         _require_resource_admission(
             _admission_token,
@@ -2329,7 +2380,15 @@ class ActiveWorkingSetProvider:
         bootstrap_fatal = getattr(collective, "_bootstrap_fatal_control", None)
         if not callable(bootstrap_fatal):
             raise RuntimeError("collective does not provide fatal bootstrap")
-        if bootstrap_fatal():
+        lifecycle_deadlines = bool(
+            getattr(collective, "_terminal_lifecycle_deadlines", False)
+        )
+        fatal_code = (
+            bootstrap_fatal(_deadline=_deadline)
+            if lifecycle_deadlines
+            else bootstrap_fatal()
+        )
+        if fatal_code:
             raise RuntimeError("collective fatal capability bootstrap failed")
         bootstrap = getattr(collective, "_bootstrap_status_or", None)
         if not callable(bootstrap):
@@ -2359,6 +2418,10 @@ class ActiveWorkingSetProvider:
         try:
             device_status = self._allocate_status_device()
             device_records = allocation_records((device_status,))
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                records=device_records,
+            )
             _publish_lease_construction_resource(
                 _construction_slot,
                 records=device_records,
@@ -2372,6 +2435,10 @@ class ActiveWorkingSetProvider:
         try:
             host_status = self._allocate_status_host()
             host_records = allocation_records((host_status,))
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                records=host_records,
+            )
             _publish_lease_construction_resource(
                 _construction_slot,
                 records=host_records,
@@ -2385,7 +2452,11 @@ class ActiveWorkingSetProvider:
             local_code |= 2
 
         try:
-            aggregate_code = bootstrap(local_code)
+            aggregate_code = (
+                bootstrap(local_code, _deadline=_deadline)
+                if lifecycle_deadlines
+                else bootstrap(local_code)
+            )
         except BaseException as error:
             device_status = None
             host_status = None
@@ -2398,6 +2469,8 @@ class ActiveWorkingSetProvider:
             device_status = None
             host_status = None
             if local_error is not None:
+                if not isinstance(local_error, Exception):
+                    raise local_error
                 raise ValueError(
                     "working-set status allocation failed"
                 ) from local_error
@@ -2475,7 +2548,11 @@ class ActiveWorkingSetProvider:
         cache = self._cache
         if cache is None:
             return
-        cache._set_resource_recorder(self._persistent_resources.capture)
+        cache._set_resource_recorder(
+            self._persistent_resources.capture,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         record.capture(
             resource=cache,
             kind="cache",
@@ -2598,6 +2675,7 @@ class ActiveWorkingSetProvider:
         cache_reservation,
         store_reservation,
         status_workspace,
+        _deadline=None,
     ):
         _require_resource_admission(
             token,
@@ -2621,11 +2699,18 @@ class ActiveWorkingSetProvider:
             )
         constructed_cache = record.construction_resource("cache")
         constructed_lease = record.construction_resource("lease")
-        cleanup_error = None
         try:
+            _remaining_lifecycle_time(
+                _deadline,
+                "lease construction lifecycle timed out before receipt rollback",
+            )
             record.restore_consumed_receipts(self.runtime)
+            _remaining_lifecycle_time(
+                _deadline,
+                "lease construction lifecycle timed out during receipt rollback",
+            )
         except BaseException as caught:
-            cleanup_error = caught
+            return caught
         for resource in (
             scheduler,
             pool,
@@ -2637,33 +2722,45 @@ class ActiveWorkingSetProvider:
             if resource is None:
                 continue
             try:
+                _remaining_lifecycle_time(
+                    _deadline,
+                    "lease construction lifecycle timed out before cleanup",
+                )
                 if resource is store_reservation:
                     resource.close()
                 else:
+                    close_kwargs = {
+                        "_admission_token": token,
+                        "_admission_validator": _admission_validator,
+                    }
+                    if resource in {scheduler, pool, constructed_cache}:
+                        close_kwargs["_deadline"] = _deadline
                     resource.close(
-                        _admission_token=token,
-                        _admission_validator=_admission_validator,
+                        **close_kwargs,
                     )
+                _remaining_lifecycle_time(
+                    _deadline,
+                    "lease construction lifecycle timed out during cleanup",
+                )
             except BaseException as caught:
-                if cleanup_error is None:
-                    cleanup_error = caught
+                return caught
         if self._cache is constructed_cache:
             self._cache = None
         if constructed_lease is not None:
             try:
                 constructed_lease._abort_construction_references(first_error)
             except BaseException as caught:
-                if cleanup_error is None:
-                    cleanup_error = caught
+                return caught
         if self._cache is not None:
             try:
                 self._cache._set_resource_recorder(
-                    self._persistent_resources.capture
+                    self._persistent_resources.capture,
+                    _admission_token=token,
+                    _admission_validator=_admission_validator,
                 )
             except BaseException as caught:
-                if cleanup_error is None:
-                    cleanup_error = caught
-        return cleanup_error
+                return caught
+        return None
 
     def _raise_construction_transition_preemption(self):
         gate = self.runtime._terminal_gate
@@ -2778,6 +2875,7 @@ class ActiveWorkingSetProvider:
                     cache_reservation=cache_reservation,
                     store_reservation=store_reservation,
                     status_workspace=status_workspace,
+                    _deadline=transaction.deadline,
                 )
             except BaseException as caught:
                 cleanup_error = caught
@@ -2944,6 +3042,7 @@ class ActiveWorkingSetProvider:
                 _admission_validator=construction_validator,
                 _resource_recorder=status_recorder,
                 _construction_slot=construction_slots["status_workspace"],
+                _deadline=transaction.deadline,
             )
             self._raise_construction_transition_preemption()
             dirty_key = request.distributed_plan.execution_plan.output.key
@@ -2969,7 +3068,11 @@ class ActiveWorkingSetProvider:
                 )
             set_recorder = getattr(self._cache, "_set_resource_recorder", None)
             if callable(set_recorder):
-                set_recorder(cache_recorder)
+                set_recorder(
+                    cache_recorder,
+                    _admission_token=construction_token,
+                    _admission_validator=construction_validator,
+                )
             record.capture(self._cache, kind="cache")
             cache_reservation = self._cache.reserve(
                 allowlist,
@@ -3259,10 +3362,11 @@ class ActiveWorkingSetProvider:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(
-            _admission_token,
-            _admission_validator,
-        )
+        if _admission_token is None or _admission_validator is None:
+            raise TypeError(
+                "runtime resource state requires an exact admission pair"
+            )
+        _require_resource_admission(_admission_token, _admission_validator)
         cache = self._cache
         lease = self._active_lease
         scheduler = None if lease is None else lease.scheduler
@@ -3282,7 +3386,10 @@ class ActiveWorkingSetProvider:
                 else (
                     scheduler.retained_event_count
                     if scheduler.poisoned
-                    else scheduler.event_count
+                    else scheduler._runtime_event_count(
+                        _admission_token=_admission_token,
+                        _admission_validator=_admission_validator,
+                    )
                 )
             ),
         }
@@ -3295,6 +3402,7 @@ class ActiveWorkingSetProvider:
         *,
         _admission_token,
         _admission_validator,
+        _deadline=None,
     ):
         if _admission_token is None or _admission_validator is None:
             raise TypeError(
@@ -3311,52 +3419,46 @@ class ActiveWorkingSetProvider:
             _admission_token,
             "provider_close",
         )
+        _remaining_lifecycle_time(
+            _deadline,
+            "provider lifecycle timed out before runtime cleanup",
+        )
         if self._closed:
             return
-        error = None
         lease = self._active_lease
         cache = self._cache
         if lease is not None:
             try:
-                lease.close()
-            except BaseException as caught:
-                if error is None:
-                    error = caught
-        if cache is not None and error is None:
-            try:
-                _require_resource_admission(
-                    _admission_token,
-                    _admission_validator,
-                )
-                cache.close(
-                    _admission_token=_admission_token,
-                    _admission_validator=_admission_validator,
-                )
-            except BaseException as caught:
-                if error is None:
-                    error = caught
-        try:
-            if cache is not None and getattr(cache, "poisoned", False):
-                self._retain_terminal_resources(cache)
-        finally:
-            if (
-                runtime is not None
-                and getattr(runtime, "_active_provider", None) is self
-            ):
-                runtime._active_provider = None
-            self._active_lease = None
-            self._cache = None
-            self._cache_factory = None
-            self._pool_factory = None
-            self._scheduler_factory = None
-            self._event_factory = None
-            self.last_compute_event = None
-            self.runtime = None
-            if self._terminal_error is None:
-                self._terminal_error = error
-            self._closed = True
-        if error is not None:
-            raise error
+                lease.close(_lifecycle_deadline=_deadline)
+            except BaseException:
+                self._active_lease = lease
+                raise
+            self._active_lease = lease
+        if cache is not None:
+            _require_resource_admission(
+                _admission_token,
+                _admission_validator,
+            )
+            cache.close(
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+                _deadline=_deadline,
+            )
+        _remaining_lifecycle_time(
+            _deadline,
+            "provider lifecycle timed out before reference commit",
+        )
+        if getattr(runtime, "_active_provider", None) is self:
+            runtime._active_provider = None
+        self._active_lease = None
+        self._cache = None
+        self._cache_factory = None
+        self._pool_factory = None
+        self._scheduler_factory = None
+        self._event_factory = None
+        self.last_compute_event = None
+        self.runtime = None
+        self._closed = True
 
     def close(self):
         runtime = self.runtime

@@ -4,6 +4,7 @@ from dataclasses import replace
 import inspect
 import threading
 import traceback
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ from renormalizer.backend._distributed.providers import (
     _LeaseStatusWorkspace,
 )
 from renormalizer.backend._distributed import providers as providers_module
+from renormalizer.backend._distributed import terminal as terminal_module
 from renormalizer.backend._distributed.terminal import (
     _FatalTransition,
     _LeaseConstructionResourceSlot,
@@ -42,6 +44,7 @@ from renormalizer.backend.tests.residency.test_active_provider import (
     _active_case,
     _block_request,
     _explicit_budget,
+    _FakeCupyBackend,
     _provider,
     _runtime,
 )
@@ -485,7 +488,10 @@ def _blocked_ordinary_operation(monkeypatch, lease, row, entered, release):
                     identity,
                     _admission_token=token,
                 )
-                loaded.close()
+                loaded.close(
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
 
         return operation
 
@@ -1224,8 +1230,9 @@ def test_execution_config_setup_row_drains_before_terminal_transition(
             assert lease is None
 
         def _close_for_runtime(
-            self, *, _admission_token, _admission_validator
+            self, *, _admission_token, _admission_validator, _deadline
         ):
+            assert isinstance(_deadline, float)
             self.closed = True
 
     original_install = runtime._install_active_provider
@@ -1629,12 +1636,12 @@ def test_fatal_partial_status_construction_retains_allocations_and_receipt(
         allocated.append(array)
         return array
 
-    def bootstrap(local_code):
+    def bootstrap(local_code, **kwargs):
         if failure_point == "bootstrap":
             entered.set()
             assert release.wait(_TIMEOUT_S)
             raise failure
-        return original_bootstrap(local_code)
+        return original_bootstrap(local_code, **kwargs)
 
     monkeypatch.setattr(provider, "_allocate_status_device", allocate_device)
     monkeypatch.setattr(provider, "_allocate_status_host", allocate_host)
@@ -2167,7 +2174,11 @@ def test_live_operations_and_state_use_exact_epoch_admissions(monkeypatch):
         identity = lease.cache_identities[0]
         cache_operation[0] = "load"
         loaded = lease._load_identity(identity)
-        loaded.close()
+        with lease._lease_admission("load_close") as token:
+            loaded.close(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
 
         original_contains = provider.cache.contains
         monkeypatch.setattr(
@@ -3213,9 +3224,18 @@ def test_fatal_drains_h2d_descendant_before_readiness_publication(monkeypatch):
         dtype=np.dtype(output_ref.dtype),
         order="C",
     )
-    with lease._lease_admission("prefetch"):
-        with lease.pool.checkout(destination.nbytes) as slot:
-            ticket = lease.scheduler.stage_h2d(output_ref, destination, slot)
+    with lease._lease_admission("prefetch") as token:
+        admitted = {
+            "_admission_token": token,
+            "_admission_validator": lease._exact_admission_validator(token),
+        }
+        with lease.pool.checkout(destination.nbytes, **admitted) as slot:
+            ticket = lease.scheduler.stage_h2d(
+                output_ref,
+                destination,
+                slot,
+                **admitted,
+            )
     assert event.recorded.wait(_TIMEOUT_S)
 
     owner = ticket._owner
@@ -3357,8 +3377,9 @@ def test_elected_lease_close_binds_every_step_and_dirty_callback(monkeypatch):
 
     original_begin = runtime._terminal_gate.begin_lease_close
 
-    def begin(epoch):
-        result = original_begin(epoch)
+    def begin(epoch, **kwargs):
+        result = original_begin(epoch, **kwargs)
+        assert isinstance(result[0].deadline, float)
         transitions.append(result)
         return result
 
@@ -3565,8 +3586,9 @@ def test_second_lease_close_and_runtime_close_join_elected_owner(monkeypatch):
         assert release_close_step.wait(_TIMEOUT_S)
         return original_observe(**kwargs)
 
-    def begin(epoch):
-        result = original_begin(epoch)
+    def begin(epoch, **kwargs):
+        result = original_begin(epoch, **kwargs)
+        assert isinstance(result[0].deadline, float)
         begin_calls.append(result)
         if result[1] is False:
             joiner_began.set()
@@ -5931,6 +5953,7 @@ def test_after_real_reservation_is_exactly_fatal_retained(monkeypatch, row):
     finally:
         for resource in captured:
             if not resource._closed:
+                resource._managed = False
                 resource.close()
         _close_case(runtime, store)
 
@@ -6987,3 +7010,668 @@ def test_resource_state_spurious_wakes_share_one_terminal_deadline(monkeypatch):
         assert not owner.is_alive()
         _repair_test_abandoned_close_entry(gate)
         runtime._closed = True
+
+
+@pytest.mark.parametrize("resource_name", ("pool", "cache", "scheduler"))
+def test_managed_resource_close_requires_admission_before_state_read(
+    resource_name,
+):
+    runtime, _, _, store, provider, lease = _open_active_case(
+        store_id="terminal-managed-close-{}".format(resource_name)
+    )
+    resource = {
+        "pool": lease.pool,
+        "cache": provider.cache,
+        "scheduler": lease.scheduler,
+    }[resource_name]
+    before = dict(resource.__dict__)
+    try:
+        with pytest.raises(TypeError, match="admission"):
+            resource.close()
+        assert resource.__dict__ == before
+    finally:
+        _close_case(runtime, store)
+
+
+def test_managed_runtime_resource_state_requires_admission_before_read():
+    runtime, _, _, store, provider, _ = _open_active_case(
+        store_id="terminal-managed-runtime-state"
+    )
+    before = (
+        provider._active_lease,
+        provider._cache,
+        provider._closed,
+    )
+    try:
+        with pytest.raises(TypeError, match="admission"):
+            provider.runtime_resource_state()
+        assert (
+            provider._active_lease,
+            provider._cache,
+            provider._closed,
+        ) == before
+    finally:
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("row", _CONSTRUCTION_RESOURCE_ROWS)
+def test_construction_slot_contains_owner_before_overridable_publish(
+    monkeypatch,
+    row,
+):
+    class SlotFailure(BaseException):
+        pass
+
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-direct-slot-owner-{}".format(row),
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    failure = SlotFailure("{} slot wrapper failed before real".format(row))
+    snapshots = []
+    original_publish = _LeaseConstructionResourceSlot.publish
+
+    def fail_before_publish(slot, resource=None, **kwargs):
+        if slot.name != row or snapshots:
+            return original_publish(slot, resource, **kwargs)
+        snapshots.append(slot.snapshot())
+        raise failure
+
+    monkeypatch.setattr(
+        _LeaseConstructionResourceSlot,
+        "publish",
+        fail_before_publish,
+    )
+    try:
+        with pytest.raises(SlotFailure) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is failure
+        assert len(snapshots) == 1
+        snapshot = snapshots[0]
+        if row == "status_workspace":
+            assert snapshot.records
+        else:
+            assert snapshot.resource is not None
+        if row == "pool":
+            assert snapshot.resource._slot._array is not None
+            assert snapshot.records == snapshot.resource.allocation_records
+    finally:
+        _repair_test_construction_state(runtime._terminal_gate)
+        _close_case(runtime, store)
+
+
+def test_scheduler_slot_contains_partial_owner_and_stream_before_wrapper(
+    monkeypatch,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    transaction = gate._prepare_lease_construction(
+        "scheduler_slot_probe",
+        resource_names=("scheduler",),
+    )
+    epoch, token = gate.begin_lease(
+        "scheduler_slot_probe",
+        _transaction=transaction,
+    )
+    validator = runtime._exact_admission_validator(
+        token,
+        scope="construction",
+        epoch=epoch,
+    )
+    failure = RuntimeError("scheduler slot wrapper failed before real")
+    snapshots = []
+    original_publish = _LeaseConstructionResourceSlot.publish
+
+    def fail_before_publish(slot, resource=None, **kwargs):
+        if slot.name != "scheduler" or snapshots:
+            return original_publish(slot, resource, **kwargs)
+        snapshots.append(slot.snapshot())
+        raise failure
+
+    monkeypatch.setattr(
+        _LeaseConstructionResourceSlot,
+        "publish",
+        fail_before_publish,
+    )
+    backend = _FakeCupyBackend()
+    store = SimpleNamespace(copy_into=lambda *_args, **_kwargs: None)
+    pool = SimpleNamespace(checkout=lambda *_args, **_kwargs: None)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            TransferScheduler(
+                store,
+                backend,
+                pool,
+                _admission_token=token,
+                _admission_validator=validator,
+                _construction_slot=transaction.resource_slots["scheduler"],
+            )
+        assert caught.value is failure
+        snapshot = snapshots[0]
+        assert snapshot.resource is not None
+        assert snapshot.resource._stream is backend._cupy.cuda.stream
+        assert snapshot.streams == (backend._cupy.cuda.stream,)
+        snapshot.resource.close(
+            _admission_token=token,
+            _admission_validator=validator,
+        )
+        gate._abort_lease_construction(
+            transaction,
+            failure,
+            lambda: None,
+            lambda _primary: None,
+        )
+    finally:
+        _repair_test_construction_state(gate)
+        runtime._closed = True
+
+
+def test_construction_rollback_stops_after_first_uncertain_cleanup(
+    monkeypatch,
+):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-rollback-first-uncertainty",
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    primary = RuntimeError("construction failed after all resources")
+    uncertainty = RuntimeError("scheduler close completion is uncertain")
+    observed = []
+    original_scheduler_factory = provider._scheduler_factory
+    original_pool_factory = provider._pool_factory
+    original_cache_factory = provider._cache_factory
+    original_store_reserve = store.reserve
+
+    def scheduler_factory(*args, **kwargs):
+        scheduler = original_scheduler_factory(*args, **kwargs)
+        close = scheduler.close
+
+        def fail_after_close(*close_args, **close_kwargs):
+            observed.append("scheduler")
+            close(*close_args, **close_kwargs)
+            raise uncertainty
+
+        monkeypatch.setattr(scheduler, "close", fail_after_close)
+        return scheduler
+
+    def pool_factory(*args, **kwargs):
+        pool = original_pool_factory(*args, **kwargs)
+        close = pool.close
+
+        def observe_close(*close_args, **close_kwargs):
+            observed.append("pool")
+            return close(*close_args, **close_kwargs)
+
+        monkeypatch.setattr(pool, "close", observe_close)
+        return pool
+
+    def cache_factory(*args, **kwargs):
+        cache = original_cache_factory(*args, **kwargs)
+        close = cache.close
+
+        def observe_close(*close_args, **close_kwargs):
+            observed.append("cache")
+            return close(*close_args, **close_kwargs)
+
+        monkeypatch.setattr(cache, "close", observe_close)
+        return cache
+
+    def reserve(*args, **kwargs):
+        reservation = original_store_reserve(*args, **kwargs)
+        close = reservation.close
+
+        def observe_close(*close_args, **close_kwargs):
+            observed.append("store")
+            return close(*close_args, **close_kwargs)
+
+        monkeypatch.setattr(reservation, "close", observe_close)
+        return reservation
+
+    monkeypatch.setattr(provider, "_scheduler_factory", scheduler_factory)
+    monkeypatch.setattr(provider, "_pool_factory", pool_factory)
+    monkeypatch.setattr(provider, "_cache_factory", cache_factory)
+    monkeypatch.setattr(store, "reserve", reserve)
+    monkeypatch.setattr(
+        provider,
+        "_activate_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(primary),
+    )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is primary
+        assert observed == ["scheduler"]
+        assert uncertainty in runtime._terminal_secondary_errors
+        assert provider._provisional_resources is not None
+    finally:
+        _repair_test_construction_state(runtime._terminal_gate)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("resource_name", ("pool", "cache", "scheduler"))
+def test_managed_resource_close_stops_on_first_internal_uncertainty(
+    monkeypatch,
+    resource_name,
+):
+    runtime, _, _, store, provider, lease = _open_active_case(
+        store_id="terminal-managed-close-uncertainty-{}".format(resource_name)
+    )
+    gate = runtime._terminal_gate
+    token = gate.admit_lease(lease._epoch, "managed_close_uncertainty")
+    validator = runtime._exact_admission_validator(
+        token,
+        scope="lease",
+        epoch=lease._epoch,
+    )
+    failure = RuntimeError("{} close uncertainty".format(resource_name))
+    if resource_name == "pool":
+        resource = lease.pool
+        monkeypatch.setattr(
+            resource,
+            "wait_for_slot",
+            lambda **_kwargs: (_ for _ in ()).throw(failure),
+        )
+    elif resource_name == "cache":
+        resource = provider.cache
+        monkeypatch.setattr(
+            resource._reservation,
+            "close",
+            lambda **_kwargs: (_ for _ in ()).throw(failure),
+        )
+    else:
+        resource = lease.scheduler
+        monkeypatch.setattr(
+            resource,
+            "complete_all",
+            lambda **_kwargs: (_ for _ in ()).throw(failure),
+        )
+    before = dict(resource.__dict__)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            resource.close(
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+        assert caught.value is failure
+        assert resource.__dict__ == before
+    finally:
+        gate.release(token)
+        _close_case(runtime, store)
+
+
+def test_private_provider_close_retains_graph_on_cleanup_uncertainty(
+    monkeypatch,
+):
+    runtime = _runtime()
+    request, _, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-provider-close-transaction",
+    )
+    provider = _provider(runtime, request)
+    failure = RuntimeError("lease cleanup is uncertain")
+    cache_calls = []
+    lease = SimpleNamespace(
+        close=lambda **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    cache = SimpleNamespace(
+        close=lambda **_kwargs: cache_calls.append(True),
+        poisoned=False,
+    )
+    provider._active_lease = lease
+    provider._cache = cache
+    gate = runtime._terminal_gate
+    request_token = gate.admit_runtime("begin_runtime_close")
+    transition, elected = gate._freeze_runtime_close(request_token)
+    assert elected is True
+    transition = gate._drain_runtime_close(transition)
+    token = gate.admit_runtime_close(transition, "provider_close")
+    validator = runtime._exact_admission_validator(
+        token,
+        scope="runtime_close",
+        epoch=None,
+        transition_sequence=transition.sequence,
+    )
+    before = (
+        provider.runtime,
+        provider._active_lease,
+        provider._cache,
+        provider._cache_factory,
+        provider._pool_factory,
+        provider._scheduler_factory,
+    )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            provider._close_for_runtime(
+                _admission_token=token,
+                _admission_validator=validator,
+                _deadline=transition.deadline,
+            )
+        assert caught.value is failure
+        assert cache_calls == []
+        assert (
+            provider.runtime,
+            provider._active_lease,
+            provider._cache,
+            provider._cache_factory,
+            provider._pool_factory,
+            provider._scheduler_factory,
+        ) == before
+    finally:
+        gate.release(token)
+        _repair_test_abandoned_close_entry(gate)
+        runtime._closed = True
+        if not store.closed:
+            store.close()
+
+
+def test_runtime_close_stops_before_collective_after_provider_uncertainty(
+    monkeypatch,
+):
+    runtime = _runtime()
+    request, _, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-runtime-close-provider-transaction",
+    )
+    provider = _provider(runtime, request)
+    failure = RuntimeError("provider cleanup completion is uncertain")
+    scheduler = SimpleNamespace(_start_counted_completions=lambda: None)
+    lease = SimpleNamespace(
+        scheduler=scheduler,
+        close=lambda **_kwargs: (_ for _ in ()).throw(failure),
+        _resource_record=_LeaseResourceRecord(None),
+        _poisoned_error=None,
+    )
+    provider._active_lease = lease
+    provider._provisional_resources = lease._resource_record
+    collective = runtime.collective
+    collective_calls = []
+    monkeypatch.setattr(
+        collective,
+        "_close_for_runtime",
+        lambda *_args, **_kwargs: collective_calls.append(True),
+        raising=False,
+    )
+    before = (
+        runtime._active_provider,
+        runtime.collective,
+        provider.runtime,
+        provider._active_lease,
+        provider._cache_factory,
+        provider._pool_factory,
+        provider._scheduler_factory,
+    )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            runtime.close()
+        assert caught.value is failure
+        assert collective_calls == []
+        assert (
+            runtime._active_provider,
+            runtime.collective,
+            provider.runtime,
+            provider._active_lease,
+            provider._cache_factory,
+            provider._pool_factory,
+            provider._scheduler_factory,
+        ) == before
+        with runtime._terminal_gate._condition:
+            assert runtime._terminal_gate._fatal_transition.primary is failure
+            assert runtime._terminal_gate._fatal_publication_failure in {
+                _MISSING,
+                failure,
+            }
+    finally:
+        _repair_test_abandoned_close_entry(runtime._terminal_gate)
+        runtime._closed = True
+        if not store.closed:
+            store.close()
+
+
+@pytest.mark.parametrize("kind", ("lease", "runtime"))
+def test_close_stages_reuse_one_transition_deadline(monkeypatch, kind):
+    runtime, _, _, store, _, lease = _open_active_case(
+        store_id="terminal-shared-{}-deadline".format(kind)
+    )
+    gate = runtime._terminal_gate
+    if kind == "lease":
+        transition, elected = gate.begin_lease_close(lease._epoch)
+    else:
+        gate._leases[lease._epoch].phase = "closed"
+        gate._live_epoch = None
+        request = gate.admit_runtime("begin_runtime_close")
+        transition, elected = gate._freeze_runtime_close(request)
+    assert elected is True
+    captured = []
+
+    def capture(_predicate, deadline, _message, **_kwargs):
+        captured.append(deadline)
+
+    monkeypatch.setattr(gate, "_wait_until_deadline", capture)
+    try:
+        assert transition.deadline > 0
+        if kind == "lease":
+            gate.wait_for_lease_admissions(transition, 999)
+            gate.wait_for_lease_admissions(transition, 999)
+        else:
+            gate._drain_runtime_close(transition, timeout_s=999)
+            gate._drain_runtime_close(transition, timeout_s=999)
+        assert captured == [transition.deadline, transition.deadline]
+    finally:
+        monkeypatch.undo()
+        reservation = lease._store_reservation
+        if reservation is not None and not reservation._closed:
+            reservation.close()
+        _repair_test_abandoned_close_entry(gate)
+        runtime._closed = True
+        if not store.closed:
+            store.close()
+
+
+def test_failed_fatal_runtime_close_join_reuses_transition_deadline(
+    monkeypatch,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    primary = RuntimeError("fatal runtime close publication failed")
+    transition = gate.begin_fatal(primary)
+    gate._fail_fatal_publication(transition, primary)
+    captured = []
+    runtime._pending_fatal_collective = SimpleNamespace(
+        _wait_for_joined_fatal_publication=(
+            lambda *, _deadline: captured.append(_deadline)
+        ),
+    )
+
+    def fail_commit(*_args, **_kwargs):
+        raise primary
+
+    monkeypatch.setattr(gate, "commit_runtime_close", fail_commit)
+    with pytest.raises(RuntimeError) as caught:
+        runtime._commit_fatal_runtime_close(transition, primary)
+
+    assert caught.value is primary
+    assert captured == [transition.deadline]
+
+
+_MANAGED_RESOURCE_METHOD_ROWS = (
+    (PinnedBufferPool, "checkout", (1,)),
+    (PinnedBufferPool, "_checkout", (1,)),
+    (PinnedBufferPool, "_release", (object(),)),
+    (PinnedBufferPool, "reap_completed", ()),
+    (PinnedBufferPool, "wait_for_slot", ()),
+    (PinnedBufferPool, "close", ()),
+    (DeviceTensorCache, "_set_resource_recorder", (None,)),
+    (DeviceTensorCache, "reserve", ({}, 0)),
+    (DeviceTensorCache, "acquire", (None, None)),
+    (DeviceTensorCache, "reap_completed", ()),
+    (DeviceTensorCache, "wait_for_pending", ()),
+    (DeviceTensorCache, "contains", (None,)),
+    (DeviceTensorCache, "refcount", (None,)),
+    (DeviceTensorCache, "invalidate", (None,)),
+    (DeviceTensorCache, "invalidate_ref", (None,)),
+    (DeviceTensorCache, "close", ()),
+    (TransferScheduler, "stage_h2d", (None, None, None)),
+    (TransferScheduler, "wait_for_h2d", (None,)),
+    (TransferScheduler, "begin_compute", ()),
+    (TransferScheduler, "record_compute_completion", ()),
+    (TransferScheduler, "writeback_d2h", (None, None, None)),
+    (TransferScheduler, "reap_completed", ()),
+    (TransferScheduler, "complete_all", ()),
+    (TransferScheduler, "_runtime_event_count", ()),
+    (TransferScheduler, "close", ()),
+)
+
+
+@pytest.mark.parametrize(
+    "resource_type,method_name,args",
+    _MANAGED_RESOURCE_METHOD_ROWS,
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+@pytest.mark.parametrize(
+    "candidate_kind",
+    ("missing", "token_only", "validator_only", "wrong", "stale"),
+)
+def test_every_managed_resource_method_rejects_before_object_state_read(
+    resource_type,
+    method_name,
+    args,
+    candidate_kind,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    resource = object.__new__(resource_type)
+    resource._managed = True
+    token = gate.admit_runtime("managed_resource_probe")
+    validator = runtime._exact_admission_validator(
+        token,
+        scope="runtime",
+        epoch=None,
+    )
+    if candidate_kind == "missing":
+        candidate = None
+        candidate_validator = None
+    elif candidate_kind == "token_only":
+        candidate = token
+        candidate_validator = None
+    elif candidate_kind == "validator_only":
+        candidate = None
+        candidate_validator = validator
+    elif candidate_kind == "wrong":
+        candidate = replace(token, sequence=token.sequence + 1000)
+        candidate_validator = validator
+    else:
+        candidate = token
+        candidate_validator = validator
+        gate.release(token)
+        token = None
+    try:
+        with pytest.raises((TypeError, RuntimeError)):
+            getattr(resource_type, method_name)(
+                resource,
+                *args,
+                _admission_token=candidate,
+                _admission_validator=candidate_validator,
+            )
+    finally:
+        if token is not None:
+            gate.release(token)
+        runtime._closed = True
+
+
+def test_lease_close_passes_one_deadline_to_every_blocking_resource_row(
+    monkeypatch,
+):
+    runtime, _, _, store, provider, lease = _open_active_case(
+        store_id="terminal-resource-row-deadline"
+    )
+    observed = []
+    transitions = []
+    gate = runtime._terminal_gate
+    original_begin = gate.begin_lease_close
+
+    def begin(*args, **kwargs):
+        transition, elected = original_begin(*args, **kwargs)
+        transitions.append(transition)
+        return transition, elected
+
+    monkeypatch.setattr(gate, "begin_lease_close", begin)
+    for resource, method_name in (
+        (lease.scheduler, "complete_all"),
+        (provider.cache, "wait_for_pending"),
+        (lease.pool, "reap_completed"),
+        (lease.scheduler, "close"),
+        (lease.pool, "close"),
+    ):
+        original = getattr(resource, method_name)
+
+        def wrapper(*args, _original=original, _name=method_name, **kwargs):
+            observed.append((_name, kwargs.get("_deadline")))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(resource, method_name, wrapper)
+    try:
+        lease.close()
+        assert len(transitions) == 1
+        deadline = transitions[0].deadline
+        assert observed
+        assert all(row_deadline == deadline for _, row_deadline in observed)
+    finally:
+        _close_case(runtime, store)
+
+
+def test_construction_rollback_passes_transaction_deadline_to_cleanup(
+    monkeypatch,
+):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-construction-cleanup-deadline",
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    transactions = []
+    observed = []
+    original_prepare = runtime._terminal_gate._prepare_lease_construction
+    original_scheduler_factory = provider._scheduler_factory
+    primary = RuntimeError("construction activation failed")
+
+    def prepare(*args, **kwargs):
+        transaction = original_prepare(*args, **kwargs)
+        transactions.append(transaction)
+        return transaction
+
+    def scheduler_factory(*args, **kwargs):
+        scheduler = original_scheduler_factory(*args, **kwargs)
+        close = scheduler.close
+
+        def record_close(*close_args, **close_kwargs):
+            observed.append(close_kwargs.get("_deadline"))
+            return close(*close_args, **close_kwargs)
+
+        monkeypatch.setattr(scheduler, "close", record_close)
+        return scheduler
+
+    monkeypatch.setattr(
+        runtime._terminal_gate,
+        "_prepare_lease_construction",
+        prepare,
+    )
+    monkeypatch.setattr(provider, "_scheduler_factory", scheduler_factory)
+    monkeypatch.setattr(
+        provider,
+        "_activate_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(primary),
+    )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is primary
+        assert len(transactions) == 1
+        assert observed == [transactions[0].deadline]
+    finally:
+        _repair_test_construction_state(runtime._terminal_gate)
+        _close_case(runtime, store)

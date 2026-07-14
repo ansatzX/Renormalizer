@@ -1778,10 +1778,22 @@ def test_terminal_outer_context_handoff_retains_lease_without_cleanup(
             adjacent_destination = working_set.backend.empty(
                 output_ref.shape, dtype=np.dtype(output_ref.dtype), order="C"
             )
-            with working_set._lease_admission("prefetch"):
-                with working_set.pool.checkout(adjacent_destination.nbytes) as slot:
+            with working_set._lease_admission("prefetch") as token:
+                admitted = {
+                    "_admission_token": token,
+                    "_admission_validator": (
+                        working_set._exact_admission_validator(token)
+                    ),
+                }
+                with working_set.pool.checkout(
+                    adjacent_destination.nbytes,
+                    **admitted,
+                ) as slot:
                     adjacent_ticket = working_set.scheduler.stage_h2d(
-                        output_ref, adjacent_destination, slot
+                        output_ref,
+                        adjacent_destination,
+                        slot,
+                        **admitted,
                     )
             assert adjacent_ticket.completed is False
 
@@ -2684,6 +2696,15 @@ def test_sequential_outer_lease_epochs_reuse_retained_cache_entry():
     runtime.close()
 
 
+def _managed_cache_refcount(working_set, identity):
+    with working_set._lease_admission("cache_refcount") as token:
+        return working_set._provider.cache.refcount(
+            identity,
+            _admission_token=token,
+            _admission_validator=working_set._exact_admission_validator(token),
+        )
+
+
 def test_child_close_waits_for_compute_event_before_cache_reuse():
     compute_event = _ManualEvent()
     events = iter((_ManualEvent(done=True), compute_event))
@@ -2701,12 +2722,12 @@ def test_child_close_waits_for_compute_event_before_cache_reuse():
 
     child.close()
     assert provider.last_compute_event is None
-    assert provider.cache.refcount(identity) == 1
+    assert _managed_cache_refcount(working_set, identity) == 1
     working_set.reap_completed()
-    assert provider.cache.refcount(identity) == 1
+    assert _managed_cache_refcount(working_set, identity) == 1
     compute_event.complete()
     working_set.reap_completed()
-    assert provider.cache.refcount(identity) == 0
+    assert _managed_cache_refcount(working_set, identity) == 0
 
     working_set.close()
     store.close()
@@ -2728,6 +2749,7 @@ def test_terminal_compute_drain_failure_retains_outer_resource_ownership(monkeyp
         for identity in working_set.cache_identities
         if identity[1] == "input_0"
     )
+    cache_entry = provider.cache._entries[identity]
     scheduler = working_set.scheduler
     cache = provider.cache
     event = _SchedulerQueryFailureEvent(synchronize_fails=True)
@@ -2742,7 +2764,8 @@ def test_terminal_compute_drain_failure_retains_outer_resource_ownership(monkeyp
         working_set.reap_completed()
 
     assert child.bindings is None
-    assert provider.cache.refcount(identity) == 1
+    assert provider.cache._entries.get(identity) is cache_entry
+    assert cache_entry.refcount == 1
     assert provider.cache.poisoned is True
     assert scheduler.poisoned is True
     with pytest.raises(RuntimeError, match="scheduler query failure"):
@@ -4051,8 +4074,8 @@ def test_checkout_release_uncertainty_retains_writeback_ticket(monkeypatch):
         commits.append(ref)
         return commit(ref, value)
 
-    def fail_after_release(slot):
-        release(slot)
+    def fail_after_release(slot, **kwargs):
+        release(slot, **kwargs)
         raise primary
 
     def record_invalidation(ref, **kwargs):
@@ -4241,7 +4264,7 @@ def test_factory_to_working_set_borrowed_config_handoff_preserves_owners():
     runtime.close()
 
 
-def test_runtime_close_preserves_provider_error_but_still_closes_collective():
+def test_runtime_close_stops_before_collective_after_provider_error():
     class FailingOnceProvider:
         def __init__(self):
             self.close_calls = 0
@@ -4271,14 +4294,14 @@ def test_runtime_close_preserves_provider_error_but_still_closes_collective():
         runtime.close()
 
     assert provider.close_calls == 1
-    assert collective.close_calls == 1
-    assert runtime._issued_receipts == {}
-    assert runtime._active_provider is None
-    assert runtime.collective is None
+    assert collective.close_calls == 0
+    assert runtime._issued_receipts
+    assert runtime._active_provider is provider
+    assert runtime.collective is collective
     assert runtime._closed is True
     runtime.close()
     assert provider.close_calls == 1
-    assert collective.close_calls == 1
+    assert collective.close_calls == 0
     with pytest.raises(RuntimeError, match="distributed runtime is closed"):
         runtime.barrier()
     with pytest.raises(RuntimeError, match="distributed runtime is closed"):
@@ -4732,6 +4755,7 @@ def test_runtime_close_adopts_backend_poison_before_collective_cleanup_failure()
             raise cleanup_error
 
     runtime = _runtime(collective=FailingCollective())
+    collective = runtime.collective
     runtime.backend._execution_terminal_error = first_error
 
     with pytest.raises(RuntimeError) as caught:
@@ -4739,9 +4763,10 @@ def test_runtime_close_adopts_backend_poison_before_collective_cleanup_failure()
 
     assert caught.value is first_error
     assert runtime._terminal_error is first_error
+    assert runtime.collective is collective
 
 
-def test_provider_close_failure_is_terminal_and_detaches_owned_factories(monkeypatch):
+def test_provider_close_failure_is_terminal_and_retains_owned_factories(monkeypatch):
     runtime = _runtime()
     request, plan, store, _, _ = _active_case(
         runtime, store_id="provider-terminal-close"
@@ -4751,6 +4776,12 @@ def test_provider_close_failure_is_terminal_and_detaches_owned_factories(monkeyp
     receipt = runtime.preflight_residency(request, plan)
     provider.open_working_set(request, plan, store, receipt).__enter__().close()
     cache = provider.cache
+    owned_factories = (
+        provider._cache_factory,
+        provider._pool_factory,
+        provider._scheduler_factory,
+        provider._event_factory,
+    )
     close_cache = cache.close
     close_calls = []
 
@@ -4763,15 +4794,17 @@ def test_provider_close_failure_is_terminal_and_detaches_owned_factories(monkeyp
     with pytest.raises(RuntimeError, match="provider cache close failure"):
         provider.close()
 
-    assert provider.closed is True
-    assert provider.runtime is None
+    assert provider.closed is False
+    assert provider.runtime is runtime
     assert provider._active_lease is None
-    assert provider._cache is None
-    assert provider._cache_factory is None
-    assert provider._pool_factory is None
-    assert provider._scheduler_factory is None
-    assert provider._event_factory is None
-    assert runtime._active_provider is None
+    assert provider._cache is cache
+    assert (
+        provider._cache_factory,
+        provider._pool_factory,
+        provider._scheduler_factory,
+        provider._event_factory,
+    ) == owned_factories
+    assert runtime._active_provider is provider
     with pytest.raises(RuntimeError, match="provider cache close failure"):
         provider.close()
     assert len(close_calls) == 1

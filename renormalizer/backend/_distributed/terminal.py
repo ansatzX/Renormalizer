@@ -11,6 +11,18 @@ from typing import Literal
 _TERMINAL_TIMEOUT_S = 5.0
 
 
+def _remaining_lifecycle_time(deadline, message):
+    """Return the remaining terminal budget or fail before another operation."""
+    if deadline is None:
+        return None
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        raise TypeError("terminal lifecycle deadline must be a number")
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(message)
+    return remaining
+
+
 class _TerminalPhase(enum.Enum):
     HEALTHY = "healthy"
     FATAL_PENDING = "fatal_pending"
@@ -43,6 +55,7 @@ class _FatalTransition:
     gate_id: int
     primary: BaseException
     sequence: int
+    deadline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +65,7 @@ class _LeaseCloseTransition:
     owner_thread_id: int
     owner_thread: threading.Thread
     sequence: int
+    deadline: float
 
 
 @dataclass(frozen=True)
@@ -60,6 +74,7 @@ class _RuntimeCloseTransition:
     owner_thread_id: int
     owner_thread: threading.Thread
     sequence: int
+    deadline: float
 
 
 @dataclass(frozen=True)
@@ -276,6 +291,7 @@ class _LeaseConstructionTransaction:
     operation: str
     owner_thread_id: int
     owner_thread: threading.Thread
+    deadline: float
     state: Literal[
         "prepared", "active", "committed", "aborted", "fatal_retained"
     ] = "prepared"
@@ -350,6 +366,30 @@ def _publish_lease_construction_resource(
         raise TypeError("lease construction resource slot is invalid")
     slot.publish(
         resource,
+        kind=kind,
+        records=records,
+        events=events,
+        streams=streams,
+    )
+
+
+def _publish_lease_construction_resource_direct(
+    slot,
+    resource=None,
+    *,
+    kind=None,
+    records=(),
+    events=(),
+    streams=(),
+):
+    """Install physical ownership without dispatching through a slot wrapper."""
+    if slot is None:
+        return
+    if not isinstance(slot, _LeaseConstructionResourceSlot):
+        raise TypeError("lease construction resource slot is invalid")
+    slot._gate._publish_lease_construction_resource(
+        slot,
+        resource=resource,
         kind=kind,
         records=records,
         events=events,
@@ -647,6 +687,7 @@ class _TerminalLifecycleGate:
             operation=operation,
             owner_thread_id=threading.get_ident(),
             owner_thread=threading.current_thread(),
+            deadline=self._deadline(_TERMINAL_TIMEOUT_S),
         )
         for name in tuple(resource_names):
             if not isinstance(name, str) or not name:
@@ -928,6 +969,18 @@ class _TerminalLifecycleGate:
             lease = self._require_lease_construction(
                 transaction, active=transaction.state == "active"
             )
+            try:
+                _remaining_lifecycle_time(
+                    transaction.deadline,
+                    "lease construction lifecycle timed out during rollback",
+                )
+            except BaseException as deadline_error:
+                return self._retain_failed_lease_construction_locked(
+                    transaction,
+                    primary,
+                    fatal_finalizer,
+                    secondary=deadline_error,
+                )
             if self._fatal_transition is not None or not isinstance(
                 primary, Exception
             ):
@@ -982,6 +1035,17 @@ class _TerminalLifecycleGate:
             if self._phase is not _TerminalPhase.HEALTHY:
                 self._raise_for_terminal_phase()
             try:
+                _remaining_lifecycle_time(
+                    transaction.deadline,
+                    "lease construction lifecycle timed out before commit",
+                )
+            except BaseException as error:
+                return self._retain_failed_lease_construction_locked(
+                    transaction,
+                    error,
+                    fatal_finalizer,
+                )
+            try:
                 finalizer()
             except BaseException as error:
                 return self._retain_failed_lease_construction_locked(
@@ -1031,7 +1095,12 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("lease is not open")
             return self._new_token("lease", epoch, operation)
 
-    def begin_lease_close(self, epoch: int) -> tuple[_LeaseCloseTransition, bool]:
+    def begin_lease_close(
+        self,
+        epoch: int,
+        *,
+        _deadline=None,
+    ) -> tuple[_LeaseCloseTransition, bool]:
         with self._condition:
             lease = self._lease_state(epoch)
             if lease.transition is not None:
@@ -1044,12 +1113,20 @@ class _TerminalLifecycleGate:
                 _TerminalPhase.RUNTIME_CLOSED,
             ):
                 self._raise_for_terminal_phase()
+            deadline = self._deadline(_TERMINAL_TIMEOUT_S)
+            if _deadline is not None:
+                _remaining_lifecycle_time(
+                    _deadline,
+                    "lease close lifecycle timed out before election",
+                )
+                deadline = min(deadline, _deadline)
             transition = _LeaseCloseTransition(
                 gate_id=self._gate_id,
                 epoch=epoch,
                 owner_thread_id=threading.get_ident(),
                 owner_thread=threading.current_thread(),
                 sequence=self._sequence(),
+                deadline=deadline,
             )
             lease.phase = "closing"
             lease.transition = transition
@@ -1072,9 +1149,10 @@ class _TerminalLifecycleGate:
         with self._condition:
             self._require_lease_transition(transition)
             self._require_no_held_admission("drain admissions")
-            self._wait_until(
+            deadline = min(transition.deadline, self._deadline(timeout_s))
+            self._wait_until_deadline(
                 lambda: not self._has_active_tokens(),
-                timeout_s,
+                deadline,
                 "lease admission drain timed out",
             )
 
@@ -1110,7 +1188,7 @@ class _TerminalLifecycleGate:
         with self._condition:
             lease = self._require_lease_transition(transition)
             self._require_no_held_admission("join lease close")
-            deadline = self._deadline(timeout_s)
+            deadline = min(transition.deadline, self._deadline(timeout_s))
             self._wait_until_deadline(
                 lambda: (
                     lease.phase == "closed"
@@ -1158,6 +1236,10 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("lease is not closing")
             if self._has_active_tokens():
                 raise RuntimeError("lease close commit requires zero live admissions")
+            _remaining_lifecycle_time(
+                transition.deadline,
+                "lease close lifecycle timed out before commit",
+            )
             result = finalizer()
             lease.phase = "closed"
             lease.result = result
@@ -1375,10 +1457,22 @@ class _TerminalLifecycleGate:
             raise RuntimeError("runtime close is committed")
         if self._fatal_transition is None:
             if prepared_transition is None:
+                deadline = None
+                if self._runtime_close_transition is not None:
+                    deadline = self._runtime_close_transition.deadline
+                elif self._live_epoch is not None:
+                    lease = self._leases[self._live_epoch]
+                    if lease.transition is not None:
+                        deadline = lease.transition.deadline
+                    elif lease.construction is not None:
+                        deadline = lease.construction.deadline
+                if deadline is None:
+                    deadline = self._deadline(_TERMINAL_TIMEOUT_S)
                 prepared_transition = _FatalTransition(
                     gate_id=self._gate_id,
                     primary=primary,
                     sequence=self._sequence(),
+                    deadline=deadline,
                 )
             if (
                 not isinstance(prepared_transition, _FatalTransition)
@@ -1566,6 +1660,7 @@ class _TerminalLifecycleGate:
                     owner_thread_id=thread_id,
                     owner_thread=threading.current_thread(),
                     sequence=self._sequence(),
+                    deadline=self._deadline(_TERMINAL_TIMEOUT_S),
                 )
                 self._phase = _TerminalPhase.RUNTIME_CLOSING
                 elected = True
@@ -1613,7 +1708,13 @@ class _TerminalLifecycleGate:
         timeout_s=_TERMINAL_TIMEOUT_S,
     ):
         with self._condition:
-            deadline = self._deadline(timeout_s)
+            deadline = (
+                transition.deadline
+                if isinstance(transition, _FatalTransition)
+                else min(transition.deadline, self._deadline(timeout_s))
+            )
+            if deadline is None:
+                deadline = self._deadline(timeout_s)
             self._require_no_held_admission("drain runtime close")
             if isinstance(transition, _FatalTransition):
                 self._require_fatal_transition(transition)
@@ -1776,7 +1877,11 @@ class _TerminalLifecycleGate:
             self._condition.notify_all()
             return self._runtime_close_result
         current_thread = threading.current_thread()
-        deadline = self._deadline(timeout_s)
+        deadline = transition.deadline
+        if deadline is None:
+            deadline = self._deadline(timeout_s)
+        else:
+            deadline = min(deadline, self._deadline(timeout_s))
         if may_finalize and self._fatal_runtime_finalizer_state == "none":
             self._fatal_runtime_finalizer_state = "pending"
             self._fatal_runtime_finalizer_owner = current_thread
@@ -1841,9 +1946,13 @@ class _TerminalLifecycleGate:
             self._require_runtime_transition(transition)
             if transition.owner_thread is not threading.current_thread():
                 self._require_no_held_admission("join runtime close")
-                self._wait_until(
+                deadline = min(
+                    transition.deadline,
+                    self._deadline(timeout_s),
+                )
+                self._wait_until_deadline(
                     lambda: self._phase is not _TerminalPhase.RUNTIME_CLOSING,
-                    timeout_s,
+                    deadline,
                     "runtime close join timed out",
                     owner_thread=transition.owner_thread,
                     owner_message="runtime close owner exited",
@@ -1871,6 +1980,10 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("runtime close commit requires no live lease")
             if self._has_active_tokens():
                 raise RuntimeError("runtime close commit requires zero live admissions")
+            _remaining_lifecycle_time(
+                transition.deadline,
+                "runtime close lifecycle timed out before commit",
+            )
             self._runtime_close_commit_selected = True
             result = finalizer()
             self._phase = _TerminalPhase.RUNTIME_CLOSED

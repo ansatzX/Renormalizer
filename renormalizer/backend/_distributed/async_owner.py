@@ -5,6 +5,8 @@ import threading
 
 import numpy as np
 
+from renormalizer.backend._distributed.terminal import _remaining_lifecycle_time
+
 
 def _require_resource_admission(token, validator):
     if token is None and validator is None:
@@ -691,7 +693,7 @@ class AsyncResourceOwner:
     def start_counted_completion(self):
         self._start_counted_completion()
 
-    def _prepare_counted_completion(self, *, wait):
+    def _prepare_counted_completion(self, *, wait, _deadline=None):
         if self._async_admission is None:
             return None
         if (
@@ -716,16 +718,24 @@ class AsyncResourceOwner:
         else:
             self._async_requested.set()
             self._async_admission.wake()
-        return self._counted_completion_result(wait=True)
+        return self._counted_completion_result(
+            wait=True,
+            _deadline=_deadline,
+        )
 
-    def _counted_completion_result(self, *, wait):
+    def _counted_completion_result(self, *, wait, _deadline=None):
         worker = self._async_worker
         if worker is None:
             return None
         if threading.current_thread() is worker:
             return False
         if wait:
-            self._async_done.wait()
+            remaining = _remaining_lifecycle_time(
+                _deadline,
+                "async completion lifecycle timed out before worker wait",
+            )
+            if not self._async_done.wait(remaining):
+                raise TimeoutError("async completion lifecycle timed out")
         elif not self._async_done.is_set():
             return False
         if self._counted_quarantine_pending and self.state not in {
@@ -980,8 +990,11 @@ class AsyncResourceOwner:
             return False
         return self._detach("completed")
 
-    def wait(self):
-        counted = self._prepare_counted_completion(wait=True)
+    def wait(self, *, _deadline=None):
+        counted = self._prepare_counted_completion(
+            wait=True,
+            _deadline=_deadline,
+        )
         if counted is not None:
             return counted
         if self.state == "quarantined":
@@ -993,13 +1006,24 @@ class AsyncResourceOwner:
         if self._completion_event is None:
             return False
         try:
+            _remaining_lifecycle_time(
+                _deadline,
+                "async completion lifecycle timed out before event wait",
+            )
             wait_event(self._completion_event)
+            _remaining_lifecycle_time(
+                _deadline,
+                "async completion lifecycle timed out during event wait",
+            )
         except BaseException as error:
             return self.fail(error)
         return self._detach("completed")
 
-    def drain(self):
-        counted = self._prepare_counted_completion(wait=True)
+    def drain(self, *, _deadline=None):
+        counted = self._prepare_counted_completion(
+            wait=True,
+            _deadline=_deadline,
+        )
         if counted is not None:
             return counted
         if self.state == "quarantined":
@@ -1009,7 +1033,15 @@ class AsyncResourceOwner:
                 raise self.error
             return True
         try:
+            _remaining_lifecycle_time(
+                _deadline,
+                "async completion lifecycle timed out before drain",
+            )
             self._drain()
+            _remaining_lifecycle_time(
+                _deadline,
+                "async completion lifecycle timed out during drain",
+            )
         except BaseException as error:
             self._remember_error(error)
             self._move_to_quarantine()

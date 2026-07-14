@@ -1,8 +1,10 @@
 """Collective contracts and local collective behavior."""
 
 from contextlib import contextmanager
+from ctypes import sizeof
 from dataclasses import dataclass
 import os
+import socket
 import struct
 import threading
 import time
@@ -12,6 +14,7 @@ import weakref
 from renormalizer.backend._distributed.terminal import (
     _FatalMonitorHandoff,
     _TERMINAL_TIMEOUT_S,
+    _remaining_lifecycle_time,
 )
 
 
@@ -210,6 +213,7 @@ class Collective(Protocol):
 
 
 class SingleProcessCollective:
+    _terminal_lifecycle_deadlines = True
     rank = 0
     size = 1
 
@@ -244,7 +248,9 @@ class SingleProcessCollective:
         return array
 
     @staticmethod
-    def _bootstrap_fatal_control():
+    def _bootstrap_fatal_control(*, _deadline=None):
+        if _deadline is not None and time.monotonic() >= _deadline:
+            raise TimeoutError("terminal lifecycle deadline expired")
         return 0
 
     def _install_fatal_handler(self, handler):
@@ -272,7 +278,9 @@ class SingleProcessCollective:
         self._require_operational()
 
     @staticmethod
-    def _bootstrap_status_or(local_code):
+    def _bootstrap_status_or(local_code, *, _deadline=None):
+        if _deadline is not None and time.monotonic() >= _deadline:
+            raise TimeoutError("terminal lifecycle deadline expired")
         if type(local_code) is not int or local_code < 0:
             raise ValueError("bootstrap status code must be a non-negative integer")
         return local_code
@@ -301,6 +309,7 @@ class CupyNcclCollective:
     """
 
     _SUPPORTED_DTYPE_CHARS = frozenset("bBiIlLqQefdFD")
+    _terminal_lifecycle_deadlines = True
 
     def __init__(
         self,
@@ -362,6 +371,8 @@ class CupyNcclCollective:
         self._fatal_handler = None
         self._fatal_transition_handler = None
         self._fatal_transition_fallback = None
+        self._terminal_gate_fallback = None
+        self._terminal_runtime_fallback = None
         self._fatal_monitor_stop = threading.Event()
         self._fatal_monitor_thread = None
         self._fatal_monitor_state = "none"
@@ -608,8 +619,78 @@ class CupyNcclCollective:
             self._retain_fatal_secondary_direct(error)
         return winner, canonical
 
+    def _direct_terminal_gate_failure_marker(self, error):
+        reference = self._terminal_gate_fallback
+        gate = None if reference is None else reference()
+        if gate is None:
+            return None
+        discovering_token = gate._current_thread_admission()
+        return gate._terminalize_fatal_failure(error, discovering_token)
+
+    def _ensure_fail_stop_markers(self, error, diagnostics=()):
+        retained = list(diagnostics)
+        with self._fatal_condition:
+            retain_discovered = (
+                error is not self._fatal_error
+                and error is not self._fatal_pending_primary
+                and not any(
+                    existing is error
+                    for existing in self._fatal_secondary_errors
+                )
+            )
+        transition = None
+        try:
+            transition = self._direct_terminal_gate_failure_marker(error)
+        except BaseException as gate_error:
+            retained.append(gate_error)
+        primary = error if transition is None else transition.primary
+        if error is not primary:
+            retained.append(error)
+        primary, _ = self._install_fatal_failure_marker(primary, retained)
+        with self._fatal_condition:
+            observations = (
+                (error, *retained) if retain_discovered else tuple(retained)
+            )
+            for observed in observations:
+                if (
+                    not isinstance(observed, BaseException)
+                    or (
+                        observed is primary
+                        and not (retain_discovered and observed is error)
+                    )
+                    or any(
+                    existing is observed
+                    for existing in self._fatal_secondary_errors
+                    )
+                ):
+                    continue
+                self._fatal_secondary_errors = (
+                    *self._fatal_secondary_errors,
+                    observed,
+                )
+        runtime_reference = self._terminal_runtime_fallback
+        runtime = None if runtime_reference is None else runtime_reference()
+        if runtime is not None:
+            with runtime._terminal_state_lock:
+                for observed in retained:
+                    if (
+                        not isinstance(observed, BaseException)
+                        or observed is primary
+                        or any(
+                            existing is observed
+                            for existing in runtime._terminal_secondary_errors
+                        )
+                    ):
+                        continue
+                    runtime._terminal_secondary_errors = (
+                        *runtime._terminal_secondary_errors,
+                        observed,
+                    )
+        return primary
+
     def _hard_exit_once(self, error):
-        winner, primary = self._claim_fatal_hard_exit(error)
+        primary = self._ensure_fail_stop_markers(error)
+        winner, primary = self._claim_fatal_hard_exit(primary)
         if not winner:
             raise primary
         self._fatal_hard_exit()
@@ -626,9 +707,8 @@ class CupyNcclCollective:
             )
 
     def _diagnose_and_hard_exit(self, error):
-        """Retain one fail-stop diagnostic without delaying the hard exit."""
-        self._retain_fatal_secondary_direct(error)
-        self._hard_exit_once(error)
+        """Install both terminal markers before claiming the hard exit."""
+        return self._fail_stop_fatal_path(error)
 
     def _install_fatal_failure_marker(self, primary, diagnostics=()):
         """Publish the collective failure outcome and release its owner."""
@@ -655,23 +735,7 @@ class CupyNcclCollective:
         return primary, first_failure
 
     def _terminalize_unowned_fatal_failure(self, error, diagnostics=()):
-        self._retain_fatal_secondary_direct(error)
-        retained = list(diagnostics)
-        transition = None
-        try:
-            fallback = self._fatal_transition_fallback_callback()
-        except BaseException as fallback_lookup_error:
-            retained.append(fallback_lookup_error)
-            fallback = None
-        if callable(fallback):
-            try:
-                transition = fallback(error, diagnostics=tuple(retained))
-            except BaseException as fallback_error:
-                retained.append(fallback_error)
-        primary = error if transition is None else transition.primary
-        if error is not primary:
-            retained.append(error)
-        primary, _ = self._install_fatal_failure_marker(primary, retained)
+        primary = self._ensure_fail_stop_markers(error, diagnostics)
         self._hard_exit_once(primary)
 
     def _terminalize_pre_owner_fatal_failure(self, error, diagnostics=()):
@@ -736,9 +800,10 @@ class CupyNcclCollective:
                     break
                 self._fatal_condition.wait(remaining)
             primary = owner.primary
-            marker_installed = self._fatal_publication_failure is primary
-        self._retain_fatal_secondary_direct(error)
-        self._hard_exit_once(primary)
+        return self._terminalize_unowned_fatal_failure(
+            primary,
+            diagnostics=(error,),
+        )
 
     def _install_fatal(self, error, origin_rank):
         if not isinstance(error, BaseException):
@@ -959,8 +1024,12 @@ class CupyNcclCollective:
                 self._fatal_publication_owner_reservation = None
             self._fatal_condition.notify_all()
 
-    def _wait_for_joined_fatal_publication(self):
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+    def _wait_for_joined_fatal_publication(self, *, _deadline=None):
+        deadline = (
+            time.monotonic() + _FATAL_TIMEOUT_S
+            if _deadline is None
+            else _deadline
+        )
         publication_failure = None
         fail_stop_error = None
         with self._fatal_condition:
@@ -1771,15 +1840,116 @@ class CupyNcclCollective:
     def _fatal_hard_exit(self):
         os._exit(_FATAL_EXIT_CODE)
 
-    def _fatal_store_set(self, key, value):
+    @staticmethod
+    def _store_deadline(deadline):
+        if deadline is None:
+            return time.monotonic() + _FATAL_TIMEOUT_S
+        if type(deadline) is not float:
+            raise TypeError("terminal lifecycle deadline must be a float")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("terminal lifecycle deadline expired")
+        return deadline
+
+    def _bounded_tcp_store_action(self, action, deadline):
+        from cupyx.distributed import _klv_utils
+        from cupyx.distributed._store import TCPStoreProxy
+
+        proxy = self._bootstrap_store_proxy
+        if type(proxy) is not TCPStoreProxy:
+            raise TypeError("bounded TCP store requires an exact TCPStoreProxy")
+        delay = float(proxy.DELAY_FOR_RETRY)
+        for _ in range(int(proxy.MAX_NUM_RETRIES)):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("terminal lifecycle deadline expired")
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+                    client.settimeout(remaining)
+                    client.connect((proxy.host, proxy.port))
+                    client.sendall(action.klv())
+                    payload = client.recv(sizeof(_klv_utils.result_action_t))
+                    if not payload:
+                        continue
+                    result = _klv_utils.result_action_t.from_buffer_copy(payload)
+                    value = bytearray(result.value)[: result.length]
+                    if result.status == 0:
+                        return action.decode_result(value)
+                    raise RuntimeError(value.decode("utf-8"))
+            except ConnectionRefusedError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                threading.Event().wait(min(delay, remaining))
+            except socket.timeout as error:
+                raise TimeoutError(
+                    "terminal lifecycle TCP store operation timed out"
+                ) from error
+        raise TimeoutError("terminal lifecycle TCP store operation timed out")
+
+    def _store_set(self, key, value, *, _deadline=None):
+        deadline = self._store_deadline(_deadline)
+        proxy = self._bootstrap_store_proxy
         try:
-            self._bootstrap_store_proxy[key] = value
+            from cupyx.distributed import _store_actions
+            from cupyx.distributed._store import TCPStoreProxy
+        except ImportError:
+            proxy[key] = value
+            return None
+        if type(proxy) is TCPStoreProxy:
+            return self._bounded_tcp_store_action(
+                _store_actions.Set(key, value),
+                deadline,
+            )
+        proxy[key] = value
+        if time.monotonic() > deadline:
+            raise TimeoutError("terminal lifecycle deadline expired")
+        return None
+
+    def _store_get(self, key, *, _deadline=None):
+        deadline = self._store_deadline(_deadline)
+        proxy = self._bootstrap_store_proxy
+        try:
+            from cupyx.distributed import _store_actions
+            from cupyx.distributed._store import TCPStoreProxy
+        except ImportError:
+            return proxy[key]
+        if type(proxy) is TCPStoreProxy:
+            return self._bounded_tcp_store_action(
+                _store_actions.Get(key),
+                deadline,
+            )
+        value = proxy[key]
+        if time.monotonic() > deadline:
+            raise TimeoutError("terminal lifecycle deadline expired")
+        return value
+
+    def _store_barrier(self, *, _deadline=None):
+        deadline = self._store_deadline(_deadline)
+        proxy = self._bootstrap_store_proxy
+        try:
+            from cupyx.distributed import _store_actions
+            from cupyx.distributed._store import TCPStoreProxy
+        except ImportError:
+            return proxy.barrier()
+        if type(proxy) is TCPStoreProxy:
+            return self._bounded_tcp_store_action(
+                _store_actions.Barrier(),
+                deadline,
+            )
+        result = proxy.barrier()
+        if time.monotonic() > deadline:
+            raise TimeoutError("terminal lifecycle deadline expired")
+        return result
+
+    def _fatal_store_set(self, key, value, *, _deadline=None):
+        try:
+            self._store_set(key, value, _deadline=_deadline)
         except BaseException as error:
             self._fail_stop_fatal_path(error)
 
-    def _fatal_store_get(self, key):
+    def _fatal_store_get(self, key, *, _deadline=None):
         try:
-            return self._bootstrap_store_proxy[key]
+            return self._store_get(key, _deadline=_deadline)
         except BaseException as error:
             self._fail_stop_fatal_path(error)
 
@@ -1868,11 +2038,22 @@ class CupyNcclCollective:
             "communicator fatal acknowledgment timed out",
         )
 
-    def _wait_for_all_control_records(self, key, timeout_message):
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+    def _wait_for_all_control_records(
+        self,
+        key,
+        timeout_message,
+        *,
+        _deadline=None,
+    ):
+        deadline = (
+            time.monotonic() + _FATAL_TIMEOUT_S
+            if _deadline is None
+            else _deadline
+        )
         while True:
             if all(
-                int(self._fatal_store_get(key(rank))) == 1 for rank in range(self.size)
+                int(self._fatal_store_get(key(rank), _deadline=deadline)) == 1
+                for rank in range(self.size)
             ):
                 return
             if time.monotonic() >= deadline:
@@ -2153,10 +2334,15 @@ class CupyNcclCollective:
         self._fatal_monitor_stop.set()
         return outcome
 
-    def _wait_for_fatal_monitor_outcome(self, generation):
+    def _wait_for_fatal_monitor_outcome(self, generation, *, _deadline=None):
         try:
+            remaining = _remaining_lifecycle_time(
+                _deadline,
+                "communicator fatal monitor stop timed out",
+            )
             return self._fatal_monitor_handoff.wait_for_outcome(
-                generation, _FATAL_TIMEOUT_S
+                generation,
+                _FATAL_TIMEOUT_S if remaining is None else remaining,
             )
         except TimeoutError:
             error = RuntimeError("communicator fatal monitor stop timed out")
@@ -2176,10 +2362,15 @@ class CupyNcclCollective:
     def _acknowledge_fatal_monitor_exit(self, outcome):
         return self._fatal_monitor_handoff.acknowledge_exit(outcome)
 
-    def _wait_for_fatal_monitor_exit(self, outcome):
+    def _wait_for_fatal_monitor_exit(self, outcome, *, _deadline=None):
         try:
+            remaining = _remaining_lifecycle_time(
+                _deadline,
+                "communicator fatal monitor exit acknowledgment timed out",
+            )
             return self._fatal_monitor_handoff.wait_for_exit(
-                outcome, _FATAL_TIMEOUT_S
+                outcome,
+                _FATAL_TIMEOUT_S if remaining is None else remaining,
             )
         except TimeoutError:
             error = RuntimeError(
@@ -2187,10 +2378,14 @@ class CupyNcclCollective:
             )
             self._fail_stop_fatal_path(error)
 
-    def _join_fatal_monitor(self, thread):
+    def _join_fatal_monitor(self, thread, *, _deadline=None):
         if thread is None or thread is threading.current_thread():
             return
-        thread.join(_FATAL_TIMEOUT_S)
+        remaining = _remaining_lifecycle_time(
+            _deadline,
+            "communicator fatal monitor stop timed out",
+        )
+        thread.join(_FATAL_TIMEOUT_S if remaining is None else remaining)
         if thread.is_alive():
             error = RuntimeError("communicator fatal monitor stop timed out")
             self._fail_stop_fatal_path(error)
@@ -2359,7 +2554,7 @@ class CupyNcclCollective:
                 self._fatal_monitor_outcome = outcome
                 self._acknowledge_fatal_monitor_exit(outcome)
 
-    def _start_fatal_monitor(self):
+    def _start_fatal_monitor(self, *, _deadline=None):
         def monitor():
             current = threading.current_thread()
             with self._fatal_condition:
@@ -2410,7 +2605,20 @@ class CupyNcclCollective:
                 self._retain_fatal_secondary_direct(start_error)
                 return thread
             if thread.ident is not None:
-                thread.join(_FATAL_TIMEOUT_S)
+                try:
+                    remaining = _remaining_lifecycle_time(
+                        _deadline,
+                        "fatal monitor start recovery timed out",
+                    )
+                    thread.join(
+                        _FATAL_TIMEOUT_S if remaining is None else remaining
+                    )
+                    if thread.is_alive():
+                        raise TimeoutError(
+                            "fatal monitor start recovery timed out"
+                        )
+                except BaseException as recovery_error:
+                    self._retain_fatal_secondary_direct(recovery_error)
             raise
         return thread
 
@@ -2450,7 +2658,7 @@ class CupyNcclCollective:
                 "CuPy NCCL bootstrap store is unavailable for status provisioning"
             )
 
-    def _local_fatal_capability_code(self):
+    def _local_fatal_capability_code(self, *, _deadline=None):
         local_code = 0
         try:
             from cupyx.distributed._store import TCPStoreProxy
@@ -2466,8 +2674,8 @@ class CupyNcclCollective:
             ):
                 raise RuntimeError("private store contract is unavailable")
             probe_key = "{}{}".format(_STATUS_WORKSPACE_KEY_PREFIX, self.rank)
-            store_proxy[probe_key] = 0
-            if int(store_proxy[probe_key]) != 0:
+            self._store_set(probe_key, 0, _deadline=_deadline)
+            if int(self._store_get(probe_key, _deadline=_deadline)) != 0:
                 raise RuntimeError("private store round trip failed")
         except BaseException:
             local_code |= _FATAL_CAPABILITY_ERROR
@@ -2479,7 +2687,8 @@ class CupyNcclCollective:
             local_code |= _FATAL_CAPABILITY_ERROR
         return local_code
 
-    def _bootstrap_fatal_control(self):
+    def _bootstrap_fatal_control(self, *, _deadline=None):
+        deadline = self._store_deadline(_deadline)
         self._require_operational()
         if self._fatal_control_initialized:
             return 0
@@ -2494,41 +2703,74 @@ class CupyNcclCollective:
             raise RuntimeError(
                 "independent CuPy bootstrap control store is unavailable"
             )
-        local_code = self._local_fatal_capability_code()
+        local_code = self._local_fatal_capability_code(_deadline=deadline)
         local_status_key = "{}{}".format(_STATUS_WORKSPACE_KEY_PREFIX, self.rank)
-        store_proxy[local_status_key] = local_code
-        store_proxy[self._fatal_key(self.rank)] = 0
-        store_proxy[self._fatal_ack_key(self.rank)] = 0
-        store_proxy[self._active_b_key(self.rank)] = self._encode_active_b(0, 0)
-        store_proxy[self._close_ready_key(self.rank)] = 0
-        store_proxy[self._monitor_stopped_key(self.rank)] = 0
-        store_proxy[self._close_consumed_key(self.rank)] = 0
-        store_proxy[_CLOSE_RELEASE_KEY] = 0
-        store_proxy.barrier()
+        self._store_set(local_status_key, local_code, _deadline=deadline)
+        self._store_set(self._fatal_key(self.rank), 0, _deadline=deadline)
+        self._store_set(self._fatal_ack_key(self.rank), 0, _deadline=deadline)
+        self._store_set(
+            self._active_b_key(self.rank),
+            self._encode_active_b(0, 0),
+            _deadline=deadline,
+        )
+        self._store_set(self._close_ready_key(self.rank), 0, _deadline=deadline)
+        self._store_set(
+            self._monitor_stopped_key(self.rank),
+            0,
+            _deadline=deadline,
+        )
+        self._store_set(
+            self._close_consumed_key(self.rank),
+            0,
+            _deadline=deadline,
+        )
+        self._store_set(_CLOSE_RELEASE_KEY, 0, _deadline=deadline)
+        self._store_barrier(_deadline=deadline)
         aggregate = 0
         for rank in range(self.size):
             aggregate |= int(
-                store_proxy["{}{}".format(_STATUS_WORKSPACE_KEY_PREFIX, rank)]
+                self._store_get(
+                    "{}{}".format(_STATUS_WORKSPACE_KEY_PREFIX, rank),
+                    _deadline=deadline,
+                )
             )
-            int(store_proxy[self._fatal_key(rank)])
-            int(store_proxy[self._fatal_ack_key(rank)])
+            int(self._store_get(self._fatal_key(rank), _deadline=deadline))
+            int(self._store_get(self._fatal_ack_key(rank), _deadline=deadline))
             sequence, failed = self._decode_active_b(
-                store_proxy[self._active_b_key(rank)]
+                self._store_get(self._active_b_key(rank), _deadline=deadline)
             )
             if (int(sequence), int(failed)) != (0, 0):
                 aggregate |= _FATAL_CAPABILITY_ERROR
             if (
-                int(store_proxy[self._close_ready_key(rank)]) != 0
-                or int(store_proxy[self._monitor_stopped_key(rank)]) != 0
-                or int(store_proxy[self._close_consumed_key(rank)]) != 0
+                int(
+                    self._store_get(
+                        self._close_ready_key(rank),
+                        _deadline=deadline,
+                    )
+                )
+                != 0
+                or int(
+                    self._store_get(
+                        self._monitor_stopped_key(rank),
+                        _deadline=deadline,
+                    )
+                )
+                != 0
+                or int(
+                    self._store_get(
+                        self._close_consumed_key(rank),
+                        _deadline=deadline,
+                    )
+                )
+                != 0
             ):
                 aggregate |= _FATAL_CAPABILITY_ERROR
-        if int(store_proxy[_CLOSE_RELEASE_KEY]) != 0:
+        if int(self._store_get(_CLOSE_RELEASE_KEY, _deadline=deadline)) != 0:
             aggregate |= _FATAL_CAPABILITY_ERROR
-        store_proxy.barrier()
+        self._store_barrier(_deadline=deadline)
         if aggregate == 0:
             try:
-                monitor = self._start_fatal_monitor()
+                monitor = self._start_fatal_monitor(_deadline=deadline)
                 with self._fatal_condition:
                     monitor_owned = (
                         monitor is not None
@@ -2551,20 +2793,23 @@ class CupyNcclCollective:
                 self._fatal_condition.notify_all()
         return aggregate
 
-    def _bootstrap_status_or(self, local_code):
+    def _bootstrap_status_or(self, local_code, *, _deadline=None):
+        deadline = self._store_deadline(_deadline)
         if type(local_code) is not int or local_code < 0:
             raise ValueError("bootstrap status code must be a non-negative integer")
         self._validate_bootstrap_status_or()
-        store_proxy = self._bootstrap_store_proxy
         local_key = "{}{}".format(_STATUS_WORKSPACE_KEY_PREFIX, self.rank)
-        store_proxy[local_key] = local_code
-        store_proxy.barrier()
+        self._store_set(local_key, local_code, _deadline=deadline)
+        self._store_barrier(_deadline=deadline)
         aggregate = 0
         for rank in range(self.size):
             aggregate |= int(
-                store_proxy["{}{}".format(_STATUS_WORKSPACE_KEY_PREFIX, rank)]
+                self._store_get(
+                    "{}{}".format(_STATUS_WORKSPACE_KEY_PREFIX, rank),
+                    _deadline=deadline,
+                )
             )
-        store_proxy.barrier()
+        self._store_barrier(_deadline=deadline)
         return aggregate
 
     def _broadcast_unadmitted(self, array, *, root):
@@ -2806,19 +3051,46 @@ class CupyNcclCollective:
         else:
             self._require_operational()
 
-    def _wait_for_control_value(self, key, timeout_message):
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
-        while int(self._fatal_store_get(key)) != 1:
+    def _wait_for_control_value(
+        self,
+        key,
+        timeout_message,
+        *,
+        _deadline=None,
+    ):
+        deadline = (
+            time.monotonic() + _FATAL_TIMEOUT_S
+            if _deadline is None
+            else _deadline
+        )
+        while int(self._fatal_store_get(key, _deadline=deadline)) != 1:
             if time.monotonic() >= deadline:
                 error = RuntimeError(timeout_message)
                 self._diagnose_and_hard_exit(error)
             time.sleep(0.001)
 
-    def _consume_terminal_control_records(self, discovering_token=None):
+    def _consume_terminal_control_records(
+        self,
+        discovering_token=None,
+        *,
+        _deadline=None,
+    ):
         fatal = []
         for rank in range(self.size):
-            fatal.append(int(self._fatal_store_get(self._fatal_key(rank))))
-            self._decode_active_b(self._fatal_store_get(self._active_b_key(rank)))
+            fatal.append(
+                int(
+                    self._fatal_store_get(
+                        self._fatal_key(rank),
+                        _deadline=_deadline,
+                    )
+                )
+            )
+            self._decode_active_b(
+                self._fatal_store_get(
+                    self._active_b_key(rank),
+                    _deadline=_deadline,
+                )
+            )
         if any(fatal):
             origin_rank = fatal.index(1)
             with self._fatal_lock:
@@ -2841,14 +3113,27 @@ class CupyNcclCollective:
             return self._fatal_pending_primary
         return None
 
-    def _wait_for_close_ready(self, discovering_token=None):
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+    def _wait_for_close_ready(self, discovering_token=None, *, _deadline=None):
+        deadline = (
+            time.monotonic() + _FATAL_TIMEOUT_S
+            if _deadline is None
+            else _deadline
+        )
         while True:
-            primary = self._consume_terminal_control_records(discovering_token)
+            primary = self._consume_terminal_control_records(
+                discovering_token,
+                _deadline=deadline,
+            )
             if primary is not None:
                 return primary
             if all(
-                int(self._fatal_store_get(self._close_ready_key(rank))) == 1
+                int(
+                    self._fatal_store_get(
+                        self._close_ready_key(rank),
+                        _deadline=deadline,
+                    )
+                )
+                == 1
                 for rank in range(self.size)
             ):
                 return None
@@ -2857,8 +3142,12 @@ class CupyNcclCollective:
                 self._diagnose_and_hard_exit(error)
             time.sleep(0.001)
 
-    def _quiesce_operations_for_close(self):
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+    def _quiesce_operations_for_close(self, *, _deadline=None):
+        deadline = (
+            time.monotonic() + _FATAL_TIMEOUT_S
+            if _deadline is None
+            else _deadline
+        )
         fail_stop_error = None
         with self._fatal_condition:
             self._closing = True
@@ -2888,20 +3177,37 @@ class CupyNcclCollective:
             return None
         return gate.admit_runtime_close(transition, operation)
 
-    def _close_initialized_control(self, backend, gate=None, transition=None):
+    def _close_initialized_control(
+        self,
+        backend,
+        gate=None,
+        transition=None,
+        *,
+        _deadline=None,
+    ):
         ready_token = self._admit_runtime_close_step(
             gate, transition, "collective_close_ready"
         )
         try:
-            self._fatal_store_set(self._close_ready_key(self.rank), 1)
-            primary = self._wait_for_close_ready(ready_token)
+            self._fatal_store_set(
+                self._close_ready_key(self.rank),
+                1,
+                _deadline=_deadline,
+            )
+            primary = self._wait_for_close_ready(
+                ready_token,
+                _deadline=_deadline,
+            )
             if primary is None:
-                primary = self._consume_terminal_control_records(ready_token)
+                primary = self._consume_terminal_control_records(
+                    ready_token,
+                    _deadline=_deadline,
+                )
         finally:
             self._release_runtime_close_step(gate, ready_token)
 
         if primary is not None:
-            self._wait_for_joined_fatal_publication()
+            self._wait_for_joined_fatal_publication(_deadline=_deadline)
             return self._fatal_monitor_outcome
 
         stop_token = self._admit_runtime_close_step(
@@ -2912,43 +3218,61 @@ class CupyNcclCollective:
         finally:
             self._release_runtime_close_step(gate, stop_token)
 
-        outcome = self._wait_for_fatal_monitor_outcome(generation)
-        self._wait_for_fatal_monitor_exit(outcome)
+        outcome = self._wait_for_fatal_monitor_outcome(
+            generation,
+            _deadline=_deadline,
+        )
+        self._wait_for_fatal_monitor_exit(outcome, _deadline=_deadline)
         thread = self._fatal_monitor_thread
-        self._join_fatal_monitor(thread)
+        self._join_fatal_monitor(thread, _deadline=_deadline)
         if outcome.kind == "fatal_elected":
-            self._wait_for_joined_fatal_publication()
+            self._wait_for_joined_fatal_publication(_deadline=_deadline)
             return outcome
 
         if gate is not None:
             selected = gate.select_runtime_close_commit(transition)
             if selected is not transition:
-                self._wait_for_joined_fatal_publication()
+                self._wait_for_joined_fatal_publication(_deadline=_deadline)
                 return self._fatal_monitor_outcome
 
         close_token = self._admit_runtime_close_step(
             gate, transition, "collective_close"
         )
         try:
-            self._fatal_store_set(self._monitor_stopped_key(self.rank), 1)
+            self._fatal_store_set(
+                self._monitor_stopped_key(self.rank),
+                1,
+                _deadline=_deadline,
+            )
             self._wait_for_all_control_records(
                 self._monitor_stopped_key,
                 "communicator monitor-stop agreement timed out",
+                _deadline=_deadline,
             )
 
             if self.rank == 0:
-                self._fatal_store_set(_CLOSE_RELEASE_KEY, 1)
+                self._fatal_store_set(
+                    _CLOSE_RELEASE_KEY,
+                    1,
+                    _deadline=_deadline,
+                )
             else:
                 self._wait_for_control_value(
                     _CLOSE_RELEASE_KEY,
                     "communicator close release timed out",
+                    _deadline=_deadline,
                 )
                 backend.stop()
-            self._fatal_store_set(self._close_consumed_key(self.rank), 1)
+            self._fatal_store_set(
+                self._close_consumed_key(self.rank),
+                1,
+                _deadline=_deadline,
+            )
             if self.rank == 0:
                 self._wait_for_all_control_records(
                     self._close_consumed_key,
                     "communicator close consumption timed out",
+                    _deadline=_deadline,
                 )
                 backend.stop()
         finally:
@@ -2970,8 +3294,12 @@ class CupyNcclCollective:
         with self._fatal_condition:
             self._fatal_condition.notify_all()
 
-    def _wait_for_close_owner(self):
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+    def _wait_for_close_owner(self, *, _deadline=None):
+        deadline = (
+            time.monotonic() + _FATAL_TIMEOUT_S
+            if _deadline is None
+            else _deadline
+        )
         fail_stop_error = None
         with self._fatal_condition:
             while self._close_in_progress and not self._closed:
@@ -2985,14 +3313,24 @@ class CupyNcclCollective:
         if fail_stop_error is not None:
             self._diagnose_and_hard_exit(fail_stop_error)
 
-    def _close_impl(self, gate=None, transition=None):
+    def _close_impl(self, gate=None, transition=None, *, _deadline=None):
+        if _deadline is None:
+            _deadline = (
+                transition.deadline
+                if transition is not None
+                else time.monotonic() + _FATAL_TIMEOUT_S
+            )
         while True:
+            _remaining_lifecycle_time(
+                _deadline,
+                "communicator close lifecycle timed out before owner claim",
+            )
             owns_close, closed = self._claim_close_owner()
             if closed:
                 return None
             if owns_close:
                 break
-            self._wait_for_close_owner()
+            self._wait_for_close_owner(_deadline=_deadline)
         try:
             backend = self._backend
             with self._fatal_lock:
@@ -3007,10 +3345,10 @@ class CupyNcclCollective:
                     gate, transition, "collective_monitor_start"
                 )
                 try:
-                    self._start_fatal_monitor()
+                    self._start_fatal_monitor(_deadline=_deadline)
                 finally:
                     self._release_runtime_close_step(gate, restart_token)
-            self._quiesce_operations_for_close()
+            self._quiesce_operations_for_close(_deadline=_deadline)
             with self._fatal_lock:
                 terminal = self._fatal_error is not None
             try:
@@ -3018,13 +3356,20 @@ class CupyNcclCollective:
                     outcome = None
                 elif self._fatal_control_initialized:
                     outcome = self._close_initialized_control(
-                        backend, gate=gate, transition=transition
+                        backend,
+                        gate=gate,
+                        transition=transition,
+                        _deadline=_deadline,
                     )
                 else:
                     self._fatal_monitor_stop.set()
                     thread = self._fatal_monitor_thread
                     if thread is not None and thread is not threading.current_thread():
-                        thread.join(_FATAL_TIMEOUT_S)
+                        remaining = _remaining_lifecycle_time(
+                            _deadline,
+                            "communicator close lifecycle timed out joining monitor",
+                        )
+                        thread.join(remaining)
                     selected = (
                         transition
                         if gate is None
@@ -3034,7 +3379,9 @@ class CupyNcclCollective:
                         backend.stop()
                         outcome = None
                     else:
-                        self._wait_for_joined_fatal_publication()
+                        self._wait_for_joined_fatal_publication(
+                            _deadline=_deadline,
+                        )
                         outcome = self._fatal_monitor_outcome
             except BaseException:
                 if not self._fatal_control_initialized:
@@ -3057,7 +3404,11 @@ class CupyNcclCollective:
             self._release_close_owner()
 
     def _close_for_runtime(self, gate, transition):
-        return self._close_impl(gate=gate, transition=transition)
+        return self._close_impl(
+            gate=gate,
+            transition=transition,
+            _deadline=transition.deadline,
+        )
 
     def close(self):
         self._close_impl()

@@ -14,6 +14,8 @@ from renormalizer.backend._distributed.async_owner import (
 )
 from renormalizer.backend._distributed.terminal import (
     _publish_lease_construction_resource,
+    _publish_lease_construction_resource_direct,
+    _remaining_lifecycle_time,
 )
 
 
@@ -124,6 +126,7 @@ class CacheEntryLease:
 
     def __init__(self, cache, entry, *, cache_hit):
         self._cache = cache
+        self._managed = cache._managed
         self._entry = entry
         self.cache_hit = cache_hit
         self._failure = None
@@ -202,7 +205,23 @@ class CacheEntryLease:
         self._closed = True
         self._cache._release_to_owner(self._entry, self, owner)
 
-    def close(self, event=None):
+    def close(
+        self,
+        event=None,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        if (
+            getattr(self, "_managed", False)
+            and _admission_token is None
+            and _admission_validator is None
+        ):
+            raise TypeError("managed cache entry lease requires admission")
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
         if self._closed:
             return
         if event is not None:
@@ -237,6 +256,7 @@ class CacheReservation:
 
     def __init__(self, cache, allowlist, required_bytes, allocated_bytes):
         self._cache = cache
+        self._managed = cache._managed
         self._allowlist = MappingProxyType(dict(allowlist))
         self.required_bytes = required_bytes
         self.peak_allocated_bytes = allocated_bytes
@@ -252,10 +272,25 @@ class CacheReservation:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        if (
+            getattr(self, "_managed", False)
+            and _admission_token is None
+            and _admission_validator is None
+        ):
+            raise TypeError("managed cache reservation requires admission")
+        _require_resource_admission(
+            _admission_token,
+            _admission_validator,
+        )
         if self._closed:
             return
         cache = self._cache
+        if cache._managed:
+            cache._release_reservation(self)
+            self._cache = None
+            self._allowlist = MappingProxyType({})
+            self._closed = True
+            return
         try:
             cache._release_reservation(self)
         finally:
@@ -313,7 +348,13 @@ class DeviceTensorCache:
         self._cache_misses = 0
         self._poisoned_error = None
         self._closed = False
+        self._managed = _construction_slot is not None
         self._resource_recorder = _resource_recorder
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            self,
+            kind="cache",
+        )
         _publish_lease_construction_resource(
             _construction_slot,
             self,
@@ -327,7 +368,14 @@ class DeviceTensorCache:
                 _replace_kind=True,
             )
 
-    def _set_resource_recorder(self, recorder):
+    def _set_resource_recorder(
+        self,
+        recorder,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if recorder is not None and not callable(recorder):
             raise TypeError("resource recorder must be callable")
         self._resource_recorder = recorder
@@ -390,6 +438,11 @@ class DeviceTensorCache:
         if self._closed:
             raise RuntimeError("device tensor cache is closed")
 
+    def _require_admission(self, token, validator):
+        if getattr(self, "_managed", False) and token is None and validator is None:
+            raise TypeError("managed device tensor cache requires admission")
+        return _require_resource_admission(token, validator)
+
     def _poison(self, error):
         if self._poisoned_error is None:
             self._poisoned_error = error
@@ -404,7 +457,7 @@ class DeviceTensorCache:
         _admission_validator=None,
         _construction_slot=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         if _resource_recorder is not None and not callable(_resource_recorder):
             raise TypeError("resource recorder must be callable")
         self._require_usable()
@@ -434,7 +487,10 @@ class DeviceTensorCache:
         if required_bytes > self._capacity_bytes:
             raise MemoryError("cache reservation exceeds fixed cache capacity")
 
-        self.reap_completed()
+        self.reap_completed(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         outside = [
             (identity, entry)
             for identity, entry in self._entries.items()
@@ -456,6 +512,10 @@ class DeviceTensorCache:
             self, normalized, required_bytes, self._allocated_bytes
         )
         self._reservation = reservation
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            reservation,
+        )
         _publish_lease_construction_resource(
             _construction_slot,
             reservation,
@@ -532,13 +592,16 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
         _validate_identity(identity)
         reservation = self._reservation
         if reservation is None or identity not in reservation.allowlist:
             raise ValueError("cache identity is outside the active allowlist")
-        self.reap_completed()
+        self.reap_completed(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         entry = self._entries.get(identity)
         cache_hit = entry is not None
         if (
@@ -685,8 +748,13 @@ class DeviceTensorCache:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _deadline=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
+        _remaining_lifecycle_time(
+            _deadline,
+            "device cache lifecycle timed out before reap",
+        )
         if self._closed and not self.poisoned:
             return
         self._require_usable()
@@ -699,11 +767,15 @@ class DeviceTensorCache:
             except BaseException as error:
                 if owner.quarantined:
                     self._poison(error)
+                if self._managed:
+                    raise
                 errors.append(error)
         for entry in tuple(self._entries.values()):
             try:
                 self._refresh_entry(entry)
             except BaseException as error:
+                if self._managed:
+                    raise
                 errors.append(error)
         if errors:
             raise errors[0]
@@ -713,23 +785,30 @@ class DeviceTensorCache:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _deadline=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
+        _remaining_lifecycle_time(
+            _deadline,
+            "device cache lifecycle timed out before pending wait",
+        )
         errors = []
         for owner in tuple(
             dict.fromkeys(retained[0] for retained in self._owner_pending)
         ):
             try:
-                owner.wait()
+                owner.wait(_deadline=_deadline)
             except BaseException as error:
                 if owner.quarantined:
                     self._poison(error)
+                if self._managed:
+                    raise
                 errors.append(error)
         for entry in tuple(self._entries.values()):
             ticket = entry.readiness_ticket
             if entry.state == "loading" and ticket is not None:
                 try:
-                    ticket.wait()
+                    ticket.wait(_deadline=_deadline)
                     self._refresh_entry(entry)
                 except BaseException as error:
                     if getattr(ticket, "terminal_poisoned", False):
@@ -738,10 +817,18 @@ class DeviceTensorCache:
                         self._poison(error)
                     else:
                         self._fail_entry(entry, error)
+                    if self._managed:
+                        raise
                     errors.append(error)
         try:
-            self.reap_completed()
+            self.reap_completed(
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+                _deadline=_deadline,
+            )
         except BaseException as error:
+            if self._managed:
+                raise
             errors.append(error)
         if errors:
             raise errors[0]
@@ -753,10 +840,17 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         return identity in self._entries
 
-    def refcount(self, identity):
+    def refcount(
+        self,
+        identity,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if isinstance(identity, str):
             return sum(
                 entry.refcount
@@ -778,11 +872,21 @@ class DeviceTensorCache:
         entry.transfer_array = None
         entry.reverse_axis = None
 
-    def invalidate(self, identity):
+    def invalidate(
+        self,
+        identity,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         entry = self._entries.get(identity)
         if entry is None:
             return
-        self.reap_completed()
+        self.reap_completed(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         if entry.refcount:
             raise RuntimeError("cache entry is still referenced")
         self._evict(identity, entry)
@@ -794,38 +898,59 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         identities = [
             identity
             for identity in self._entries
             if identity[:4] == (ref.store_id, ref.key, ref.generation, ref.version)
         ]
         for identity in identities:
-            self.invalidate(identity)
+            self.invalidate(
+                identity,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
 
     def close(
         self,
         *,
         _admission_token=None,
         _admission_validator=None,
+        _deadline=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
+        _remaining_lifecycle_time(
+            _deadline,
+            "device cache lifecycle timed out before close",
+        )
         if self._closed:
             return
         error = self._poisoned_error
-        if self._reservation is not None:
-            try:
-                self._reservation.close()
-            except BaseException as caught:
-                if error is None:
-                    error = caught
         if self._poisoned_error is None:
             try:
-                self.wait_for_pending()
+                self.wait_for_pending(
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                    _deadline=_deadline,
+                )
             except BaseException as caught:
+                if self._managed:
+                    raise
                 if error is None:
                     error = caught
+        if self._reservation is not None and error is None:
+            try:
+                self._reservation.close(
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
+            except BaseException as caught:
+                if self._managed:
+                    raise
+                error = caught
         if self._poisoned_error is not None:
+            if self._managed:
+                raise self._poisoned_error
             self._reservation = None
             self._allocator = None
             self._closed = True
@@ -834,6 +959,12 @@ class DeviceTensorCache:
             return
         if any(entry.refcount for entry in self._entries.values()) and error is None:
             error = RuntimeError("cannot close cache with live entry leases")
+            if self._managed:
+                raise error
+        _remaining_lifecycle_time(
+            _deadline,
+            "device cache lifecycle timed out before destructive close",
+        )
         close_error = RuntimeError("device tensor cache closed with a live entry")
         for entry in tuple(self._entries.values()):
             entry.state = "failed"

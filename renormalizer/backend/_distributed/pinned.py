@@ -11,6 +11,8 @@ from renormalizer.backend._distributed.async_owner import (
 )
 from renormalizer.backend._distributed.terminal import (
     _publish_lease_construction_resource,
+    _publish_lease_construction_resource_direct,
+    _remaining_lifecycle_time,
 )
 
 
@@ -106,21 +108,31 @@ class StagingSlot:
 
 
 class _SlotCheckout(AbstractContextManager):
-    def __init__(self, pool, nbytes):
+    def __init__(self, pool, nbytes, admission_token, admission_validator):
         self._pool = pool
         self._nbytes = nbytes
+        self._admission_token = admission_token
+        self._admission_validator = admission_validator
         self._slot = None
 
     def __enter__(self):
         if self._slot is not None:
             raise RuntimeError("staging checkout is already entered")
-        self._slot = self._pool._checkout(self._nbytes)
+        self._slot = self._pool._checkout(
+            self._nbytes,
+            _admission_token=self._admission_token,
+            _admission_validator=self._admission_validator,
+        )
         return self._slot
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self._slot is not None:
             try:
-                self._pool._release(self._slot)
+                self._pool._release(
+                    self._slot,
+                    _admission_token=self._admission_token,
+                    _admission_validator=self._admission_validator,
+                )
             except BaseException:
                 if exc_value is None:
                     raise
@@ -160,32 +172,47 @@ class PinnedBufferPool:
         if _resource_recorder is not None and not callable(_resource_recorder):
             raise TypeError("resource recorder must be callable")
 
-        pinned = True
-        fallback_count = 0
-        fallback_bytes = 0
-        try:
-            array, record = _validate_storage(
-                pinned_allocator(capacity_bytes), capacity_bytes
-            )
-        except Exception:
-            array, record = _validate_storage(
-                pageable_allocator(capacity_bytes), capacity_bytes
-            )
-            pinned = False
-            fallback_count = 1
-            fallback_bytes = capacity_bytes
-
+        self._managed = _construction_slot is not None
         self._capacity_bytes = capacity_bytes
-        self._slot = StagingSlot(self, array, pinned=pinned)
-        self._allocation_record = record
+        self._slot = StagingSlot(self, None, pinned=True)
+        self._allocation_record = None
         self._closed = False
         self._checked_out_bytes = 0
         self._pending_bytes = 0
         self._peak_checked_out_bytes = 0
-        self._pageable_fallback_count = fallback_count
-        self._pageable_fallback_bytes = fallback_bytes
+        self._pageable_fallback_count = 0
+        self._pageable_fallback_bytes = 0
         self._poisoned_error = None
         self._resource_recorder = _resource_recorder
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            self,
+            kind="pinned",
+        )
+
+        pinned = True
+        try:
+            array = pinned_allocator(capacity_bytes)
+            self._slot._array = array
+            array, record = _validate_storage(array, capacity_bytes)
+        except Exception:
+            self._slot._array = None
+            array = pageable_allocator(capacity_bytes)
+            self._slot._array = array
+            array, record = _validate_storage(array, capacity_bytes)
+            pinned = False
+            self._pageable_fallback_count = 1
+            self._pageable_fallback_bytes = capacity_bytes
+
+        self._slot._array = array
+        self._slot._pinned = pinned
+        self._allocation_record = record
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            self,
+            kind="pinned",
+            records=(record,),
+        )
         _publish_lease_construction_resource(
             _construction_slot,
             self,
@@ -247,6 +274,11 @@ class PinnedBufferPool:
         if self._closed:
             raise RuntimeError("pinned buffer pool is closed")
 
+    def _require_admission(self, token, validator):
+        if getattr(self, "_managed", False) and token is None and validator is None:
+            raise TypeError("managed pinned buffer pool requires admission")
+        return _require_resource_admission(token, validator)
+
     def _poison(self, error):
         if self._poisoned_error is None:
             self._poisoned_error = error
@@ -274,17 +306,32 @@ class PinnedBufferPool:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
         if type(nbytes) is not int or nbytes <= 0:
             raise ValueError("checkout nbytes must be a positive integer")
         if nbytes > self._capacity_bytes:
             raise MemoryError("staging checkout exceeds fixed pool capacity")
-        return _SlotCheckout(self, nbytes)
+        return _SlotCheckout(
+            self,
+            nbytes,
+            _admission_token,
+            _admission_validator,
+        )
 
-    def _checkout(self, nbytes):
+    def _checkout(
+        self,
+        nbytes,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         self._require_usable()
-        self.reap_completed()
+        self.reap_completed(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
         slot = self._slot
         if slot._checked_out or slot._owner is not None:
             raise RuntimeError("no staging slot is available")
@@ -294,7 +341,14 @@ class PinnedBufferPool:
         self._peak_checked_out_bytes = max(self._peak_checked_out_bytes, nbytes)
         return slot
 
-    def _release(self, slot):
+    def _release(
+        self,
+        slot,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if slot is not self._slot or not slot._checked_out:
             raise RuntimeError("staging slot is not owned by this checkout")
         slot._checked_out = False
@@ -328,8 +382,13 @@ class PinnedBufferPool:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _deadline=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
+        _remaining_lifecycle_time(
+            _deadline,
+            "pinned pool lifecycle timed out before reap",
+        )
         if self._closed and not self.poisoned:
             return
         self._require_usable()
@@ -345,19 +404,28 @@ class PinnedBufferPool:
             raise
         if owner.completed:
             self._finalize_slot()
+        _remaining_lifecycle_time(
+            _deadline,
+            "pinned pool lifecycle timed out during reap",
+        )
 
     def wait_for_slot(
         self,
         *,
         _admission_token=None,
         _admission_validator=None,
+        _deadline=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
+        _remaining_lifecycle_time(
+            _deadline,
+            "pinned pool lifecycle timed out before owner wait",
+        )
         self._require_usable()
         owner = self._slot._owner
         if owner is not None:
             try:
-                owner.wait()
+                owner.wait(_deadline=_deadline)
             except BaseException as error:
                 if owner.quarantined:
                     self._owner_quarantined(owner)
@@ -369,20 +437,35 @@ class PinnedBufferPool:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _deadline=None,
     ):
-        _require_resource_admission(_admission_token, _admission_validator)
+        self._require_admission(_admission_token, _admission_validator)
+        _remaining_lifecycle_time(
+            _deadline,
+            "pinned pool lifecycle timed out before close",
+        )
         if self._closed:
             return
         if self._slot._checked_out:
             raise RuntimeError("cannot close pool with a checked out staging slot")
-        error = None
-        if self._poisoned_error is not None:
-            error = self._poisoned_error
-        else:
+        error = self._poisoned_error
+        if error is None:
             try:
-                self.wait_for_slot()
+                self.wait_for_slot(
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                    _deadline=_deadline,
+                )
             except BaseException as caught:
+                if self._managed:
+                    raise
                 error = caught
+        elif self._managed:
+            raise error
+        _remaining_lifecycle_time(
+            _deadline,
+            "pinned pool lifecycle timed out before destructive close",
+        )
         if self._poisoned_error is None:
             self._slot._array = None
             self._allocation_record = None
