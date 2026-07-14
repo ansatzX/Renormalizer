@@ -1025,11 +1025,7 @@ class CupyNcclCollective:
             self._fatal_condition.notify_all()
 
     def _wait_for_joined_fatal_publication(self, *, _deadline=None):
-        deadline = (
-            time.monotonic() + _FATAL_TIMEOUT_S
-            if _deadline is None
-            else _deadline
-        )
+        deadline = self._inherited_fatal_deadline(_deadline)
         publication_failure = None
         fail_stop_error = None
         with self._fatal_condition:
@@ -1057,8 +1053,8 @@ class CupyNcclCollective:
         if publication_failure is not None:
             self._fail_stop_fatal_path(publication_failure)
 
-    def _wait_for_active_broadcast_agreements(self):
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+    def _wait_for_active_broadcast_agreements(self, *, _deadline=None):
+        deadline = self._inherited_fatal_deadline(_deadline)
         fail_stop_error = None
         with self._fatal_condition:
             while self._active_broadcast_agreements:
@@ -1209,7 +1205,13 @@ class CupyNcclCollective:
                     self._fatal_publication_local.reservation = reservation
                 yield reservation
                 if joined:
-                    self._wait_for_joined_fatal_publication()
+                    self._wait_for_joined_fatal_publication(
+                        _deadline=(
+                            None
+                            if reservation.transition is None
+                            else reservation.transition.deadline
+                        ),
+                    )
                 joined_succeeded = True
             finally:
                 if attach_deferred_join:
@@ -1943,15 +1945,46 @@ class CupyNcclCollective:
 
     def _fatal_store_set(self, key, value, *, _deadline=None):
         try:
-            self._store_set(key, value, _deadline=_deadline)
+            self._store_set(
+                key,
+                value,
+                _deadline=self._inherited_fatal_deadline(_deadline),
+            )
         except BaseException as error:
             self._fail_stop_fatal_path(error)
 
     def _fatal_store_get(self, key, *, _deadline=None):
         try:
-            return self._store_get(key, _deadline=_deadline)
+            return self._store_get(
+                key,
+                _deadline=self._inherited_fatal_deadline(_deadline),
+            )
         except BaseException as error:
             self._fail_stop_fatal_path(error)
+
+    def _inherited_fatal_deadline(self, explicit=None):
+        if explicit is not None:
+            return explicit
+        reservation = getattr(
+            self._fatal_publication_local,
+            "reservation",
+            None,
+        )
+        transition = (
+            None if reservation is None else reservation.transition
+        )
+        if transition is not None and transition.deadline is not None:
+            return transition.deadline
+        reference = self._terminal_gate_fallback
+        gate = None if reference is None else reference()
+        if gate is not None:
+            with gate._condition:
+                transition = gate._fatal_transition
+                if transition is None:
+                    transition = gate._runtime_close_transition
+                if transition is not None and transition.deadline is not None:
+                    return transition.deadline
+        return time.monotonic() + _FATAL_TIMEOUT_S
 
     def _abort_local_communicator(self):
         def abort():
@@ -2230,12 +2263,19 @@ class CupyNcclCollective:
         self._active_broadcast_local.deferral = deferral
         return deferral.primary
 
-    def _read_fatal_origin(self):
+    def _read_fatal_origin(self, *, _deadline=None):
+        deadline = self._inherited_fatal_deadline(_deadline)
         return next(
             (
                 rank
                 for rank in range(self.size)
-                if int(self._bootstrap_store_proxy[self._fatal_key(rank)]) == 1
+                if int(
+                    self._fatal_store_get(
+                        self._fatal_key(rank),
+                        _deadline=deadline,
+                    )
+                )
+                == 1
             ),
             None,
         )
@@ -2983,16 +3023,21 @@ class CupyNcclCollective:
         with self._fatal_lock:
             sequence = self._active_broadcast_sequence
             self._active_broadcast_sequence += 1
+        deadline = self._inherited_fatal_deadline()
         self._fatal_store_set(
-            self._active_b_key(self.rank), self._encode_active_b(sequence, failed)
+            self._active_b_key(self.rank),
+            self._encode_active_b(sequence, failed),
+            _deadline=deadline,
         )
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
         records = None
         while records is None:
             observed = []
             complete = True
             for rank in range(self.size):
-                value = self._fatal_store_get(self._active_b_key(rank))
+                value = self._fatal_store_get(
+                    self._active_b_key(rank),
+                    _deadline=deadline,
+                )
                 try:
                     observed_sequence, observed_failed = self._decode_active_b(value)
                     observed_sequence = int(observed_sequence)

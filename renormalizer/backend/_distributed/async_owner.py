@@ -5,7 +5,10 @@ import threading
 
 import numpy as np
 
-from renormalizer.backend._distributed.terminal import _remaining_lifecycle_time
+from renormalizer.backend._distributed.terminal import (
+    _remaining_lifecycle_time,
+    _require_managed_resource_admission,
+)
 
 
 def _require_resource_admission(token, validator):
@@ -302,6 +305,7 @@ class AsyncResourceOwner:
         _resource_releaser=None,
         _defer_async_completion=False,
         _callback_requires_admission=False,
+        _managed_guard=None,
     ):
         if not isinstance(kind, str) or not kind:
             raise ValueError("async owner kind must be a non-empty string")
@@ -355,6 +359,7 @@ class AsyncResourceOwner:
         self._async_admission = _async_admission
         self._resource_recorder = _resource_recorder
         self._resource_releaser = _resource_releaser
+        self._managed_guard = _managed_guard
         # Lock order: owner state -> no other lock. Gate/admission calls and waits
         # always happen after releasing this lock.
         self._async_lock = threading.RLock()
@@ -378,37 +383,71 @@ class AsyncResourceOwner:
 
     @property
     def arrays(self):
+        self._require_admission()
         return tuple(self._arrays)
 
     @property
     def resources(self):
+        self._require_admission()
         return tuple(self._resources)
 
     @property
     def allocations(self):
+        self._require_admission()
         return tuple(self._allocations)
 
     @property
     def streams(self):
+        self._require_admission()
         return tuple(self._streams)
 
     @property
     def events(self):
+        self._require_admission()
         return tuple(self._events)
 
     @property
     def completion_event(self):
+        self._require_admission()
         return self._completion_event
 
     @property
     def completed(self):
+        self._require_admission()
         return self.state == "detached"
 
     @property
     def quarantined(self):
+        self._require_admission()
         return self.state == "quarantined"
 
-    def capture_arrays(self, *arrays):
+    def _require_admission(self, token=None, validator=None):
+        return _require_managed_resource_admission(
+            self._managed_guard,
+            token,
+            validator,
+        )
+
+    def _terminal_resource_snapshot(self):
+        """Query-free terminal ownership snapshot for the runtime owner."""
+        return {
+            "arrays": tuple(self._arrays),
+            "resources": tuple(self._resources),
+            "allocations": tuple(self._allocations),
+            "streams": tuple(self._streams),
+            "events": tuple(self._events),
+            "completion_event": self._completion_event,
+            "completed": self.state == "detached",
+            "quarantined": self.state == "quarantined",
+        }
+
+    def capture_arrays(
+        self,
+        *arrays,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture arrays")
         self._arrays = _unique((*self._arrays, *arrays))
@@ -416,26 +455,52 @@ class AsyncResourceOwner:
         if self._resource_recorder is not None:
             self._resource_recorder(resource=self, records=self._allocations)
 
-    def capture_allocations(self, *arrays):
+    def capture_allocations(
+        self,
+        *arrays,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture allocations")
         self._allocations = merge_allocation_records(self._allocations, arrays)
         if self._resource_recorder is not None:
             self._resource_recorder(resource=self, records=self._allocations)
 
-    def capture_resources(self, *resources):
+    def capture_resources(
+        self,
+        *resources,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture resources")
         self._resources = _unique((*self._resources, *resources))
 
-    def capture_streams(self, *streams):
+    def capture_streams(
+        self,
+        *streams,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture streams")
         self._streams = _unique((*self._streams, *streams))
         if self._resource_recorder is not None:
             self._resource_recorder(resource=self, streams=streams)
 
-    def add_event(self, event, *, completion=False):
+    def add_event(
+        self,
+        event,
+        *,
+        completion=False,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture events")
         if event is None:
@@ -449,14 +514,27 @@ class AsyncResourceOwner:
         if self._resource_recorder is not None:
             self._resource_recorder(resource=self, events=(event,))
 
-    def add_release_callback(self, callback):
+    def add_release_callback(
+        self,
+        callback,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if not callable(callback):
             raise TypeError("release callback must be callable")
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture release callbacks")
         self._release_callbacks.append(callback)
 
-    def arm_completion(self):
+    def arm_completion(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer arm completion")
         self._completion_armed = True
@@ -565,13 +643,26 @@ class AsyncResourceOwner:
         self._watch_counted_completion()
         self._publish_counted_start_request()
 
-    def publish_counted_completion(self):
+    def publish_counted_completion(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         with self._async_lock:
             self._async_completion_deferred = False
         self._watch_counted_completion()
         self._publish_counted_start_request()
 
-    def install_counted_admission(self, admission):
+    def install_counted_admission(
+        self,
+        admission,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         with self._async_lock:
             if self._async_admission is not None or self._async_worker is not None:
                 raise RuntimeError("async owner already has a counted admission")
@@ -580,7 +671,13 @@ class AsyncResourceOwner:
             self._async_admission = admission
             self._async_admission_state = "installed"
 
-    def watch_counted_completion(self):
+    def watch_counted_completion(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         self._watch_counted_completion()
 
     def _run_counted_completion(self, admission):
@@ -690,7 +787,13 @@ class AsyncResourceOwner:
             wake.wake()
         return cancelled
 
-    def start_counted_completion(self):
+    def start_counted_completion(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         self._start_counted_completion()
 
     def _prepare_counted_completion(self, *, wait, _deadline=None):
@@ -752,7 +855,13 @@ class AsyncResourceOwner:
             return True
         return False
 
-    def mark_enqueued(self):
+    def mark_enqueued(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self.state != "new":
             raise RuntimeError("async owner is not new")
         self.state = "enqueued"
@@ -927,7 +1036,21 @@ class AsyncResourceOwner:
             quarantine(self)
         return True
 
-    def force_quarantine(self, error, *, secondary_errors=()):
+    def force_quarantine(
+        self,
+        error,
+        *,
+        secondary_errors=(),
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
+        return self._force_quarantine_terminal(
+            error,
+            secondary_errors=secondary_errors,
+        )
+
+    def _force_quarantine_terminal(self, error, *, secondary_errors=()):
         self._remember_error(error)
         for secondary_error in secondary_errors:
             self._remember_secondary(secondary_error)
@@ -940,7 +1063,15 @@ class AsyncResourceOwner:
         self._cancel_unclaimed_async()
         self._move_to_quarantine()
 
-    def fail(self, error, *, secondary_errors=()):
+    def fail(
+        self,
+        error,
+        *,
+        secondary_errors=(),
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         self._remember_error(error)
         for secondary_error in secondary_errors:
             self._remember_secondary(secondary_error)
@@ -970,7 +1101,13 @@ class AsyncResourceOwner:
             pass
         raise self.error
 
-    def reap(self):
+    def reap(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         counted = self._prepare_counted_completion(wait=False)
         if counted is not None:
             return counted
@@ -990,7 +1127,14 @@ class AsyncResourceOwner:
             return False
         return self._detach("completed")
 
-    def wait(self, *, _deadline=None):
+    def wait(
+        self,
+        *,
+        _deadline=None,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         counted = self._prepare_counted_completion(
             wait=True,
             _deadline=_deadline,
@@ -1019,7 +1163,14 @@ class AsyncResourceOwner:
             return self.fail(error)
         return self._detach("completed")
 
-    def drain(self, *, _deadline=None):
+    def drain(
+        self,
+        *,
+        _deadline=None,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         counted = self._prepare_counted_completion(
             wait=True,
             _deadline=_deadline,
@@ -1048,7 +1199,13 @@ class AsyncResourceOwner:
             raise self.error
         return self._detach("drained")
 
-    def take_result(self):
+    def take_result(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self.state != "detached":
             raise RuntimeError("async owner is not complete")
         result = self.result
@@ -1089,11 +1246,12 @@ class RuntimeTerminalQuarantine:
             self.first_error = retained_error
         if all(retained is not owner for retained in self._owners):
             self._owners.append(owner)
+        snapshot = owner._terminal_resource_snapshot()
         self.retain_snapshot(
             resources=(owner,),
-            allocations=owner.allocations,
-            events=owner.events,
-            streams=owner.streams,
+            allocations=snapshot["allocations"],
+            events=snapshot["events"],
+            streams=snapshot["streams"],
         )
 
     def retain_error(self, error):
@@ -1158,7 +1316,16 @@ class RuntimeTerminalQuarantine:
         for resource in resources:
             if resource is None:
                 continue
-            records = tuple(getattr(resource, "allocation_records", ()))
+            terminal_records = getattr(
+                resource,
+                "_terminal_allocation_records",
+                None,
+            )
+            records = (
+                tuple(terminal_records())
+                if callable(terminal_records)
+                else tuple(getattr(resource, "allocation_records", ()))
+            )
             kind = getattr(resource, "_terminal_resource_kind", None)
             self.retain_snapshot(
                 resources=(resource,),

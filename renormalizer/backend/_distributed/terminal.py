@@ -51,6 +51,79 @@ class _ResourceAdmission:
 
 
 @dataclass(frozen=True)
+class _ManagedResourceAdmissionGuard:
+    """Immutable capability binding one managed resource graph to one gate."""
+
+    gate: object = field(repr=False)
+    gate_id: int = field(init=False)
+
+    def __post_init__(self):
+        gate_id = getattr(self.gate, "_gate_id", None)
+        condition = getattr(self.gate, "_condition", None)
+        if type(gate_id) is not int or condition is None:
+            raise TypeError("managed resource admission guard requires a gate")
+        object.__setattr__(self, "gate_id", gate_id)
+
+    def require(self, token=None, validator=None):
+        if (token is None) != (validator is None):
+            raise TypeError("managed resource requires an exact admission pair")
+        gate = self.gate
+        if token is None:
+            with gate._condition:
+                sequence = gate._thread_tokens.get(threading.get_ident())
+                if sequence is None:
+                    raise TypeError("managed resource requires admission")
+                state = gate._tokens.get(sequence)
+                if state is None or state.status != "active":
+                    raise RuntimeError(
+                        "managed resource admission state is inconsistent"
+                    )
+                gate._require_token_thread(state)
+                return state.token
+        if not callable(validator):
+            raise TypeError("managed resource admission validator is required")
+        validated = validator(token)
+        if validated is not token:
+            raise RuntimeError("managed resource admission validator changed token")
+        with gate._condition:
+            state = gate._token_state(token)
+            gate._require_token_thread(state)
+            if token.gate_id != self.gate_id:
+                raise RuntimeError(
+                    "managed resource admission belongs to another gate"
+                )
+        return token
+
+
+def _require_managed_resource_admission(guard, token=None, validator=None):
+    """Validate managed access or preserve explicit standalone behavior."""
+    if guard is None:
+        if token is None and validator is None:
+            return None
+        if token is None:
+            raise TypeError("resource admission token is required")
+        if not callable(validator):
+            raise TypeError("resource admission validator is required")
+        return validator(token)
+    if not isinstance(guard, _ManagedResourceAdmissionGuard):
+        raise TypeError("managed resource admission guard is invalid")
+    return guard.require(token, validator)
+
+
+def _resolve_managed_resource_guard(*, standalone, guard):
+    """Resolve an explicit constructor ownership mode without token inference."""
+    if type(standalone) is not bool:
+        raise TypeError("resource standalone mode must be a boolean")
+    if standalone:
+        if guard is not None:
+            raise TypeError("standalone resource cannot receive a managed guard")
+        return None
+    if not isinstance(guard, _ManagedResourceAdmissionGuard):
+        raise TypeError("managed resource construction requires an admission guard")
+    return guard
+
+
+@dataclass(frozen=True)
 class _FatalTransition:
     gate_id: int
     primary: BaseException
@@ -1149,10 +1222,9 @@ class _TerminalLifecycleGate:
         with self._condition:
             self._require_lease_transition(transition)
             self._require_no_held_admission("drain admissions")
-            deadline = min(transition.deadline, self._deadline(timeout_s))
             self._wait_until_deadline(
                 lambda: not self._has_active_tokens(),
-                deadline,
+                transition.deadline,
                 "lease admission drain timed out",
             )
 
@@ -1188,7 +1260,6 @@ class _TerminalLifecycleGate:
         with self._condition:
             lease = self._require_lease_transition(transition)
             self._require_no_held_admission("join lease close")
-            deadline = min(transition.deadline, self._deadline(timeout_s))
             self._wait_until_deadline(
                 lambda: (
                     lease.phase == "closed"
@@ -1202,7 +1273,7 @@ class _TerminalLifecycleGate:
                         and self._fatal_transition is not None
                     )
                 ),
-                deadline,
+                transition.deadline,
                 "lease close join timed out",
                 owner_thread=transition.owner_thread,
                 owner_message="lease close owner exited",
@@ -1563,9 +1634,12 @@ class _TerminalLifecycleGate:
         with self._condition:
             self._require_fatal_transition(transition)
             self._require_no_held_admission("drain admissions")
-            self._wait_until(
+            deadline = transition.deadline
+            if deadline is None:
+                deadline = self._deadline(timeout_s)
+            self._wait_until_deadline(
                 lambda: not self._has_active_tokens(),
-                timeout_s,
+                deadline,
                 "fatal admission drain timed out",
             )
 
@@ -1577,9 +1651,12 @@ class _TerminalLifecycleGate:
             self._require_no_held_admission("publish fatal")
             if self._has_active_tokens():
                 raise RuntimeError("fatal publication requires zero live admissions")
-            self._wait_until(
+            deadline = transition.deadline
+            if deadline is None:
+                deadline = self._deadline(_TERMINAL_TIMEOUT_S)
+            self._wait_until_deadline(
                 lambda: self._fatal_runtime_finalizer_state != "pending",
-                _TERMINAL_TIMEOUT_S,
+                deadline,
                 "fatal runtime finalizer wait timed out",
                 owner_thread=self._fatal_runtime_finalizer_thread,
                 owner_message="fatal runtime finalizer owner exited",
@@ -1615,12 +1692,16 @@ class _TerminalLifecycleGate:
     def wait_for_published(self, timeout_s: float):
         with self._condition:
             self._require_no_held_admission("wait for fatal publication")
-            self._wait_until(
+            transition = self._fatal_transition
+            deadline = None if transition is None else transition.deadline
+            if deadline is None:
+                deadline = self._deadline(timeout_s)
+            self._wait_until_deadline(
                 lambda: (
                     self._fatal_snapshot is not _MISSING
                     or self._fatal_publication_failure is not _MISSING
                 ),
-                timeout_s,
+                deadline,
                 "fatal publication wait timed out",
             )
             if self._fatal_publication_failure is not _MISSING:
@@ -1708,11 +1789,7 @@ class _TerminalLifecycleGate:
         timeout_s=_TERMINAL_TIMEOUT_S,
     ):
         with self._condition:
-            deadline = (
-                transition.deadline
-                if isinstance(transition, _FatalTransition)
-                else min(transition.deadline, self._deadline(timeout_s))
-            )
+            deadline = transition.deadline
             if deadline is None:
                 deadline = self._deadline(timeout_s)
             self._require_no_held_admission("drain runtime close")
@@ -1880,8 +1957,6 @@ class _TerminalLifecycleGate:
         deadline = transition.deadline
         if deadline is None:
             deadline = self._deadline(timeout_s)
-        else:
-            deadline = min(deadline, self._deadline(timeout_s))
         if may_finalize and self._fatal_runtime_finalizer_state == "none":
             self._fatal_runtime_finalizer_state = "pending"
             self._fatal_runtime_finalizer_owner = current_thread
@@ -1946,13 +2021,9 @@ class _TerminalLifecycleGate:
             self._require_runtime_transition(transition)
             if transition.owner_thread is not threading.current_thread():
                 self._require_no_held_admission("join runtime close")
-                deadline = min(
-                    transition.deadline,
-                    self._deadline(timeout_s),
-                )
                 self._wait_until_deadline(
                     lambda: self._phase is not _TerminalPhase.RUNTIME_CLOSING,
-                    deadline,
+                    transition.deadline,
                     "runtime close join timed out",
                     owner_thread=transition.owner_thread,
                     owner_message="runtime close owner exited",

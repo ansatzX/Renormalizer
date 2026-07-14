@@ -8,6 +8,7 @@ from typing import ContextManager, Protocol
 import numpy as np
 
 from renormalizer.backend._distributed.async_owner import (
+    AsyncAllocationRecord,
     _CountedAsyncAdmission,
     _require_resource_admission,
     allocation_records,
@@ -29,11 +30,14 @@ from renormalizer.backend._distributed.residency import (
     ResidencyRequest,
 )
 from renormalizer.backend._distributed.terminal import (
+    _ManagedResourceAdmissionGuard,
     _TerminalPhase,
     _TERMINAL_TIMEOUT_S,
     _publish_lease_construction_resource,
     _publish_lease_construction_resource_direct,
     _remaining_lifecycle_time,
+    _require_managed_resource_admission,
+    _resolve_managed_resource_guard,
 )
 from renormalizer.backend._distributed.transfer import (
     TransferScheduler,
@@ -799,13 +803,19 @@ class _LeaseStatusWorkspace:
         host_status,
         *,
         _construction_slot=None,
+        _managed_guard=None,
+        _standalone=True,
     ):
-        self.device_status = device_status
-        self.host_status = host_status
+        self._managed_guard = _resolve_managed_resource_guard(
+            standalone=_standalone,
+            guard=_managed_guard,
+        )
+        self._device_status = device_status
+        self._host_status = host_status
         self._allocation_records = allocation_records((device_status, host_status))
         self._borrower = None
         self._closed = False
-        self._managed = _construction_slot is not None
+        self._managed = self._managed_guard is not None
         _publish_lease_construction_resource_direct(
             _construction_slot,
             self,
@@ -818,14 +828,30 @@ class _LeaseStatusWorkspace:
         )
 
     @property
+    def device_status(self):
+        _require_managed_resource_admission(self._managed_guard)
+        return self._device_status
+
+    @property
+    def host_status(self):
+        _require_managed_resource_admission(self._managed_guard)
+        return self._host_status
+
+    @property
     def borrower(self):
+        _require_managed_resource_admission(self._managed_guard)
         return self._borrower
 
     @property
     def allocation_records(self):
+        _require_managed_resource_admission(self._managed_guard)
+        return self._allocation_records
+
+    def _terminal_allocation_records(self):
         return self._allocation_records
 
     def attach(self, owner):
+        _require_managed_resource_admission(self._managed_guard)
         from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
 
         if self._closed:
@@ -834,7 +860,7 @@ class _LeaseStatusWorkspace:
             raise TypeError("status workspace requires an AsyncResourceOwner")
         if self._borrower is not None:
             raise RuntimeError("working-set status workspace is already borrowed")
-        for array in (self.device_status, self.host_status):
+        for array in (self._device_status, self._host_status):
             if not any(retained is array for retained in owner.arrays):
                 raise RuntimeError("status workspace array is not owned by the call")
         owner.capture_resources(self)
@@ -852,20 +878,26 @@ class _LeaseStatusWorkspace:
         _admission_token=None,
         _admission_validator=None,
     ):
+        guard = getattr(self, "_managed_guard", None)
         if (
-            getattr(self, "_managed", False)
+            guard is None
+            and getattr(self, "_managed", False)
             and _admission_token is None
             and _admission_validator is None
         ):
             raise TypeError("managed status workspace requires admission")
-        _require_resource_admission(_admission_token, _admission_validator)
+        _require_managed_resource_admission(
+            guard,
+            _admission_token,
+            _admission_validator,
+        )
         if self._closed:
             return
         borrower = self._borrower
         if borrower is not None and not borrower.quarantined:
             raise RuntimeError("working-set status workspace is still borrowed")
-        self.device_status = None
-        self.host_status = None
+        self._device_status = None
+        self._host_status = None
         self._allocation_records = ()
         self._closed = True
 
@@ -967,6 +999,7 @@ class WorkingSetLease:
         self._closing = False
         self._closed = False
         self._profile_enabled = profile_enabled
+        self._runtime_close_prepared = False
         self._timer = timer
         self._started_at = timer() if profile_enabled else None
         self._peak_sampler = peak_sampler
@@ -1282,7 +1315,10 @@ class WorkingSetLease:
             primary = prior_error if prior_error is not None else error
             if owner is not None:
                 secondary = () if error is primary else (error,)
-                owner.force_quarantine(primary, secondary_errors=secondary)
+                owner._force_quarantine_terminal(
+                    primary,
+                    secondary_errors=secondary,
+                )
             self._provider.runtime._enter_communicator_fatal(primary, owner)
             raise primary
         self._active_operator_owner = owner
@@ -1293,7 +1329,10 @@ class WorkingSetLease:
         except BaseException as error:
             primary = call.record_primary(error)
             if call.disposition == "FATAL":
-                owner.force_quarantine(primary, secondary_errors=call.secondary_errors)
+                owner._force_quarantine_terminal(
+                    primary,
+                    secondary_errors=call.secondary_errors,
+                )
                 self._provider.runtime._enter_communicator_fatal(primary, owner)
             else:
                 try:
@@ -1899,7 +1938,14 @@ class WorkingSetLease:
         self._retain_terminal_lease_safely(provider, primary)
         raise primary
 
-    def _run_elected_close(self, transition, *, provider, runtime):
+    def _run_elected_close(
+        self,
+        transition,
+        *,
+        provider,
+        runtime,
+        defer_references=False,
+    ):
         """Run every fallible elected-owner action under the caller's guard."""
         gate = runtime._terminal_gate
         scheduler = self.scheduler
@@ -2054,11 +2100,22 @@ class WorkingSetLease:
         gate.wait_for_lease_admissions(transition, _TERMINAL_TIMEOUT_S)
         result = gate.commit_lease_close(
             transition,
-            lambda: self._commit_close_references(provider, error),
+            lambda: (
+                self._prepare_runtime_close_references(error)
+                if defer_references
+                else self._commit_close_references(provider, error)
+            ),
         )
         if isinstance(result, BaseException):
             raise result
         return result
+
+    def _prepare_runtime_close_references(self, error):
+        self._poisoned_error = error
+        self._closing = False
+        self._closed = True
+        self._runtime_close_prepared = True
+        return error
 
     def _commit_close_references(self, provider, error):
         provider._lease_closed(self)
@@ -2092,6 +2149,7 @@ class WorkingSetLease:
         self._timer = None
         self._started_at = None
         self._profile_enabled = False
+        self._runtime_close_prepared = False
         self._closing = False
         self._closed = True
         return error
@@ -2128,9 +2186,17 @@ class WorkingSetLease:
         self._closing = False
         self._closed = True
 
-    def close(self, wait=True, *, _lifecycle_deadline=None):
+    def close(
+        self,
+        wait=True,
+        *,
+        _lifecycle_deadline=None,
+        _runtime_prepare=False,
+    ):
         if type(wait) is not bool:
             raise TypeError("wait must be a boolean")
+        if type(_runtime_prepare) is not bool:
+            raise TypeError("runtime prepare mode must be a boolean")
         if self._closed:
             return
         self._handoff_published_terminal()
@@ -2186,6 +2252,7 @@ class WorkingSetLease:
                 transition,
                 provider=provider,
                 runtime=runtime,
+                defer_references=_runtime_prepare,
             )
 
         def fail_stop(_transition, error):
@@ -2204,6 +2271,79 @@ class WorkingSetLease:
             fail_stop=fail_stop,
             deadline=_lifecycle_deadline,
         )
+
+
+class _ProviderRuntimeCloseFinalizeAction:
+    """Query-free, reversible reference commit after all close rows succeed."""
+
+    def __init__(self, provider, lease, error):
+        self._provider = provider
+        self._runtime = provider.runtime
+        self._lease = lease
+        self._error = error
+        self._state = "prepared"
+        self._provider_state = None
+        self._lease_state = None
+        self._record = None
+        self._record_state = None
+        self._runtime_provider = None
+
+    def seal(self):
+        if self._provider_state is not None:
+            return self
+        self._provider_state = dict(self._provider.__dict__)
+        self._runtime_provider = self._runtime._active_provider
+        if self._lease is not None:
+            self._lease_state = dict(self._lease.__dict__)
+            self._record = self._lease._resource_record
+            if self._record is not None:
+                self._record_state = dict(self._record.__dict__)
+        return self
+
+    def finalize(self):
+        if self._state == "finalized":
+            return self._error
+        if self._state != "prepared" or self._provider_state is None:
+            raise RuntimeError("provider runtime close finalize action is invalid")
+        try:
+            if self._lease is not None:
+                self._lease._commit_close_references(
+                    self._provider,
+                    self._error,
+                )
+            runtime = self._runtime
+            provider = self._provider
+            if runtime._active_provider is provider:
+                runtime._active_provider = None
+            provider._active_lease = None
+            provider._cache = None
+            provider._cache_factory = None
+            provider._pool_factory = None
+            provider._scheduler_factory = None
+            provider._event_factory = None
+            provider.last_compute_event = None
+            provider.runtime = None
+            provider._closed = True
+            provider._runtime_close_finalize = None
+            self._state = "finalized"
+            return self._error
+        except BaseException:
+            self.restore()
+            raise
+
+    def restore(self):
+        if self._provider_state is None:
+            return
+        self._provider.__dict__.clear()
+        self._provider.__dict__.update(self._provider_state)
+        if self._lease is not None and self._lease_state is not None:
+            self._lease.__dict__.clear()
+            self._lease.__dict__.update(self._lease_state)
+        if self._record is not None and self._record_state is not None:
+            self._record.__dict__.clear()
+            self._record.__dict__.update(self._record_state)
+        self._runtime._active_provider = self._runtime_provider
+        self._state = "prepared"
 
 
 class ActiveWorkingSetProvider:
@@ -2225,7 +2365,12 @@ class ActiveWorkingSetProvider:
         event_factory=None,
         _admission_token=None,
         _admission_validator=None,
+        _standalone=False,
     ):
+        if type(_standalone) is not bool:
+            raise TypeError("provider standalone mode must be a boolean")
+        if not _standalone and _admission_token is None:
+            raise TypeError("managed provider construction requires admission")
         if _admission_token is not None:
             if _admission_validator is None:
                 _admission_validator = runtime._exact_admission_validator(
@@ -2244,6 +2389,12 @@ class ActiveWorkingSetProvider:
         if type(prefetch_depth) is not int or prefetch_depth <= 0:
             raise ValueError("prefetch_depth must be a positive integer")
         self.runtime = runtime
+        self._standalone = _standalone
+        self._managed_guard = (
+            None
+            if _standalone
+            else _ManagedResourceAdmissionGuard(runtime._terminal_gate)
+        )
         self.device_budget_resolution = device_budget_resolution
         self.host_budget_resolution = host_budget_resolution
         self.prefetch_depth = prefetch_depth
@@ -2260,6 +2411,7 @@ class ActiveWorkingSetProvider:
         self._terminal_quarantine = runtime._terminal_quarantine
         self._last_authorized_cache_bytes = 0
         self._closed = False
+        self._runtime_close_finalize = None
         self.metrics = WorkingSetMetrics()
         self.last_compute_event = None
         existing = getattr(runtime, "_active_provider", None)
@@ -2270,14 +2422,17 @@ class ActiveWorkingSetProvider:
 
     @property
     def closed(self):
+        _require_managed_resource_admission(self._managed_guard)
         return self._closed
 
     @property
     def terminal_poisoned(self):
+        _require_managed_resource_admission(self._managed_guard)
         return self._terminal_error is not None
 
     @property
     def cache(self):
+        _require_managed_resource_admission(self._managed_guard)
         if self._cache is None:
             raise RuntimeError("active provider cache has not been allocated")
         return self._cache
@@ -2298,19 +2453,23 @@ class ActiveWorkingSetProvider:
         _admission_token=None,
         _admission_validator=None,
     ):
-        if _admission_token is not None:
-            if _admission_validator is None:
-                _admission_validator = self.runtime._exact_admission_validator(
-                    _admission_token,
-                    scope="runtime_setup",
-                    epoch=None,
-                )
-            _require_resource_admission(
-                _admission_token,
-                _admission_validator,
-            )
-        elif _admission_validator is not None:
-            raise TypeError("provider config admission token is required")
+        _require_managed_resource_admission(
+            getattr(self, "_managed_guard", None),
+            _admission_token,
+            _admission_validator,
+        )
+        return self._matches_config_values(
+            device_budget,
+            host_budget,
+            prefetch_depth,
+        )
+
+    def _matches_config_values(
+        self,
+        device_budget,
+        host_budget,
+        prefetch_depth,
+    ):
         return (
             device_budget == self.device_budget_resolution
             and host_budget == self.host_budget_resolution
@@ -2345,20 +2504,46 @@ class ActiveWorkingSetProvider:
     def acquire(self, request):
         raise RuntimeError("factory provider cannot acquire operand blocks directly")
 
-    def _allocate_status_device(self):
+    def _allocate_status_device(self, *, _construction_slot):
         backend = self.runtime.backend
         if backend.name == "numpy":
-            return backend.empty((1,), dtype=np.int32, order="C")
+            array = backend.empty((1,), dtype=np.int32, order="C")
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                records=allocation_records((array,)),
+            )
+            return array
         cupy = backend._cupy
         nbytes = np.dtype(np.int32).itemsize
         with cupy.cuda.Device(backend._device_index):
             memory = cupy.cuda.Memory(nbytes)
+            memory_record = AsyncAllocationRecord(
+                ("device", int(memory.ptr)),
+                memory,
+                int(memory.size),
+            )
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                records=(memory_record,),
+            )
             pointer = cupy.cuda.MemoryPointer(memory, 0)
-            return cupy.ndarray((1,), dtype=np.int32, memptr=pointer, order="C")
+            array = cupy.ndarray(
+                (1,), dtype=np.int32, memptr=pointer, order="C"
+            )
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                records=allocation_records((array,)),
+            )
+            return array
 
     @staticmethod
-    def _allocate_status_host():
-        return np.empty((1,), dtype=np.int32, order="C")
+    def _allocate_status_host(*, _construction_slot):
+        array = np.empty((1,), dtype=np.int32, order="C")
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            records=allocation_records((array,)),
+        )
+        return array
 
     def _provision_status_workspace(
         self,
@@ -2416,7 +2601,9 @@ class ActiveWorkingSetProvider:
         local_error = None
         local_code = 0
         try:
-            device_status = self._allocate_status_device()
+            device_status = self._allocate_status_device(
+                _construction_slot=_construction_slot,
+            )
             device_records = allocation_records((device_status,))
             _publish_lease_construction_resource_direct(
                 _construction_slot,
@@ -2433,7 +2620,9 @@ class ActiveWorkingSetProvider:
             local_error = error
             local_code |= 1
         try:
-            host_status = self._allocate_status_host()
+            host_status = self._allocate_status_host(
+                _construction_slot=_construction_slot,
+            )
             host_records = allocation_records((host_status,))
             _publish_lease_construction_resource_direct(
                 _construction_slot,
@@ -2479,6 +2668,8 @@ class ActiveWorkingSetProvider:
             device_status,
             host_status,
             _construction_slot=_construction_slot,
+            _managed_guard=self._managed_guard,
+            _standalone=self._standalone,
         )
         _resource_recorder(resource=workspace)
         return workspace
@@ -2954,7 +3145,7 @@ class ActiveWorkingSetProvider:
             raise TypeError("store must be a HostTensorStore")
         if not isinstance(receipt, ResidencyPreflightReceipt):
             raise TypeError("receipt must be a ResidencyPreflightReceipt")
-        if not self.matches_config(
+        if not self._matches_config_values(
             request.device_budget, request.host_budget, request.prefetch_depth
         ):
             raise ValueError("request budgets do not match active provider config")
@@ -3065,6 +3256,8 @@ class ActiveWorkingSetProvider:
                     _admission_token=construction_token,
                     _admission_validator=construction_validator,
                     _construction_slot=construction_slots["cache"],
+                    _managed_guard=self._managed_guard,
+                    _standalone=self._standalone,
                 )
             set_recorder = getattr(self._cache, "_set_resource_recorder", None)
             if callable(set_recorder):
@@ -3090,6 +3283,8 @@ class ActiveWorkingSetProvider:
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
                 _construction_slot=construction_slots["pool"],
+                _managed_guard=self._managed_guard,
+                _standalone=self._standalone,
             )
             self._raise_construction_transition_preemption()
             from renormalizer.utils.log import PROFILING, get_logger
@@ -3119,6 +3314,8 @@ class ActiveWorkingSetProvider:
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
                 _construction_slot=construction_slots["scheduler"],
+                _managed_guard=self._managed_guard,
+                _standalone=self._standalone,
             )
             self._raise_construction_transition_preemption()
             if profile_enabled:
@@ -3320,13 +3517,17 @@ class ActiveWorkingSetProvider:
                             )
                 owns_cache_lease = any(
                     type(resource) is CacheEntryLease and resource._cache is self._cache
-                    for resource in retained_owner.resources
+                    for resource in retained_owner._terminal_resource_snapshot()[
+                        "resources"
+                    ]
                 )
                 if self._cache is not None and owns_cache_lease:
                     self._cache._poison(primary)
                 owns_pool_slot = lease is not None and any(
                     type(resource) is StagingSlot and resource._pool is lease.pool
-                    for resource in retained_owner.resources
+                    for resource in retained_owner._terminal_resource_snapshot()[
+                        "resources"
+                    ]
                 )
                 if owns_pool_slot and lease.pool is not None:
                     lease.pool._poison(primary)
@@ -3340,6 +3541,7 @@ class ActiveWorkingSetProvider:
                 )
 
     def resource_state(self):
+        _require_managed_resource_admission(self._managed_guard)
         cache = self._cache
         lease = self._active_lease
         pool = None if lease is None else lease.pool
@@ -3362,11 +3564,19 @@ class ActiveWorkingSetProvider:
         _admission_token=None,
         _admission_validator=None,
     ):
-        if _admission_token is None or _admission_validator is None:
-            raise TypeError(
-                "runtime resource state requires an exact admission pair"
-            )
-        _require_resource_admission(_admission_token, _admission_validator)
+        guard = getattr(self, "_managed_guard", None)
+        if (
+            guard is None
+            and getattr(self, "_managed", False)
+            and _admission_token is None
+            and _admission_validator is None
+        ):
+            raise TypeError("managed provider state requires admission")
+        _require_managed_resource_admission(
+            guard,
+            _admission_token,
+            _admission_validator,
+        )
         cache = self._cache
         lease = self._active_lease
         scheduler = None if lease is None else lease.scheduler
@@ -3424,12 +3634,17 @@ class ActiveWorkingSetProvider:
             "provider lifecycle timed out before runtime cleanup",
         )
         if self._closed:
-            return
+            return self._runtime_close_finalize
+        if self._runtime_close_finalize is not None:
+            return self._runtime_close_finalize
         lease = self._active_lease
         cache = self._cache
         if lease is not None:
             try:
-                lease.close(_lifecycle_deadline=_deadline)
+                lease.close(
+                    _lifecycle_deadline=_deadline,
+                    _runtime_prepare=True,
+                )
             except BaseException:
                 self._active_lease = lease
                 raise
@@ -3446,19 +3661,16 @@ class ActiveWorkingSetProvider:
             )
         _remaining_lifecycle_time(
             _deadline,
-            "provider lifecycle timed out before reference commit",
+            "provider lifecycle timed out before prepare commit",
         )
-        if getattr(runtime, "_active_provider", None) is self:
-            runtime._active_provider = None
-        self._active_lease = None
-        self._cache = None
-        self._cache_factory = None
-        self._pool_factory = None
-        self._scheduler_factory = None
-        self._event_factory = None
-        self.last_compute_event = None
-        self.runtime = None
-        self._closed = True
+        action = _ProviderRuntimeCloseFinalizeAction(
+            self,
+            lease,
+            None if lease is None else lease._poisoned_error,
+        )
+        self._runtime_close_finalize = action
+        action.seal()
+        return action
 
     def close(self):
         runtime = self.runtime

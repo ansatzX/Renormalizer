@@ -1700,7 +1700,7 @@ class CupyDistributedRuntime:
                 retain_resources(lease)
             if owner is not None:
                 if owner.state not in {"detached", "quarantined"}:
-                    owner.force_quarantine(primary)
+                    owner._force_quarantine_terminal(primary)
             self._publish_deferred_async_quarantines()
             with self._terminal_gate._condition:
                 if self._terminal_gate._fatal_transition is not transition:
@@ -2012,6 +2012,7 @@ class CupyDistributedRuntime:
                     prefetch_depth=prefetch_depth,
                     _admission_token=_admission_token,
                     _admission_validator=validator,
+                    _standalone=False,
                 )
                 self._install_active_provider(
                     provider,
@@ -2989,7 +2990,11 @@ class CupyDistributedRuntime:
             secondary = gate._fail_selected_runtime_close(
                 transition,
                 primary,
-                lambda: self._clear_runtime_references(primary),
+                lambda: self._clear_runtime_references(
+                    primary,
+                    clear_collective=False,
+                    preserve_resources=True,
+                ),
             )
             if secondary is not None:
                 with self._terminal_state_lock:
@@ -3059,8 +3064,12 @@ class CupyDistributedRuntime:
 
         provider, lease, _ = self._runtime_close_snapshot()
         collective = self.collective
+        provider_finalize = None
         if lease is not None:
-            lease.close(_lifecycle_deadline=transition.deadline)
+            lease.close(
+                _lifecycle_deadline=transition.deadline,
+                _runtime_prepare=True,
+            )
         if self._terminal_gate.phase in (
             _TerminalPhase.FATAL_PENDING,
             _TerminalPhase.FATAL_PUBLISHED,
@@ -3080,7 +3089,7 @@ class CupyDistributedRuntime:
                     epoch=None,
                     transition_sequence=transition.sequence,
                 )
-                provider._close_for_runtime(
+                provider_finalize = provider._close_for_runtime(
                     _admission_token=provider_token,
                     _admission_validator=provider_validator,
                     _deadline=transition.deadline,
@@ -3127,8 +3136,29 @@ class CupyDistributedRuntime:
             transition.deadline,
             "runtime close lifecycle timed out before commit",
         )
+
+        def finalize_runtime_close():
+            issued_receipts = dict(self._issued_receipts)
+            active_provider = self._active_provider
+            retained_collective = self.collective
+            was_closed = self._closed
+            try:
+                if provider_finalize is not None:
+                    provider_finalize.finalize()
+                return self._clear_runtime_references(error)
+            except BaseException:
+                self._issued_receipts.clear()
+                self._issued_receipts.update(issued_receipts)
+                self._active_provider = active_provider
+                self.collective = retained_collective
+                self._closed = was_closed
+                if provider_finalize is not None:
+                    provider_finalize.restore()
+                raise
+
         result = self._terminal_gate.commit_runtime_close(
-            transition, lambda: self._clear_runtime_references(error)
+            transition,
+            finalize_runtime_close,
         )
         if isinstance(result, BaseException):
             fatal_transition = self._terminal_gate._fatal_transition

@@ -19,6 +19,8 @@ from renormalizer.backend._distributed.terminal import (
     _publish_lease_construction_resource,
     _publish_lease_construction_resource_direct,
     _remaining_lifecycle_time,
+    _require_managed_resource_admission,
+    _resolve_managed_resource_guard,
 )
 
 
@@ -134,43 +136,85 @@ class AsyncCompletionHandle:
         if not isinstance(owner, AsyncResourceOwner):
             raise TypeError("completion handle requires an AsyncResourceOwner")
         self._owner = owner
+        self._managed_guard = owner._managed_guard
+
+    def _require_admission(self, token=None, validator=None):
+        return _require_managed_resource_admission(
+            self._managed_guard,
+            token,
+            validator,
+        )
 
     @property
     def owner(self):
+        self._require_admission()
         return self._owner
 
     @property
     def event(self):
+        self._require_admission()
         return self._owner.completion_event
 
     @property
     def completed(self):
+        self._require_admission()
         return self._owner.completed
 
     @property
     def error(self):
+        self._require_admission()
         return self._owner.error
 
     @property
     def terminal_poisoned(self):
+        self._require_admission()
         return self._owner.quarantined
 
-    def owned_events(self):
+    def owned_events(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         return self._owner.events
 
-    def reap(self):
-        return self._owner.reap()
+    def reap(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
+        return self._owner.reap(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
-    def wait(self, *, _deadline=None):
-        return self._owner.wait(_deadline=_deadline)
+    def wait(
+        self,
+        *,
+        _deadline=None,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
+        return self._owner.wait(
+            _deadline=_deadline,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
     def query(self):
+        self._require_admission()
         return self.reap()
 
     def synchronize(self):
+        self._require_admission()
         return self.wait()
 
     def close(self):
+        self._require_admission()
         return self.wait()
 
 
@@ -183,30 +227,45 @@ class TransferTicket(AsyncCompletionHandle):
 
     @property
     def direction(self):
+        self._require_admission()
         return self._owner.direction
 
     @property
     def nbytes(self):
+        self._require_admission()
         return self._owner.nbytes
 
     @property
     def elapsed_s(self):
+        self._require_admission()
         return self._owner.elapsed_s
 
     @property
     def result(self):
+        self._require_admission()
         return self._owner.result
 
     @property
     def _accounted(self):
+        self._require_admission()
         return self._owner.accounted
 
     @_accounted.setter
     def _accounted(self, value):
+        self._require_admission()
         self._owner.accounted = bool(value)
 
-    def take_result(self):
-        return self._owner.take_result()
+    def take_result(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
+        return self._owner.take_result(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
     def detach_terminal_callbacks(self):
         # Quarantine must retain the complete owner, including its callback.
@@ -237,8 +296,15 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
         _construction_slot=None,
+        _managed_guard=None,
+        _standalone=True,
+        _stream_factory=None,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
+        self._managed_guard = _resolve_managed_resource_guard(
+            standalone=_standalone,
+            guard=_managed_guard,
+        )
         if not callable(getattr(store, "copy_into", None)):
             raise TypeError("transfer scheduler requires HostTensorStore.copy_into")
         if getattr(backend, "name", None) not in {"numpy", "cupy"}:
@@ -264,7 +330,9 @@ class TransferScheduler:
         ):
             if supplied is not None and not callable(supplied):
                 raise TypeError("{} must be callable".format(name))
-        self._managed = _construction_slot is not None
+        if _stream_factory is not None and not callable(_stream_factory):
+            raise TypeError("scheduler stream factory must be callable")
+        self._managed = self._managed_guard is not None
         self.store = store
         self.backend = backend
         self.pool = pool
@@ -315,8 +383,17 @@ class TransferScheduler:
         if self._cupy is None:
             default_event_factory = _ImmediateEvent
         else:
-            with self._cupy.cuda.Device(backend._device_index):
-                self._stream = self._cupy.cuda.Stream(non_blocking=True)
+            stream_factory = (
+                self._create_stream_owned
+                if _stream_factory is None
+                else _stream_factory
+            )
+            self._stream = stream_factory(
+                cupy=self._cupy,
+                device_index=backend._device_index,
+                scheduler=self,
+                construction_slot=_construction_slot,
+            )
             default_event_factory = lambda: self._cupy.cuda.Event(disable_timing=True)
         self._event_factory = (
             default_event_factory if event_factory is None else event_factory
@@ -334,22 +411,43 @@ class TransferScheduler:
         if self._resource_recorder is not None:
             self._resource_recorder(resource=self, streams=(self._stream,))
 
+    @staticmethod
+    def _create_stream_owned(
+        *,
+        cupy,
+        device_index,
+        scheduler,
+        construction_slot,
+    ):
+        with cupy.cuda.Device(device_index):
+            stream = cupy.cuda.Stream(non_blocking=True)
+        _publish_lease_construction_resource_direct(
+            construction_slot,
+            scheduler,
+            streams=(stream,),
+        )
+        return stream
+
     @property
     def stream_count(self):
+        self._require_admission(None, None)
         return int(self._stream is not None)
 
     @property
     def pending_ticket_count(self):
+        self._require_admission(None, None)
         return len(self._tickets)
 
     @property
     def retained_event_count(self):
+        self._require_admission(None, None)
         return len(self._event_owners) + sum(
             len(owner.events) for owner in self._quarantined_owners
         )
 
     @property
     def retained_streams(self):
+        self._require_admission(None, None)
         owners = (*self._owners.values(), *self._quarantined_owners)
         return tuple(
             {
@@ -364,6 +462,7 @@ class TransferScheduler:
 
     @property
     def retained_events(self):
+        self._require_admission(None, None)
         owners = (*self._owners.values(), *self._quarantined_owners)
         return tuple(
             {
@@ -377,12 +476,12 @@ class TransferScheduler:
 
     @property
     def poisoned(self):
+        self._require_admission(None, None)
         return self._poisoned_error is not None
 
     @property
     def event_count(self):
-        if self._managed:
-            raise TypeError("managed transfer scheduler state requires admission")
+        self._require_admission(None, None)
         self.reap_completed()
         return self.retained_event_count
 
@@ -408,9 +507,19 @@ class TransferScheduler:
             raise RuntimeError("transfer scheduler is closed")
 
     def _require_admission(self, token, validator):
-        if getattr(self, "_managed", False) and token is None and validator is None:
+        guard = getattr(self, "_managed_guard", None)
+        if (
+            guard is None
+            and getattr(self, "_managed", False)
+            and token is None
+            and validator is None
+        ):
             raise TypeError("managed transfer scheduler requires admission")
-        return _require_resource_admission(token, validator)
+        return _require_managed_resource_admission(
+            guard,
+            token,
+            validator,
+        )
 
     def _poison(self, error):
         if self._poisoned_error is None:
@@ -432,6 +541,7 @@ class TransferScheduler:
         defer_counted_completion=False,
         defer_counted_admission=False,
     ):
+        self._require_admission(None, None)
         scheduler_ref = weakref.ref(self)
         cupy = self._cupy
         device_index = getattr(self.backend, "_device_index", None)
@@ -498,6 +608,7 @@ class TransferScheduler:
                 _resource_releaser=self._resource_releaser,
                 _defer_async_completion=defer_counted_completion,
                 _callback_requires_admission=callback_requires_admission,
+                _managed_guard=self._managed_guard,
             )
         except BaseException:
             if async_admission is not None:
@@ -524,9 +635,10 @@ class TransferScheduler:
         self._owner_detached(owner)
         if all(retained is not owner for retained in self._quarantined_owners):
             self._quarantined_owners.append(owner)
+        snapshot = owner._terminal_resource_snapshot()
         owns_pool_slot = any(
             type(resource) is StagingSlot and resource._pool is self.pool
-            for resource in owner.resources
+            for resource in snapshot["resources"]
         )
         if owns_pool_slot:
             self.pool._poison(owner.error)
@@ -564,8 +676,12 @@ class TransferScheduler:
         )
 
     def _new_event_from(self, owner, factory, *, completion=False):
-        event = factory()
-        owner.add_event(event, completion=completion)
+        self._require_admission(None, None)
+        event = self._create_event_owned(
+            owner=owner,
+            factory=factory,
+            completion=completion,
+        )
         self._events.append(event)
         self._event_owners[id(event)] = owner
         if not callable(getattr(event, "record", None)):
@@ -580,7 +696,13 @@ class TransferScheduler:
         return event
 
     @staticmethod
-    def _record(event, stream=None):
+    def _create_event_owned(*, owner, factory, completion):
+        event = factory()
+        owner.add_event(event, completion=completion)
+        return event
+
+    def _record(self, event, stream=None):
+        self._require_admission(None, None)
         event.record(stream)
 
     @staticmethod
@@ -1016,7 +1138,7 @@ class TransferScheduler:
 
     def _start_counted_completions(self):
         for owner in tuple(self._owners.values()):
-            owner.start_counted_completion()
+            owner._start_counted_completion()
 
     def close(
         self,

@@ -889,6 +889,7 @@ def _block_request(working_set, source_rank=0, broadcast_variable=None):
 
 
 def _provider(runtime, request, **kwargs):
+    kwargs.setdefault("_standalone", True)
     return ActiveWorkingSetProvider(
         runtime,
         device_budget_resolution=request.device_budget,
@@ -1218,12 +1219,12 @@ def test_two_rank_missing_abort_capability_rejects_before_status_allocation(
         monkeypatch.setattr(
             state["provider"],
             "_allocate_status_device",
-            lambda: allocations.append("device"),
+            lambda **_kwargs: allocations.append("device"),
         )
         monkeypatch.setattr(
             state["provider"],
             "_allocate_status_host",
-            lambda: allocations.append("host"),
+            lambda **_kwargs: allocations.append("host"),
         )
     try:
         results, errors = _open_two_rank_cases(states)
@@ -1271,13 +1272,13 @@ def test_two_rank_status_pair_partial_allocation_uses_cpu_schedule_only(
         monkeypatch.setattr(
             state["provider"],
             "_allocate_status_device",
-            lambda rank=rank: allocate(rank, "device_status"),
+            lambda rank=rank, **_kwargs: allocate(rank, "device_status"),
             raising=False,
         )
         monkeypatch.setattr(
             state["provider"],
             "_allocate_status_host",
-            lambda rank=rank: allocate(rank, "host_status"),
+            lambda rank=rank, **_kwargs: allocate(rank, "host_status"),
             raising=False,
         )
 

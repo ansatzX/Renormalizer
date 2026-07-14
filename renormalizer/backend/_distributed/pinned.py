@@ -13,6 +13,8 @@ from renormalizer.backend._distributed.terminal import (
     _publish_lease_construction_resource,
     _publish_lease_construction_resource_direct,
     _remaining_lifecycle_time,
+    _require_managed_resource_admission,
+    _resolve_managed_resource_guard,
 )
 
 
@@ -42,6 +44,7 @@ class StagingSlot:
 
     def __init__(self, pool, array, *, pinned):
         self._pool = pool
+        self._managed_guard = pool._managed_guard
         self._array = array
         self._pinned = pinned
         self._nbytes = 0
@@ -50,29 +53,47 @@ class StagingSlot:
 
     @property
     def array(self):
+        _require_managed_resource_admission(self._managed_guard)
         if self._array is None:
             raise RuntimeError("staging slot is closed")
         return self._array
 
     @property
     def pinned(self):
+        _require_managed_resource_admission(self._managed_guard)
         return self._pinned
 
     @property
     def nbytes(self):
+        _require_managed_resource_admission(self._managed_guard)
         return self._nbytes
 
     @property
     def capacity_bytes(self):
+        _require_managed_resource_admission(self._managed_guard)
         return self._pool.capacity_bytes
 
     @property
     def completion_event(self):
+        _require_managed_resource_admission(self._managed_guard)
         if self._owner is not None:
             return self._owner.completion_event
         return None
 
-    def view(self, shape, dtype, *, order="C"):
+    def view(
+        self,
+        shape,
+        dtype,
+        *,
+        order="C",
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_managed_resource_admission(
+            self._managed_guard,
+            _admission_token,
+            _admission_validator,
+        )
         if not self._checked_out:
             raise RuntimeError("staging slot is not checked out")
         if order not in {"C", "F"}:
@@ -91,7 +112,18 @@ class StagingSlot:
             order=order,
         )
 
-    def retain_until(self, completion):
+    def retain_until(
+        self,
+        completion,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_managed_resource_admission(
+            self._managed_guard,
+            _admission_token,
+            _admission_validator,
+        )
         if not self._checked_out:
             raise RuntimeError("staging slot is not checked out")
         if self._owner is not None:
@@ -157,8 +189,14 @@ class PinnedBufferPool:
         _admission_token=None,
         _admission_validator=None,
         _construction_slot=None,
+        _managed_guard=None,
+        _standalone=True,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
+        self._managed_guard = _resolve_managed_resource_guard(
+            standalone=_standalone,
+            guard=_managed_guard,
+        )
         if type(capacity_bytes) is not int or capacity_bytes < 0:
             raise ValueError("capacity_bytes must be a non-negative integer")
         if lanes != 1:
@@ -172,7 +210,7 @@ class PinnedBufferPool:
         if _resource_recorder is not None and not callable(_resource_recorder):
             raise TypeError("resource recorder must be callable")
 
-        self._managed = _construction_slot is not None
+        self._managed = self._managed_guard is not None
         self._capacity_bytes = capacity_bytes
         self._slot = StagingSlot(self, None, pinned=True)
         self._allocation_record = None
@@ -228,42 +266,54 @@ class PinnedBufferPool:
 
     @property
     def capacity_bytes(self):
+        self._require_admission(None, None)
         return self._capacity_bytes
 
     @property
     def allocated_bytes(self):
+        self._require_admission(None, None)
         if self._slot._array is None:
             return 0
         return self._allocation_record.capacity_bytes
 
     @property
     def allocation_records(self):
+        self._require_admission(None, None)
+        return self._terminal_allocation_records()
+
+    def _terminal_allocation_records(self):
         if self._allocation_record is None:
             return ()
         return (self._allocation_record,)
 
     @property
     def checked_out_bytes(self):
+        self._require_admission(None, None)
         return self._checked_out_bytes
 
     @property
     def pending_bytes(self):
+        self._require_admission(None, None)
         return self._pending_bytes
 
     @property
     def peak_checked_out_bytes(self):
+        self._require_admission(None, None)
         return self._peak_checked_out_bytes
 
     @property
     def pageable_fallback_count(self):
+        self._require_admission(None, None)
         return self._pageable_fallback_count
 
     @property
     def pageable_fallback_bytes(self):
+        self._require_admission(None, None)
         return self._pageable_fallback_bytes
 
     @property
     def poisoned(self):
+        self._require_admission(None, None)
         return self._poisoned_error is not None
 
     def _require_usable(self):
@@ -275,9 +325,19 @@ class PinnedBufferPool:
             raise RuntimeError("pinned buffer pool is closed")
 
     def _require_admission(self, token, validator):
-        if getattr(self, "_managed", False) and token is None and validator is None:
+        guard = getattr(self, "_managed_guard", None)
+        if (
+            guard is None
+            and getattr(self, "_managed", False)
+            and token is None
+            and validator is None
+        ):
             raise TypeError("managed pinned buffer pool requires admission")
-        return _require_resource_admission(token, validator)
+        return _require_managed_resource_admission(
+            guard,
+            token,
+            validator,
+        )
 
     def _poison(self, error):
         if self._poisoned_error is None:

@@ -16,6 +16,8 @@ from renormalizer.backend._distributed.terminal import (
     _publish_lease_construction_resource,
     _publish_lease_construction_resource_direct,
     _remaining_lifecycle_time,
+    _require_managed_resource_admission,
+    _resolve_managed_resource_guard,
 )
 
 
@@ -127,6 +129,7 @@ class CacheEntryLease:
     def __init__(self, cache, entry, *, cache_hit):
         self._cache = cache
         self._managed = cache._managed
+        self._managed_guard = cache._managed_guard
         self._entry = entry
         self.cache_hit = cache_hit
         self._failure = None
@@ -141,18 +144,36 @@ class CacheEntryLease:
             raise RuntimeError("cache entry lease is closed")
         return self._entry
 
+    def _require_admission(self, token=None, validator=None):
+        guard = getattr(self, "_managed_guard", None)
+        if (
+            guard is None
+            and getattr(self, "_managed", False)
+            and token is None
+            and validator is None
+        ):
+            raise TypeError("managed cache entry lease requires admission")
+        return _require_managed_resource_admission(
+            guard,
+            token,
+            validator,
+        )
+
     @property
     def identity(self):
+        self._require_admission()
         return self._require_entry().spec.identity
 
     @property
     def state(self):
+        self._require_admission()
         if self._entry is not None:
             return self._entry.state
         return "failed" if self._failure is not None else "closed"
 
     @property
     def array(self):
+        self._require_admission()
         entry = self._require_entry()
         if entry.array is None:
             raise RuntimeError("cache entry lease failed") from entry.error
@@ -160,6 +181,7 @@ class CacheEntryLease:
 
     @property
     def transfer_array(self):
+        self._require_admission()
         entry = self._require_entry()
         if entry.transfer_array is None:
             raise RuntimeError("cache entry lease failed") from entry.error
@@ -167,17 +189,39 @@ class CacheEntryLease:
 
     @property
     def reverse_axis(self):
+        self._require_admission()
         return self._require_entry().reverse_axis
 
-    def install_readiness(self, ticket):
+    def install_readiness(
+        self,
+        ticket,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         entry = self._require_entry()
         self._cache._install_readiness(entry, ticket)
 
-    def wait_for_ready(self, waiter):
+    def wait_for_ready(
+        self,
+        waiter,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         entry = self._require_entry()
         self._cache._wait_for_ready(entry, waiter)
 
-    def fail(self, error):
+    def fail(
+        self,
+        error,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         entry = self._require_entry()
         self._cache._fail_entry(entry, error)
 
@@ -191,7 +235,14 @@ class CacheEntryLease:
         self._owner = None
         self._closed = True
 
-    def transfer_to(self, owner):
+    def transfer_to(
+        self,
+        owner,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(_admission_token, _admission_validator)
         if self._closed:
             return
         if not isinstance(owner, AsyncResourceOwner):
@@ -212,13 +263,7 @@ class CacheEntryLease:
         _admission_token=None,
         _admission_validator=None,
     ):
-        if (
-            getattr(self, "_managed", False)
-            and _admission_token is None
-            and _admission_validator is None
-        ):
-            raise TypeError("managed cache entry lease requires admission")
-        _require_resource_admission(
+        self._require_admission(
             _admission_token,
             _admission_validator,
         )
@@ -226,7 +271,11 @@ class CacheEntryLease:
             return
         if event is not None:
             owner = require_async_owner(event, "cache lease transfer")
-            self.transfer_to(owner)
+            self.transfer_to(
+                owner,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
             return
         cache = self._cache
         entry = self._entry
@@ -236,6 +285,7 @@ class CacheEntryLease:
             self._detach()
 
     def __enter__(self):
+        self._require_admission()
         if self._closed:
             raise RuntimeError("cache entry lease is closed")
         return self
@@ -257,6 +307,7 @@ class CacheReservation:
     def __init__(self, cache, allowlist, required_bytes, allocated_bytes):
         self._cache = cache
         self._managed = cache._managed
+        self._managed_guard = cache._managed_guard
         self._allowlist = MappingProxyType(dict(allowlist))
         self.required_bytes = required_bytes
         self.peak_allocated_bytes = allocated_bytes
@@ -264,6 +315,10 @@ class CacheReservation:
 
     @property
     def allowlist(self):
+        guard = getattr(self, "_managed_guard", None)
+        if guard is None and getattr(self, "_managed", False):
+            raise TypeError("managed cache reservation requires admission")
+        _require_managed_resource_admission(guard)
         return self._allowlist
 
     def close(
@@ -272,13 +327,16 @@ class CacheReservation:
         _admission_token=None,
         _admission_validator=None,
     ):
+        guard = getattr(self, "_managed_guard", None)
         if (
-            getattr(self, "_managed", False)
+            guard is None
+            and getattr(self, "_managed", False)
             and _admission_token is None
             and _admission_validator is None
         ):
             raise TypeError("managed cache reservation requires admission")
-        _require_resource_admission(
+        _require_managed_resource_admission(
+            guard,
             _admission_token,
             _admission_validator,
         )
@@ -299,6 +357,7 @@ class CacheReservation:
             self._closed = True
 
     def __enter__(self):
+        _require_managed_resource_admission(self._managed_guard)
         if self._closed:
             raise RuntimeError("cache reservation is closed")
         return self
@@ -328,8 +387,14 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
         _construction_slot=None,
+        _managed_guard=None,
+        _standalone=True,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
+        self._managed_guard = _resolve_managed_resource_guard(
+            standalone=_standalone,
+            guard=_managed_guard,
+        )
         if type(capacity_bytes) is not int or capacity_bytes < 0:
             raise ValueError("capacity_bytes must be a non-negative integer")
         if not callable(allocator):
@@ -348,7 +413,7 @@ class DeviceTensorCache:
         self._cache_misses = 0
         self._poisoned_error = None
         self._closed = False
-        self._managed = _construction_slot is not None
+        self._managed = self._managed_guard is not None
         self._resource_recorder = _resource_recorder
         _publish_lease_construction_resource_direct(
             _construction_slot,
@@ -390,44 +455,57 @@ class DeviceTensorCache:
                 _replace_kind=True,
             )
 
+    def _terminal_allocation_records(self):
+        return tuple(retained[0] for retained in self._allocation_refcounts.values())
+
     @property
     def capacity_bytes(self):
+        self._require_admission(None, None)
         return self._capacity_bytes
 
     @property
     def allocated_bytes(self):
+        self._require_admission(None, None)
         return self._allocated_bytes
 
     @property
     def allocation_records(self):
-        return tuple(retained[0] for retained in self._allocation_refcounts.values())
+        self._require_admission(None, None)
+        return self._terminal_allocation_records()
 
     @property
     def peak_allocated_bytes(self):
+        self._require_admission(None, None)
         return self._peak_allocated_bytes
 
     @property
     def reserved_bytes(self):
+        self._require_admission(None, None)
         return 0 if self._reservation is None else self._reservation.required_bytes
 
     @property
     def cache_hits(self):
+        self._require_admission(None, None)
         return self._cache_hits
 
     @property
     def cache_misses(self):
+        self._require_admission(None, None)
         return self._cache_misses
 
     @property
     def entry_count(self):
+        self._require_admission(None, None)
         return len(self._entries)
 
     @property
     def pending_release_count(self):
+        self._require_admission(None, None)
         return len(self._owner_pending)
 
     @property
     def poisoned(self):
+        self._require_admission(None, None)
         return self._poisoned_error is not None
 
     def _require_usable(self):
@@ -439,9 +517,19 @@ class DeviceTensorCache:
             raise RuntimeError("device tensor cache is closed")
 
     def _require_admission(self, token, validator):
-        if getattr(self, "_managed", False) and token is None and validator is None:
+        guard = getattr(self, "_managed_guard", None)
+        if (
+            guard is None
+            and getattr(self, "_managed", False)
+            and token is None
+            and validator is None
+        ):
             raise TypeError("managed device tensor cache requires admission")
-        return _require_resource_admission(token, validator)
+        return _require_managed_resource_admission(
+            guard,
+            token,
+            validator,
+        )
 
     def _poison(self, error):
         if self._poisoned_error is None:

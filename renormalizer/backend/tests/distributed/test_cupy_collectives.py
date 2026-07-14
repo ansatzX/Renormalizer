@@ -4050,6 +4050,7 @@ def test_failed_owner_terminal_slot_holds_fatal_reservation_against_close(monkey
             runtime,
             device_budget_resolution=budget,
             host_budget_resolution=budget,
+            _standalone=True,
         )
         for runtime in runtimes
     ]
@@ -5502,6 +5503,7 @@ def test_real_operator_quarantine_stays_private_until_active_b_agreement(
         runtime,
         device_budget_resolution=budget,
         host_budget_resolution=budget,
+        _standalone=True,
     )
     owner = AsyncResourceOwner(
         "real-operator-active-b",
@@ -9903,3 +9905,26 @@ def test_fatal_monitor_start_receives_construction_lifecycle_deadline(
 
     assert wrapper._bootstrap_fatal_control(_deadline=deadline) == 0
     assert captured == [deadline]
+
+
+def test_fatal_origin_read_uses_bounded_store_get_with_inherited_deadline(
+    monkeypatch,
+):
+    _, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    deadline = time.monotonic() + _TASK_18_2_TIMEOUT_S
+    calls = []
+
+    class RawStore:
+        def __getitem__(self, key):
+            raise AssertionError("fatal origin used an unbounded raw store read")
+
+    wrapper._bootstrap_store_proxy = RawStore()
+
+    def bounded_get(key, *, _deadline=None):
+        calls.append((key, _deadline))
+        return 1
+
+    monkeypatch.setattr(wrapper, "_fatal_store_get", bounded_get)
+
+    assert wrapper._read_fatal_origin(_deadline=deadline) == 0
+    assert calls == [(wrapper._fatal_key(0), deadline)]
