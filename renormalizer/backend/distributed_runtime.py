@@ -1386,12 +1386,13 @@ class CupyDistributedRuntime:
                 owner._remember_secondary(error)
             with self._terminal_state_lock:
                 self._remember_terminal_secondary_locked(error, primary, owner)
+            self._terminal_gate._fail_fatal_publication(transition, primary)
             if error is not primary:
                 raise primary
             raise
         return primary
 
-    def _enter_communicator_fatal(
+    def _enter_communicator_fatal_unchecked(
         self, primary, owner=None, discovering_token=None
     ):
         if not isinstance(primary, BaseException):
@@ -1476,10 +1477,54 @@ class CupyDistributedRuntime:
             return transition.primary
         if not owns_publication:
             return self._terminal_gate.wait_for_published(_TERMINAL_TIMEOUT_S)
-        snapshot = self._publish_communicator_fatal_transition(transition)
-        publish(snapshot)
-        self._terminal_gate.publish_fatal(transition, snapshot)
+        try:
+            snapshot = self._publish_communicator_fatal_transition(transition)
+            publish(snapshot)
+            self._terminal_gate.publish_fatal(transition, snapshot)
+        except BaseException as publication_error:
+            with self._terminal_state_lock:
+                self._remember_terminal_secondary_locked(
+                    publication_error,
+                    transition.primary,
+                    owner,
+                )
+            self._terminal_gate._fail_fatal_publication(
+                transition,
+                transition.primary,
+            )
+            raise transition.primary
         return snapshot
+
+    def _enter_communicator_fatal(
+        self, primary, owner=None, discovering_token=None
+    ):
+        """Publish fatal or install the gate's bounded publication failure."""
+        try:
+            return self._enter_communicator_fatal_unchecked(
+                primary,
+                owner=owner,
+                discovering_token=discovering_token,
+            )
+        except BaseException as publication_error:
+            transition = self._terminal_gate._fatal_transition
+            if transition is None:
+                raise
+            primary = transition.primary
+            failure_was_recorded = (
+                self._terminal_gate._fatal_publication_failed(
+                    transition, primary
+                )
+            )
+            if failure_was_recorded:
+                raise
+            with self._terminal_state_lock:
+                self._remember_terminal_secondary_locked(
+                    publication_error,
+                    primary,
+                    owner,
+                )
+            self._terminal_gate._fail_fatal_publication(transition, primary)
+            raise primary
 
     def barrier(self):
         self._require_usable()
@@ -2445,12 +2490,20 @@ class CupyDistributedRuntime:
 
     def _commit_fatal_runtime_close(self, transition, error):
         def finalize_pending():
-            return self._clear_runtime_references(
-                error,
-                publish_error=False,
-                mark_closed=False,
-                clear_collective=False,
-            )
+            try:
+                return self._clear_runtime_references(
+                    error,
+                    publish_error=False,
+                    mark_closed=False,
+                    clear_collective=False,
+                )
+            except BaseException as clear_error:
+                with self._terminal_state_lock:
+                    self._remember_terminal_secondary_locked(
+                        clear_error,
+                        transition.primary,
+                    )
+                return transition.primary
 
         try:
             result = self._terminal_gate.commit_runtime_close(
@@ -2478,26 +2531,80 @@ class CupyDistributedRuntime:
                 )
                 if callable(join_publication):
                     join_publication()
+                else:
+                    self._finish_failed_fatal_runtime_close(transition)
             raise
         if not self._closed:
-            self._clear_runtime_references(
-                error,
+            try:
+                self._clear_runtime_references(
+                    error,
+                    publish_error=False,
+                    clear_collective=False,
+                )
+            except BaseException as clear_error:
+                with self._terminal_state_lock:
+                    self._remember_terminal_secondary_locked(
+                        clear_error,
+                        transition.primary,
+                    )
+        return result
+
+    def _finish_failed_fatal_runtime_close(self, transition):
+        primary = transition.primary
+        self._terminal_gate._fail_fatal_publication(transition, primary)
+        secondary = self._terminal_gate._complete_failed_fatal_runtime_close(
+            transition,
+            lambda: self._clear_runtime_references(
+                primary,
                 publish_error=False,
                 clear_collective=False,
-            )
-        return result
+            ),
+        )
+        if secondary is not None:
+            with self._terminal_state_lock:
+                self._remember_terminal_secondary_locked(
+                    secondary,
+                    primary,
+                )
+        raise primary
 
     def _fail_stop_elected_runtime_close(self, transition, error):
         gate = self._terminal_gate
         with gate._condition:
             fatal_transition = gate._fatal_transition
             phase = gate._phase
+            commit_selected = gate._runtime_close_commit_selected
         if fatal_transition is None and phase is _TerminalPhase.RUNTIME_CLOSED:
             raise error
         primary = (
             error if fatal_transition is None else fatal_transition.primary
         )
-        primary = self._enter_communicator_fatal(primary)
+        if fatal_transition is None and commit_selected:
+            secondary = gate._fail_selected_runtime_close(
+                transition,
+                primary,
+                lambda: self._clear_runtime_references(primary),
+            )
+            if secondary is not None:
+                with self._terminal_state_lock:
+                    self._remember_terminal_secondary_locked(
+                        secondary,
+                        primary,
+                    )
+            raise primary
+        try:
+            primary = self._enter_communicator_fatal(primary)
+        except BaseException as publication_error:
+            fatal_transition = gate._fatal_transition
+            if fatal_transition is None or fatal_transition.primary is not primary:
+                raise primary
+            if publication_error is not primary:
+                with self._terminal_state_lock:
+                    self._remember_terminal_secondary_locked(
+                        publication_error,
+                        primary,
+                    )
+            self._finish_failed_fatal_runtime_close(fatal_transition)
         fatal_transition = gate._fatal_transition
         if fatal_transition is None or fatal_transition.primary is not primary:
             raise RuntimeError("runtime close fatal transition changed") from primary
@@ -2529,55 +2636,23 @@ class CupyDistributedRuntime:
         )
         return collective.close()
 
-    def close(self):
-        if self._closed:
-            return
-        error = self._terminal_error
-        if error is None:
-            error = getattr(self.backend, "_execution_terminal_error", None)
-        request = None
-        try:
-            request = self._terminal_gate.admit_runtime("begin_runtime_close")
-        except RuntimeError:
-            transition, elected = self._terminal_gate._freeze_runtime_close(None)
-        else:
-            transition, elected = self._terminal_gate._freeze_runtime_close(request)
+    def _run_elected_runtime_close(self, transition, error):
+        """Run every fallible elected-owner action under the caller's guard."""
+        _, _, frozen_scheduler = self._runtime_close_snapshot()
+        if frozen_scheduler is not None:
+            frozen_scheduler._start_counted_completions()
+        transition = self._terminal_gate._drain_runtime_close(transition)
         if isinstance(transition, _FatalTransition):
-            error = transition.primary
-            self._commit_fatal_runtime_close(transition, error)
-            raise error
+            primary = transition.primary
+            self._commit_fatal_runtime_close(transition, primary)
+            raise primary
 
-        if elected:
-            try:
-                _, _, frozen_scheduler = self._runtime_close_snapshot()
-                if frozen_scheduler is not None:
-                    frozen_scheduler._start_counted_completions()
-                transition = self._terminal_gate._drain_runtime_close(transition)
-            except BaseException as caught:
-                self._fail_stop_elected_runtime_close(transition, caught)
-        else:
-            transition = self._terminal_gate._drain_runtime_close(transition)
-        if isinstance(transition, _FatalTransition):
-            error = transition.primary
-            self._commit_fatal_runtime_close(transition, error)
-            raise error
-        if not elected:
-            result = self._terminal_gate.commit_runtime_close(
-                transition, lambda: None
-            )
-            if isinstance(result, BaseException):
-                raise result
-            return result
-
-        try:
-            provider, lease, _ = self._runtime_close_snapshot()
-        except BaseException as caught:
-            self._fail_stop_elected_runtime_close(transition, caught)
+        provider, lease, _ = self._runtime_close_snapshot()
         collective = self.collective
         if lease is not None:
             try:
                 lease.close()
-            except BaseException as caught:
+            except Exception as caught:
                 if error is None:
                     error = caught
         if self._terminal_gate.phase in (
@@ -2593,7 +2668,7 @@ class CupyDistributedRuntime:
                 provider_token = self._terminal_gate.admit_runtime_close(
                     transition, "provider_close"
                 )
-            except BaseException as caught:
+            except Exception as caught:
                 if self._terminal_gate.phase in (
                     _TerminalPhase.FATAL_PENDING,
                     _TerminalPhase.FATAL_PUBLISHED,
@@ -2616,7 +2691,7 @@ class CupyDistributedRuntime:
                         _admission_token=provider_token,
                         _admission_validator=provider_validator,
                     )
-                except BaseException as caught:
+                except Exception as caught:
                     if error is None:
                         error = caught
                 finally:
@@ -2647,7 +2722,7 @@ class CupyDistributedRuntime:
                         )
                     finally:
                         self._release_runtime_close_step(collective_token)
-        except BaseException as caught:
+        except Exception as caught:
             if error is None:
                 error = caught
 
@@ -2661,12 +2736,9 @@ class CupyDistributedRuntime:
             raise error
         if self._terminal_error is not None:
             error = self._terminal_error
-        try:
-            result = self._terminal_gate.commit_runtime_close(
-                transition, lambda: self._clear_runtime_references(error)
-            )
-        except BaseException as caught:
-            self._fail_stop_elected_runtime_close(transition, caught)
+        result = self._terminal_gate.commit_runtime_close(
+            transition, lambda: self._clear_runtime_references(error)
+        )
         if isinstance(result, BaseException):
             fatal_transition = self._terminal_gate._fatal_transition
             if (
@@ -2678,6 +2750,42 @@ class CupyDistributedRuntime:
         if error is not None:
             raise error
         return result
+
+    def close(self):
+        if self._closed:
+            return
+        error = self._terminal_error
+        if error is None:
+            error = getattr(self.backend, "_execution_terminal_error", None)
+        request = None
+        try:
+            request = self._terminal_gate.admit_runtime("begin_runtime_close")
+        except RuntimeError:
+            transition, elected = self._terminal_gate._freeze_runtime_close(None)
+        else:
+            transition, elected = self._terminal_gate._freeze_runtime_close(request)
+        if isinstance(transition, _FatalTransition):
+            error = transition.primary
+            self._commit_fatal_runtime_close(transition, error)
+            raise error
+
+        if not elected:
+            transition = self._terminal_gate._drain_runtime_close(transition)
+            if isinstance(transition, _FatalTransition):
+                error = transition.primary
+                self._commit_fatal_runtime_close(transition, error)
+                raise error
+            result = self._terminal_gate.commit_runtime_close(
+                transition, lambda: None
+            )
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        try:
+            return self._run_elected_runtime_close(transition, error)
+        except BaseException as caught:
+            self._fail_stop_elected_runtime_close(transition, caught)
 
     def resource_state(self):
         gate = self._terminal_gate

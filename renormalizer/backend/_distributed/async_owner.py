@@ -165,8 +165,10 @@ class _CountedAsyncAdmission:
         self._parent = parent
         self._capability = capability
         self._token = gate.spawn_async(parent, capability)
+        self._state_lock = threading.RLock()
         self._claimed = None
         self._released = False
+        self._state = "installed"
 
     def _validate_claimed(self, claimed):
         parent = self._parent
@@ -204,21 +206,25 @@ class _CountedAsyncAdmission:
 
     @property
     def token(self):
-        return self._token if self._claimed is None else self._claimed
+        with self._state_lock:
+            return self._token if self._claimed is None else self._claimed
 
     @property
     def close_owned(self):
         return self.token.scope == "lease_close"
 
     def run(self, operation, callback):
-        if self._released or self._claimed is not None:
-            raise RuntimeError("async admission is no longer claimable")
-        claimed = self._gate.claim_async(
-            self._token,
-            self._capability,
-            operation,
-        )
-        self._claimed = claimed
+        # Admission state may enter the gate lock; it never enters an owner lock.
+        with self._state_lock:
+            if self._state != "installed":
+                raise RuntimeError("async admission is no longer claimable")
+            claimed = self._gate.claim_async(
+                self._token,
+                self._capability,
+                operation,
+            )
+            self._claimed = claimed
+            self._state = "claimed"
         try:
             return self._run_admitted_callback(
                 callback,
@@ -231,15 +237,26 @@ class _CountedAsyncAdmission:
             except RuntimeError as error:
                 if "converted" not in str(error):
                     raise
-            self._released = True
+            finally:
+                with self._state_lock:
+                    self._released = True
+                    self._state = "released"
 
     def cancel(self):
-        if self._released:
-            return
-        if self._claimed is not None:
-            raise RuntimeError("claimed async admission cannot be cancelled")
-        self._gate.release(self._token)
-        self._released = True
+        with self._state_lock:
+            if self._state in {"cancelled", "released"}:
+                return False
+            if self._state == "claimed":
+                return False
+            cancelled = self._gate.cancel_async(
+                self._token,
+                self._capability,
+            )
+            if not cancelled:
+                return False
+            self._released = True
+            self._state = "cancelled"
+            return True
 
     def wake(self):
         with self._gate._condition:
@@ -336,6 +353,8 @@ class AsyncResourceOwner:
         self._async_admission = _async_admission
         self._resource_recorder = _resource_recorder
         self._resource_releaser = _resource_releaser
+        # Lock order: owner state -> no other lock. Gate/admission calls and waits
+        # always happen after releasing this lock.
         self._async_lock = threading.RLock()
         self._async_worker = None
         self._async_done = threading.Event()
@@ -343,6 +362,10 @@ class AsyncResourceOwner:
         self._counted_quarantine_pending = False
         self._async_completion_deferred = bool(_defer_async_completion)
         self._async_start_pending = False
+        self._async_admission_state = (
+            "uninstalled" if _async_admission is None else "installed"
+        )
+        self._async_quarantine_requested = False
         if self._resource_recorder is not None:
             self._resource_recorder(
                 resource=self,
@@ -445,15 +468,19 @@ class AsyncResourceOwner:
                 or not self._completion_armed
                 or self._completion_event is None
                 or self.state != "enqueued"
+                or self._async_admission_state != "installed"
             ):
                 return
+            admission = self._async_admission
             worker = threading.Thread(
                 target=self._run_counted_completion,
+                args=(admission,),
                 name="renormalizer-async-completion",
                 daemon=True,
             )
             self._async_worker = worker
-            if self._async_admission.close_owned:
+            self._async_admission_state = "worker"
+            if admission.close_owned:
                 self._async_start_pending = True
         worker.start()
         self._publish_counted_start_request()
@@ -466,6 +493,8 @@ class AsyncResourceOwner:
                 or self._async_worker is None
                 or self._async_completion_deferred
                 or self._async_requested.is_set()
+                or self._async_admission is None
+                or self._async_admission_state == "cancelled"
             ):
                 return
             self._async_start_pending = False
@@ -493,16 +522,21 @@ class AsyncResourceOwner:
             if self.state not in {"new", "enqueued"}:
                 raise RuntimeError("async owner can no longer install an admission")
             self._async_admission = admission
+            self._async_admission_state = "installed"
 
     def watch_counted_completion(self):
         self._watch_counted_completion()
 
-    def _run_counted_completion(self):
-        admission = self._async_admission
+    def _run_counted_completion(self, admission):
         execution_requested = admission.wait_for_execution(self._async_requested)
 
         def complete(*, _admission_token, _admission_validator):
-            if self.state in {"detached", "quarantined"}:
+            with self._async_lock:
+                terminal_requested = self._async_quarantine_requested or (
+                    self.state in {"detached", "quarantined"}
+                )
+            if terminal_requested:
+                self._counted_quarantine_pending = True
                 return
             if not execution_requested:
                 self._counted_quarantine_pending = True
@@ -531,6 +565,9 @@ class AsyncResourceOwner:
             if self.state not in {"detached", "quarantined"}:
                 self._counted_quarantine_pending = True
         finally:
+            with self._async_lock:
+                if self._async_admission_state != "cancelled":
+                    self._async_admission_state = "terminal"
             self._async_done.set()
 
     def _resolve_counted_wait_failure(self, error):
@@ -551,16 +588,37 @@ class AsyncResourceOwner:
                 pass
 
     def _cancel_unclaimed_async(self):
-        admission = self._async_admission
-        if admission is None:
-            return
-        if self._async_worker is not None:
-            self._async_requested.set()
+        with self._async_lock:
+            admission = self._async_admission
+            worker = self._async_worker
+            if admission is None:
+                return True
+            if worker is not None:
+                self._async_start_pending = False
+                self._async_requested.set()
+        if worker is not None:
             admission.wake()
-            return
-        admission.cancel()
-        self._async_admission = None
-        self._async_done.set()
+            return False
+
+        cancelled = admission.cancel()
+        wake = None
+        with self._async_lock:
+            if cancelled:
+                self._async_admission_state = "cancelled"
+                self._async_admission = None
+                self._async_start_pending = False
+                self._async_requested.set()
+                wake = admission
+                if self._async_worker is None:
+                    self._async_done.set()
+            else:
+                self._async_admission_state = "worker"
+                self._async_start_pending = False
+                self._async_requested.set()
+                wake = self._async_admission
+        if wake is not None:
+            wake.wake()
+        return cancelled
 
     def start_counted_completion(self):
         self._start_counted_completion()
@@ -780,12 +838,16 @@ class AsyncResourceOwner:
         return True
 
     def _move_to_quarantine(self):
-        self.state = "quarantined"
-        quarantine = self._quarantine
-        self._detached = None
-        self._quarantine = None
+        with self._async_lock:
+            if self.state in {"detached", "quarantined"}:
+                return False
+            self.state = "quarantined"
+            quarantine = self._quarantine
+            self._detached = None
+            self._quarantine = None
         if quarantine is not None:
             quarantine(self)
+        return True
 
     def force_quarantine(self, error, *, secondary_errors=()):
         self._remember_error(error)
@@ -795,6 +857,8 @@ class AsyncResourceOwner:
             return
         if self.state == "detached":
             return
+        with self._async_lock:
+            self._async_quarantine_requested = True
         self._cancel_unclaimed_async()
         self._move_to_quarantine()
 

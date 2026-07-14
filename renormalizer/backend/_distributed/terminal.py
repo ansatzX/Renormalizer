@@ -593,6 +593,9 @@ class _TerminalLifecycleGate:
                 if self._phase in (
                     _TerminalPhase.FATAL_PENDING,
                     _TerminalPhase.FATAL_PUBLISHED,
+                ) or (
+                    self._phase is _TerminalPhase.RUNTIME_CLOSED
+                    and self._fatal_transition is not None
                 ):
                     raise RuntimeError("fatal transition preempted lease close") from (
                         self._fatal_transition.primary
@@ -717,6 +720,23 @@ class _TerminalLifecycleGate:
             state.async_claimed = True
             self._thread_tokens[thread_id] = claimed.sequence
             return claimed
+
+    def cancel_async(self, token, owner_identity) -> bool:
+        """Release one unclaimed descendant from any terminal-management thread."""
+        with self._condition:
+            state = self._token_state(token)
+            if state.async_capability is _MISSING:
+                raise RuntimeError("resource admission is not an async descendant")
+            if state.async_capability is not owner_identity:
+                raise RuntimeError(
+                    "async admission cancel capability does not match"
+                )
+            if state.async_claimed:
+                return False
+            state.status = "released"
+            state.async_capability = _MISSING
+            self._condition.notify_all()
+            return True
 
     def release(self, token: _ResourceAdmission) -> None:
         with self._condition:
@@ -1109,3 +1129,62 @@ class _TerminalLifecycleGate:
             self._runtime_close_result = result
             self._condition.notify_all()
             return result
+
+    def _fail_selected_runtime_close(self, transition, primary, finalizer):
+        """Finish an irrevocable healthy close after its elected owner fails."""
+        if not isinstance(primary, BaseException):
+            raise TypeError("runtime close failure must be an exception")
+        if not callable(finalizer):
+            raise TypeError("runtime close failure finalizer must be callable")
+        with self._condition:
+            self._require_runtime_transition(transition)
+            if transition.owner_thread_id != threading.get_ident():
+                raise RuntimeError(
+                    "only the elected runtime close owner may fail close"
+                )
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                return None
+            if not self._runtime_close_commit_selected:
+                raise RuntimeError("runtime close is not irrevocably selected")
+            sequence = self._thread_tokens.get(threading.get_ident())
+            if sequence is not None:
+                self._convert_token_state(self._tokens[sequence])
+            secondary = None
+            try:
+                finalizer()
+            except BaseException as error:
+                secondary = error
+            self._phase = _TerminalPhase.RUNTIME_CLOSED
+            self._runtime_close_result = primary
+            self._condition.notify_all()
+            return secondary
+
+    def _complete_failed_fatal_runtime_close(self, transition, finalizer):
+        """Close a runtime whose fatal publisher installed the failure marker."""
+        if not callable(finalizer):
+            raise TypeError("fatal runtime close finalizer must be callable")
+        with self._condition:
+            self._require_fatal_transition(transition)
+            if self._fatal_publication_failure is not transition.primary:
+                raise RuntimeError("fatal publication failure is not recorded")
+            if self._phase is _TerminalPhase.RUNTIME_CLOSED:
+                return None
+            self._require_no_held_admission("complete failed fatal runtime close")
+            thread_id = threading.get_ident()
+            run_finalizer = self._fatal_runtime_finalizer_state == "none"
+            if run_finalizer:
+                self._fatal_runtime_finalizer_state = "pending"
+                self._fatal_runtime_finalizer_owner = thread_id
+            elif self._fatal_runtime_finalizer_owner == thread_id:
+                run_finalizer = True
+            secondary = None
+            if run_finalizer:
+                try:
+                    finalizer()
+                except BaseException as error:
+                    secondary = error
+            self._fatal_runtime_finalizer_state = "complete"
+            self._phase = _TerminalPhase.RUNTIME_CLOSED
+            self._runtime_close_result = transition.primary
+            self._condition.notify_all()
+            return secondary

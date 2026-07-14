@@ -921,7 +921,7 @@ class WorkingSetLease:
             provider._terminal_error = terminal
         if runtime is not None and runtime._terminal_error is None:
             runtime._terminal_error = terminal
-        provider._retain_terminal_lease(self, terminal)
+        self._retain_terminal_lease_safely(provider, terminal)
         raise terminal
 
     def validate_setup(self, distributed_plan, source_bindings, context):
@@ -1657,12 +1657,21 @@ class WorkingSetLease:
         ):
             return
         primary = self._terminal_close_primary()
-        provider._retain_terminal_lease(self, primary)
+        self._retain_terminal_lease_safely(provider, primary)
         raise primary
 
-    def _fail_stop_elected_close(self, error):
-        provider = self._provider
+    def _retain_terminal_lease_safely(self, provider, primary):
         runtime = provider.runtime
+        try:
+            provider._retain_terminal_lease(self, primary)
+        except BaseException as retention_error:
+            with runtime._terminal_state_lock:
+                runtime._remember_terminal_secondary_locked(
+                    retention_error,
+                    primary,
+                )
+
+    def _fail_stop_elected_close(self, error, *, provider, runtime):
         gate = runtime._terminal_gate
         with gate._condition:
             fatal_transition = gate._fatal_transition
@@ -1672,101 +1681,35 @@ class WorkingSetLease:
         primary = (
             error if fatal_transition is None else fatal_transition.primary
         )
-        primary = runtime._enter_communicator_fatal(primary)
-        provider._retain_terminal_lease(self, primary)
+        try:
+            primary = runtime._enter_communicator_fatal(primary)
+        except BaseException as publication_error:
+            fatal_transition = gate._fatal_transition
+            if fatal_transition is None or fatal_transition.primary is not primary:
+                raise primary
+            if publication_error is not primary:
+                with runtime._terminal_state_lock:
+                    runtime._remember_terminal_secondary_locked(
+                        publication_error,
+                        primary,
+                    )
+            self._retain_terminal_lease_safely(provider, primary)
+            runtime._finish_failed_fatal_runtime_close(fatal_transition)
+        self._retain_terminal_lease_safely(provider, primary)
         raise primary
 
-    def _commit_close_references(self, provider, error):
-        provider._lease_closed(self)
-        provider.last_compute_event = None
-        self._resource_record.clear()
-        self._children.clear()
-        self._active_operator_owner = None
-        self._active_operator_scope = None
-        self._dirty = None
-        self._dirty_allocation_records = ()
-        self._writeback_ticket = None
-        self._poisoned_error = error
-        self._entries = {}
-        self._current_lookup = {}
-        self._future_queue = []
-        self._prefetch_tickets = []
-        self.cache_identities = ()
-        self._cache_reservation = None
-        self._store_reservation = None
-        self.pool = None
-        self.scheduler = None
-        self._status_workspace = None
-        self.store = None
-        self.request = None
-        self.plan = None
-        self.receipt = None
-        self.context = None
-        self.backend = None
-        self._provider = None
-        self._peak_sampler = None
-        self._timer = None
-        self._started_at = None
-        self._profile_enabled = False
-        self._closing = False
-        self._closed = True
-        return error
-
-    def close(self, wait=True):
-        if type(wait) is not bool:
-            raise TypeError("wait must be a boolean")
-        if self._closed:
-            return
-        self._handoff_published_terminal()
-        if not wait:
-            try:
-                with self._lease_admission("close_progress") as token:
-                    validator = self._exact_admission_validator(token)
-                    self._schedule_writeback(
-                        _admission_token=token,
-                        _admission_validator=validator,
-                    )
-                    self.reap_completed(_admission_token=token)
-                return
-            except BaseException as caught:
-                self._poison(caught)
-                return
-
-        provider = self._provider
-        runtime = provider.runtime
+    def _run_elected_close(self, transition, *, provider, runtime):
+        """Run every fallible elected-owner action under the caller's guard."""
         gate = runtime._terminal_gate
-        try:
-            transition, elected = gate.begin_lease_close(self._epoch)
-        except BaseException:
-            primary = self._terminal_close_primary()
-            provider._retain_terminal_lease(self, primary)
-            raise primary
-        self._closing = True
-        if not elected:
-            try:
-                result = gate.wait_for_lease_closed(
-                    transition,
-                    _TERMINAL_TIMEOUT_S,
-                )
-            except BaseException:
-                self._raise_terminal_close_preemption()
-                raise
-            if isinstance(result, BaseException):
-                raise result
-            return result
-
-        try:
-            scheduler = self.scheduler
-            scheduler._start_counted_completions()
-            error = self._poisoned_error
-            old_ref = None if self._dirty is None else self._dirty[0]
-            planned_cache_bytes = self._cache_reservation.required_bytes
-            pool = self.pool
-            status_workspace = self._status_workspace
-            cache_reservation = self._cache_reservation
-            store_reservation = self._store_reservation
-        except BaseException as caught:
-            self._fail_stop_elected_close(caught)
+        scheduler = self.scheduler
+        scheduler._start_counted_completions()
+        error = self._poisoned_error
+        old_ref = None if self._dirty is None else self._dirty[0]
+        planned_cache_bytes = self._cache_reservation.required_bytes
+        pool = self.pool
+        status_workspace = self._status_workspace
+        cache_reservation = self._cache_reservation
+        store_reservation = self._store_reservation
 
         def remember(caught):
             nonlocal error
@@ -1780,14 +1723,14 @@ class WorkingSetLease:
                     operation,
                     callback,
                 )
-            except BaseException as caught:
+            except Exception as caught:
                 if gate.phase in (
                     _TerminalPhase.FATAL_PENDING,
                     _TerminalPhase.FATAL_PUBLISHED,
                     _TerminalPhase.RUNTIME_CLOSED,
                 ):
                     primary = self._terminal_close_primary()
-                    provider._retain_terminal_lease(self, primary)
+                    self._retain_terminal_lease_safely(provider, primary)
                     raise primary
                 remember(caught)
                 return None
@@ -1797,7 +1740,7 @@ class WorkingSetLease:
             for child in tuple(self._children):
                 try:
                     child.close(_admission_token=token)
-                except BaseException as caught:
+                except Exception as caught:
                     if child_error is None:
                         child_error = caught
             if child_error is not None:
@@ -1926,18 +1869,106 @@ class WorkingSetLease:
             ),
         )
 
-        try:
-            gate.wait_for_lease_admissions(transition, _TERMINAL_TIMEOUT_S)
-            result = gate.commit_lease_close(
-                transition,
-                lambda: self._commit_close_references(provider, error),
-            )
-        except BaseException as caught:
-            self._raise_terminal_close_preemption()
-            self._fail_stop_elected_close(caught)
+        gate.wait_for_lease_admissions(transition, _TERMINAL_TIMEOUT_S)
+        result = gate.commit_lease_close(
+            transition,
+            lambda: self._commit_close_references(provider, error),
+        )
         if isinstance(result, BaseException):
             raise result
         return result
+
+    def _commit_close_references(self, provider, error):
+        provider._lease_closed(self)
+        provider.last_compute_event = None
+        self._resource_record.clear()
+        self._children.clear()
+        self._active_operator_owner = None
+        self._active_operator_scope = None
+        self._dirty = None
+        self._dirty_allocation_records = ()
+        self._writeback_ticket = None
+        self._poisoned_error = error
+        self._entries = {}
+        self._current_lookup = {}
+        self._future_queue = []
+        self._prefetch_tickets = []
+        self.cache_identities = ()
+        self._cache_reservation = None
+        self._store_reservation = None
+        self.pool = None
+        self.scheduler = None
+        self._status_workspace = None
+        self.store = None
+        self.request = None
+        self.plan = None
+        self.receipt = None
+        self.context = None
+        self.backend = None
+        self._provider = None
+        self._peak_sampler = None
+        self._timer = None
+        self._started_at = None
+        self._profile_enabled = False
+        self._closing = False
+        self._closed = True
+        return error
+
+    def close(self, wait=True):
+        if type(wait) is not bool:
+            raise TypeError("wait must be a boolean")
+        if self._closed:
+            return
+        self._handoff_published_terminal()
+        if not wait:
+            try:
+                with self._lease_admission("close_progress") as token:
+                    validator = self._exact_admission_validator(token)
+                    self._schedule_writeback(
+                        _admission_token=token,
+                        _admission_validator=validator,
+                    )
+                    self.reap_completed(_admission_token=token)
+                return
+            except BaseException as caught:
+                self._poison(caught)
+                return
+
+        provider = self._provider
+        runtime = provider.runtime
+        gate = runtime._terminal_gate
+        try:
+            transition, elected = gate.begin_lease_close(self._epoch)
+        except BaseException:
+            primary = self._terminal_close_primary()
+            self._retain_terminal_lease_safely(provider, primary)
+            raise primary
+        self._closing = True
+        if not elected:
+            try:
+                result = gate.wait_for_lease_closed(
+                    transition,
+                    _TERMINAL_TIMEOUT_S,
+                )
+            except BaseException:
+                self._raise_terminal_close_preemption()
+                raise
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        try:
+            return self._run_elected_close(
+                transition,
+                provider=provider,
+                runtime=runtime,
+            )
+        except BaseException as caught:
+            self._fail_stop_elected_close(
+                caught,
+                provider=provider,
+                runtime=runtime,
+            )
 
 
 class ActiveWorkingSetProvider:
