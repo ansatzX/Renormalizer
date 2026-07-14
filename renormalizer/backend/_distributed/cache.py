@@ -13,6 +13,7 @@ from renormalizer.backend._distributed.async_owner import (
     require_async_owner,
 )
 from renormalizer.backend._distributed.terminal import (
+    _MANAGED_LIVE_EPOCH,
     _publish_lease_construction_resource,
     _publish_lease_construction_resource_direct,
     _remaining_lifecycle_time,
@@ -130,6 +131,7 @@ class CacheEntryLease:
         self._cache = cache
         self._managed = cache._managed
         self._managed_guard = cache._managed_guard
+        self._managed_epoch = cache._managed_epoch
         self._entry = entry
         self.cache_hit = cache_hit
         self._failure = None
@@ -144,7 +146,21 @@ class CacheEntryLease:
             raise RuntimeError("cache entry lease is closed")
         return self._entry
 
-    def _require_admission(self, token=None, validator=None):
+    def _require_admission(
+        self,
+        token=None,
+        validator=None,
+        *,
+        allowed_operations=(
+            "acquire",
+            "child_close",
+            "load",
+            "operator_call",
+            "prefetch",
+            "resource_state",
+            "async_completion",
+        ),
+    ):
         guard = getattr(self, "_managed_guard", None)
         if (
             guard is None
@@ -157,6 +173,9 @@ class CacheEntryLease:
             guard,
             token,
             validator,
+            allowed_scopes=("lease", "lease_close"),
+            allowed_operations=allowed_operations,
+            epoch=lambda _token: self._managed_epoch,
         )
 
     @property
@@ -266,6 +285,13 @@ class CacheEntryLease:
         self._require_admission(
             _admission_token,
             _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "prefetch",
+                "async_completion",
+            ),
         )
         if self._closed:
             return
@@ -308,6 +334,7 @@ class CacheReservation:
         self._cache = cache
         self._managed = cache._managed
         self._managed_guard = cache._managed_guard
+        self._managed_epoch = cache._managed_epoch
         self._allowlist = MappingProxyType(dict(allowlist))
         self.required_bytes = required_bytes
         self.peak_allocated_bytes = allocated_bytes
@@ -318,7 +345,18 @@ class CacheReservation:
         guard = getattr(self, "_managed_guard", None)
         if guard is None and getattr(self, "_managed", False):
             raise TypeError("managed cache reservation requires admission")
-        _require_managed_resource_admission(guard)
+        _require_managed_resource_admission(
+            guard,
+            allowed_scopes=("construction", "lease"),
+            allowed_operations=(
+                "lease_construction",
+                "acquire",
+                "load",
+                "prefetch",
+                "resource_state",
+            ),
+            epoch=lambda _token: self._managed_epoch,
+        )
         return self._allowlist
 
     def close(
@@ -339,6 +377,12 @@ class CacheReservation:
             guard,
             _admission_token,
             _admission_validator,
+            allowed_scopes=("construction", "lease_close"),
+            allowed_operations=(
+                "lease_construction",
+                "cache_reservation_close",
+            ),
+            epoch=lambda _token: self._managed_epoch,
         )
         if self._closed:
             return
@@ -357,7 +401,12 @@ class CacheReservation:
             self._closed = True
 
     def __enter__(self):
-        _require_managed_resource_admission(self._managed_guard)
+        _require_managed_resource_admission(
+            self._managed_guard,
+            allowed_scopes=("construction",),
+            allowed_operations=("lease_construction",),
+            epoch=lambda _token: self._managed_epoch,
+        )
         if self._closed:
             raise RuntimeError("cache reservation is closed")
         return self
@@ -389,6 +438,7 @@ class DeviceTensorCache:
         _construction_slot=None,
         _managed_guard=None,
         _standalone=True,
+        _allocator_owns_construction_slot=False,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
         self._managed_guard = _resolve_managed_resource_guard(
@@ -401,6 +451,8 @@ class DeviceTensorCache:
             raise TypeError("allocator must be callable")
         if _resource_recorder is not None and not callable(_resource_recorder):
             raise TypeError("resource recorder must be callable")
+        if type(_allocator_owns_construction_slot) is not bool:
+            raise TypeError("allocator ownership mode must be a boolean")
         self._capacity_bytes = capacity_bytes
         self._allocator = allocator
         self._entries = {}
@@ -414,7 +466,14 @@ class DeviceTensorCache:
         self._poisoned_error = None
         self._closed = False
         self._managed = self._managed_guard is not None
+        self._managed_epoch = (
+            None if _admission_token is None else _admission_token.epoch
+        )
         self._resource_recorder = _resource_recorder
+        self._construction_slot = _construction_slot
+        self._allocator_owns_construction_slot = (
+            _allocator_owns_construction_slot
+        )
         _publish_lease_construction_resource_direct(
             _construction_slot,
             self,
@@ -439,10 +498,34 @@ class DeviceTensorCache:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _construction_slot=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        admission = self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_scopes=("construction", "lease_close"),
+            allowed_operations=(
+                "lease_construction",
+                "cache_lifetime_reconcile",
+            ),
+            epoch_resolver=lambda candidate: (
+                _MANAGED_LIVE_EPOCH
+                if candidate.scope == "construction"
+                else self._managed_epoch
+            ),
+        )
+        if admission is not None:
+            self._managed_epoch = admission.epoch
         if recorder is not None and not callable(recorder):
             raise TypeError("resource recorder must be callable")
+        if _construction_slot is not None:
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                self,
+                kind="cache",
+                records=self._terminal_allocation_records(),
+            )
+            self._construction_slot = _construction_slot
         self._resource_recorder = recorder
         self._record_allocation_snapshot()
 
@@ -516,7 +599,15 @@ class DeviceTensorCache:
         if self._closed:
             raise RuntimeError("device tensor cache is closed")
 
-    def _require_admission(self, token, validator):
+    def _require_admission(
+        self,
+        token,
+        validator,
+        *,
+        allowed_scopes=("construction", "lease", "lease_close", "runtime_close"),
+        allowed_operations=None,
+        epoch_resolver=None,
+    ):
         guard = getattr(self, "_managed_guard", None)
         if (
             guard is None
@@ -525,10 +616,19 @@ class DeviceTensorCache:
             and validator is None
         ):
             raise TypeError("managed device tensor cache requires admission")
+        if epoch_resolver is None:
+            def epoch_resolver(candidate):
+                if candidate.scope == "runtime_close":
+                    return None
+                return self._managed_epoch
+
         return _require_managed_resource_admission(
             guard,
             token,
             validator,
+            allowed_scopes=allowed_scopes,
+            allowed_operations=allowed_operations,
+            epoch=epoch_resolver,
         )
 
     def _poison(self, error):
@@ -545,7 +645,12 @@ class DeviceTensorCache:
         _admission_validator=None,
         _construction_slot=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_scopes=("construction",),
+            allowed_operations=("lease_construction",),
+        )
         if _resource_recorder is not None and not callable(_resource_recorder):
             raise TypeError("resource recorder must be callable")
         self._require_usable()
@@ -700,7 +805,13 @@ class DeviceTensorCache:
             raise RuntimeError("cache entry load has no readiness metadata")
         if entry is None:
             spec = reservation.allowlist[identity]
-            allocated = self._allocator(spec)
+            if self._allocator_owns_construction_slot:
+                allocated = self._allocator(
+                    spec,
+                    _construction_slot=self._construction_slot,
+                )
+            else:
+                allocated = self._allocator(spec)
             if isinstance(allocated, CacheAllocation):
                 allocation = allocated
             else:
@@ -1006,7 +1117,12 @@ class DeviceTensorCache:
         _admission_validator=None,
         _deadline=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_scopes=("construction", "runtime_close"),
+            allowed_operations=("lease_construction", "provider_close"),
+        )
         _remaining_lifecycle_time(
             _deadline,
             "device cache lifecycle timed out before close",

@@ -137,12 +137,15 @@ class AsyncCompletionHandle:
             raise TypeError("completion handle requires an AsyncResourceOwner")
         self._owner = owner
         self._managed_guard = owner._managed_guard
+        self._managed_epoch = owner._managed_epoch
 
     def _require_admission(self, token=None, validator=None):
         return _require_managed_resource_admission(
             self._managed_guard,
             token,
             validator,
+            allowed_scopes=("lease", "lease_close"),
+            epoch=lambda _token: self._managed_epoch,
         )
 
     @property
@@ -333,6 +336,9 @@ class TransferScheduler:
         if _stream_factory is not None and not callable(_stream_factory):
             raise TypeError("scheduler stream factory must be callable")
         self._managed = self._managed_guard is not None
+        self._managed_epoch = (
+            None if _admission_token is None else _admission_token.epoch
+        )
         self.store = store
         self.backend = backend
         self.pool = pool
@@ -506,7 +512,13 @@ class TransferScheduler:
         if self._closed:
             raise RuntimeError("transfer scheduler is closed")
 
-    def _require_admission(self, token, validator):
+    def _require_admission(
+        self,
+        token,
+        validator,
+        *,
+        allowed_operations=None,
+    ):
         guard = getattr(self, "_managed_guard", None)
         if (
             guard is None
@@ -519,6 +531,9 @@ class TransferScheduler:
             guard,
             token,
             validator,
+            allowed_scopes=("construction", "lease", "lease_close"),
+            allowed_operations=allowed_operations,
+            epoch=lambda _token: self._managed_epoch,
         )
 
     def _poison(self, error):
@@ -609,6 +624,7 @@ class TransferScheduler:
                 _defer_async_completion=defer_counted_completion,
                 _callback_requires_admission=callback_requires_admission,
                 _managed_guard=self._managed_guard,
+                _managed_epoch=self._managed_epoch,
             )
         except BaseException:
             if async_admission is not None:
@@ -1073,6 +1089,17 @@ class TransferScheduler:
             _admission_validator,
         )
         if reservation is not None:
+            from renormalizer.backend._distributed.residency import (
+                _HostTensorReservation,
+            )
+
+            if isinstance(reservation, _HostTensorReservation):
+                return reservation.commit(
+                    destination_ref,
+                    staging,
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
             return reservation.commit(destination_ref, staging)
         return store.update(
             destination_ref.key,
@@ -1136,9 +1163,16 @@ class TransferScheduler:
         if errors:
             raise errors[0]
 
-    def _start_counted_completions(self):
+    def _start_counted_completions(self, *, _close_transition=None):
+        if self._managed_guard is not None:
+            self._managed_guard.require_close_transition(
+                _close_transition,
+                epoch=lambda _transition: self._managed_epoch,
+            )
         for owner in tuple(self._owners.values()):
-            owner._start_counted_completion()
+            owner._start_counted_completion(
+                _close_transition=_close_transition,
+            )
 
     def close(
         self,
@@ -1147,7 +1181,11 @@ class TransferScheduler:
         _admission_validator=None,
         _deadline=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("lease_construction", "scheduler_close"),
+        )
         _remaining_lifecycle_time(
             _deadline,
             "transfer scheduler lifecycle timed out before close",

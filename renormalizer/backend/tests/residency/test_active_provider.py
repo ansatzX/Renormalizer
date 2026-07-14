@@ -4071,9 +4071,9 @@ def test_checkout_release_uncertainty_retains_writeback_ticket(monkeypatch):
     invalidations = []
     primary = RuntimeError("injected checkout release failure")
 
-    def record_commit(ref, value):
+    def record_commit(ref, value, **kwargs):
         commits.append(ref)
-        return commit(ref, value)
+        return commit(ref, value, **kwargs)
 
     def fail_after_release(slot, **kwargs):
         release(slot, **kwargs)
@@ -4126,9 +4126,9 @@ def test_successful_dirty_cas_is_accounted_once_before_invalidation_failure(
     invalidations = []
     primary = RuntimeError("injected cache invalidation failure")
 
-    def record_commit(ref, value):
+    def record_commit(ref, value, **kwargs):
         commits.append(ref)
-        return commit(ref, value)
+        return commit(ref, value, **kwargs)
 
     def fail_invalidation(ref, **_kwargs):
         invalidations.append(ref)
@@ -4177,7 +4177,7 @@ def test_writeback_callback_uncertainty_retains_dirty_refs_and_reservation(
 
     primary = RuntimeError("injected dirty CAS callback failure")
 
-    def fail_commit(ref, value):
+    def fail_commit(ref, value, **_kwargs):
         raise primary
 
     monkeypatch.setattr(working_set._store_reservation, "commit", fail_commit)

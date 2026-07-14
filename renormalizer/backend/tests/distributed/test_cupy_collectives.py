@@ -706,8 +706,8 @@ def test_fatal_waits_for_runtime_admission_outside_publication_lock(monkeypatch)
 
     original_abort = wrapper._abort_local_communicator
 
-    def record_abort_start():
-        event = original_abort()
+    def record_abort_start(**kwargs):
+        event = original_abort(**kwargs)
         order.append(("abort_start", wrapper._fatal_publication_lock._is_owned()))
         return event
 
@@ -1067,17 +1067,17 @@ def test_monitor_detected_fatal_retires_before_every_publication_sentinel(
     monkeypatch.setattr(wrapper, "_fatal_store_get", record_store_get)
     original_read = wrapper._read_fatal_origin
 
-    def record_monitor_read():
+    def record_monitor_read(**kwargs):
         with gate._condition:
             store_access_phases.append(("monitor_read", None, gate._phase))
-        return original_read()
+        return original_read(**kwargs)
 
     monkeypatch.setattr(wrapper, "_read_fatal_origin", record_monitor_read)
     original_abort = wrapper._abort_local_communicator
 
-    def record_abort():
+    def record_abort(**kwargs):
         record_sentinel("abort")
-        return original_abort()
+        return original_abort(**kwargs)
 
     monkeypatch.setattr(wrapper, "_abort_local_communicator", record_abort)
     original_runtime_publish = runtime._publish_communicator_fatal_transition
@@ -1093,9 +1093,9 @@ def test_monitor_detected_fatal_retires_before_every_publication_sentinel(
     )
     original_collective_publish = wrapper._publish_communicator_fatal_locked
 
-    def record_collective_publish(primary):
+    def record_collective_publish(primary, **kwargs):
         record_sentinel("collective_public")
-        return original_collective_publish(primary)
+        return original_collective_publish(primary, **kwargs)
 
     monkeypatch.setattr(
         wrapper,
@@ -1214,7 +1214,7 @@ def test_close_joins_local_fatal_publication_before_clearing_collective(
         lambda key, **_kwargs: retained_store[key],
     )
 
-    def retained_abort():
+    def retained_abort(**_kwargs):
         with wrapper._fatal_lock:
             if not wrapper._fatal_abort_started:
                 wrapper._fatal_abort_started = True
@@ -1870,10 +1870,10 @@ def test_gate_fatal_election_preselects_monitor_before_collective_prepare(
     release_prepare = threading.Event()
     original_prepare = wrapper._prepare_local_fatal_locked
 
-    def pause_collective_prepare():
+    def pause_collective_prepare(**kwargs):
         prepare_entered.set()
         assert release_prepare.wait(_TASK_18_2_TIMEOUT_S * 2)
-        return original_prepare()
+        return original_prepare(**kwargs)
 
     monkeypatch.setattr(wrapper, "_prepare_local_fatal_locked", pause_collective_prepare)
     publisher, results, errors, done = _start_task_18_2_call(
@@ -2005,7 +2005,7 @@ def test_legacy_callable_adopts_active_operator_primary_before_publication(
     monkeypatch.setattr(wrapper, "_fatal_store_set", record_store)
     original_abort = wrapper._abort_local_communicator
 
-    def record_abort():
+    def record_abort(**kwargs):
         sentinels.append(
             (
                 "abort",
@@ -2013,7 +2013,7 @@ def test_legacy_callable_adopts_active_operator_primary_before_publication(
                 runtime._terminal_gate._fatal_transition.primary,
             )
         )
-        return original_abort()
+        return original_abort(**kwargs)
 
     monkeypatch.setattr(wrapper, "_abort_local_communicator", record_abort)
     callbacks = []
@@ -2125,10 +2125,10 @@ def test_local_fatal_waits_for_delayed_monitor_exit_before_publication(
 
     original_read = wrapper._read_fatal_origin
 
-    def record_monitor_store_read():
+    def record_monitor_store_read(**kwargs):
         with gate._condition:
             store_read_phases.append(gate._phase)
-        return original_read()
+        return original_read(**kwargs)
 
     monkeypatch.setattr(wrapper, "_read_fatal_origin", record_monitor_store_read)
     original_monitor_wait = wrapper._fatal_monitor_stop.wait
@@ -2264,9 +2264,9 @@ def test_close_ready_fatal_joins_monitor_before_publication_and_prevents_late_st
     monkeypatch.setattr(wrapper, "_fatal_store_set", store_set)
     original_read = wrapper._read_fatal_origin
 
-    def read_fatal_origin():
+    def read_fatal_origin(**kwargs):
         record_store_access("monitor_read")
-        return original_read()
+        return original_read(**kwargs)
 
     monkeypatch.setattr(wrapper, "_read_fatal_origin", read_fatal_origin)
     original_select = wrapper._select_fatal_monitor_outcome
@@ -4290,14 +4290,14 @@ def test_monitor_atomically_hands_existing_local_fatal_to_worker(monkeypatch):
     monkeypatch.setattr(wrappers[1], "_begin_fatal_publication", record_begin)
     original_prepare = wrappers[1]._prepare_local_fatal_locked
 
-    def hold_observable_direct_owner():
+    def hold_observable_direct_owner(**kwargs):
         if threading.current_thread().name == "task-18.2-direct-publisher":
             reservation = wrappers[1]._fatal_publication_local.reservation
             assert reservation.started is True
             assert direct_begins == [(True, False, False, 1)]
             direct_owner_reserved.set()
             assert release_direct_owner.wait(3.0)
-        return original_prepare()
+        return original_prepare(**kwargs)
 
     monkeypatch.setattr(
         wrappers[1], "_prepare_local_fatal_locked", hold_observable_direct_owner
@@ -5293,7 +5293,7 @@ def test_active_broadcast_validation_failure_self_defers_first_owner(monkeypatch
     worker_name = "task-18.2-validation-first-owner"
     original_wait = wrapper._wait_for_active_broadcast_agreements
 
-    def forbid_active_broadcast_self_wait():
+    def forbid_active_broadcast_self_wait(**kwargs):
         if (
             threading.current_thread().name == worker_name
             and wrapper._active_broadcast_agreements
@@ -5301,7 +5301,7 @@ def test_active_broadcast_validation_failure_self_defers_first_owner(monkeypatch
             error = AssertionError("active-B discoverer waited on itself")
             self_wait_errors.append(error)
             raise error
-        return original_wait()
+        return original_wait(**kwargs)
 
     def hard_exit():
         hard_exits.append(threading.current_thread().name)
@@ -5378,10 +5378,10 @@ def test_active_broadcast_validation_failure_joins_existing_owner(monkeypatch):
     original_barrier_wait = wrapper._wait_for_active_broadcast_agreements
     original_join = wrapper._wait_for_joined_fatal_publication
 
-    def observe_owner_barrier():
+    def observe_owner_barrier(**kwargs):
         if threading.current_thread().name == owner_name:
             owner_waiting.set()
-        return original_barrier_wait()
+        return original_barrier_wait(**kwargs)
 
     def forbid_active_broadcast_self_join(**kwargs):
         if (
@@ -5645,7 +5645,7 @@ def test_fatal_owner_cancellation_retains_owner_and_bounds_close(monkeypatch):
     publisher_name = "task-18.2-cancelled-fatal-owner"
     close_name = "task-18.2-cancelled-fatal-close"
 
-    def cancel_barrier():
+    def cancel_barrier(**_kwargs):
         raise cancellation
 
     monkeypatch.setattr(
@@ -7568,6 +7568,7 @@ def test_gate_failure_signal_uses_one_immutable_finite_claim(monkeypatch):
 
 def test_live_gate_failure_claim_is_not_stolen_after_deadline(monkeypatch):
     from renormalizer.backend._distributed import collectives as collectives_module
+    from renormalizer.backend._distributed import terminal as terminal_module
 
     class FatalHardExit(BaseException):
         pass
@@ -7593,6 +7594,7 @@ def test_live_gate_failure_claim_is_not_stolen_after_deadline(monkeypatch):
     hard_exit_claimed = threading.Event()
 
     monkeypatch.setattr(collectives_module, "_FATAL_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(terminal_module, "_TERMINAL_TIMEOUT_S", 0.05)
     real_gate_primitive = gate._fail_fatal_publication
 
     def record_gate_primitive(transition, failure):
@@ -9035,7 +9037,7 @@ def test_structured_terminalizer_marks_before_diagnostic_and_hard_exits_once(
         monkeypatch.setattr(
             wrapper,
             "_read_fatal_origin",
-            lambda: (_ for _ in ()).throw(trigger),
+            lambda **_kwargs: (_ for _ in ()).throw(trigger),
         )
 
         def call():
@@ -9050,7 +9052,9 @@ def test_structured_terminalizer_marks_before_diagnostic_and_hard_exits_once(
         monkeypatch.setattr(
             wrapper._fatal_monitor_handoff,
             "wait_for_selection",
-            lambda _timeout: (_ for _ in ()).throw(TimeoutError()),
+            lambda *_args, **_kwargs: (
+                _ for _ in ()
+            ).throw(TimeoutError()),
         )
 
         def call():
@@ -9278,7 +9282,7 @@ def test_true_pre_owner_monitor_read_failure_marks_before_exit(monkeypatch):
     hard_exits = []
     original_dispatch = wrapper._dispatch_fatal_secondaries
 
-    def fail_read():
+    def fail_read(**_kwargs):
         raise primary
 
     def record_dispatch(errors):
@@ -9442,7 +9446,7 @@ def test_blocked_monitor_read_does_not_block_stop_or_publish_late_result(
     stop_results = []
     read_calls = []
 
-    def blocked_read():
+    def blocked_read(**_kwargs):
         read_calls.append(True)
         if len(read_calls) > 1:
             return None
@@ -9928,3 +9932,154 @@ def test_fatal_origin_read_uses_bounded_store_get_with_inherited_deadline(
 
     assert wrapper._read_fatal_origin(_deadline=deadline) == 0
     assert calls == [(wrapper._fatal_key(0), deadline)]
+
+
+@pytest.mark.parametrize(
+    "family",
+    (
+        "abort_wait",
+        "acknowledgments",
+        "monitor_outcome",
+        "monitor_selection",
+        "monitor_exit",
+        "monitor_join",
+        "fatal_prepare",
+        "fatal_publish",
+    ),
+)
+def test_every_fatal_wait_family_consumes_one_transition_deadline(
+    monkeypatch,
+    family,
+):
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    primary = RuntimeError("fatal deadline family {}".format(family))
+    transition = runtime._terminal_gate.begin_fatal(primary)
+    deadline = transition.deadline
+    observed = []
+
+    if family == "abort_wait":
+        class AbortEvent:
+            def wait(self, timeout):
+                observed.append(timeout)
+                return True
+
+        wrapper._fatal_abort_event = AbortEvent()
+        wrapper._fatal_abort_completed = True
+        wrapper._fatal_abort_error = None
+        monkeypatch.setattr(
+            time,
+            "monotonic",
+            lambda: deadline - 1.25,
+        )
+        wrapper._wait_for_local_communicator_abort(_deadline=deadline)
+        assert observed == [pytest.approx(1.25)]
+    elif family == "acknowledgments":
+        monkeypatch.setattr(
+            wrapper,
+            "_wait_for_all_control_records",
+            lambda *_args, _deadline=None, **_kwargs: observed.append(_deadline),
+        )
+        wrapper._wait_for_fatal_acknowledgments(_deadline=deadline)
+        assert observed == [deadline]
+    elif family == "monitor_outcome":
+        expected = object()
+        monkeypatch.setattr(
+            wrapper._fatal_monitor_handoff,
+            "wait_for_outcome",
+            lambda generation, *, _deadline: (
+                observed.append((generation, _deadline)) or expected
+            ),
+        )
+        assert wrapper._wait_for_fatal_monitor_outcome(
+            7,
+            _deadline=deadline,
+        ) is expected
+        assert observed == [(7, deadline)]
+    elif family == "monitor_selection":
+        expected = object()
+        monkeypatch.setattr(
+            wrapper._fatal_monitor_handoff,
+            "wait_for_selection",
+            lambda *, _deadline: observed.append(_deadline) or expected,
+        )
+        assert wrapper._wait_for_fatal_monitor_selection(
+            _deadline=deadline,
+        ) is expected
+        assert observed == [deadline]
+    elif family == "monitor_exit":
+        outcome = object()
+        monkeypatch.setattr(
+            wrapper._fatal_monitor_handoff,
+            "wait_for_exit",
+            lambda retained, *, _deadline: (
+                observed.append((retained, _deadline)) or retained
+            ),
+        )
+        assert wrapper._wait_for_fatal_monitor_exit(
+            outcome,
+            _deadline=deadline,
+        ) is outcome
+        assert observed == [(outcome, deadline)]
+    elif family == "monitor_join":
+        class Monitor:
+            def join(self, timeout):
+                observed.append(timeout)
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        monkeypatch.setattr(time, "monotonic", lambda: deadline - 2.0)
+        wrapper._join_fatal_monitor(Monitor(), _deadline=deadline)
+        assert observed == [pytest.approx(2.0)]
+    elif family == "fatal_prepare":
+        wrapper._fatal_pending_primary = primary
+        wrapper._fatal_store_announced = True
+        wrapper._fatal_monitor_thread = None
+        outcome = SimpleNamespace(kind="fatal_elected", primary=primary)
+        monkeypatch.setattr(
+            wrapper,
+            "_select_runtime_fatal_outcome",
+            lambda retained, *, _deadline: (
+                observed.append(("select", retained, _deadline)) or outcome
+            ),
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_abort_local_communicator",
+            lambda *, _deadline: observed.append(("abort", _deadline)),
+        )
+        wrapper._prepare_local_fatal_locked(_deadline=deadline)
+        assert observed == [
+            ("select", primary, deadline),
+            ("abort", deadline),
+        ]
+    else:
+        wrapper._fatal_control_initialized = True
+        wrapper._fatal_pending_primary = primary
+        monkeypatch.setattr(
+            wrapper,
+            "_wait_for_local_communicator_abort",
+            lambda *, _deadline: observed.append(("abort", _deadline)),
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_fatal_store_set",
+            lambda *_args, _deadline=None, **_kwargs: observed.append(
+                ("store", _deadline)
+            ),
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_wait_for_fatal_acknowledgments",
+            lambda *, _deadline: observed.append(("ack", _deadline)),
+        )
+        assert wrapper._publish_communicator_fatal_locked(
+            primary,
+            _deadline=deadline,
+        ) is primary
+        assert observed == [
+            ("abort", deadline),
+            ("store", deadline),
+            ("ack", deadline),
+        ]

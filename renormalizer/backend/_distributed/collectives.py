@@ -788,7 +788,7 @@ class CupyNcclCollective:
         if owner is None:
             return self._terminalize_pre_owner_fatal_failure(error)
 
-        deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        deadline = self._inherited_fatal_deadline()
         with self._fatal_condition:
             while (
                 self._fatal_publication_failure is None
@@ -1172,6 +1172,9 @@ class CupyNcclCollective:
                 transition=transition,
             )
             reservation.retain_diagnostics(diagnostics)
+            deadline = self._inherited_fatal_deadline(
+                None if transition is None else transition.deadline
+            )
         except BaseException as setup_error:
             if self._current_thread_claimed_fatal_hard_exit():
                 raise
@@ -1188,7 +1191,9 @@ class CupyNcclCollective:
             raise primary
         if not started:
             if monitor_deferred:
-                outcome = self._wait_for_fatal_monitor_selection()
+                outcome = self._wait_for_fatal_monitor_selection(
+                    _deadline=deadline,
+                )
                 if outcome.kind != "fatal_elected" or outcome.primary is not primary:
                     raise RuntimeError("deferred monitor fatal outcome changed")
                 self._fatal_monitor_outcome = outcome
@@ -1231,21 +1236,31 @@ class CupyNcclCollective:
             if transition is not None and transition.primary is not primary:
                 raise RuntimeError("communicator fatal primary changed")
             if transition is not None:
-                self._confirm_runtime_fatal_outcome(primary)
+                self._confirm_runtime_fatal_outcome(
+                    primary,
+                    _deadline=deadline,
+                )
             self._refresh_fatal_handler(
                 reservation,
                 fatal_owner=fatal_owner,
                 discovering_token=discovering_token,
             )
             if not defer_completion:
-                self._wait_for_active_broadcast_agreements()
-                self._prepare_local_fatal_locked()
+                self._wait_for_active_broadcast_agreements(
+                    _deadline=deadline,
+                )
+                self._prepare_local_fatal_locked(_deadline=deadline)
             yield reservation
             if defer_completion:
-                self._wait_for_active_broadcast_agreements()
-                self._prepare_local_fatal_locked()
+                self._wait_for_active_broadcast_agreements(
+                    _deadline=deadline,
+                )
+                self._prepare_local_fatal_locked(_deadline=deadline)
             self._run_fatal_handler(reservation)
-            self._publish_communicator_fatal_locked(primary)
+            self._publish_communicator_fatal_locked(
+                primary,
+                _deadline=deadline,
+            )
             self._complete_fatal_handler(reservation)
             transition_errors = self._collect_fatal_transition_secondaries(
                 reservation.transition_handler,
@@ -1456,7 +1471,9 @@ class CupyNcclCollective:
         failure_confirmed,
     ):
         current_thread = threading.current_thread()
-        protocol_deadline = time.monotonic() + _FATAL_TIMEOUT_S
+        protocol_deadline = self._inherited_fatal_deadline(
+            transition.deadline,
+        )
         signal_errors = []
         for _attempt in range(2):
             claim = _FatalGateFailureClaim(
@@ -1986,7 +2003,9 @@ class CupyNcclCollective:
                     return transition.deadline
         return time.monotonic() + _FATAL_TIMEOUT_S
 
-    def _abort_local_communicator(self):
+    def _abort_local_communicator(self, *, _deadline=None):
+        deadline = self._inherited_fatal_deadline(_deadline)
+
         def abort():
             current = threading.current_thread()
             with self._fatal_condition:
@@ -2048,12 +2067,21 @@ class CupyNcclCollective:
             if claimed:
                 self._retain_fatal_secondary_direct(start_error)
             elif thread.ident is not None:
-                thread.join(_FATAL_TIMEOUT_S)
+                remaining = _remaining_lifecycle_time(
+                    deadline,
+                    "NCCL communicator abort start recovery timed out",
+                )
+                thread.join(remaining)
         return self._fatal_abort_event
 
-    def _wait_for_local_communicator_abort(self):
+    def _wait_for_local_communicator_abort(self, *, _deadline=None):
+        deadline = self._inherited_fatal_deadline(_deadline)
         event = self._fatal_abort_event
-        if not event.wait(_FATAL_TIMEOUT_S):
+        remaining = _remaining_lifecycle_time(
+            deadline,
+            "NCCL communicator abort timed out",
+        )
+        if not event.wait(remaining):
             error = RuntimeError("NCCL communicator abort timed out")
             self._fail_stop_fatal_path(error)
         with self._fatal_lock:
@@ -2065,10 +2093,11 @@ class CupyNcclCollective:
             error = RuntimeError("NCCL communicator abort did not complete")
             self._fail_stop_fatal_path(error)
 
-    def _wait_for_fatal_acknowledgments(self):
+    def _wait_for_fatal_acknowledgments(self, *, _deadline=None):
         self._wait_for_all_control_records(
             self._fatal_ack_key,
             "communicator fatal acknowledgment timed out",
+            _deadline=self._inherited_fatal_deadline(_deadline),
         )
 
     def _wait_for_all_control_records(
@@ -2078,11 +2107,7 @@ class CupyNcclCollective:
         *,
         _deadline=None,
     ):
-        deadline = (
-            time.monotonic() + _FATAL_TIMEOUT_S
-            if _deadline is None
-            else _deadline
-        )
+        deadline = self._inherited_fatal_deadline(_deadline)
         while True:
             if all(
                 int(self._fatal_store_get(key(rank), _deadline=deadline)) == 1
@@ -2094,31 +2119,43 @@ class CupyNcclCollective:
                 self._fail_stop_fatal_path(error)
             time.sleep(0.001)
 
-    def _prepare_local_fatal_locked(self):
+    def _prepare_local_fatal_locked(self, *, _deadline=None):
+        deadline = self._inherited_fatal_deadline(_deadline)
         with self._fatal_lock:
             announce = not self._fatal_store_announced
             self._fatal_store_announced = True
             primary = self._fatal_pending_primary
             monitor = self._fatal_monitor_thread
             monitor_live = monitor is not None and monitor.is_alive()
-        outcome = self._select_runtime_fatal_outcome(primary)
+        outcome = self._select_runtime_fatal_outcome(
+            primary,
+            _deadline=deadline,
+        )
         if monitor is threading.current_thread():
             raise RuntimeError("fatal monitor cannot own communicator publication")
         elif monitor_live:
-            self._wait_for_fatal_monitor_exit(outcome)
-            self._join_fatal_monitor(monitor)
+            self._wait_for_fatal_monitor_exit(
+                outcome,
+                _deadline=deadline,
+            )
+            self._join_fatal_monitor(monitor, _deadline=deadline)
         if announce:
-            self._fatal_store_set(self._fatal_key(self.rank), 1)
-        self._abort_local_communicator()
+            self._fatal_store_set(
+                self._fatal_key(self.rank),
+                1,
+                _deadline=deadline,
+            )
+        self._abort_local_communicator(_deadline=deadline)
 
-    def _publish_communicator_fatal_locked(self, primary):
+    def _publish_communicator_fatal_locked(self, primary, *, _deadline=None):
+        deadline = self._inherited_fatal_deadline(_deadline)
         with self._fatal_lock:
             if self._fatal_protocol_completed:
                 return primary
         if not self._fatal_control_initialized:
             missing = RuntimeError("communicator fatal control is unavailable")
             self._fail_stop_fatal_path(missing)
-        self._wait_for_local_communicator_abort()
+        self._wait_for_local_communicator_abort(_deadline=deadline)
         with self._fatal_lock:
             with self._fatal_publication_lock:
                 if self._fatal_pending_primary is not primary:
@@ -2126,8 +2163,12 @@ class CupyNcclCollective:
                 if self._fatal_error is None:
                     self._fatal_error = primary
                     self._fatal_origin_rank = self._fatal_pending_origin_rank
-        self._fatal_store_set(self._fatal_ack_key(self.rank), 1)
-        self._wait_for_fatal_acknowledgments()
+        self._fatal_store_set(
+            self._fatal_ack_key(self.rank),
+            1,
+            _deadline=deadline,
+        )
+        self._wait_for_fatal_acknowledgments(_deadline=deadline)
         with self._fatal_lock:
             self._fatal_protocol_completed = True
         return primary
@@ -2353,7 +2394,8 @@ class CupyNcclCollective:
         self._fatal_monitor_stop.set()
         return outcome
 
-    def _confirm_runtime_fatal_outcome(self, primary):
+    def _confirm_runtime_fatal_outcome(self, primary, *, _deadline=None):
+        self._inherited_fatal_deadline(_deadline)
         outcome = self._select_fatal_monitor_outcome("fatal_elected", primary)
         if outcome.kind != "fatal_elected" or outcome.primary is not primary:
             raise RuntimeError("clean monitor stop preempted communicator fatal")
@@ -2363,12 +2405,16 @@ class CupyNcclCollective:
         self._fatal_monitor_stop.set()
         return outcome
 
-    def _select_runtime_fatal_outcome(self, primary):
+    def _select_runtime_fatal_outcome(self, primary, *, _deadline=None):
+        deadline = self._inherited_fatal_deadline(_deadline)
         with self._fatal_lock:
             confirmed = self._fatal_monitor_outcome_confirmed
             outcome = self._fatal_monitor_outcome
         if not confirmed:
-            return self._confirm_runtime_fatal_outcome(primary)
+            return self._confirm_runtime_fatal_outcome(
+                primary,
+                _deadline=deadline,
+            )
         if outcome.kind != "fatal_elected" or outcome.primary is not primary:
             raise RuntimeError("clean monitor stop preempted communicator fatal")
         self._fatal_monitor_stop.set()
@@ -2376,22 +2422,24 @@ class CupyNcclCollective:
 
     def _wait_for_fatal_monitor_outcome(self, generation, *, _deadline=None):
         try:
-            remaining = _remaining_lifecycle_time(
-                _deadline,
+            deadline = self._inherited_fatal_deadline(_deadline)
+            _remaining_lifecycle_time(
+                deadline,
                 "communicator fatal monitor stop timed out",
             )
             return self._fatal_monitor_handoff.wait_for_outcome(
                 generation,
-                _FATAL_TIMEOUT_S if remaining is None else remaining,
+                _deadline=deadline,
             )
         except TimeoutError:
             error = RuntimeError("communicator fatal monitor stop timed out")
             self._fail_stop_fatal_path(error)
 
-    def _wait_for_fatal_monitor_selection(self):
+    def _wait_for_fatal_monitor_selection(self, *, _deadline=None):
         try:
+            deadline = self._inherited_fatal_deadline(_deadline)
             return self._fatal_monitor_handoff.wait_for_selection(
-                _FATAL_TIMEOUT_S
+                _deadline=deadline,
             )
         except TimeoutError:
             error = RuntimeError(
@@ -2404,13 +2452,14 @@ class CupyNcclCollective:
 
     def _wait_for_fatal_monitor_exit(self, outcome, *, _deadline=None):
         try:
-            remaining = _remaining_lifecycle_time(
-                _deadline,
+            deadline = self._inherited_fatal_deadline(_deadline)
+            _remaining_lifecycle_time(
+                deadline,
                 "communicator fatal monitor exit acknowledgment timed out",
             )
             return self._fatal_monitor_handoff.wait_for_exit(
                 outcome,
-                _FATAL_TIMEOUT_S if remaining is None else remaining,
+                _deadline=deadline,
             )
         except TimeoutError:
             error = RuntimeError(
@@ -2421,16 +2470,19 @@ class CupyNcclCollective:
     def _join_fatal_monitor(self, thread, *, _deadline=None):
         if thread is None or thread is threading.current_thread():
             return
+        deadline = self._inherited_fatal_deadline(_deadline)
         remaining = _remaining_lifecycle_time(
-            _deadline,
+            deadline,
             "communicator fatal monitor stop timed out",
         )
-        thread.join(_FATAL_TIMEOUT_S if remaining is None else remaining)
+        thread.join(remaining)
         if thread.is_alive():
             error = RuntimeError("communicator fatal monitor stop timed out")
             self._fail_stop_fatal_path(error)
 
     def _start_fatal_monitor_publication(self, error, origin_rank):
+        deadline = self._inherited_fatal_deadline()
+
         def publish():
             current = threading.current_thread()
             diagnostics = ()
@@ -2518,7 +2570,11 @@ class CupyNcclCollective:
                     self._dispatch_fatal_secondaries((start_error,))
                 return thread
             if thread.ident is not None:
-                thread.join(_FATAL_TIMEOUT_S)
+                remaining = _remaining_lifecycle_time(
+                    deadline,
+                    "remote fatal publisher start recovery timed out",
+                )
+                thread.join(remaining)
             self._terminalize_pre_owner_fatal_failure(
                 error,
                 diagnostics=(start_error,),

@@ -20,6 +20,7 @@ from renormalizer.backend._distributed.solvers import (
 from renormalizer.backend._distributed.terminal import (
     _publish_lease_construction_resource,
     _publish_lease_construction_resource_direct,
+    _require_managed_resource_admission,
 )
 from renormalizer.backend._distributed.transfer import TransferProfile
 
@@ -383,7 +384,23 @@ class HostTensorStore:
                 raise ValueError("destination must be writable")
             np.copyto(destination, source, casting="no")
 
-    def reserve(self, snapshot, *, dirty_ref, _construction_slot=None):
+    def reserve(
+        self,
+        snapshot,
+        *,
+        dirty_ref,
+        _construction_slot=None,
+        _managed_guard=None,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        _require_managed_resource_admission(
+            _managed_guard,
+            _admission_token,
+            _admission_validator,
+            allowed_scopes=("construction",),
+            allowed_operations=("lease_construction",),
+        )
         if not isinstance(snapshot, HostTensorStoreSnapshot):
             raise TypeError("snapshot must be a HostTensorStoreSnapshot")
         if not isinstance(dirty_ref, HostTensorRef):
@@ -400,7 +417,15 @@ class HostTensorStore:
                 raise HostTensorError(
                     "authorized dirty ref is outside the complete snapshot"
                 )
-            reservation = _HostTensorReservation(self, snapshot, dirty_ref)
+            reservation = _HostTensorReservation(
+                self,
+                snapshot,
+                dirty_ref,
+                _managed_guard=_managed_guard,
+                _managed_epoch=(
+                    None if _admission_token is None else _admission_token.epoch
+                ),
+            )
             self._reservations[id(reservation)] = reservation
         _publish_lease_construction_resource_direct(
             _construction_slot,
@@ -539,21 +564,70 @@ class HostTensorStore:
 
 
 class _HostTensorReservation:
-    def __init__(self, store, snapshot, dirty_ref):
+    def __init__(
+        self,
+        store,
+        snapshot,
+        dirty_ref,
+        *,
+        _managed_guard=None,
+        _managed_epoch=None,
+    ):
         self._store = store
         self._snapshot = snapshot
         self._dirty_ref = dirty_ref
         self._committed = False
         self._closed = False
+        self._managed_guard = _managed_guard
+        self._managed_epoch = _managed_epoch
+
+    def _require_admission(
+        self,
+        token=None,
+        validator=None,
+        *,
+        allowed_scopes,
+        allowed_operations,
+    ):
+        return _require_managed_resource_admission(
+            self._managed_guard,
+            token,
+            validator,
+            allowed_scopes=allowed_scopes,
+            allowed_operations=allowed_operations,
+            epoch=lambda _token: self._managed_epoch,
+        )
 
     @property
     def refs(self):
+        self._require_admission(
+            allowed_scopes=("construction", "lease", "lease_close"),
+            allowed_operations=(
+                "lease_construction",
+                "operator_call",
+                "resource_state",
+                "schedule_writeback",
+                "store_reservation_close",
+                "async_completion",
+            ),
+        )
         if self._closed:
             return ()
         return self._snapshot.refs
 
     @property
     def snapshot(self):
+        self._require_admission(
+            allowed_scopes=("construction", "lease", "lease_close"),
+            allowed_operations=(
+                "lease_construction",
+                "operator_call",
+                "resource_state",
+                "schedule_writeback",
+                "store_reservation_close",
+                "async_completion",
+            ),
+        )
         if self._closed:
             raise HostTensorError("host tensor reservation is closed")
         return self._snapshot
@@ -563,12 +637,39 @@ class _HostTensorReservation:
         self._snapshot = snapshot
         self._committed = True
 
-    def commit(self, ref, value):
+    def commit(
+        self,
+        ref,
+        value,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_scopes=("lease", "lease_close"),
+            allowed_operations=("async_completion",),
+        )
         if self._closed:
             raise HostTensorError("host tensor reservation is closed")
         return self._store._commit_reservation(self, ref, value)
 
-    def close(self):
+    def close(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_scopes=("construction", "lease_close"),
+            allowed_operations=(
+                "lease_construction",
+                "store_reservation_close",
+            ),
+        )
         if self._closed:
             return
         store = self._store

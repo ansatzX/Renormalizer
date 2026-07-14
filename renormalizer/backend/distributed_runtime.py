@@ -1470,7 +1470,7 @@ class CupyDistributedRuntime:
             if owner is None:
                 status_workspace = getattr(lease, "_status_workspace", None)
                 if status_workspace is not None:
-                    owner = status_workspace.borrower
+                    owner = getattr(status_workspace, "_borrower", None)
         call = None if owner is None else getattr(owner, "_operator_call", None)
         backend = self.backend
         transition = self._terminal_gate._fatal_transition
@@ -2912,16 +2912,16 @@ class CupyDistributedRuntime:
                 transition,
                 finalize_pending,
             )
-        except BaseException:
+        except BaseException as commit_error:
             with self._terminal_gate._condition:
                 publication_failed = (
                     self._terminal_gate._fatal_transition is transition
                     and self._terminal_gate._fatal_publication_failure
                     is transition.primary
                 )
+            with self._terminal_state_lock:
+                collective = self._pending_fatal_collective
             if publication_failed:
-                with self._terminal_state_lock:
-                    collective = self._pending_fatal_collective
                 join_publication = (
                     None
                     if collective is None
@@ -2933,6 +2933,16 @@ class CupyDistributedRuntime:
                 )
                 if callable(join_publication):
                     join_publication(_deadline=transition.deadline)
+                else:
+                    self._finish_failed_fatal_runtime_close(transition)
+            else:
+                fail_stop = (
+                    None
+                    if collective is None
+                    else getattr(collective, "_fail_stop_fatal_path", None)
+                )
+                if callable(fail_stop):
+                    fail_stop(commit_error)
                 else:
                     self._finish_failed_fatal_runtime_close(transition)
             raise
@@ -3055,7 +3065,9 @@ class CupyDistributedRuntime:
         )
         _, _, frozen_scheduler = self._runtime_close_snapshot()
         if frozen_scheduler is not None:
-            frozen_scheduler._start_counted_completions()
+            frozen_scheduler._start_counted_completions(
+                _close_transition=transition,
+            )
         transition = self._terminal_gate._drain_runtime_close(transition)
         if isinstance(transition, _FatalTransition):
             primary = transition.primary

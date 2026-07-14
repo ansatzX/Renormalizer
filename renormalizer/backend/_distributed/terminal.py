@@ -50,6 +50,73 @@ class _ResourceAdmission:
     transition_sequence: int | None = None
 
 
+_MANAGED_LIVE_EPOCH = object()
+_MANAGED_DEFERRED_EPOCH = object()
+
+_MANAGED_SCOPE_OPERATIONS = {
+    "runtime": frozenset(
+        {
+            "barrier_collective",
+            "begin_runtime_close",
+            "resource_state",
+        }
+    ),
+    "runtime_setup": frozenset(
+        {
+            "budget_probe",
+            "execution_config",
+            "execution_config_backend_sync",
+            "preflight_residency",
+            "provider_config_match",
+            "provider_construct",
+            "provider_install",
+        }
+    ),
+    "construction": frozenset({"lease_construction"}),
+    "lease": frozenset(
+        {
+            "acquire",
+            "cache_refcount",
+            "child_close",
+            "close_progress",
+            "load",
+            "mark_dirty",
+            "operator_call",
+            "prefetch",
+            "reap",
+            "resource_state",
+        }
+    ),
+    "lease_close": frozenset(
+        {
+            "cache_invalidate",
+            "cache_lifetime_reconcile",
+            "cache_reservation_close",
+            "cache_wait",
+            "child_close",
+            "emit_profile",
+            "observe_peaks",
+            "pool_close",
+            "pool_reap",
+            "schedule_writeback",
+            "scheduler_close",
+            "scheduler_complete",
+            "status_close",
+            "store_reservation_close",
+        }
+    ),
+    "runtime_close": frozenset(
+        {
+            "collective_close",
+            "collective_close_ready",
+            "collective_monitor_start",
+            "collective_monitor_stop",
+            "provider_close",
+        }
+    ),
+}
+
+
 @dataclass(frozen=True)
 class _ManagedResourceAdmissionGuard:
     """Immutable capability binding one managed resource graph to one gate."""
@@ -64,7 +131,15 @@ class _ManagedResourceAdmissionGuard:
             raise TypeError("managed resource admission guard requires a gate")
         object.__setattr__(self, "gate_id", gate_id)
 
-    def require(self, token=None, validator=None):
+    def require(
+        self,
+        token=None,
+        validator=None,
+        *,
+        allowed_scopes=None,
+        allowed_operations=None,
+        epoch=_MANAGED_LIVE_EPOCH,
+    ):
         if (token is None) != (validator is None):
             raise TypeError("managed resource requires an exact admission pair")
         gate = self.gate
@@ -78,24 +153,62 @@ class _ManagedResourceAdmissionGuard:
                     raise RuntimeError(
                         "managed resource admission state is inconsistent"
                     )
-                gate._require_token_thread(state)
-                return state.token
-        if not callable(validator):
-            raise TypeError("managed resource admission validator is required")
-        validated = validator(token)
-        if validated is not token:
-            raise RuntimeError("managed resource admission validator changed token")
+                token = state.token
+        else:
+            if not callable(validator):
+                raise TypeError("managed resource admission validator is required")
+            validated = validator(token)
+            if validated is not token:
+                raise RuntimeError("managed resource admission validator changed token")
+
+        if callable(epoch):
+            with gate._condition:
+                if token.gate_id != self.gate_id:
+                    raise RuntimeError(
+                        "managed resource admission belongs to another gate"
+                    )
+                gate._require_managed_resource_admission_locked(
+                    token,
+                    allowed_scopes=allowed_scopes,
+                    allowed_operations=allowed_operations,
+                    epoch=_MANAGED_DEFERRED_EPOCH,
+                )
+            resolved_epoch = epoch(token)
+        else:
+            resolved_epoch = epoch
         with gate._condition:
-            state = gate._token_state(token)
-            gate._require_token_thread(state)
             if token.gate_id != self.gate_id:
                 raise RuntimeError(
                     "managed resource admission belongs to another gate"
                 )
+            gate._require_managed_resource_admission_locked(
+                token,
+                allowed_scopes=allowed_scopes,
+                allowed_operations=allowed_operations,
+                epoch=resolved_epoch,
+            )
         return token
 
+    def require_close_transition(self, transition, *, epoch):
+        gate = self.gate
+        if callable(epoch):
+            gate._require_managed_close_transition(
+                transition,
+                epoch=_MANAGED_DEFERRED_EPOCH,
+            )
+            epoch = epoch(transition)
+        return gate._require_managed_close_transition(transition, epoch=epoch)
 
-def _require_managed_resource_admission(guard, token=None, validator=None):
+
+def _require_managed_resource_admission(
+    guard,
+    token=None,
+    validator=None,
+    *,
+    allowed_scopes=None,
+    allowed_operations=None,
+    epoch=_MANAGED_LIVE_EPOCH,
+):
     """Validate managed access or preserve explicit standalone behavior."""
     if guard is None:
         if token is None and validator is None:
@@ -107,7 +220,13 @@ def _require_managed_resource_admission(guard, token=None, validator=None):
         return validator(token)
     if not isinstance(guard, _ManagedResourceAdmissionGuard):
         raise TypeError("managed resource admission guard is invalid")
-    return guard.require(token, validator)
+    return guard.require(
+        token,
+        validator,
+        allowed_scopes=allowed_scopes,
+        allowed_operations=allowed_operations,
+        epoch=epoch,
+    )
 
 
 def _resolve_managed_resource_guard(*, standalone, guard):
@@ -282,10 +401,28 @@ class _FatalMonitorHandoff:
                     self._condition.notify_all()
             return self._outcome
 
+    @staticmethod
+    def _wait_deadline(timeout_s, deadline):
+        if deadline is not None:
+            if timeout_s is not None:
+                raise TypeError("fatal monitor wait received two deadlines")
+            _remaining_lifecycle_time(
+                deadline,
+                "fatal monitor lifecycle deadline expired",
+            )
+            return deadline
+        if timeout_s is None:
+            raise TypeError("fatal monitor wait requires a lifecycle deadline")
+        return _TerminalLifecycleGate._deadline(timeout_s)
+
     def wait_for_outcome(
-        self, generation: int, timeout_s: float
+        self,
+        generation: int,
+        timeout_s: float | None = None,
+        *,
+        _deadline=None,
     ) -> _MonitorOutcome:
-        deadline = _TerminalLifecycleGate._deadline(timeout_s)
+        deadline = self._wait_deadline(timeout_s, _deadline)
         with self._condition:
             if generation != self._requested_generation:
                 raise RuntimeError("monitor stop generation is not current")
@@ -296,8 +433,13 @@ class _FatalMonitorHandoff:
                 self._condition.wait(remaining)
             return self._outcome
 
-    def wait_for_selection(self, timeout_s: float) -> _MonitorOutcome:
-        deadline = _TerminalLifecycleGate._deadline(timeout_s)
+    def wait_for_selection(
+        self,
+        timeout_s: float | None = None,
+        *,
+        _deadline=None,
+    ) -> _MonitorOutcome:
+        deadline = self._wait_deadline(timeout_s, _deadline)
         with self._condition:
             while self._outcome is None:
                 remaining = deadline - time.monotonic()
@@ -318,9 +460,13 @@ class _FatalMonitorHandoff:
             return self._exited_outcome
 
     def wait_for_exit(
-        self, outcome: _MonitorOutcome, timeout_s: float
+        self,
+        outcome: _MonitorOutcome,
+        timeout_s: float | None = None,
+        *,
+        _deadline=None,
     ) -> _MonitorOutcome:
-        deadline = _TerminalLifecycleGate._deadline(timeout_s)
+        deadline = self._wait_deadline(timeout_s, _deadline)
         with self._condition:
             if outcome is not self._outcome:
                 raise RuntimeError("monitor exit outcome is not selected")
@@ -467,6 +613,7 @@ def _publish_lease_construction_resource_direct(
         records=records,
         events=events,
         streams=streams,
+        _allow_committed=True,
     )
 
 
@@ -614,6 +761,156 @@ class _TerminalLifecycleGate:
         if state.async_capability is _MISSING or state.async_claimed:
             if self._thread_tokens.get(thread_id) != state.token.sequence:
                 raise RuntimeError("resource admission thread state is inconsistent")
+
+    def _require_managed_resource_admission_locked(
+        self,
+        token,
+        *,
+        allowed_scopes,
+        allowed_operations,
+        epoch,
+    ):
+        """Prove one canonical managed-resource capability under the gate lock."""
+        state = self._token_state(token)
+        self._require_token_thread(state)
+        scopes = (
+            tuple(_MANAGED_SCOPE_OPERATIONS)
+            if allowed_scopes is None
+            else tuple(allowed_scopes)
+        )
+        if token.scope not in scopes:
+            raise RuntimeError(
+                "managed resource admission scope is not authorized"
+            )
+        canonical_operations = _MANAGED_SCOPE_OPERATIONS.get(token.scope, ())
+        operations = (
+            canonical_operations | {"async_completion"}
+            if allowed_operations is None
+            else frozenset(allowed_operations)
+        )
+        is_async = token.parent_sequence is not None
+        if is_async:
+            if token.operation != "async_completion":
+                raise RuntimeError(
+                    "managed resource admission async operation is not canonical"
+                )
+            if "async_completion" not in operations:
+                raise RuntimeError(
+                    "managed resource admission operation is not authorized"
+                )
+            if state.async_capability is _MISSING or not state.async_claimed:
+                raise RuntimeError(
+                    "managed resource admission capability is not claimed"
+                )
+            parent_state = self._tokens.get(token.parent_sequence)
+            if parent_state is None:
+                raise RuntimeError(
+                    "managed resource admission parent is unavailable"
+                )
+            parent = parent_state.token
+            if (
+                parent.scope != token.scope
+                or parent.epoch != token.epoch
+                or parent.transition_sequence != token.transition_sequence
+                or parent.operation
+                not in _MANAGED_SCOPE_OPERATIONS.get(parent.scope, ())
+            ):
+                raise RuntimeError(
+                    "managed resource admission parent is not canonical"
+                )
+        elif token.operation not in canonical_operations or token.operation not in operations:
+            raise RuntimeError(
+                "managed resource admission operation is not authorized"
+            )
+
+        if token.scope == "lease_close":
+            lease = self._lease_state(token.epoch)
+            transition = lease.transition
+            if (
+                lease.phase != "closing"
+                or transition is None
+                or token.transition_sequence != transition.sequence
+            ):
+                raise RuntimeError(
+                    "managed resource admission lease transition is stale"
+                )
+            if not is_async:
+                self._require_lease_close_owner(transition)
+        elif token.scope == "runtime_close":
+            transition = self._runtime_close_transition
+            self._require_runtime_transition(transition)
+            if (
+                self._phase is not _TerminalPhase.RUNTIME_CLOSING
+                or token.transition_sequence != transition.sequence
+            ):
+                raise RuntimeError(
+                    "managed resource admission runtime transition is stale"
+                )
+            if not is_async and transition.owner_thread is not threading.current_thread():
+                raise RuntimeError(
+                    "managed resource admission runtime close owner changed"
+                )
+        elif token.transition_sequence is not None:
+            raise RuntimeError(
+                "managed resource admission transition is not canonical"
+            )
+
+        if epoch is _MANAGED_DEFERRED_EPOCH:
+            return token
+        if epoch is _MANAGED_LIVE_EPOCH:
+            if token.scope in {"construction", "lease", "lease_close"}:
+                if self._live_epoch is None or token.epoch != self._live_epoch:
+                    raise RuntimeError(
+                        "managed resource admission lease epoch is not current"
+                    )
+            elif token.epoch is not None:
+                raise RuntimeError(
+                    "managed resource admission runtime epoch is not canonical"
+                )
+            if token.scope in {"runtime", "runtime_setup"} and self._live_epoch is not None:
+                raise RuntimeError(
+                    "managed resource admission cannot cross a live lease"
+                )
+        elif token.epoch != epoch:
+            raise RuntimeError(
+                "managed resource admission lease epoch is not authorized"
+            )
+        return token
+
+    def _require_managed_close_transition(self, transition, *, epoch):
+        """Validate the exact elected close owner used to prestart descendants."""
+        with self._condition:
+            if isinstance(transition, _LeaseCloseTransition):
+                lease = self._require_lease_transition(transition)
+                self._require_lease_close_owner(transition)
+                if lease.phase != "closing" or (
+                    epoch is not _MANAGED_DEFERRED_EPOCH
+                    and transition.epoch != epoch
+                ):
+                    raise RuntimeError(
+                        "managed resource close transition epoch changed"
+                    )
+            elif isinstance(transition, _RuntimeCloseTransition):
+                self._require_runtime_transition(transition)
+                if transition.owner_thread is not threading.current_thread():
+                    raise RuntimeError(
+                        "managed resource runtime close owner changed"
+                    )
+                if self._phase is not _TerminalPhase.RUNTIME_CLOSING:
+                    raise RuntimeError(
+                        "managed resource runtime close transition is stale"
+                    )
+                if (
+                    epoch is not _MANAGED_DEFERRED_EPOCH
+                    and epoch is not None
+                    and self._live_epoch != epoch
+                ):
+                    raise RuntimeError(
+                        "managed resource runtime close lease epoch changed"
+                    )
+            else:
+                raise TypeError("managed resource close transition is required")
+            return transition
 
     def _convertible_token_state(self, token):
         state = self._token_state(token)
@@ -807,10 +1104,36 @@ class _TerminalLifecycleGate:
         records=(),
         events=(),
         streams=(),
+        _allow_committed=False,
     ):
         with self._condition:
             transaction = self._require_lease_construction_resource_slot(slot)
-            self._require_lease_construction(transaction, active=True)
+            if _allow_committed and transaction.state == "committed":
+                if transaction.epoch is None:
+                    raise RuntimeError(
+                        "committed lease construction has no live epoch"
+                    )
+                lease = self._lease_state(transaction.epoch)
+                if lease.construction is not transaction:
+                    raise RuntimeError("stale lease construction transaction")
+                if lease.phase not in {"open", "closing"}:
+                    raise RuntimeError(
+                        "lease construction ownership slot is no longer live"
+                    )
+                sequence = self._thread_tokens.get(threading.get_ident())
+                state = None if sequence is None else self._tokens.get(sequence)
+                if state is None:
+                    raise TypeError(
+                        "committed construction resource publication requires admission"
+                    )
+                self._require_managed_resource_admission_locked(
+                    state.token,
+                    allowed_scopes=("lease", "lease_close"),
+                    allowed_operations=None,
+                    epoch=transaction.epoch,
+                )
+            else:
+                self._require_lease_construction(transaction, active=True)
             if resource is not None:
                 if slot._resource is not None and slot._resource is not resource:
                     raise RuntimeError(

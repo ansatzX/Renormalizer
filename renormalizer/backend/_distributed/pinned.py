@@ -51,31 +51,40 @@ class StagingSlot:
         self._owner = None
         self._checked_out = False
 
+    def _require_admission(self, token=None, validator=None):
+        return _require_managed_resource_admission(
+            self._managed_guard,
+            token,
+            validator,
+            allowed_scopes=("construction", "lease", "lease_close"),
+            epoch=lambda _token: self._pool._managed_epoch,
+        )
+
     @property
     def array(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         if self._array is None:
             raise RuntimeError("staging slot is closed")
         return self._array
 
     @property
     def pinned(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         return self._pinned
 
     @property
     def nbytes(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         return self._nbytes
 
     @property
     def capacity_bytes(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         return self._pool.capacity_bytes
 
     @property
     def completion_event(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         if self._owner is not None:
             return self._owner.completion_event
         return None
@@ -89,11 +98,7 @@ class StagingSlot:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_managed_resource_admission(
-            self._managed_guard,
-            _admission_token,
-            _admission_validator,
-        )
+        self._require_admission(_admission_token, _admission_validator)
         if not self._checked_out:
             raise RuntimeError("staging slot is not checked out")
         if order not in {"C", "F"}:
@@ -119,11 +124,7 @@ class StagingSlot:
         _admission_token=None,
         _admission_validator=None,
     ):
-        _require_managed_resource_admission(
-            self._managed_guard,
-            _admission_token,
-            _admission_validator,
-        )
+        self._require_admission(_admission_token, _admission_validator)
         if not self._checked_out:
             raise RuntimeError("staging slot is not checked out")
         if self._owner is not None:
@@ -191,6 +192,7 @@ class PinnedBufferPool:
         _construction_slot=None,
         _managed_guard=None,
         _standalone=True,
+        _allocator_owns_construction_slot=False,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
         self._managed_guard = _resolve_managed_resource_guard(
@@ -209,8 +211,13 @@ class PinnedBufferPool:
             raise TypeError("staging allocators must be callable")
         if _resource_recorder is not None and not callable(_resource_recorder):
             raise TypeError("resource recorder must be callable")
+        if type(_allocator_owns_construction_slot) is not bool:
+            raise TypeError("allocator ownership mode must be a boolean")
 
         self._managed = self._managed_guard is not None
+        self._managed_epoch = (
+            None if _admission_token is None else _admission_token.epoch
+        )
         self._capacity_bytes = capacity_bytes
         self._slot = StagingSlot(self, None, pinned=True)
         self._allocation_record = None
@@ -230,7 +237,13 @@ class PinnedBufferPool:
 
         pinned = True
         try:
-            array = pinned_allocator(capacity_bytes)
+            if _allocator_owns_construction_slot:
+                array = pinned_allocator(
+                    capacity_bytes,
+                    _construction_slot=_construction_slot,
+                )
+            else:
+                array = pinned_allocator(capacity_bytes)
             self._slot._array = array
             array, record = _validate_storage(array, capacity_bytes)
         except Exception:
@@ -324,7 +337,13 @@ class PinnedBufferPool:
         if self._closed:
             raise RuntimeError("pinned buffer pool is closed")
 
-    def _require_admission(self, token, validator):
+    def _require_admission(
+        self,
+        token,
+        validator,
+        *,
+        allowed_operations=None,
+    ):
         guard = getattr(self, "_managed_guard", None)
         if (
             guard is None
@@ -337,6 +356,9 @@ class PinnedBufferPool:
             guard,
             token,
             validator,
+            allowed_scopes=("construction", "lease", "lease_close"),
+            allowed_operations=allowed_operations,
+            epoch=lambda _token: self._managed_epoch,
         )
 
     def _poison(self, error):
@@ -499,7 +521,11 @@ class PinnedBufferPool:
         _admission_validator=None,
         _deadline=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("lease_construction", "pool_close"),
+        )
         _remaining_lifecycle_time(
             _deadline,
             "pinned pool lifecycle timed out before close",

@@ -306,6 +306,7 @@ class AsyncResourceOwner:
         _defer_async_completion=False,
         _callback_requires_admission=False,
         _managed_guard=None,
+        _managed_epoch=None,
     ):
         if not isinstance(kind, str) or not kind:
             raise ValueError("async owner kind must be a non-empty string")
@@ -360,6 +361,7 @@ class AsyncResourceOwner:
         self._resource_recorder = _resource_recorder
         self._resource_releaser = _resource_releaser
         self._managed_guard = _managed_guard
+        self._managed_epoch = _managed_epoch
         # Lock order: owner state -> no other lock. Gate/admission calls and waits
         # always happen after releasing this lock.
         self._async_lock = threading.RLock()
@@ -426,6 +428,8 @@ class AsyncResourceOwner:
             self._managed_guard,
             token,
             validator,
+            allowed_scopes=("lease", "lease_close"),
+            epoch=lambda _token: self._managed_epoch,
         )
 
     def _terminal_resource_snapshot(self):
@@ -636,7 +640,15 @@ class AsyncResourceOwner:
             admission = self._async_admission
         admission.wake()
 
-    def _start_counted_completion(self):
+    def _start_counted_completion(self, *, _close_transition=None):
+        if self._managed_guard is not None:
+            if _close_transition is None:
+                self._require_admission()
+            else:
+                self._managed_guard.require_close_transition(
+                    _close_transition,
+                    epoch=lambda _transition: self._managed_epoch,
+                )
         with self._async_lock:
             if not self._async_requested.is_set():
                 self._async_start_pending = True
@@ -797,6 +809,7 @@ class AsyncResourceOwner:
         self._start_counted_completion()
 
     def _prepare_counted_completion(self, *, wait, _deadline=None):
+        self._require_admission()
         if self._async_admission is None:
             return None
         if (
@@ -827,6 +840,7 @@ class AsyncResourceOwner:
         )
 
     def _counted_completion_result(self, *, wait, _deadline=None):
+        self._require_admission()
         worker = self._async_worker
         if worker is None:
             return None

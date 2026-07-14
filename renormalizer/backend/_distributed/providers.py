@@ -804,6 +804,7 @@ class _LeaseStatusWorkspace:
         *,
         _construction_slot=None,
         _managed_guard=None,
+        _managed_epoch=None,
         _standalone=True,
     ):
         self._managed_guard = _resolve_managed_resource_guard(
@@ -816,6 +817,7 @@ class _LeaseStatusWorkspace:
         self._borrower = None
         self._closed = False
         self._managed = self._managed_guard is not None
+        self._managed_epoch = _managed_epoch
         _publish_lease_construction_resource_direct(
             _construction_slot,
             self,
@@ -827,31 +829,57 @@ class _LeaseStatusWorkspace:
             records=self._allocation_records,
         )
 
+    def _require_admission(
+        self,
+        token=None,
+        validator=None,
+        *,
+        allowed_scopes=("construction", "lease", "lease_close"),
+        allowed_operations=(
+            "lease_construction",
+            "operator_call",
+            "resource_state",
+            "status_close",
+            "async_completion",
+        ),
+    ):
+        return _require_managed_resource_admission(
+            self._managed_guard,
+            token,
+            validator,
+            allowed_scopes=allowed_scopes,
+            allowed_operations=allowed_operations,
+            epoch=lambda _token: self._managed_epoch,
+        )
+
     @property
     def device_status(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         return self._device_status
 
     @property
     def host_status(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         return self._host_status
 
     @property
     def borrower(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         return self._borrower
 
     @property
     def allocation_records(self):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission()
         return self._allocation_records
 
     def _terminal_allocation_records(self):
         return self._allocation_records
 
     def attach(self, owner):
-        _require_managed_resource_admission(self._managed_guard)
+        self._require_admission(
+            allowed_scopes=("lease",),
+            allowed_operations=("operator_call",),
+        )
         from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
 
         if self._closed:
@@ -890,6 +918,9 @@ class _LeaseStatusWorkspace:
             guard,
             _admission_token,
             _admission_validator,
+            allowed_scopes=("construction", "lease_close"),
+            allowed_operations=("lease_construction", "status_close"),
+            epoch=lambda _token: self._managed_epoch,
         )
         if self._closed:
             return
@@ -1786,7 +1817,10 @@ class WorkingSetLease:
             _admission_token,
             _admission_validator,
         )
-        return reservation.close()
+        return reservation.close(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+        )
 
     def _emit_profile(
         self,
@@ -1949,7 +1983,9 @@ class WorkingSetLease:
         """Run every fallible elected-owner action under the caller's guard."""
         gate = runtime._terminal_gate
         scheduler = self.scheduler
-        scheduler._start_counted_completions()
+        scheduler._start_counted_completions(
+            _close_transition=transition,
+        )
         error = self._poisoned_error
         old_ref = None if self._dirty is None else self._dirty[0]
         planned_cache_bytes = self._cache_reservation.required_bytes
@@ -2273,6 +2309,115 @@ class WorkingSetLease:
         )
 
 
+@dataclass(frozen=True)
+class _ObjectGraphFieldSnapshot:
+    name: str
+    value: object
+    kind: str
+    contents: tuple | None
+
+    @classmethod
+    def capture(cls, name, value):
+        if isinstance(value, dict):
+            return cls(name, value, "dict", tuple(value.items()))
+        if isinstance(value, list):
+            return cls(name, value, "list", tuple(value))
+        if isinstance(value, set):
+            return cls(name, value, "set", tuple(value))
+        return cls(name, value, "value", None)
+
+    def restore(self, target):
+        value = self.value
+        if self.kind == "dict":
+            value.clear()
+            value.update(self.contents)
+        elif self.kind == "list":
+            value[:] = self.contents
+        elif self.kind == "set":
+            value.clear()
+            value.update(self.contents)
+        target.__dict__[self.name] = value
+
+
+@dataclass(frozen=True)
+class _ObjectGraphSnapshot:
+    target: object
+    fields: tuple
+
+    @classmethod
+    def capture(cls, target):
+        return cls(
+            target,
+            tuple(
+                _ObjectGraphFieldSnapshot.capture(name, value)
+                for name, value in target.__dict__.items()
+            ),
+        )
+
+    def restore(self):
+        retained_names = {field.name for field in self.fields}
+        for name in tuple(self.target.__dict__):
+            if name not in retained_names:
+                del self.target.__dict__[name]
+        for field in self.fields:
+            field.restore(self.target)
+
+
+@dataclass(frozen=True)
+class _LeaseResourceRecordGraphSnapshot:
+    record: _LeaseResourceRecord
+    record_state: _ObjectGraphSnapshot
+    slot_states: tuple
+
+    @classmethod
+    def capture(cls, record):
+        slots = tuple(record._construction_slots.values())
+        return cls(
+            record,
+            _ObjectGraphSnapshot.capture(record),
+            tuple(_ObjectGraphSnapshot.capture(slot) for slot in slots),
+        )
+
+    def restore(self):
+        self.record_state.restore()
+        for slot_state in self.slot_states:
+            slot_state.restore()
+
+
+@dataclass(frozen=True)
+class _ProviderRuntimeCloseGraphSnapshot:
+    provider_state: _ObjectGraphSnapshot
+    lease_state: _ObjectGraphSnapshot | None
+    record_state: _LeaseResourceRecordGraphSnapshot | None
+    runtime_provider: object
+    runtime_quarantine: object
+
+    @classmethod
+    def capture(cls, provider, lease):
+        runtime = provider.runtime
+        record = None if lease is None else lease._resource_record
+        return cls(
+            _ObjectGraphSnapshot.capture(provider),
+            None if lease is None else _ObjectGraphSnapshot.capture(lease),
+            (
+                None
+                if record is None
+                else _LeaseResourceRecordGraphSnapshot.capture(record)
+            ),
+            runtime._active_provider,
+            runtime._terminal_quarantine,
+        )
+
+    def restore(self, runtime):
+        self.provider_state.restore()
+        if self.lease_state is not None:
+            self.lease_state.restore()
+        if self.record_state is not None:
+            self.record_state.restore()
+        runtime._active_provider = self.runtime_provider
+        runtime._terminal_quarantine = self.runtime_quarantine
+
+
 class _ProviderRuntimeCloseFinalizeAction:
     """Query-free, reversible reference commit after all close rows succeed."""
 
@@ -2282,28 +2427,21 @@ class _ProviderRuntimeCloseFinalizeAction:
         self._lease = lease
         self._error = error
         self._state = "prepared"
-        self._provider_state = None
-        self._lease_state = None
-        self._record = None
-        self._record_state = None
-        self._runtime_provider = None
+        self._graph_snapshot = None
 
     def seal(self):
-        if self._provider_state is not None:
+        if self._graph_snapshot is not None:
             return self
-        self._provider_state = dict(self._provider.__dict__)
-        self._runtime_provider = self._runtime._active_provider
-        if self._lease is not None:
-            self._lease_state = dict(self._lease.__dict__)
-            self._record = self._lease._resource_record
-            if self._record is not None:
-                self._record_state = dict(self._record.__dict__)
+        self._graph_snapshot = _ProviderRuntimeCloseGraphSnapshot.capture(
+            self._provider,
+            self._lease,
+        )
         return self
 
     def finalize(self):
         if self._state == "finalized":
             return self._error
-        if self._state != "prepared" or self._provider_state is None:
+        if self._state != "prepared" or self._graph_snapshot is None:
             raise RuntimeError("provider runtime close finalize action is invalid")
         try:
             if self._lease is not None:
@@ -2332,17 +2470,9 @@ class _ProviderRuntimeCloseFinalizeAction:
             raise
 
     def restore(self):
-        if self._provider_state is None:
+        if self._graph_snapshot is None:
             return
-        self._provider.__dict__.clear()
-        self._provider.__dict__.update(self._provider_state)
-        if self._lease is not None and self._lease_state is not None:
-            self._lease.__dict__.clear()
-            self._lease.__dict__.update(self._lease_state)
-        if self._record is not None and self._record_state is not None:
-            self._record.__dict__.clear()
-            self._record.__dict__.update(self._record_state)
-        self._runtime._active_provider = self._runtime_provider
+        self._graph_snapshot.restore(self._runtime)
         self._state = "prepared"
 
 
@@ -2432,7 +2562,21 @@ class ActiveWorkingSetProvider:
 
     @property
     def cache(self):
-        _require_managed_resource_admission(self._managed_guard)
+        _require_managed_resource_admission(
+            self._managed_guard,
+            allowed_scopes=("construction", "lease", "lease_close"),
+            allowed_operations=(
+                "lease_construction",
+                "acquire",
+                "cache_refcount",
+                "load",
+                "prefetch",
+                "reap",
+                "cache_wait",
+                "cache_invalidate",
+                "cache_lifetime_reconcile",
+            ),
+        )
         if self._cache is None:
             raise RuntimeError("active provider cache has not been allocated")
         return self._cache
@@ -2457,6 +2601,12 @@ class ActiveWorkingSetProvider:
             getattr(self, "_managed_guard", None),
             _admission_token,
             _admission_validator,
+            allowed_scopes=("runtime_setup",),
+            allowed_operations=(
+                "execution_config",
+                "preflight_residency",
+                "provider_config_match",
+            ),
         )
         return self._matches_config_values(
             device_budget,
@@ -2669,29 +2819,69 @@ class ActiveWorkingSetProvider:
             host_status,
             _construction_slot=_construction_slot,
             _managed_guard=self._managed_guard,
+            _managed_epoch=_admission_token.epoch,
             _standalone=self._standalone,
         )
         _resource_recorder(resource=workspace)
         return workspace
 
-    def _empty_cache_array(self, spec, *, order):
+    def _empty_cache_array(
+        self,
+        spec,
+        *,
+        order,
+        _construction_slot=None,
+    ):
         backend = self.runtime.backend
         if backend.name == "numpy":
-            return backend.empty(spec.shape, dtype=np.dtype(spec.dtype), order=order)
+            array = backend.empty(
+                spec.shape,
+                dtype=np.dtype(spec.dtype),
+                order=order,
+            )
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                self._cache,
+                kind="cache",
+                records=allocation_records((array,)),
+            )
+            return array
         cupy = backend._cupy
         with cupy.cuda.Device(backend._device_index):
             memory = cupy.cuda.Memory(spec.nbytes)
+            record = AsyncAllocationRecord(
+                ("device", int(memory.ptr)),
+                memory,
+                int(memory.size),
+            )
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                self._cache,
+                kind="cache",
+                records=(record,),
+            )
             pointer = cupy.cuda.MemoryPointer(memory, 0)
-            return cupy.ndarray(
+            array = cupy.ndarray(
                 spec.shape,
                 dtype=np.dtype(spec.dtype),
                 memptr=pointer,
                 order=order,
             )
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            self._cache,
+            kind="cache",
+            records=allocation_records((array,)),
+        )
+        return array
 
-    def _cache_allocator(self, spec):
+    def _cache_allocator(self, spec, *, _construction_slot=None):
         if spec.layout != "strided":
-            return self._empty_cache_array(spec, order=spec.layout)
+            return self._empty_cache_array(
+                spec,
+                order=spec.layout,
+                _construction_slot=_construction_slot,
+            )
         try:
             reverse_axis = next(
                 axis
@@ -2702,21 +2892,47 @@ class ActiveWorkingSetProvider:
             raise ValueError(
                 "a singleton cache entry cannot realize strided layout"
             ) from error
-        transfer_array = self._empty_cache_array(spec, order="C")
+        transfer_array = self._empty_cache_array(
+            spec,
+            order="C",
+            _construction_slot=_construction_slot,
+        )
         selected = [slice(None)] * len(spec.shape)
         selected[reverse_axis] = slice(None, None, -1)
         array = transfer_array[tuple(selected)]
         return CacheAllocation(array, transfer_array, reverse_axis)
 
-    def _pinned_allocator(self, nbytes):
+    def _pinned_allocator(self, nbytes, *, _construction_slot=None):
         backend = self.runtime.backend
         if backend.name == "numpy":
-            return np.empty(nbytes, dtype=np.uint8)
+            array = np.empty(nbytes, dtype=np.uint8)
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                kind="pinned",
+                records=allocation_records((array,)),
+            )
+            return array
         cupy = backend._cupy
         with cupy.cuda.Device(backend._device_index):
             memory = cupy.cuda.PinnedMemory(nbytes)
+            record = AsyncAllocationRecord(
+                ("host", int(memory.ptr)),
+                memory,
+                int(memory.size),
+            )
+            _publish_lease_construction_resource_direct(
+                _construction_slot,
+                kind="pinned",
+                records=(record,),
+            )
             pointer = cupy.cuda.PinnedMemoryPointer(memory, 0)
-        return np.frombuffer(pointer, dtype=np.uint8, count=nbytes)
+        array = np.frombuffer(pointer, dtype=np.uint8, count=nbytes)
+        _publish_lease_construction_resource_direct(
+            _construction_slot,
+            kind="pinned",
+            records=allocation_records((array,)),
+        )
+        return array
 
     def _lease_cache_recorder(self, record):
         def capture(**captured):
@@ -2806,6 +3022,7 @@ class ActiveWorkingSetProvider:
         _admission_validator,
         _resource_recorder=None,
         _construction_slot=None,
+        _managed_guard=None,
     ):
         _require_resource_admission(
             _admission_token,
@@ -2817,6 +3034,9 @@ class ActiveWorkingSetProvider:
             snapshot,
             dirty_ref=dirty_ref,
             _construction_slot=_construction_slot,
+            _managed_guard=_managed_guard,
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
         )
         _resource_recorder(resource=reservation)
         return reservation
@@ -2917,18 +3137,15 @@ class ActiveWorkingSetProvider:
                     _deadline,
                     "lease construction lifecycle timed out before cleanup",
                 )
-                if resource is store_reservation:
-                    resource.close()
-                else:
-                    close_kwargs = {
-                        "_admission_token": token,
-                        "_admission_validator": _admission_validator,
-                    }
-                    if resource in {scheduler, pool, constructed_cache}:
-                        close_kwargs["_deadline"] = _deadline
-                    resource.close(
-                        **close_kwargs,
-                    )
+                close_kwargs = {
+                    "_admission_token": token,
+                    "_admission_validator": _admission_validator,
+                }
+                if resource in {scheduler, pool, constructed_cache}:
+                    close_kwargs["_deadline"] = _deadline
+                resource.close(
+                    **close_kwargs,
+                )
                 _remaining_lifecycle_time(
                     _deadline,
                     "lease construction lifecycle timed out during cleanup",
@@ -3246,6 +3463,7 @@ class ActiveWorkingSetProvider:
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
                 _construction_slot=construction_slots["store_reservation"],
+                _managed_guard=self._managed_guard,
             )
             self._raise_construction_transition_preemption()
             if self._cache is None:
@@ -3258,6 +3476,7 @@ class ActiveWorkingSetProvider:
                     _construction_slot=construction_slots["cache"],
                     _managed_guard=self._managed_guard,
                     _standalone=self._standalone,
+                    _allocator_owns_construction_slot=True,
                 )
             set_recorder = getattr(self._cache, "_set_resource_recorder", None)
             if callable(set_recorder):
@@ -3265,6 +3484,7 @@ class ActiveWorkingSetProvider:
                     cache_recorder,
                     _admission_token=construction_token,
                     _admission_validator=construction_validator,
+                    _construction_slot=construction_slots["cache"],
                 )
             record.capture(self._cache, kind="cache")
             cache_reservation = self._cache.reserve(
@@ -3285,6 +3505,7 @@ class ActiveWorkingSetProvider:
                 _construction_slot=construction_slots["pool"],
                 _managed_guard=self._managed_guard,
                 _standalone=self._standalone,
+                _allocator_owns_construction_slot=True,
             )
             self._raise_construction_transition_preemption()
             from renormalizer.utils.log import PROFILING, get_logger
@@ -3541,18 +3762,27 @@ class ActiveWorkingSetProvider:
                 )
 
     def resource_state(self):
-        _require_managed_resource_admission(self._managed_guard)
+        _require_managed_resource_admission(
+            self._managed_guard,
+            allowed_scopes=("runtime", "lease"),
+            allowed_operations=("resource_state",),
+        )
         cache = self._cache
         lease = self._active_lease
         pool = None if lease is None else lease.pool
+        reservation = None if cache is None else cache._reservation
         state = {
             "active_leases": int(lease is not None),
-            "reserved_cache_bytes": 0 if cache is None else cache.reserved_bytes,
-            "retained_cache_bytes": 0 if cache is None else cache.allocated_bytes,
+            "reserved_cache_bytes": (
+                0 if reservation is None else reservation.required_bytes
+            ),
+            "retained_cache_bytes": 0 if cache is None else cache._allocated_bytes,
             "hard_cache_capacity_bytes": self.device_budget_resolution.resolved_bytes,
             "authorized_cache_bytes": self._last_authorized_cache_bytes,
-            "checked_out_pinned_bytes": 0 if pool is None else pool.checked_out_bytes,
-            "pending_pinned_bytes": 0 if pool is None else pool.pending_bytes,
+            "checked_out_pinned_bytes": (
+                0 if pool is None else pool._checked_out_bytes
+            ),
+            "pending_pinned_bytes": 0 if pool is None else pool._pending_bytes,
         }
         if self._terminal_quarantine.poisoned:
             state.update(self._terminal_quarantine.resource_state())
@@ -3576,20 +3806,26 @@ class ActiveWorkingSetProvider:
             guard,
             _admission_token,
             _admission_validator,
+            allowed_scopes=("runtime", "lease"),
+            allowed_operations=("resource_state",),
         )
         cache = self._cache
         lease = self._active_lease
         scheduler = None if lease is None else lease.scheduler
         state = {
             "active_leases": int(lease is not None),
-            "cache_bytes": 0 if cache is None else cache.allocated_bytes,
+            "cache_bytes": 0 if cache is None else cache._allocated_bytes,
             "cache_refs": (
                 0
                 if cache is None
                 else sum(entry.refcount for entry in cache._entries.values())
             ),
-            "pinned_bytes": 0 if lease is None else lease.pool.allocated_bytes,
-            "stream_count": 0 if scheduler is None else scheduler.stream_count,
+            "pinned_bytes": (
+                0 if lease is None else lease.pool._allocation_record.capacity_bytes
+            ),
+            "stream_count": (
+                0 if scheduler is None else int(scheduler._stream is not None)
+            ),
             "event_count": (
                 0
                 if scheduler is None
