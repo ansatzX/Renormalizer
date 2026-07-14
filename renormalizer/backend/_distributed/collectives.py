@@ -361,6 +361,7 @@ class CupyNcclCollective:
         self._fatal_protocol_completed = False
         self._fatal_handler = None
         self._fatal_transition_handler = None
+        self._fatal_transition_fallback = None
         self._fatal_monitor_stop = threading.Event()
         self._fatal_monitor_thread = None
         self._fatal_monitor_state = "none"
@@ -502,6 +503,10 @@ class CupyNcclCollective:
                 return
             self._fatal_secondary_errors = (*self._fatal_secondary_errors, error)
 
+    def _retain_fatal_secondaries_direct(self, errors):
+        for error in tuple(errors):
+            self._retain_fatal_secondary_direct(error)
+
     def _dispatch_fatal_secondaries(self, errors):
         for error in errors:
             if not isinstance(error, BaseException):
@@ -610,33 +615,98 @@ class CupyNcclCollective:
         self._fatal_hard_exit()
         raise primary
 
+    def _current_thread_claimed_fatal_hard_exit(self, primary=None):
+        with self._fatal_condition:
+            return (
+                self._fatal_hard_exit_claimant is threading.current_thread()
+                and (
+                    primary is None
+                    or self._fatal_hard_exit_primary is primary
+                )
+            )
+
     def _diagnose_and_hard_exit(self, error):
         """Retain one fail-stop diagnostic without delaying the hard exit."""
+        self._retain_fatal_secondary_direct(error)
+        self._hard_exit_once(error)
+
+    def _install_fatal_failure_marker(self, primary, diagnostics=()):
+        """Publish the collective failure outcome and release its owner."""
+        if not isinstance(primary, BaseException):
+            raise TypeError("fatal publication failure must be an exception")
+        retained = list(diagnostics)
+        with self._fatal_condition:
+            existing = self._fatal_publication_failure
+            if existing is not None:
+                if primary is not existing:
+                    retained.append(primary)
+                primary = existing
+            owner = self._fatal_publication_owner_reservation
+            if owner is not None and owner.primary is not primary:
+                retained.append(owner.primary)
+            pending = self._fatal_pending_primary
+            if pending is not None and pending is not primary:
+                retained.append(pending)
+            self._fatal_pending_primary = primary
+            first_failure = self._fatal_publication_failure is None
+            self._fatal_publication_failure = primary
+            self._fatal_condition.notify_all()
+        self._retain_fatal_secondaries_direct(retained)
+        return primary, first_failure
+
+    def _terminalize_unowned_fatal_failure(self, error, diagnostics=()):
+        self._retain_fatal_secondary_direct(error)
+        retained = list(diagnostics)
+        transition = None
         try:
-            self._dispatch_fatal_secondaries((error,))
-        finally:
-            self._hard_exit_once(error)
+            fallback = self._fatal_transition_fallback_callback()
+        except BaseException as fallback_lookup_error:
+            retained.append(fallback_lookup_error)
+            fallback = None
+        if callable(fallback):
+            try:
+                transition = fallback(error, diagnostics=tuple(retained))
+            except BaseException as fallback_error:
+                retained.append(fallback_error)
+        primary = error if transition is None else transition.primary
+        if error is not primary:
+            retained.append(error)
+        primary, _ = self._install_fatal_failure_marker(primary, retained)
+        self._hard_exit_once(primary)
 
     def _terminalize_pre_owner_fatal_failure(self, error, diagnostics=()):
         """Elect one structured owner before marker-first fail-stop publication."""
-        transition_handler = self._fatal_transition_handler_callback()
-        begin = (
-            None
-            if transition_handler is None
-            else getattr(transition_handler, "begin", None)
-        )
-        if not callable(begin):
-            self._diagnose_and_hard_exit(error)
-        transition = begin(error)
+        retained = list(diagnostics)
+        transition_handler = None
+        transition = None
+        try:
+            transition_handler = self._fatal_transition_handler_callback()
+        except BaseException as handler_error:
+            retained.append(handler_error)
+        begin = None
+        if transition_handler is not None:
+            try:
+                begin = getattr(transition_handler, "begin", None)
+            except BaseException as begin_lookup_error:
+                retained.append(begin_lookup_error)
+        if callable(begin):
+            try:
+                transition = begin(error)
+            except BaseException as begin_error:
+                retained.append(begin_error)
+        if transition is None:
+            return self._terminalize_unowned_fatal_failure(
+                error,
+                diagnostics=tuple(retained),
+            )
         primary = transition.primary
-        retained = tuple(diagnostics)
         if error is not primary:
-            retained = (*retained, error)
+            retained.append(error)
         return self._terminalize_structured_fatal_failure(
             primary,
             transition_handler=transition_handler,
             transition=transition,
-            diagnostics=retained,
+            diagnostics=tuple(retained),
         )
 
     def _fail_stop_fatal_path(self, error):
@@ -667,10 +737,7 @@ class CupyNcclCollective:
                 self._fatal_condition.wait(remaining)
             primary = owner.primary
             marker_installed = self._fatal_publication_failure is primary
-        if marker_installed:
-            self._dispatch_fatal_secondaries((error,))
-        else:
-            self._retain_fatal_secondary_direct(error)
+        self._retain_fatal_secondary_direct(error)
         self._hard_exit_once(primary)
 
     def _install_fatal(self, error, origin_rank):
@@ -1041,6 +1108,8 @@ class CupyNcclCollective:
             )
             reservation.retain_diagnostics(diagnostics)
         except BaseException as setup_error:
+            if self._current_thread_claimed_fatal_hard_exit():
+                raise
             with self._fatal_condition:
                 marker_installed = self._fatal_publication_failure is not None
             primary = self._terminalize_structured_fatal_failure(
@@ -1065,18 +1134,23 @@ class CupyNcclCollective:
                     discovering_token=discovering_token,
                 )
             attach_deferred_join = joined and defer_completion
+            joined_succeeded = False
             try:
                 if attach_deferred_join:
                     self._fatal_publication_local.reservation = reservation
                 yield reservation
+                if joined:
+                    self._wait_for_joined_fatal_publication()
+                joined_succeeded = True
             finally:
-                try:
-                    if joined:
-                        self._wait_for_joined_fatal_publication()
-                finally:
-                    if attach_deferred_join:
-                        del self._fatal_publication_local.reservation
-                    self._dispatch_fatal_secondaries(reservation.diagnostics)
+                if attach_deferred_join:
+                    del self._fatal_publication_local.reservation
+                if joined and not joined_succeeded:
+                    self._retain_fatal_secondaries_direct(
+                        reservation.diagnostics
+                    )
+            if joined_succeeded:
+                self._dispatch_fatal_secondaries(reservation.diagnostics)
             return
         publication_succeeded = False
         local_installed = False
@@ -1114,6 +1188,8 @@ class CupyNcclCollective:
             )
             publication_succeeded = True
         except BaseException as error:
+            if self._current_thread_claimed_fatal_hard_exit():
+                raise
             with self._fatal_condition:
                 marker_installed = self._fatal_publication_failure is not None
             primary = self._fail_fatal_publication(reservation, error)
@@ -1142,10 +1218,19 @@ class CupyNcclCollective:
             reference = weakref.WeakMethod(handler)
         except TypeError:
             reference = weakref.ref(handler)
+        fallback = getattr(handler, "_terminalize_failure", None)
+        if callable(fallback):
+            try:
+                fallback_reference = weakref.WeakMethod(fallback)
+            except TypeError:
+                fallback_reference = weakref.ref(fallback)
+        else:
+            fallback_reference = None
         with self._fatal_lock:
             self._fatal_handler = reference
             if callable(getattr(handler, "begin", None)):
                 self._fatal_transition_handler = reference
+            self._fatal_transition_fallback = fallback_reference
 
     def _fatal_handler_callback(self):
         with self._fatal_lock:
@@ -1155,6 +1240,11 @@ class CupyNcclCollective:
     def _fatal_transition_handler_callback(self):
         with self._fatal_lock:
             reference = self._fatal_transition_handler
+        return None if reference is None else reference()
+
+    def _fatal_transition_fallback_callback(self):
+        with self._fatal_lock:
+            reference = self._fatal_transition_fallback
         return None if reference is None else reference()
 
     def _refresh_fatal_handler(
@@ -1483,6 +1573,7 @@ class CupyNcclCollective:
             signal_errors.append(handler_error)
             failure_confirmed = None
         signal_gate = transition is not None and callable(failure_handler)
+        gate_confirmed = False
         if signal_gate:
             if not callable(failure_confirmed):
                 legacy_signal = [False]
@@ -1496,7 +1587,7 @@ class CupyNcclCollective:
                     return legacy_signal[0]
 
             try:
-                _, caught_signal_errors = (
+                gate_confirmed, caught_signal_errors = (
                     self._signal_reserved_fatal_gate_failure(
                         primary,
                         transition,
@@ -1508,6 +1599,22 @@ class CupyNcclCollective:
                 signal_errors.append(signal_error)
             else:
                 signal_errors.extend(caught_signal_errors)
+        if transition is not None and not gate_confirmed:
+            try:
+                fallback = self._fatal_transition_fallback_callback()
+            except BaseException as fallback_lookup_error:
+                signal_errors.append(fallback_lookup_error)
+                fallback = None
+            if callable(fallback):
+                try:
+                    retained_transition = fallback(
+                        primary,
+                        diagnostics=tuple(signal_errors),
+                        transition=transition,
+                    )
+                    gate_confirmed = retained_transition.primary is primary
+                except BaseException as fallback_error:
+                    signal_errors.append(fallback_error)
         diagnostic_errors = list(diagnostics)
         diagnostic_errors.extend(signal_errors)
         if first_failure and not (
@@ -1516,10 +1623,12 @@ class CupyNcclCollective:
             diagnostic_errors.append(error)
         if consistency_error is not None:
             diagnostic_errors.append(consistency_error)
-        self._dispatch_fatal_secondaries(diagnostic_errors)
-        self._dispatch_fatal_transition_secondaries(
-            transition_handler, diagnostic_errors
+        retained_primary, _ = self._install_fatal_failure_marker(
+            primary,
+            diagnostic_errors,
         )
+        if retained_primary is not primary:
+            self._retain_fatal_secondary_direct(primary)
         return owned, first_failure
 
     def _structured_fatal_failure_context(self):
@@ -1552,13 +1661,9 @@ class CupyNcclCollective:
                 transition_handler = retained_handler
             if transition is None:
                 transition = retained_transition
-        with self._fatal_condition:
-            marker_before = self._fatal_publication_failure
-        terminalization_errors = []
-        owned = False
-        first_failure = False
+        terminalization_errors = list(diagnostics)
         try:
-            owned, first_failure = self._fail_reserved_fatal_publication(
+            owned, _ = self._fail_reserved_fatal_publication(
                 error,
                 transition_handler=transition_handler,
                 transition=transition,
@@ -1566,41 +1671,22 @@ class CupyNcclCollective:
             )
         except BaseException as terminalization_error:
             terminalization_errors.append(terminalization_error)
+            owned = False
         with self._fatal_condition:
             primary = self._fatal_publication_failure
-            marker_installed = primary is not None
         if primary is None and transition is not None:
             primary = transition.primary
         if primary is None:
             primary = error
-        must_exit = (
-            (owned and first_failure)
-            or (marker_before is None and marker_installed)
-            or not marker_installed
-        )
-        if not marker_installed:
-            terminalization_errors.extend(diagnostics)
+        if not owned and self._fatal_publication_failure is None:
             terminalization_errors.append(error)
-        else:
-            transition_errors = self._collect_fatal_transition_secondaries(
-                transition_handler,
-                transition,
+            return self._terminalize_unowned_fatal_failure(
+                primary,
+                diagnostics=tuple(terminalization_errors),
             )
-            self._dispatch_fatal_secondaries(transition_errors)
-            self._dispatch_fatal_transition_secondaries(
-                transition_handler,
-                transition_errors,
-            )
-        if terminalization_errors:
-            if must_exit:
-                try:
-                    self._dispatch_fatal_secondaries(terminalization_errors)
-                finally:
-                    self._hard_exit_once(primary)
-            self._dispatch_fatal_secondaries(terminalization_errors)
-        elif must_exit:
-            self._hard_exit_once(primary)
-        return primary
+        terminalization_errors.append(error)
+        self._retain_fatal_secondaries_direct(terminalization_errors)
+        self._hard_exit_once(primary)
 
     def _fail_fatal_publication(self, reservation, error):
         if reservation.failure_signaled:
@@ -1934,7 +2020,7 @@ class CupyNcclCollective:
         deferral = self._active_broadcast_local.deferral
         if deferral is not None:
             if error is not deferral.primary:
-                self._dispatch_fatal_secondaries((error,))
+                self._retain_fatal_secondary_direct(error)
             reservation = deferral.reservation
             if transition is not None:
                 if reservation.transition is None:
@@ -2005,7 +2091,7 @@ class CupyNcclCollective:
         if outcome.kind != "fatal_elected":
             raise RuntimeError("clean monitor stop preempted communicator fatal")
         if outcome.primary is not primary:
-            self._dispatch_fatal_secondaries((primary,))
+            self._retain_fatal_secondary_direct(primary)
         return outcome
 
     def _elect_collective_fatal_outcome(self, candidate, origin_rank):
@@ -2016,7 +2102,7 @@ class CupyNcclCollective:
                 else self._fatal_pending_primary
             )
         if primary is not candidate:
-            self._dispatch_fatal_secondaries((candidate,))
+            self._retain_fatal_secondary_direct(candidate)
 
         def pre_reserve_owner():
             reserved, started = self._pre_reserve_fatal_publication(
@@ -2039,7 +2125,7 @@ class CupyNcclCollective:
         if outcome.kind != "fatal_elected":
             raise RuntimeError("clean monitor stop preempted communicator fatal")
         if outcome.primary is not primary:
-            self._dispatch_fatal_secondaries((primary,))
+            self._retain_fatal_secondary_direct(primary)
         with self._fatal_lock:
             self._fatal_monitor_outcome = outcome
             self._fatal_monitor_outcome_confirmed = True
@@ -2113,6 +2199,7 @@ class CupyNcclCollective:
         def publish():
             current = threading.current_thread()
             diagnostics = ()
+            publication_succeeded = False
             with self._fatal_condition:
                 if (
                     self._fatal_monitor_publisher_thread is not current
@@ -2128,7 +2215,10 @@ class CupyNcclCollective:
                     release_admitted=True,
                     join_existing=True,
                 )
+                publication_succeeded = True
             except BaseException as publication_error:
+                if self._current_thread_claimed_fatal_hard_exit():
+                    raise
                 self._fail_stop_fatal_path(publication_error)
             finally:
                 with self._fatal_condition:
@@ -2137,7 +2227,10 @@ class CupyNcclCollective:
                     if self._fatal_monitor_publisher_thread is current:
                         self._fatal_monitor_publisher_state = "completed"
                     self._fatal_condition.notify_all()
-                self._dispatch_fatal_secondaries(diagnostics)
+                if publication_succeeded:
+                    self._dispatch_fatal_secondaries(diagnostics)
+                else:
+                    self._retain_fatal_secondaries_direct(diagnostics)
 
         thread = threading.Thread(
             target=publish,
@@ -2167,7 +2260,12 @@ class CupyNcclCollective:
                 )
                 if claimed:
                     if self._fatal_monitor_publisher_state == "completed":
-                        dispatch_directly = True
+                        dispatch_directly = (
+                            self._fatal_publication_failure is None
+                            and self._fatal_error is not None
+                        )
+                        if not dispatch_directly:
+                            self._retain_fatal_secondary_direct(start_error)
                     elif all(
                         retained is not start_error
                         for retained in self._fatal_monitor_publisher_diagnostics
@@ -2223,6 +2321,8 @@ class CupyNcclCollective:
                         if outcome is not None:
                             return
                 except BaseException as error:
+                    if self._current_thread_claimed_fatal_hard_exit():
+                        raise
                     if self._fatal_monitor_stop.is_set():
                         outcome = self._observe_fatal_monitor_outcome()
                         return

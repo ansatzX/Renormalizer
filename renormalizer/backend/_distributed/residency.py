@@ -17,6 +17,9 @@ from renormalizer.backend._distributed.solvers import (
     canonical_solver_memory_profile,
     krylov_coefficient_payload,
 )
+from renormalizer.backend._distributed.terminal import (
+    _publish_lease_construction_resource,
+)
 from renormalizer.backend._distributed.transfer import TransferProfile
 
 
@@ -379,7 +382,7 @@ class HostTensorStore:
                 raise ValueError("destination must be writable")
             np.copyto(destination, source, casting="no")
 
-    def reserve(self, snapshot, *, dirty_ref):
+    def reserve(self, snapshot, *, dirty_ref, _construction_slot=None):
         if not isinstance(snapshot, HostTensorStoreSnapshot):
             raise TypeError("snapshot must be a HostTensorStoreSnapshot")
         if not isinstance(dirty_ref, HostTensorRef):
@@ -398,7 +401,19 @@ class HostTensorStore:
                 )
             reservation = _HostTensorReservation(self, snapshot, dirty_ref)
             self._reservations[id(reservation)] = reservation
-            return reservation
+        try:
+            _publish_lease_construction_resource(
+                _construction_slot,
+                reservation,
+            )
+        except BaseException:
+            if _construction_slot is not None:
+                _construction_slot._gate._publish_lease_construction_resource(
+                    _construction_slot,
+                    resource=reservation,
+                )
+            raise
+        return reservation
 
     def _release_reservation(self, reservation):
         with self._lock:

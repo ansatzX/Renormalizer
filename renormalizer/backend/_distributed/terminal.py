@@ -275,6 +275,7 @@ class _LeaseConstructionTransaction:
     gate_id: int
     operation: str
     owner_thread_id: int
+    owner_thread: threading.Thread
     state: Literal[
         "prepared", "active", "committed", "aborted", "fatal_retained"
     ] = "prepared"
@@ -645,6 +646,7 @@ class _TerminalLifecycleGate:
             gate_id=self._gate_id,
             operation=operation,
             owner_thread_id=threading.get_ident(),
+            owner_thread=threading.current_thread(),
         )
         for name in tuple(resource_names):
             if not isinstance(name, str) or not name:
@@ -1435,6 +1437,30 @@ class _TerminalLifecycleGate:
             )
             if transition.primary is not primary:
                 raise RuntimeError("fatal primary changed during recovery")
+            return transition
+
+    def _terminalize_fatal_failure(
+        self,
+        primary,
+        discovering_token=None,
+    ):
+        """Install one canonical fatal failure outcome without callbacks."""
+        if not isinstance(primary, BaseException):
+            raise TypeError("fatal primary must be an exception")
+        with self._condition:
+            discovering_state = None
+            if discovering_token is not None:
+                discovering_state = self._recoverable_fatal_token_state(
+                    discovering_token
+                )
+            transition = self._begin_fatal_locked(primary, discovering_state)
+            primary = transition.primary
+            if self._fatal_snapshot is _MISSING:
+                if self._fatal_publication_failure is _MISSING:
+                    self._fatal_publication_failure = primary
+                elif self._fatal_publication_failure is not primary:
+                    raise RuntimeError("fatal publication failure changed")
+            self._condition.notify_all()
             return transition
 
     def wait_for_admissions(

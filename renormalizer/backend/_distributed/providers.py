@@ -1868,40 +1868,16 @@ class WorkingSetLease:
         cache_reservation = self._cache_reservation
         store_reservation = self._store_reservation
 
-        def remember(caught):
-            nonlocal error
-            if error is None:
-                error = caught
-
         def run_step(operation, callback):
-            try:
-                return self._lease_close_step(
-                    transition,
-                    operation,
-                    callback,
-                )
-            except Exception as caught:
-                if gate.phase in (
-                    _TerminalPhase.FATAL_PENDING,
-                    _TerminalPhase.FATAL_PUBLISHED,
-                    _TerminalPhase.RUNTIME_CLOSED,
-                ):
-                    primary = self._terminal_close_primary()
-                    self._retain_terminal_lease_safely(provider, primary)
-                    raise primary
-                remember(caught)
-                return None
+            return self._lease_close_step(
+                transition,
+                operation,
+                callback,
+            )
 
         def close_children(token, validator):
-            child_error = None
             for child in tuple(self._children):
-                try:
-                    child.close(_admission_token=token)
-                except Exception as caught:
-                    if child_error is None:
-                        child_error = caught
-            if child_error is not None:
-                raise child_error
+                child.close(_admission_token=token)
 
         run_step("child_close", close_children)
         if error is None:
@@ -2569,10 +2545,10 @@ class ActiveWorkingSetProvider:
         )
         if not callable(_resource_recorder):
             raise TypeError("store reservation recorder must be callable")
-        reservation = store.reserve(snapshot, dirty_ref=dirty_ref)
-        _publish_lease_construction_resource(
-            _construction_slot,
-            reservation,
+        reservation = store.reserve(
+            snapshot,
+            dirty_ref=dirty_ref,
+            _construction_slot=_construction_slot,
         )
         _resource_recorder(resource=reservation)
         return reservation
@@ -3233,7 +3209,12 @@ class ActiveWorkingSetProvider:
                     try:
                         runtime._accept_async_quarantine(retained_owner, primary)
                     except BaseException as callback_error:
-                        retained_owner._remember_secondary(callback_error)
+                        with runtime._terminal_state_lock:
+                            runtime._retain_terminal_secondary_locked(
+                                callback_error,
+                                primary,
+                                retained_owner,
+                            )
                 owns_cache_lease = any(
                     type(resource) is CacheEntryLease and resource._cache is self._cache
                     for resource in retained_owner.resources

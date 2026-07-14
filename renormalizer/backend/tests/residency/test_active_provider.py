@@ -3971,7 +3971,34 @@ def test_working_set_close_releases_dirty_array_ticket_and_staging_storage():
     runtime.close()
 
 
-def test_writeback_scheduling_failure_preserves_error_and_releases_all_owners(
+def _assert_cleanup_failure_is_fatal_retained(
+    runtime,
+    provider,
+    working_set,
+    primary,
+):
+    gate = runtime._terminal_gate
+    assert provider._active_lease is working_set
+    assert provider.resource_state()["active_leases"] == 1
+    assert working_set._store_reservation is not None
+    assert working_set._store_reservation._closed is False
+    with gate._condition:
+        assert gate._fatal_transition.primary is primary
+        assert gate._phase is _TerminalPhase.FATAL_PUBLISHED
+        assert gate._leases[working_set._epoch].phase == "fatal_retained"
+        assert not gate._has_active_tokens()
+
+
+def _release_retained_working_set_test_case(runtime, store, working_set):
+    reservation = working_set._store_reservation
+    if reservation is not None and not reservation._closed:
+        reservation.close()
+    runtime._closed = True
+    if not store.closed:
+        store.close()
+
+
+def test_writeback_scheduling_failure_preserves_error_and_retains_all_owners(
     monkeypatch,
 ):
     runtime = _runtime()
@@ -3981,28 +4008,29 @@ def test_writeback_scheduling_failure_preserves_error_and_releases_all_owners(
     working_set = provider.open_working_set(request, plan, store, receipt).__enter__()
     working_set.mark_dirty("output", np.arange(4, dtype=np.float64))
 
+    primary = RuntimeError("injected writeback scheduling failure")
+
     def fail_writeback(*args, **kwargs):
-        raise RuntimeError("injected writeback scheduling failure")
+        raise primary
 
     monkeypatch.setattr(working_set.scheduler, "writeback_d2h", fail_writeback)
     try:
-        with pytest.raises(RuntimeError, match="writeback scheduling failure"):
+        with pytest.raises(RuntimeError, match="writeback scheduling failure") as caught:
             working_set.close()
-
-        assert provider.resource_state()["active_leases"] == 0
-        assert provider.resource_state()["reserved_cache_bytes"] == 0
-        assert working_set._dirty is None
-        store.put("after-failure", np.ones(1, dtype=np.float64))
+        assert caught.value is primary
+        _assert_cleanup_failure_is_fatal_retained(
+            runtime,
+            provider,
+            working_set,
+            primary,
+        )
+        assert working_set._dirty is not None
     finally:
-        if not working_set._closed:
-            working_set._dirty = None
-            monkeypatch.undo()
-            working_set.close()
-        store.close()
-        runtime.close()
+        monkeypatch.undo()
+        _release_retained_working_set_test_case(runtime, store, working_set)
 
 
-def test_writeback_ticket_is_consumed_when_checkout_release_raises(monkeypatch):
+def test_checkout_release_uncertainty_retains_writeback_ticket(monkeypatch):
     runtime = _runtime()
     request, plan, store, _, center = _active_case(
         runtime, store_id="writeback-release-failure"
@@ -4017,6 +4045,7 @@ def test_writeback_ticket_is_consumed_when_checkout_release_raises(monkeypatch):
     invalidate = provider.cache.invalidate_ref
     commits = []
     invalidations = []
+    primary = RuntimeError("injected checkout release failure")
 
     def record_commit(ref, value):
         commits.append(ref)
@@ -4024,7 +4053,7 @@ def test_writeback_ticket_is_consumed_when_checkout_release_raises(monkeypatch):
 
     def fail_after_release(slot):
         release(slot)
-        raise RuntimeError("injected checkout release failure")
+        raise primary
 
     def record_invalidation(ref, **kwargs):
         invalidations.append(ref)
@@ -4034,21 +4063,26 @@ def test_writeback_ticket_is_consumed_when_checkout_release_raises(monkeypatch):
     monkeypatch.setattr(working_set.pool, "_release", fail_after_release)
     monkeypatch.setattr(provider.cache, "invalidate_ref", record_invalidation)
 
-    with pytest.raises(RuntimeError, match="checkout release failure"):
-        working_set.close()
-
-    updated = store.ref("output")
-    assert updated.version == center.version + 1
-    np.testing.assert_array_equal(store.read(updated), dirty)
-    assert commits == [center]
-    assert invalidations == [center]
-    assert working_set.metrics.dirty_writeback_count == 1
-    assert working_set.metrics.dirty_writeback_bytes == center.nbytes
-    assert working_set._writeback_ticket is None
-    working_set.close()
-    assert commits == [center]
-    store.close()
-    runtime.close()
+    try:
+        with pytest.raises(RuntimeError, match="checkout release failure") as caught:
+            working_set.close()
+        assert caught.value is primary
+        updated = store.ref("output")
+        assert updated.version == center.version + 1
+        np.testing.assert_array_equal(store.read(updated), dirty)
+        assert commits == [center]
+        assert invalidations == []
+        assert working_set.metrics.dirty_writeback_count == 0
+        assert working_set._writeback_ticket is not None
+        _assert_cleanup_failure_is_fatal_retained(
+            runtime,
+            provider,
+            working_set,
+            primary,
+        )
+    finally:
+        monkeypatch.undo()
+        _release_retained_working_set_test_case(runtime, store, working_set)
 
 
 def test_successful_dirty_cas_is_accounted_once_before_invalidation_failure(
@@ -4066,6 +4100,7 @@ def test_successful_dirty_cas_is_accounted_once_before_invalidation_failure(
     commit = working_set._store_reservation.commit
     commits = []
     invalidations = []
+    primary = RuntimeError("injected cache invalidation failure")
 
     def record_commit(ref, value):
         commits.append(ref)
@@ -4073,30 +4108,35 @@ def test_successful_dirty_cas_is_accounted_once_before_invalidation_failure(
 
     def fail_invalidation(ref, **_kwargs):
         invalidations.append(ref)
-        raise RuntimeError("injected cache invalidation failure")
+        raise primary
 
     monkeypatch.setattr(working_set._store_reservation, "commit", record_commit)
     monkeypatch.setattr(provider.cache, "invalidate_ref", fail_invalidation)
 
-    with pytest.raises(RuntimeError, match="cache invalidation failure"):
-        working_set.close()
+    try:
+        with pytest.raises(RuntimeError, match="cache invalidation failure") as caught:
+            working_set.close()
+        assert caught.value is primary
+        updated = store.ref("output")
+        assert updated.version == center.version + 1
+        np.testing.assert_array_equal(store.read(updated), dirty)
+        assert commits == [center]
+        assert invalidations == [center]
+        assert working_set.metrics.dirty_writeback_count == 1
+        assert working_set.metrics.dirty_writeback_bytes == center.nbytes
+        assert working_set.metrics.dirty_writeback_s >= 0.0
+        _assert_cleanup_failure_is_fatal_retained(
+            runtime,
+            provider,
+            working_set,
+            primary,
+        )
+    finally:
+        monkeypatch.undo()
+        _release_retained_working_set_test_case(runtime, store, working_set)
 
-    updated = store.ref("output")
-    assert updated.version == center.version + 1
-    np.testing.assert_array_equal(store.read(updated), dirty)
-    assert commits == [center]
-    assert invalidations == [center]
-    assert working_set.metrics.dirty_writeback_count == 1
-    assert working_set.metrics.dirty_writeback_bytes == center.nbytes
-    assert working_set.metrics.dirty_writeback_s >= 0.0
-    working_set.close()
-    assert commits == [center]
-    assert working_set.metrics.dirty_writeback_count == 1
-    store.close()
-    runtime.close()
 
-
-def test_writeback_callback_failure_releases_dirty_refs_and_store_reservation(
+def test_writeback_callback_uncertainty_retains_dirty_refs_and_reservation(
     monkeypatch,
 ):
     runtime = _runtime()
@@ -4111,22 +4151,30 @@ def test_writeback_callback_failure_releases_dirty_refs_and_store_reservation(
     working_set.mark_dirty("output", dirty)
     del dirty
 
+    primary = RuntimeError("injected dirty CAS callback failure")
+
     def fail_commit(ref, value):
-        raise RuntimeError("injected dirty CAS callback failure")
+        raise primary
 
     monkeypatch.setattr(working_set._store_reservation, "commit", fail_commit)
-    with pytest.raises(RuntimeError, match="dirty CAS callback failure"):
-        working_set.close()
-    gc.collect()
-
-    assert store.ref("output") == center
-    assert provider.resource_state()["active_leases"] == 0
-    assert working_set._dirty is None
-    assert working_set._writeback_ticket is None
-    assert dirty_ref() is None
-    store.put("after-callback-failure", np.ones(1, dtype=np.float64))
-    store.close()
-    runtime.close()
+    try:
+        with pytest.raises(RuntimeError, match="dirty CAS callback failure") as caught:
+            working_set.close()
+        assert caught.value is primary
+        gc.collect()
+        assert store.ref("output") == center
+        assert working_set._dirty is not None
+        assert working_set._writeback_ticket is not None
+        assert dirty_ref() is not None
+        _assert_cleanup_failure_is_fatal_retained(
+            runtime,
+            provider,
+            working_set,
+            primary,
+        )
+    finally:
+        monkeypatch.undo()
+        _release_retained_working_set_test_case(runtime, store, working_set)
 
 
 def test_metrics_are_bounded_scalars_replaced_for_each_outer_lease():

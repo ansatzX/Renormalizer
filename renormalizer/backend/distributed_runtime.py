@@ -11,6 +11,7 @@ import json
 import math
 import os
 import threading
+import time
 import uuid
 import weakref
 
@@ -177,6 +178,13 @@ class _RuntimeCommunicatorFatalHook:
 
     def record_secondary(self, error):
         self._runtime()._record_structured_fatal_secondary(error)
+
+    def _terminalize_failure(self, primary, diagnostics=(), transition=None):
+        return self._runtime()._terminalize_communicator_fatal_failure(
+            primary,
+            diagnostics=diagnostics,
+            transition=transition,
+        )
 
 
 _MISSING_TERMINAL_FIELD = object()
@@ -1157,10 +1165,7 @@ class CupyDistributedRuntime:
         with gate._condition:
             if transition is None or gate._fatal_transition is not transition:
                 return False
-            return (
-                gate._fatal_snapshot is not _TERMINAL_MISSING
-                or gate._fatal_publication_failure is not _TERMINAL_MISSING
-            )
+            return gate._fatal_snapshot is not _TERMINAL_MISSING
 
     def _dispatch_terminal_owner_secondaries(
         self,
@@ -1359,7 +1364,7 @@ class CupyDistributedRuntime:
         *,
         owner=None,
     ):
-        """Install the gate outcome before best-effort diagnostic fan-out."""
+        """Install the gate outcome and retain diagnostics without callbacks."""
         primary = transition.primary
         gate = self._terminal_gate
         with gate._condition:
@@ -1386,13 +1391,38 @@ class CupyDistributedRuntime:
                         )
             except BaseException:
                 pass
-        self._dispatch_terminal_collective_secondaries(
-            tuple(self._terminal_pending_collective_diagnostics),
-            primary,
-            transition,
-        )
-        self._dispatch_terminal_secondaries_after_outcome(transition)
         return primary
+
+    def _terminalize_communicator_fatal_failure(
+        self,
+        primary,
+        *,
+        diagnostics=(),
+        transition=None,
+    ):
+        """Non-pluggable fallback for a failed structured fatal begin."""
+        if not isinstance(primary, BaseException):
+            raise TypeError("communicator fatal failure must be an exception")
+        gate = self._terminal_gate
+        discovering_token = gate._current_thread_admission()
+        retained_transition = gate._terminalize_fatal_failure(
+            primary,
+            discovering_token,
+        )
+        canonical = retained_transition.primary
+        with self._terminal_state_lock:
+            prior = self._terminal_error
+            self._terminal_error = canonical
+            if self._pending_fatal_collective is None:
+                self._pending_fatal_collective = self.collective
+            for error in (primary, prior, *tuple(diagnostics)):
+                self._retain_terminal_secondary_locked(error, canonical)
+            if transition is not None and transition is not retained_transition:
+                self._retain_terminal_secondary_locked(
+                    RuntimeError("communicator fatal transition changed"),
+                    canonical,
+                )
+        return retained_transition
 
     def _force_async_primary_locked(self, owner, primary):
         if owner is None:
@@ -1826,6 +1856,21 @@ class CupyDistributedRuntime:
                 getattr(collective, "_begin_fatal_publication", None)
             )
             if structured_collective:
+                try:
+                    exit_claimed = (
+                        collective._current_thread_claimed_fatal_hard_exit(
+                            primary
+                        )
+                    )
+                except BaseException as claim_error:
+                    with self._terminal_state_lock:
+                        self._retain_terminal_secondary_locked(
+                            claim_error,
+                            primary,
+                        )
+                    exit_claimed = False
+                if exit_claimed:
+                    raise
                 terminalize = getattr(
                     collective,
                     "_terminalize_structured_fatal_failure",
@@ -3186,19 +3231,78 @@ class CupyDistributedRuntime:
 
     def resource_state(self):
         gate = self._terminal_gate
+        deadline = time.monotonic() + _TERMINAL_TIMEOUT_S
+
+        def fail_terminal_wait(error):
+            with gate._condition:
+                transition = gate._fatal_transition
+                primary = error if transition is None else transition.primary
+            if error is not primary:
+                with self._terminal_state_lock:
+                    self._retain_terminal_secondary_locked(error, primary)
+            try:
+                published = self._enter_communicator_fatal(primary)
+                if isinstance(published, BaseException):
+                    primary = published
+            except BaseException as publication_error:
+                with gate._condition:
+                    transition = gate._fatal_transition
+                    if transition is not None:
+                        primary = transition.primary
+                if publication_error is not primary:
+                    with self._terminal_state_lock:
+                        self._retain_terminal_secondary_locked(
+                            publication_error,
+                            primary,
+                        )
+            raise primary
+
         while True:
+            owner_thread = None
             with gate._condition:
                 phase = gate._phase
                 live_epoch = gate._live_epoch
-                lease_phase = (
-                    None
-                    if live_epoch is None
-                    else gate._leases[live_epoch].phase
+                lease_state = (
+                    None if live_epoch is None else gate._leases[live_epoch]
                 )
+                lease_phase = None if lease_state is None else lease_state.phase
                 fatal = gate._fatal_transition
+                if phase is _TerminalPhase.RUNTIME_CLOSING:
+                    transition = gate._runtime_close_transition
+                    owner_thread = (
+                        None if transition is None else transition.owner_thread
+                    )
+                elif lease_phase == "constructing":
+                    construction = lease_state.construction
+                    owner_thread = (
+                        None
+                        if construction is None
+                        else construction.owner_thread
+                    )
+                elif lease_phase == "closing":
+                    transition = lease_state.transition
+                    owner_thread = (
+                        None if transition is None else transition.owner_thread
+                    )
+                elif phase is _TerminalPhase.FATAL_PENDING:
+                    owner_thread = gate._fatal_runtime_finalizer_thread
 
             if phase is _TerminalPhase.FATAL_PENDING:
-                gate.wait_for_published(_TERMINAL_TIMEOUT_S)
+                if owner_thread is not None and not owner_thread.is_alive():
+                    fail_terminal_wait(
+                        RuntimeError("resource_state terminal owner exited")
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fail_terminal_wait(
+                        TimeoutError("resource_state terminal wait timed out")
+                    )
+                try:
+                    gate.wait_for_published(remaining)
+                except TimeoutError:
+                    fail_terminal_wait(
+                        TimeoutError("resource_state terminal wait timed out")
+                    )
                 continue
             if phase is _TerminalPhase.FATAL_PUBLISHED or (
                 phase is _TerminalPhase.RUNTIME_CLOSED and fatal is not None
@@ -3212,7 +3316,33 @@ class CupyDistributedRuntime:
                 "fatal_retained",
             ):
                 with gate._condition:
-                    gate._condition.wait(_TERMINAL_TIMEOUT_S)
+                    current_epoch = gate._live_epoch
+                    current_lease_phase = (
+                        None
+                        if current_epoch is None
+                        else gate._leases[current_epoch].phase
+                    )
+                    if (
+                        gate._phase is not phase
+                        or current_epoch != live_epoch
+                        or current_lease_phase != lease_phase
+                    ):
+                        continue
+                    if owner_thread is not None and not owner_thread.is_alive():
+                        wait_error = RuntimeError(
+                            "resource_state terminal owner exited"
+                        )
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            wait_error = TimeoutError(
+                                "resource_state terminal wait timed out"
+                            )
+                        else:
+                            wait_error = None
+                            gate._condition.wait(remaining)
+                if wait_error is not None:
+                    fail_terminal_wait(wait_error)
                 continue
 
             try:

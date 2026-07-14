@@ -3803,8 +3803,8 @@ def test_deferred_quarantine_failure_retains_owner_and_fail_stops_close(
     assert callback_calls == [owner]
     assert owner.state == "quarantined"
     assert owner.error is primary
-    assert owner.secondary_errors == (callback_error,)
-    assert runtime._terminal_secondary_errors == (callback_error,)
+    assert owner.secondary_errors == ()
+    assert runtime._terminal_secondary_errors == ()
     assert wrapper._fatal_secondary_errors == (callback_error,)
     assert wrapper._fatal_publication_failure is primary
     assert hard_exit_observations == [
@@ -7387,7 +7387,9 @@ def test_persistent_hidden_fatal_recovery_operation_uses_bounded_fail_stop(
     )
 
 
-def test_gate_failure_callback_cancellation_retries_and_wakes_waiters(monkeypatch):
+def test_gate_failure_callback_cancellation_falls_back_and_wakes_waiters(
+    monkeypatch,
+):
     class CallbackCancelled(BaseException):
         pass
 
@@ -7493,14 +7495,9 @@ def test_gate_failure_callback_cancellation_retries_and_wakes_waiters(monkeypatc
     assert wait_errors == [primary]
     assert owner_state[0].owner_thread is owner
     assert owner_state[0].primary is primary
-    assert callback_observations == [
-        (False, False, False),
-        (False, False, False),
-    ]
+    assert callback_observations == [(False, False, False)]
     assert reentrant_results == [(True, False)]
-    assert len(gate_primitive_calls) == 1
-    assert gate_primitive_calls[0][1] is primary
-    assert gate_primitive_calls[0][2:] == (False, False, False)
+    assert gate_primitive_calls == []
     with wrapper._fatal_condition:
         assert wrapper._fatal_publications == 1
         assert wrapper._fatal_publication_failure is primary
@@ -8968,9 +8965,6 @@ def test_structured_terminalizer_marks_before_diagnostic_and_hard_exits_once(
     monkeypatch,
     catch_path,
 ):
-    class DiagnosticFailure(BaseException):
-        pass
-
     class FatalHardExit(BaseException):
         pass
 
@@ -8978,26 +8972,23 @@ def test_structured_terminalizer_marks_before_diagnostic_and_hard_exits_once(
     gate = runtime._terminal_gate
     primary = RuntimeError("{} structured primary".format(catch_path))
     trigger = RuntimeError("{} structured trigger".format(catch_path))
-    diagnostic_failure = DiagnosticFailure(
-        "{} structured diagnostic".format(catch_path)
-    )
-    transition = _reserve_task_18_3_structured_failure(
-        runtime, wrapper, primary
-    )
     diagnostic_calls = []
-    marker_observations = []
+    first_action = []
+    action_ready = threading.Event()
+    release_diagnostic = threading.Event()
     hard_exits = []
 
-    def fail_diagnostic(error):
+    def block_diagnostic(error):
         diagnostic_calls.append(error)
-        with wrapper._fatal_condition:
-            collective_marked = wrapper._fatal_publication_failure is primary
-        with gate._condition:
-            gate_marked = gate._fatal_publication_failure is primary
-        marker_observations.append((collective_marked, gate_marked))
-        raise diagnostic_failure
+        if not first_action:
+            first_action.append("diagnostic")
+            action_ready.set()
+        assert release_diagnostic.wait(_TASK_18_2_TIMEOUT_S)
 
     def hard_exit():
+        if not first_action:
+            first_action.append("hard_exit")
+            action_ready.set()
         hard_exits.append(
             (
                 wrapper._fatal_condition._is_owned(),
@@ -9007,40 +8998,69 @@ def test_structured_terminalizer_marks_before_diagnostic_and_hard_exits_once(
         )
         raise FatalHardExit(catch_path)
 
-    monkeypatch.setattr(wrapper, "_record_fatal_secondary", fail_diagnostic)
+    monkeypatch.setattr(wrapper, "_record_fatal_secondary", block_diagnostic)
     monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
     if catch_path == "monitor_read":
-        handoff = wrapper._fatal_monitor_handoff
-        with handoff._condition:
-            handoff._fatal_reservation = None
-            handoff._outcome = None
         monkeypatch.setattr(
             wrapper,
             "_read_fatal_origin",
             lambda: (_ for _ in ()).throw(trigger),
         )
-        call = wrapper._monitor_fatal_records
+
+        def call():
+            _reserve_task_18_3_structured_failure(runtime, wrapper, primary)
+            handoff = wrapper._fatal_monitor_handoff
+            with handoff._condition:
+                handoff._fatal_reservation = None
+                handoff._outcome = None
+            return wrapper._monitor_fatal_records()
+
     elif catch_path == "timeout":
         monkeypatch.setattr(
             wrapper._fatal_monitor_handoff,
             "wait_for_selection",
             lambda _timeout: (_ for _ in ()).throw(TimeoutError()),
         )
-        call = wrapper._wait_for_fatal_monitor_selection
+
+        def call():
+            _reserve_task_18_3_structured_failure(runtime, wrapper, primary)
+            return wrapper._wait_for_fatal_monitor_selection()
+
     else:
-        call = lambda: wrapper._terminalize_structured_fatal_failure(
-            trigger,
-            transition_handler=runtime._communicator_fatal_hook,
-            transition=transition,
-        )
 
-    with pytest.raises(FatalHardExit):
-        call()
+        def call():
+            transition = _reserve_task_18_3_structured_failure(
+                runtime, wrapper, primary
+            )
+            return wrapper._terminalize_structured_fatal_failure(
+                trigger,
+                transition_handler=runtime._communicator_fatal_hook,
+                transition=transition,
+            )
 
-    assert len(diagnostic_calls) == 1
-    assert marker_observations == [(True, True)]
+    worker, results, errors, done = _start_task_18_2_call(
+        call,
+        name="task-18.3-no-fail-stop-diagnostic-{}".format(catch_path),
+    )
+    try:
+        assert action_ready.wait(_TASK_18_2_TIMEOUT_S)
+    finally:
+        release_diagnostic.set()
+        _join_task_18_2_call(worker, done)
+
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], FatalHardExit)
+    assert first_action == ["hard_exit"]
+    assert diagnostic_calls == []
     assert hard_exits == [(False, False, False)]
-    assert diagnostic_failure in wrapper._fatal_secondary_errors
+    if catch_path == "timeout":
+        assert any(
+            "outcome selection timed out" in str(error)
+            for error in wrapper._fatal_secondary_errors
+        )
+    else:
+        assert trigger in wrapper._fatal_secondary_errors
     with wrapper._fatal_condition:
         assert wrapper._fatal_publication_failure is primary
     with gate._condition:
@@ -9056,9 +9076,6 @@ def test_recovered_structured_election_terminalizes_before_diagnostics(
     class RecoveryFailure(BaseException):
         pass
 
-    class DiagnosticFailure(BaseException):
-        pass
-
     class FatalHardExit(BaseException):
         pass
 
@@ -9067,7 +9084,6 @@ def test_recovered_structured_election_terminalizes_before_diagnostics(
     primary = RuntimeError("recovered structured primary")
     election_failure = ElectionFailure("interrupt after owner reservation")
     recovery_failure = RecoveryFailure("recovery context failed")
-    diagnostic_failure = DiagnosticFailure("recovery diagnostic failed")
     original_pre_reserve = wrapper._pre_reserve_fatal_publication
     diagnostic_calls = []
     marker_observations = []
@@ -9087,7 +9103,7 @@ def test_recovered_structured_election_terminalizes_before_diagnostics(
         with gate._condition:
             gate_marked = gate._fatal_publication_failure is primary
         marker_observations.append((collective_marked, gate_marked))
-        raise diagnostic_failure
+        raise AssertionError("fail-stop invoked a pluggable diagnostic")
 
     def hard_exit():
         hard_exits.append(
@@ -9109,12 +9125,11 @@ def test_recovered_structured_election_terminalizes_before_diagnostics(
     with pytest.raises(FatalHardExit):
         runtime._enter_communicator_fatal(primary)
 
-    assert diagnostic_calls == [recovery_failure, election_failure]
-    assert marker_observations == [(True, True), (True, True)]
+    assert diagnostic_calls == []
+    assert marker_observations == []
     assert hard_exits == [(False, False, False)]
     assert recovery_failure in wrapper._fatal_secondary_errors
     assert election_failure in wrapper._fatal_secondary_errors
-    assert diagnostic_failure in wrapper._fatal_secondary_errors
     with wrapper._fatal_condition:
         assert wrapper._fatal_publication_failure is primary
     with gate._condition:
@@ -9192,7 +9207,7 @@ def test_remote_fatal_publisher_thread_start_is_transactional(
             with gate._condition:
                 assert gate._fatal_transition.primary is primary
                 assert gate._fatal_publication_failure is primary
-            assert diagnostic_observations == [(True, True)]
+            assert diagnostic_observations == []
             assert hard_exits == [
                 (threading.current_thread(), (True, True))
             ]
@@ -9260,14 +9275,63 @@ def test_true_pre_owner_monitor_read_failure_marks_before_exit(monkeypatch):
     with pytest.raises(FatalHardExit):
         wrapper._monitor_fatal_records()
 
-    assert dispatch_observations
-    assert all(observation == (True, True) for observation in dispatch_observations)
+    assert dispatch_observations == []
     assert hard_exits == [(False, False, False)]
     with wrapper._fatal_condition:
         assert wrapper._fatal_publication_failure is primary
     with gate._condition:
         assert gate._fatal_transition.primary is primary
         assert gate._fatal_publication_failure is primary
+
+
+def test_fatal_outcome_replacement_retains_without_locked_diagnostic(
+    monkeypatch,
+):
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("already selected fatal primary")
+    later = RuntimeError("later fatal election candidate")
+    outcome = wrapper._fatal_monitor_handoff.select_fatal(primary)
+    diagnostic_entered = threading.Event()
+    release_diagnostic = threading.Event()
+    action_ready = threading.Event()
+    first_action = []
+    diagnostic_calls = []
+
+    def block_diagnostic(error):
+        diagnostic_calls.append(error)
+        if not first_action:
+            first_action.append("diagnostic")
+            action_ready.set()
+        diagnostic_entered.set()
+        assert release_diagnostic.wait(_TASK_18_2_TIMEOUT_S)
+
+    def reserve_under_terminal_locks():
+        with gate._condition:
+            with runtime._terminal_state_lock:
+                selected = wrapper._reserve_runtime_fatal_outcome(later)
+        if not first_action:
+            first_action.append("returned")
+            action_ready.set()
+        return selected
+
+    monkeypatch.setattr(wrapper, "_record_fatal_secondary", block_diagnostic)
+    worker, results, errors, done = _start_task_18_2_call(
+        reserve_under_terminal_locks,
+        name="task-18.3-locked-fatal-replacement",
+    )
+    try:
+        assert action_ready.wait(_TASK_18_2_TIMEOUT_S)
+    finally:
+        release_diagnostic.set()
+        _join_task_18_2_call(worker, done)
+
+    assert errors == []
+    assert results == [outcome]
+    assert first_action == ["returned"]
+    assert diagnostic_entered.is_set() is False
+    assert diagnostic_calls == []
+    assert later in wrapper._fatal_secondary_errors
 
 
 def test_owner_and_non_owner_fail_stop_share_one_hard_exit(monkeypatch):
@@ -9584,3 +9648,127 @@ def test_fatal_control_initialization_commits_only_with_owned_monitor(
         release_monitor.set()
         if worker is not None and worker.ident is not None:
             worker.join(_TASK_18_2_TIMEOUT_S)
+
+
+@pytest.mark.parametrize(
+    "begin_boundary",
+    ("handler_lookup", "before_real_begin", "after_real_begin"),
+)
+def test_monitor_start_failure_totalizes_fatal_begin_failure(
+    monkeypatch,
+    begin_boundary,
+):
+    class MonitorStartFailure(BaseException):
+        pass
+
+    class FatalBeginFailure(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    store = _SharedStore(1)
+    raw_comm = _RawComm()
+    wrapper, backend = _cpu_collective(0, 1, store, raw_comm)
+    runtime = _task_18_2_runtime(wrapper, backend)
+    gate = runtime._terminal_gate
+    start_failure = MonitorStartFailure("fatal monitor did not start")
+    begin_failure = FatalBeginFailure(
+        "{} fatal begin failed".format(begin_boundary)
+    )
+    hard_exits = []
+    diagnostic_calls = []
+    original_start = threading.Thread.start
+    original_begin = runtime._communicator_fatal_hook.begin
+
+    def fail_monitor_start(thread):
+        if thread.name.startswith("renormalizer-fatal-monitor-rank-"):
+            raise start_failure
+        return original_start(thread)
+
+    if begin_boundary == "handler_lookup":
+        monkeypatch.setattr(
+            wrapper,
+            "_fatal_transition_handler_callback",
+            lambda: (_ for _ in ()).throw(begin_failure),
+        )
+    elif begin_boundary == "before_real_begin":
+        monkeypatch.setattr(
+            runtime._communicator_fatal_hook,
+            "begin",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(begin_failure),
+        )
+    else:
+
+        def fail_after_begin(*args, **kwargs):
+            original_begin(*args, **kwargs)
+            raise begin_failure
+
+        monkeypatch.setattr(
+            runtime._communicator_fatal_hook,
+            "begin",
+            fail_after_begin,
+        )
+
+    def diagnostic(error):
+        diagnostic_calls.append(error)
+        raise AssertionError("fatal-begin fail-stop dispatched diagnostics")
+
+    def hard_exit():
+        with wrapper._fatal_condition:
+            collective_marker = wrapper._fatal_publication_failure
+            publications = wrapper._fatal_publications
+            owner = wrapper._fatal_publication_owner_reservation
+        with gate._condition:
+            transition = gate._fatal_transition
+            gate_marker = gate._fatal_publication_failure
+        hard_exits.append(
+            (
+                collective_marker,
+                gate_marker,
+                None if transition is None else transition.primary,
+                publications,
+                owner,
+                wrapper._fatal_condition._is_owned(),
+                gate._condition._is_owned(),
+            )
+        )
+        raise FatalHardExit()
+
+    monkeypatch.setattr(threading.Thread, "start", fail_monitor_start)
+    monkeypatch.setattr(wrapper, "_record_fatal_secondary", diagnostic)
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    with pytest.raises(FatalHardExit):
+        wrapper._bootstrap_fatal_control()
+
+    assert wrapper._fatal_control_initialized is False
+    assert wrapper._fatal_monitor_thread is None
+    assert wrapper._fatal_monitor_state == "start_failed"
+    assert diagnostic_calls == []
+    assert len(hard_exits) == 1
+    (
+        collective_marker,
+        gate_marker,
+        transition_primary,
+        publications,
+        owner,
+        collective_locked,
+        gate_locked,
+    ) = hard_exits[0]
+    assert (
+        collective_marker,
+        gate_marker,
+        transition_primary,
+        collective_locked,
+        gate_locked,
+    ) == (start_failure, start_failure, start_failure, False, False)
+    if begin_boundary == "after_real_begin":
+        assert publications == 1
+        assert owner.primary is start_failure
+        assert owner.owner_thread is threading.current_thread()
+    else:
+        assert publications == 0
+        assert owner is None
+    assert begin_failure in wrapper._fatal_secondary_errors
+    assert begin_failure in runtime._terminal_secondary_errors
