@@ -206,6 +206,9 @@ class TransferTicket(AsyncCompletionHandle):
         # Quarantine must retain the complete owner, including its callback.
         return None
 
+    def _publish_completion(self):
+        self._owner.publish_counted_completion()
+
 
 class TransferScheduler:
     """Single-lane scheduler with one explicit transfer stream on CuPy."""
@@ -222,6 +225,9 @@ class TransferScheduler:
         timing_event_factory=None,
         elapsed_time_reader=None,
         quarantine=None,
+        _async_admission_factory=None,
+        _resource_recorder=None,
+        _resource_releaser=None,
     ):
         if not callable(getattr(store, "copy_into", None)):
             raise TypeError("transfer scheduler requires HostTensorStore.copy_into")
@@ -233,6 +239,14 @@ class TransferScheduler:
             raise TypeError("profile_enabled must be a boolean")
         if quarantine is not None and not callable(quarantine):
             raise TypeError("quarantine must be callable")
+        if _async_admission_factory is not None and not callable(
+            _async_admission_factory
+        ):
+            raise TypeError("async admission factory must be callable")
+        if _resource_recorder is not None and not callable(_resource_recorder):
+            raise TypeError("resource recorder must be callable")
+        if _resource_releaser is not None and not callable(_resource_releaser):
+            raise TypeError("resource releaser must be callable")
         for supplied, name in (
             (event_factory, "event_factory"),
             (timing_event_factory, "timing_event_factory"),
@@ -280,6 +294,9 @@ class TransferScheduler:
         self._event_owners = {}
         self._quarantined_owners = []
         self._quarantine = quarantine
+        self._async_admission_factory = _async_admission_factory
+        self._resource_recorder = _resource_recorder
+        self._resource_releaser = _resource_releaser
         self._quarantining = False
         self._closed = False
         self._poisoned_error = None
@@ -288,6 +305,8 @@ class TransferScheduler:
         self.h2d_s = 0.0
         self.d2h_s = 0.0
         self.last_compute_event = None
+        if self._resource_recorder is not None:
+            self._resource_recorder(resource=self, streams=(self._stream,))
 
     @property
     def stream_count(self):
@@ -363,6 +382,8 @@ class TransferScheduler:
         timer=None,
         started_at=None,
         elapsed_reader=None,
+        defer_counted_completion=False,
+        defer_counted_admission=False,
     ):
         scheduler_ref = weakref.ref(self)
         cupy = self._cupy
@@ -400,21 +421,40 @@ class TransferScheduler:
             if scheduler is not None:
                 scheduler._account_owner(owner)
 
-        owner = AsyncResourceOwner(
-            kind,
-            arrays=arrays,
-            resources=resources,
-            streams=streams,
-            callback=callback,
-            accounting=account,
-            nbytes=nbytes,
-            timer=timer,
-            started_at=started_at,
-            elapsed_reader=elapsed_reader,
-            drainer=drain,
-            detached=self._owner_detached,
-            quarantine=self._owner_quarantined,
-        )
+        async_admission = None
+        if (
+            self._async_admission_factory is not None
+            and not defer_counted_admission
+        ):
+            capability = object()
+            async_admission = self._async_admission_factory(
+                capability,
+                "{}_completion".format(kind),
+            )
+        try:
+            owner = AsyncResourceOwner(
+                kind,
+                arrays=arrays,
+                resources=resources,
+                streams=streams,
+                callback=callback,
+                accounting=account,
+                nbytes=nbytes,
+                timer=timer,
+                started_at=started_at,
+                elapsed_reader=elapsed_reader,
+                drainer=drain,
+                detached=self._owner_detached,
+                quarantine=self._owner_quarantined,
+                _async_admission=async_admission,
+                _resource_recorder=self._resource_recorder,
+                _resource_releaser=self._resource_releaser,
+                _defer_async_completion=defer_counted_completion,
+            )
+        except BaseException:
+            if async_admission is not None:
+                async_admission.cancel()
+            raise
         holder["owner"] = owner
         self._owners[id(owner)] = owner
         return owner
@@ -565,6 +605,7 @@ class TransferScheduler:
                 if self._profile_enabled and self._cupy is not None
                 else None
             ),
+            defer_counted_completion=True,
         )
         ticket = TransferTicket(owner)
         self._tickets.append(ticket)
@@ -659,6 +700,7 @@ class TransferScheduler:
             arrays=captured_arrays,
             resources=(bindings, *cache_leases, *resources),
             nbytes=sum(int(array.nbytes) for array in captured_arrays),
+            defer_counted_admission=True,
         )
         try:
             if self._cupy is not None:
@@ -706,9 +748,18 @@ class TransferScheduler:
             raise RuntimeError("compute owner is not active")
         owner.capture_arrays(*arrays)
         try:
+            if self._async_admission_factory is not None:
+                capability = object()
+                owner.install_counted_admission(
+                    self._async_admission_factory(
+                        capability,
+                        "compute_completion",
+                    )
+                )
             event = self._new_event(owner, completion=True)
             stream = None if not owner.streams else owner.streams[0]
             self._record(event, stream)
+            owner.watch_counted_completion()
         except BaseException as error:
             owner.fail(error)
         self.last_compute_event = handle
@@ -829,6 +880,10 @@ class TransferScheduler:
         if errors:
             raise errors[0]
 
+    def _start_counted_completions(self):
+        for owner in tuple(self._owners.values()):
+            owner.start_counted_completion()
+
     def close(self):
         if self._closed:
             if self._poisoned_error is not None:
@@ -858,6 +913,9 @@ class TransferScheduler:
         self._timing_event_factory = None
         self._elapsed_time_reader = None
         self._quarantine = None
+        self._async_admission_factory = None
+        self._resource_recorder = None
+        self._resource_releaser = None
         self._closed = True
         if self._poisoned_error is None:
             self._profile_enabled = False

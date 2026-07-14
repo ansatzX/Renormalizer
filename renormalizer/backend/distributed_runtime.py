@@ -560,6 +560,7 @@ class CupyDistributedRuntime:
     _legacy_fatal_publication_owner: int | None = field(
         default=None, init=False, repr=False
     )
+    _fatal_provider_finalized: bool = field(default=False, init=False, repr=False)
     _deferred_async_quarantines: list = field(
         default_factory=list, init=False, repr=False
     )
@@ -579,6 +580,59 @@ class CupyDistributedRuntime:
     @property
     def terminal_poisoned(self):
         return self._terminal_error is not None
+
+    def _require_admission(
+        self,
+        token,
+        *,
+        scope,
+        epoch,
+        transition_sequence=None,
+    ):
+        gate = self._terminal_gate
+        with gate._condition:
+            state = gate._token_state(token)
+            gate._require_token_thread(state)
+            if token.scope != scope or token.epoch != epoch:
+                raise RuntimeError(
+                    "resource admission does not match the required runtime scope"
+                )
+            if token.transition_sequence != transition_sequence:
+                raise RuntimeError(
+                    "resource admission does not match the required transition"
+                )
+            return token
+
+    def _release_admission(self, token):
+        if token is None:
+            return
+        try:
+            self._terminal_gate.release(token)
+        except RuntimeError as error:
+            if "converted" not in str(error):
+                raise
+
+    def _install_active_provider(self, provider, *, _admission_token):
+        self._require_admission(
+            _admission_token,
+            scope="runtime_setup",
+            epoch=None,
+        )
+        existing = self._active_provider
+        if existing is not None and existing is not provider:
+            raise RuntimeError("runtime already owns an active working-set provider")
+        self._active_provider = provider
+        return provider
+
+    def _publish_residency_receipt(self, receipt, *, _admission_token):
+        self._require_admission(
+            _admission_token,
+            scope="runtime_setup",
+            epoch=None,
+        )
+        self._issued_receipts.clear()
+        self._issued_receipts[id(receipt)] = receipt
+        return receipt
 
     def _require_usable(self):
         primary = None
@@ -1154,9 +1208,27 @@ class CupyDistributedRuntime:
             )
             with self._terminal_state_lock:
                 context = self._pending_fatal_context
-            provider, lease, owner = (
-                (None, None, None) if context is None else context
+                provider, lease, owner = (
+                    (None, None, None) if context is None else context
+                )
+                _, current_provider, current_lease, current_owner = (
+                    self._normalize_communicator_fatal(primary, owner)
+                )
+                if provider is None:
+                    provider = current_provider
+                if lease is None and provider is current_provider:
+                    lease = current_lease
+                if owner is None:
+                    owner = current_owner
+                self._pending_fatal_context = (provider, lease, owner)
+                self._issued_receipts.clear()
+            retain_resources = (
+                None
+                if provider is None
+                else getattr(provider, "_retain_transition_resources", None)
             )
+            if callable(retain_resources):
+                retain_resources(lease)
             if owner is not None:
                 if owner.state not in {"detached", "quarantined"}:
                     owner.force_quarantine(primary)
@@ -1189,6 +1261,8 @@ class CupyDistributedRuntime:
     ):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
+        if discovering_token is None:
+            discovering_token = self._terminal_gate._current_thread_admission()
         deferred_primary = self._defer_current_active_broadcast_fatal(
             primary,
             owner=owner,
@@ -1274,7 +1348,11 @@ class CupyDistributedRuntime:
 
     def barrier(self):
         self._require_usable()
-        return self.collective.barrier()
+        token = self._terminal_gate.admit_runtime("barrier_collective")
+        try:
+            return self.collective.barrier()
+        finally:
+            self._release_admission(token)
 
     def execution_config(
         self,
@@ -1285,9 +1363,41 @@ class CupyDistributedRuntime:
         prefetch_depth=1,
     ):
         self._require_usable()
+        token = self._terminal_gate.admit_runtime_setup("execution_config")
+        try:
+            return self._execution_config(
+                residency_policy=residency_policy,
+                device_memory_budget_bytes=device_memory_budget_bytes,
+                host_memory_budget_bytes=host_memory_budget_bytes,
+                prefetch_depth=prefetch_depth,
+                _admission_token=token,
+            )
+        finally:
+            self._release_admission(token)
+
+    def _execution_config(
+        self,
+        *,
+        residency_policy,
+        device_memory_budget_bytes,
+        host_memory_budget_bytes,
+        prefetch_depth,
+        _admission_token,
+    ):
+        self._require_admission(
+            _admission_token,
+            scope="runtime_setup",
+            epoch=None,
+        )
         backend_metadata = self._synchronize_active_backend()
-        device_resolution = self._resolve_budget("device", device_memory_budget_bytes)
-        host_resolution = self._resolve_budget("host", host_memory_budget_bytes)
+        device_resolution = self._resolve_budget(
+            "device",
+            device_memory_budget_bytes,
+        )
+        host_resolution = self._resolve_budget(
+            "host",
+            host_memory_budget_bytes,
+        )
         if residency_policy == "active_working_set":
             config = getattr(self.backend, "config", None)
             if (
@@ -1302,14 +1412,21 @@ class CupyDistributedRuntime:
             )
 
             if self._active_provider is None:
-                self._active_provider = ActiveWorkingSetProvider(
+                provider = ActiveWorkingSetProvider(
                     self,
                     device_budget_resolution=device_resolution,
                     host_budget_resolution=host_resolution,
                     prefetch_depth=prefetch_depth,
+                    _admission_token=_admission_token,
+                )
+                self._install_active_provider(
+                    provider, _admission_token=_admission_token
                 )
             elif not self._active_provider.matches_config(
-                device_resolution, host_resolution, prefetch_depth
+                device_resolution,
+                host_resolution,
+                prefetch_depth,
+                _admission_token=_admission_token,
             ):
                 raise ValueError(
                     "active provider already has different frozen budget metadata"
@@ -1340,6 +1457,22 @@ class CupyDistributedRuntime:
     def preflight_residency(self, request, plan):
         """Run the fixed Stage 5 agreement schedule without creating resources."""
         self._require_usable()
+        token = self._terminal_gate.admit_runtime_setup("preflight_residency")
+        try:
+            return self._preflight_residency(
+                request,
+                plan,
+                _admission_token=token,
+            )
+        finally:
+            self._release_admission(token)
+
+    def _preflight_residency(self, request, plan, *, _admission_token):
+        self._require_admission(
+            _admission_token,
+            scope="runtime_setup",
+            epoch=None,
+        )
         local_error = None
         try:
             if not isinstance(request, ResidencyRequest):
@@ -1365,6 +1498,7 @@ class CupyDistributedRuntime:
                     request.device_budget,
                     request.host_budget,
                     request.prefetch_depth,
+                    _admission_token=_admission_token,
                 )
             ):
                 raise ValueError("residency request budgets do not match the runtime")
@@ -1388,9 +1522,9 @@ class CupyDistributedRuntime:
                 device_budget_hash=device_budget_hash,
                 host_budget_hash=host_budget_hash,
             )
-            self._issued_receipts.clear()
-            self._issued_receipts[id(receipt)] = receipt
-            return receipt
+            return self._publish_residency_receipt(
+                receipt, _admission_token=_admission_token
+            )
 
         status = self._control_array([int(local_error is not None)], np.int32)
         failed = int(
@@ -1551,12 +1685,33 @@ class CupyDistributedRuntime:
             device_budget_hash=hashes[2],
             host_budget_hash=hashes[3],
         )
-        self._issued_receipts.clear()
-        self._issued_receipts[id(receipt)] = receipt
-        return receipt
+        return self._publish_residency_receipt(
+            receipt, _admission_token=_admission_token
+        )
 
-    def consume_residency_receipt(self, receipt, request, plan):
+    def consume_residency_receipt(
+        self,
+        receipt,
+        request,
+        plan,
+        *,
+        _admission_token,
+    ):
         self._require_usable()
+        token = self._require_admission(
+            _admission_token,
+            scope="construction",
+            epoch=_admission_token.epoch,
+        )
+        with self._terminal_gate._condition:
+            lease = self._terminal_gate._lease_state(token.epoch)
+            if (
+                lease.phase != "constructing"
+                or self._terminal_gate._live_epoch != token.epoch
+            ):
+                raise RuntimeError(
+                    "receipt consumption requires a constructing lease epoch"
+                )
         if not isinstance(receipt, ResidencyPreflightReceipt):
             raise TypeError("receipt must be a ResidencyPreflightReceipt")
         issued = self._issued_receipts.pop(id(receipt), None)
@@ -1600,7 +1755,26 @@ class CupyDistributedRuntime:
             value = getter()
         return np.asarray(value)
 
-    def _requested_budget_agrees(self, requested, resource):
+    def _requested_budget_agrees(
+        self, requested, resource, *, _admission_token=None
+    ):
+        if _admission_token is None:
+            _admission_token = self._terminal_gate._current_thread_admission()
+            if _admission_token is None:
+                token = self._terminal_gate.admit_runtime_setup("budget_probe")
+                try:
+                    return self._requested_budget_agrees(
+                        requested,
+                        resource,
+                        _admission_token=token,
+                    )
+                finally:
+                    self._release_admission(token)
+        self._require_admission(
+            _admission_token,
+            scope="runtime_setup",
+            epoch=None,
+        )
         local_error = None
         encoded = 0
         try:
@@ -1643,7 +1817,23 @@ class CupyDistributedRuntime:
         if int(minimum) != int(maximum):
             raise RuntimeError("{} memory budget request disagreement".format(resource))
 
-    def _auto_available_snapshot(self, resource):
+    def _auto_available_snapshot(self, resource, *, _admission_token=None):
+        if _admission_token is None:
+            _admission_token = self._terminal_gate._current_thread_admission()
+            if _admission_token is None:
+                token = self._terminal_gate.admit_runtime_setup("budget_probe")
+                try:
+                    return self._auto_available_snapshot(
+                        resource,
+                        _admission_token=token,
+                    )
+                finally:
+                    self._release_admission(token)
+        self._require_admission(
+            _admission_token,
+            scope="runtime_setup",
+            epoch=None,
+        )
         cached_name = "_auto_{}_budget".format(resource)
         cached = getattr(self, cached_name)
         if cached is not None:
@@ -1701,8 +1891,29 @@ class CupyDistributedRuntime:
         setattr(self, cached_name, resolution)
         return resolution
 
-    def _resolve_budget(self, resource, requested):
-        self._requested_budget_agrees(requested, resource)
+    def _resolve_budget(self, resource, requested, *, _admission_token=None):
+        if _admission_token is None:
+            _admission_token = self._terminal_gate._current_thread_admission()
+            if _admission_token is None:
+                token = self._terminal_gate.admit_runtime_setup("budget_probe")
+                try:
+                    return self._resolve_budget(
+                        resource,
+                        requested,
+                        _admission_token=token,
+                    )
+                finally:
+                    self._release_admission(token)
+        self._require_admission(
+            _admission_token,
+            scope="runtime_setup",
+            epoch=None,
+        )
+        self._requested_budget_agrees(
+            requested,
+            resource,
+            _admission_token=_admission_token,
+        )
         if requested is not None:
             return MemoryBudgetResolution(
                 requested_bytes=requested,
@@ -1711,9 +1922,28 @@ class CupyDistributedRuntime:
                 available_snapshot_bytes=None,
                 resource=resource,
             )
-        return self._auto_available_snapshot(resource)
+        return self._auto_available_snapshot(
+            resource, _admission_token=_admission_token
+        )
 
-    def _synchronize_active_backend(self):
+    def _synchronize_active_backend(self, *, _admission_token=None):
+        if _admission_token is None:
+            _admission_token = self._terminal_gate._current_thread_admission()
+            if _admission_token is None:
+                token = self._terminal_gate.admit_runtime_setup(
+                    "execution_config_backend_sync"
+                )
+                try:
+                    return self._synchronize_active_backend(
+                        _admission_token=token
+                    )
+                finally:
+                    self._release_admission(token)
+        self._require_admission(
+            _admission_token,
+            scope="runtime_setup",
+            epoch=None,
+        )
         expected_name = getattr(self.backend, "name", None)
         expected_device = getattr(self.backend, "device", None)
         expected_config = getattr(self.backend, "config", None)
@@ -1836,7 +2066,33 @@ class CupyDistributedRuntime:
                 raise
 
     def _commit_fatal_runtime_close(self, transition, error):
+        collective = self.collective
+        provider = self._active_provider
+
+        def finalize_provider_once():
+            with self._terminal_state_lock:
+                if self._fatal_provider_finalized:
+                    return
+                try:
+                    finalize_provider = (
+                        None
+                        if provider is None
+                        else getattr(
+                            provider, "_finalize_terminal_runtime_close", None
+                        )
+                    )
+                    if callable(finalize_provider):
+                        finalize_provider(error)
+                except BaseException as close_error:
+                    self._remember_terminal_secondary_locked(
+                        close_error,
+                        error,
+                    )
+                finally:
+                    self._fatal_provider_finalized = True
+
         def finalize_pending():
+            finalize_provider_once()
             return self._clear_runtime_references(
                 error,
                 publish_error=False,
@@ -1844,6 +2100,12 @@ class CupyDistributedRuntime:
                 clear_collective=False,
             )
 
+        with self._terminal_gate._condition:
+            already_published = (
+                self._terminal_gate._phase is _TerminalPhase.FATAL_PUBLISHED
+            )
+        if already_published:
+            finalize_provider_once()
         try:
             result = self._terminal_gate.commit_runtime_close(
                 transition,
@@ -1871,6 +2133,16 @@ class CupyDistributedRuntime:
                 if callable(join_publication):
                     join_publication()
             raise
+        finalize_provider_once()
+        if collective is not None:
+            try:
+                collective.close()
+            except BaseException as close_error:
+                with self._terminal_state_lock:
+                    self._remember_terminal_secondary_locked(
+                        close_error,
+                        error,
+                    )
         if not self._closed:
             self._clear_runtime_references(error)
         return result
@@ -1881,12 +2153,24 @@ class CupyDistributedRuntime:
         error = self._terminal_error
         if error is None:
             error = getattr(self.backend, "_execution_terminal_error", None)
+        preclose_provider = self._active_provider
+        preclose_scheduler = (
+            None
+            if preclose_provider is None
+            else getattr(
+                getattr(preclose_provider, "_active_lease", None),
+                "scheduler",
+                None,
+            )
+        )
         request = None
         try:
             request = self._terminal_gate.admit_runtime("begin_runtime_close")
         except RuntimeError:
             transition = self._terminal_gate.begin_runtime_close(None)
         else:
+            if preclose_scheduler is not None:
+                preclose_scheduler._start_counted_completions()
             transition = self._terminal_gate.begin_runtime_close(request)
         if isinstance(transition, _FatalTransition):
             error = transition.primary
@@ -1902,17 +2186,45 @@ class CupyDistributedRuntime:
 
         provider = self._active_provider
         collective = self.collective
-        if provider is not None:
-            provider_token = self._terminal_gate.admit_runtime_close(
-                transition, "provider_close"
-            )
+        lease = None if provider is None else getattr(provider, "_active_lease", None)
+        if lease is not None:
             try:
-                provider.close()
+                lease.close()
             except BaseException as caught:
                 if error is None:
                     error = caught
-            finally:
-                self._release_runtime_close_step(provider_token)
+        if self._terminal_gate.phase in (
+            _TerminalPhase.FATAL_PENDING,
+            _TerminalPhase.FATAL_PUBLISHED,
+        ):
+            fatal_transition = self._terminal_gate.begin_runtime_close(None)
+            error = fatal_transition.primary
+            self._commit_fatal_runtime_close(fatal_transition, error)
+            raise error
+        if provider is not None:
+            try:
+                provider_token = self._terminal_gate.admit_runtime_close(
+                    transition, "provider_close"
+                )
+            except BaseException as caught:
+                if self._terminal_gate.phase in (
+                    _TerminalPhase.FATAL_PENDING,
+                    _TerminalPhase.FATAL_PUBLISHED,
+                ):
+                    fatal_transition = self._terminal_gate.begin_runtime_close(None)
+                    error = fatal_transition.primary
+                    self._commit_fatal_runtime_close(fatal_transition, error)
+                    raise error
+                if error is None:
+                    error = caught
+            else:
+                try:
+                    provider.close()
+                except BaseException as caught:
+                    if error is None:
+                        error = caught
+                finally:
+                    self._release_runtime_close_step(provider_token)
         try:
             if collective is not None and self._terminal_gate.phase not in (
                 _TerminalPhase.FATAL_PENDING,
@@ -1946,26 +2258,97 @@ class CupyDistributedRuntime:
         result = self._terminal_gate.commit_runtime_close(
             transition, lambda: self._clear_runtime_references(error)
         )
+        if isinstance(result, BaseException):
+            fatal_transition = self._terminal_gate._fatal_transition
+            if (
+                fatal_transition is not None
+                and fatal_transition.primary is result
+            ):
+                self._commit_fatal_runtime_close(fatal_transition, result)
+            raise result
         if error is not None:
             raise error
         return result
 
     def resource_state(self):
-        if self._active_provider is None:
-            state = {
-                "active_leases": 0,
-                "cache_bytes": 0,
-                "cache_refs": 0,
-                "pinned_bytes": 0,
-                "stream_count": 0,
-                "event_count": 0,
-            }
-        else:
-            state = self._active_provider.runtime_resource_state()
+        gate = self._terminal_gate
+        while True:
+            with gate._condition:
+                phase = gate._phase
+                live_epoch = gate._live_epoch
+                lease_phase = (
+                    None
+                    if live_epoch is None
+                    else gate._leases[live_epoch].phase
+                )
+                fatal = gate._fatal_transition
+
+            if phase is _TerminalPhase.FATAL_PENDING:
+                gate.wait_for_published(_TERMINAL_TIMEOUT_S)
+                continue
+            if phase is _TerminalPhase.FATAL_PUBLISHED or (
+                phase is _TerminalPhase.RUNTIME_CLOSED and fatal is not None
+            ):
+                return self._terminal_resource_state()
+            if phase is _TerminalPhase.RUNTIME_CLOSED:
+                return self._terminal_resource_state()
+            if phase is _TerminalPhase.RUNTIME_CLOSING or lease_phase in (
+                "constructing",
+                "closing",
+                "fatal_retained",
+            ):
+                with gate._condition:
+                    gate._condition.wait(_TERMINAL_TIMEOUT_S)
+                continue
+
+            try:
+                if live_epoch is None:
+                    token = gate.admit_runtime("resource_state")
+                    scope = "runtime"
+                else:
+                    token = gate.admit_lease(live_epoch, "resource_state")
+                    scope = "lease"
+            except RuntimeError:
+                continue
+            try:
+                self._require_admission(
+                    token,
+                    scope=scope,
+                    epoch=live_epoch if scope == "lease" else None,
+                )
+                provider = self._active_provider
+                if provider is None:
+                    state = self._empty_resource_state()
+                else:
+                    state = provider.runtime_resource_state()
+            finally:
+                self._release_admission(token)
+            break
+
         if self._terminal_quarantine.poisoned:
             retained = self._terminal_quarantine.retained_resource_state()
             for key in ("cache_bytes", "pinned_bytes", "stream_count", "event_count"):
                 state[key] = max(state[key], retained[key])
+            state.update(self._terminal_quarantine.resource_state())
+        return state
+
+    @staticmethod
+    def _empty_resource_state():
+        return {
+            "active_leases": 0,
+            "cache_bytes": 0,
+            "cache_refs": 0,
+            "pinned_bytes": 0,
+            "stream_count": 0,
+            "event_count": 0,
+        }
+
+    def _terminal_resource_state(self):
+        state = self._empty_resource_state()
+        retained = self._terminal_quarantine.retained_resource_state()
+        for key in ("cache_bytes", "pinned_bytes", "stream_count", "event_count"):
+            state[key] = retained[key]
+        if self._terminal_quarantine.poisoned:
             state.update(self._terminal_quarantine.resource_state())
         return state
 

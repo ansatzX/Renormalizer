@@ -42,6 +42,7 @@ from renormalizer.backend._distributed.residency import (
     ResidencyRequest,
 )
 from renormalizer.backend._distributed.solvers import build_krylov_memory_profile
+from renormalizer.backend._distributed.terminal import _TerminalPhase
 from renormalizer.backend._distributed.transfer import (
     TransferScheduler,
     TransferTicket,
@@ -535,6 +536,7 @@ class _TwoRankCollective:
         self._pending_fatal_error = None
         self._fatal_control_initialized = False
         self._closed = False
+        self._active_broadcast_local = threading.local()
 
     def _exchange(self, kind, value, *, op=None, root=None):
         self._require_operational()
@@ -579,11 +581,34 @@ class _TwoRankCollective:
             self._observe_remote_fatal(*fatal)
             self._raise_terminal()
 
-    def _publish_communicator_fatal(self, error):
+    def _publish_communicator_fatal_now(self, error):
         if self._fatal_error is None:
             self._fatal_error = error
         self.group.publish_fatal(self.rank, self._fatal_error)
         self.group.wait_for_fatal_acks()
+
+    def _publish_communicator_fatal(self, error):
+        admission = getattr(self._active_broadcast_local, "admission", None)
+        if admission is not None:
+            if admission[0] is None:
+                admission[0] = error
+            if self._fatal_error is None:
+                self._fatal_error = admission[0]
+            return
+        self._publish_communicator_fatal_now(error)
+
+    @contextmanager
+    def _active_broadcast_admission(self):
+        if hasattr(self._active_broadcast_local, "admission"):
+            raise RuntimeError("active broadcast admission cannot be nested")
+        admission = [None]
+        self._active_broadcast_local.admission = admission
+        try:
+            yield self.broadcast, self._agree_active_broadcast
+        finally:
+            del self._active_broadcast_local.admission
+            if admission[0] is not None:
+                self._publish_communicator_fatal_now(admission[0])
 
     def _agree_active_broadcast(self, failed):
         sequence = self._active_broadcast_sequence
@@ -1747,10 +1772,11 @@ def test_terminal_outer_context_handoff_retains_lease_without_cleanup(
             adjacent_destination = working_set.backend.empty(
                 output_ref.shape, dtype=np.dtype(output_ref.dtype), order="C"
             )
-            with working_set.pool.checkout(adjacent_destination.nbytes) as slot:
-                adjacent_ticket = working_set.scheduler.stage_h2d(
-                    output_ref, adjacent_destination, slot
-                )
+            with working_set._lease_admission("prefetch"):
+                with working_set.pool.checkout(adjacent_destination.nbytes) as slot:
+                    adjacent_ticket = working_set.scheduler.stage_h2d(
+                        output_ref, adjacent_destination, slot
+                    )
             assert adjacent_ticket.completed is False
 
             expected_records = {}
@@ -1758,6 +1784,7 @@ def test_terminal_outer_context_handoff_retains_lease_without_cleanup(
                 *working_set.allocation_records,
                 *provider.cache.allocation_records,
                 *working_set.pool.allocation_records,
+                allocation_record(adjacent_destination),
             ):
                 retained = expected_records.get(record.identity)
                 if retained is None or record.capacity_bytes > retained.capacity_bytes:
@@ -1852,7 +1879,8 @@ def test_terminal_outer_context_handoff_retains_lease_without_cleanup(
             snapshot = snapshots[rank]
             lease = snapshot["lease"]
             status_workspace = snapshot["status_workspace"]
-            assert snapshot["provider"].closed is True
+            assert snapshot["provider"].closed is False
+            assert snapshot["provider"]._active_lease is lease
             assert lease._closed is False
             assert status_workspace._closed is False
             assert status_workspace.allocation_records == snapshot["status_records"]
@@ -2467,7 +2495,7 @@ def test_partial_acquisition_transfers_first_cache_lease_to_call_owner(monkeypat
     drained_resources = []
     error = RuntimeError("injected second operand acquisition failure")
 
-    def fail_second(identity, *, prefetch=False):
+    def fail_second(identity, *, prefetch=False, _admission_token=None):
         if not prefetch and loaded:
             owner = working_set._active_operator_owner
             first = loaded[0]
@@ -2475,7 +2503,11 @@ def test_partial_acquisition_transfers_first_cache_lease_to_call_owner(monkeypat
             assert any(resource is first for resource in owner.resources)
             owner._drainer = lambda: drained_resources.append(tuple(owner.resources))
             raise error
-        lease = original_load(identity, prefetch=prefetch)
+        lease = original_load(
+            identity,
+            prefetch=prefetch,
+            _admission_token=_admission_token,
+        )
         if not prefetch:
             loaded.append(lease)
         return lease
@@ -2610,6 +2642,39 @@ def test_outer_lease_reuses_static_slice_across_repeated_child_leases():
     runtime.close()
 
 
+def test_sequential_outer_lease_epochs_reuse_retained_cache_entry():
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime, store_id="sequential-outer-epochs"
+    )
+    provider = _provider(runtime, request)
+
+    first_receipt = runtime.preflight_residency(request, plan)
+    with provider.open_working_set(
+        request, plan, store, first_receipt
+    ) as first_working_set:
+        first_epoch = first_working_set._epoch
+        with first_working_set.acquire(_block_request(first_working_set)) as first:
+            first_ptr = first.bindings.arrays["input_0"].__array_interface__["data"][0]
+
+    second_receipt = runtime.preflight_residency(request, plan)
+    with provider.open_working_set(
+        request, plan, store, second_receipt
+    ) as second_working_set:
+        second_epoch = second_working_set._epoch
+        with second_working_set.acquire(_block_request(second_working_set)) as second:
+            second_ptr = second.bindings.arrays["input_0"].__array_interface__["data"][0]
+
+    assert second_epoch > first_epoch
+    assert second_ptr == first_ptr
+    assert provider.metrics.cache_hits == 1
+    assert provider.metrics.cache_misses == 0
+    assert provider.metrics.h2d_count == 0
+    assert runtime._terminal_gate.phase is _TerminalPhase.HEALTHY
+    store.close()
+    runtime.close()
+
+
 def test_child_close_waits_for_compute_event_before_cache_reuse():
     compute_event = _ManualEvent()
     events = iter((_ManualEvent(done=True), compute_event))
@@ -2679,10 +2744,11 @@ def test_terminal_compute_drain_failure_retains_outer_resource_ownership(monkeyp
     assert working_set.scheduler is scheduler
     assert working_set.pool is not None
     assert working_set._status_workspace._closed is False
-    assert provider._active_lease is None
+    assert provider._active_lease is working_set
     assert working_set in provider._terminal_resources
     assert scheduler in provider._terminal_resources
-    provider.close()
+    with pytest.raises(RuntimeError, match="scheduler query failure"):
+        provider.close()
     assert provider.closed is True
     assert provider.runtime is None
     assert provider._cache is None
@@ -3235,7 +3301,17 @@ def test_compute_post_enqueue_drain_failure_reaches_runtime_quarantine():
     runtime._active_provider = provider
     working_set = provider.open_working_set(request, plan, store, receipt).__enter__()
     child = working_set.acquire(_block_request(working_set)).__enter__()
-    expected_bytes = sum(int(array.nbytes) for array in child.bindings.arrays.values())
+    owner = child._compute_handle.owner
+    expected_records = {}
+    for record in (
+        *working_set._status_workspace.allocation_records,
+        *provider.cache.allocation_records,
+        *working_set.pool.allocation_records,
+        *owner.allocations,
+    ):
+        retained = expected_records.get(record.identity)
+        if retained is None or record.capacity_bytes > retained.capacity_bytes:
+            expected_records[record.identity] = record
     retained_array = next(iter(child.bindings.arrays.values()))
     retained_ref = weakref.ref(retained_array)
     scheduler = working_set.scheduler
@@ -3243,7 +3319,7 @@ def test_compute_post_enqueue_drain_failure_reaches_runtime_quarantine():
     scheduler.backend = fake_backend
     scheduler._cupy = fake_backend._cupy
     scheduler._stream = fake_backend._cupy.cuda.stream
-    child._compute_handle.owner.capture_streams(fake_backend._cupy.cuda.stream)
+    owner.capture_streams(fake_backend._cupy.cuda.stream)
     scheduler._event_factory = _RecordFailureEvent
 
     with pytest.raises(RuntimeError, match="post-enqueue event failure"):
@@ -3255,8 +3331,10 @@ def test_compute_post_enqueue_drain_failure_reaches_runtime_quarantine():
     assert runtime.terminal_poisoned is True
     expected_state = {
         "quarantined_owner_count": 1,
-        "quarantined_array_count": 2,
-        "quarantined_bytes": expected_bytes,
+        "quarantined_array_count": len(expected_records),
+        "quarantined_bytes": sum(
+            record.capacity_bytes for record in expected_records.values()
+        ),
         "quarantined_event_count": 1,
         "quarantined_stream_count": 1,
     }
@@ -3270,19 +3348,12 @@ def test_compute_post_enqueue_drain_failure_reaches_runtime_quarantine():
     with pytest.raises(RuntimeError, match="terminal-poisoned"):
         runtime.execution_config(residency_policy="active_working_set")
 
-    retained_pool_bytes = working_set.pool.allocated_bytes
-    status_records = working_set._status_workspace.allocation_records
     with pytest.raises(RuntimeError, match="post-enqueue event failure"):
         runtime.close()
     assert collective.close_calls == 1
     runtime.close()
     assert collective.close_calls == 1
-    terminal_state = dict(expected_state)
-    terminal_state["quarantined_array_count"] += 1 + len(status_records)
-    terminal_state["quarantined_bytes"] += retained_pool_bytes + sum(
-        record.capacity_bytes for record in status_records
-    )
-    for key, value in terminal_state.items():
+    for key, value in expected_state.items():
         assert provider.resource_state()[key] == value
         assert runtime.resource_state()[key] == value
     gc.collect()

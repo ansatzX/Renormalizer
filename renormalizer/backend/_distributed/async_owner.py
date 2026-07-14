@@ -1,6 +1,7 @@
 """Single-owner lifecycle for resources touched by asynchronous CUDA work."""
 
 from dataclasses import dataclass
+import threading
 
 import numpy as np
 
@@ -146,6 +147,69 @@ def require_async_owner(value, context):
     return owner
 
 
+class _CountedAsyncAdmission:
+    """One pre-counted descendant claimed only by its completion worker."""
+
+    def __init__(self, gate, parent, capability):
+        self._gate = gate
+        self._capability = capability
+        self._token = gate.spawn_async(parent, capability)
+        self._claimed = None
+        self._released = False
+
+    @property
+    def token(self):
+        return self._token if self._claimed is None else self._claimed
+
+    @property
+    def close_owned(self):
+        return self.token.scope == "lease_close"
+
+    def run(self, operation, callback):
+        if self._released or self._claimed is not None:
+            raise RuntimeError("async admission is no longer claimable")
+        claimed = self._gate.claim_async(
+            self._token,
+            self._capability,
+            operation,
+        )
+        self._claimed = claimed
+        try:
+            return callback()
+        finally:
+            try:
+                self._gate.release(claimed)
+            except RuntimeError as error:
+                if "converted" not in str(error):
+                    raise
+            self._released = True
+
+    def cancel(self):
+        if self._released:
+            return
+        if self._claimed is not None:
+            raise RuntimeError("claimed async admission cannot be cancelled")
+        self._gate.release(self._token)
+        self._released = True
+
+    def wake(self):
+        with self._gate._condition:
+            self._gate._condition.notify_all()
+
+    def wait_for_execution(self, requested):
+        with self._gate._condition:
+            while not requested.is_set():
+                phase = getattr(self._gate._phase, "value", None)
+                if phase in {
+                    "fatal_pending",
+                    "fatal_published",
+                    "runtime_closed",
+                }:
+                    return False
+                self._gate._condition.wait()
+            return True
+
+
 class AsyncResourceOwner:
     """Own one async operation until completion, successful drain, or quarantine."""
 
@@ -165,6 +229,10 @@ class AsyncResourceOwner:
         drainer=None,
         detached=None,
         quarantine=None,
+        _async_admission=None,
+        _resource_recorder=None,
+        _resource_releaser=None,
+        _defer_async_completion=False,
     ):
         if not isinstance(kind, str) or not kind:
             raise ValueError("async owner kind must be a non-empty string")
@@ -178,6 +246,8 @@ class AsyncResourceOwner:
             (drainer, "drainer"),
             (detached, "detached"),
             (quarantine, "quarantine"),
+            (_resource_recorder, "resource recorder"),
+            (_resource_releaser, "resource releaser"),
         ):
             if value is not None and not callable(value):
                 raise TypeError("{} must be callable".format(name))
@@ -210,6 +280,21 @@ class AsyncResourceOwner:
         self._quarantine = quarantine
         self._release_callbacks = []
         self._completion_armed = False
+        self._async_admission = _async_admission
+        self._resource_recorder = _resource_recorder
+        self._resource_releaser = _resource_releaser
+        self._async_worker = None
+        self._async_done = threading.Event()
+        self._async_requested = threading.Event()
+        self._counted_quarantine_pending = False
+        self._async_completion_deferred = bool(_defer_async_completion)
+        self._async_start_pending = False
+        if self._resource_recorder is not None:
+            self._resource_recorder(
+                resource=self,
+                records=self._allocations,
+                streams=self._streams,
+            )
 
     @property
     def arrays(self):
@@ -248,11 +333,15 @@ class AsyncResourceOwner:
             raise RuntimeError("async owner can no longer capture arrays")
         self._arrays = _unique((*self._arrays, *arrays))
         self._allocations = merge_allocation_records(self._allocations, arrays)
+        if self._resource_recorder is not None:
+            self._resource_recorder(resource=self, records=self._allocations)
 
     def capture_allocations(self, *arrays):
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture allocations")
         self._allocations = merge_allocation_records(self._allocations, arrays)
+        if self._resource_recorder is not None:
+            self._resource_recorder(resource=self, records=self._allocations)
 
     def capture_resources(self, *resources):
         if self.state not in {"new", "enqueued"}:
@@ -263,6 +352,8 @@ class AsyncResourceOwner:
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture streams")
         self._streams = _unique((*self._streams, *streams))
+        if self._resource_recorder is not None:
+            self._resource_recorder(resource=self, streams=streams)
 
     def add_event(self, event, *, completion=False):
         if self.state not in {"new", "enqueued"}:
@@ -275,6 +366,8 @@ class AsyncResourceOwner:
             if self._completion_event is not None:
                 raise RuntimeError("async owner already has a completion event")
             self._completion_event = event
+        if self._resource_recorder is not None:
+            self._resource_recorder(resource=self, events=(event,))
 
     def add_release_callback(self, callback):
         if not callable(callback):
@@ -287,6 +380,168 @@ class AsyncResourceOwner:
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer arm completion")
         self._completion_armed = True
+        self._watch_counted_completion()
+
+    def _watch_counted_completion(self):
+        if (
+            self._async_admission is None
+            or self._async_worker is not None
+            or not self._completion_armed
+            or self._completion_event is None
+            or self.state != "enqueued"
+        ):
+            return
+        worker = threading.Thread(
+            target=self._run_counted_completion,
+            name="renormalizer-async-completion",
+            daemon=True,
+        )
+        self._async_worker = worker
+        worker.start()
+        if self._async_admission.close_owned:
+            self._start_counted_completion()
+
+    def _start_counted_completion(self):
+        self._watch_counted_completion()
+        if self._async_worker is not None:
+            if self._async_completion_deferred:
+                self._async_start_pending = True
+                return
+            self._async_requested.set()
+            self._async_admission.wake()
+
+    def publish_counted_completion(self):
+        self._async_completion_deferred = False
+        self._watch_counted_completion()
+        if self._async_start_pending and self._async_worker is not None:
+            self._async_start_pending = False
+            self._async_requested.set()
+            self._async_admission.wake()
+
+    def install_counted_admission(self, admission):
+        if self._async_admission is not None or self._async_worker is not None:
+            raise RuntimeError("async owner already has a counted admission")
+        if self.state not in {"new", "enqueued"}:
+            raise RuntimeError("async owner can no longer install an admission")
+        self._async_admission = admission
+
+    def watch_counted_completion(self):
+        self._watch_counted_completion()
+
+    def _run_counted_completion(self):
+        admission = self._async_admission
+        execution_requested = admission.wait_for_execution(self._async_requested)
+
+        def complete():
+            if self.state in {"detached", "quarantined"}:
+                return
+            if not execution_requested:
+                self._counted_quarantine_pending = True
+                return
+            try:
+                wait_event(self._completion_event)
+            except BaseException as error:
+                self._resolve_counted_wait_failure(error)
+                return
+            if self.state in {"detached", "quarantined"}:
+                return
+            try:
+                self._detach("completed")
+            except BaseException:
+                # _detach records callback/accounting failures before raising them.
+                return
+
+        try:
+            admission.run("async_completion", complete)
+        except BaseException as error:
+            self._remember_error(error)
+            if self.state not in {"detached", "quarantined"}:
+                self._counted_quarantine_pending = True
+        finally:
+            self._async_done.set()
+
+    def _resolve_counted_wait_failure(self, error):
+        if self.error is None:
+            self._remember_error(error)
+        else:
+            self._remember_secondary(error)
+        try:
+            self._drain()
+        except BaseException as drain_error:
+            self._remember_secondary(drain_error)
+            self._counted_quarantine_pending = True
+            return
+        if self.state not in {"detached", "quarantined"}:
+            try:
+                self._detach("drained")
+            except BaseException:
+                pass
+
+    def _cancel_unclaimed_async(self):
+        admission = self._async_admission
+        if admission is None:
+            return
+        if self._async_worker is not None:
+            self._async_requested.set()
+            admission.wake()
+            return
+        admission.cancel()
+        self._async_admission = None
+        self._async_done.set()
+
+    def start_counted_completion(self):
+        self._start_counted_completion()
+
+    def _prepare_counted_completion(self, *, wait):
+        if self._async_admission is None:
+            return None
+        if (
+            not wait
+            and not self._async_requested.is_set()
+            and not self._async_done.is_set()
+        ):
+            try:
+                if not event_complete(self._completion_event):
+                    return False
+            except BaseException as error:
+                self._remember_error(error)
+        if self._async_worker is None:
+            if (
+                self._async_completion_deferred
+                or not self._completion_armed
+                or self._completion_event is None
+                or self.state != "enqueued"
+            ):
+                return False
+            self._start_counted_completion()
+        else:
+            self._async_requested.set()
+            self._async_admission.wake()
+        return self._counted_completion_result(wait=True)
+
+    def _counted_completion_result(self, *, wait):
+        worker = self._async_worker
+        if worker is None:
+            return None
+        if threading.current_thread() is worker:
+            return False
+        if wait:
+            self._async_done.wait()
+        elif not self._async_done.is_set():
+            return False
+        if self._counted_quarantine_pending and self.state not in {
+            "detached",
+            "quarantined",
+        }:
+            self._counted_quarantine_pending = False
+            self._move_to_quarantine()
+        if self.state == "quarantined":
+            raise self.error
+        if self.state == "detached":
+            if self.error is not None:
+                raise self.error
+            return True
+        return False
 
     def mark_enqueued(self):
         if self.state != "new":
@@ -399,6 +654,16 @@ class AsyncResourceOwner:
                 else:
                     self._remember_secondary(error)
 
+        if self._resource_releaser is not None:
+            try:
+                self._resource_releaser(self)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                    self.error = error
+                else:
+                    self._remember_secondary(error)
+
         self._arrays = ()
         self._allocations = ()
         self._resources = ()
@@ -413,6 +678,8 @@ class AsyncResourceOwner:
         self._drainer = None
         self._detached = None
         self._quarantine = None
+        self._resource_recorder = None
+        self._resource_releaser = None
         self._release_callbacks = []
         self._completion_armed = False
         if first_error is not None:
@@ -435,6 +702,7 @@ class AsyncResourceOwner:
             return
         if self.state == "detached":
             return
+        self._cancel_unclaimed_async()
         self._move_to_quarantine()
 
     def fail(self, error, *, secondary_errors=()):
@@ -445,6 +713,10 @@ class AsyncResourceOwner:
             raise self.error
         if self.state == "detached":
             raise self.error
+        if self._async_worker is not None:
+            self.force_quarantine(self.error, secondary_errors=secondary_errors)
+            raise self.error
+        self._cancel_unclaimed_async()
         if self.state == "new":
             try:
                 self._detach("drained")
@@ -464,6 +736,9 @@ class AsyncResourceOwner:
         raise self.error
 
     def reap(self):
+        counted = self._prepare_counted_completion(wait=False)
+        if counted is not None:
+            return counted
         if self.state == "quarantined":
             raise self.error
         if self.state == "detached":
@@ -481,6 +756,9 @@ class AsyncResourceOwner:
         return self._detach("completed")
 
     def wait(self):
+        counted = self._prepare_counted_completion(wait=True)
+        if counted is not None:
+            return counted
         if self.state == "quarantined":
             raise self.error
         if self.state == "detached":
@@ -496,6 +774,9 @@ class AsyncResourceOwner:
         return self._detach("completed")
 
     def drain(self):
+        counted = self._prepare_counted_completion(wait=True)
+        if counted is not None:
+            return counted
         if self.state == "quarantined":
             raise self.error
         if self.state == "detached":
@@ -524,7 +805,11 @@ class RuntimeTerminalQuarantine:
     def __init__(self):
         self._owners = []
         self._allocations = {}
+        self._cache_allocations = {}
+        self._pinned_allocations = {}
         self._resources = []
+        self._events = {}
+        self._streams = {}
         self.first_error = None
 
     @property
@@ -537,20 +822,7 @@ class RuntimeTerminalQuarantine:
 
     @property
     def allocations(self):
-        allocations = dict(self._allocations)
-        for identity, allocation in self._retained_resource_allocations().items():
-            retained = allocations.get(identity)
-            if retained is None or allocation.capacity_bytes > retained.capacity_bytes:
-                allocations[identity] = allocation
-        for owner in self._owners:
-            for allocation in owner.allocations:
-                retained = allocations.get(allocation.identity)
-                if (
-                    retained is None
-                    or allocation.capacity_bytes > retained.capacity_bytes
-                ):
-                    allocations[allocation.identity] = allocation
-        return tuple(allocations.values())
+        return tuple(self._allocations.values())
 
     def retain(self, owner, error=None):
         if not isinstance(owner, AsyncResourceOwner):
@@ -560,6 +832,12 @@ class RuntimeTerminalQuarantine:
             self.first_error = retained_error
         if all(retained is not owner for retained in self._owners):
             self._owners.append(owner)
+        self.retain_snapshot(
+            resources=(owner,),
+            allocations=owner.allocations,
+            events=owner.events,
+            streams=owner.streams,
+        )
 
     def retain_error(self, error):
         if not isinstance(error, BaseException):
@@ -577,50 +855,75 @@ class RuntimeTerminalQuarantine:
             if retained is None or record.capacity_bytes > retained.capacity_bytes:
                 self._allocations[record.identity] = record
 
-    def retain_resources(self, resources):
+    @staticmethod
+    def _retain_typed_allocations(target, records):
+        for record in records:
+            if not isinstance(record, AsyncAllocationRecord):
+                raise TypeError(
+                    "terminal allocation retention requires AsyncAllocationRecord"
+                )
+            retained = target.get(record.identity)
+            if retained is None or record.capacity_bytes > retained.capacity_bytes:
+                target[record.identity] = record
+
+    def retain_snapshot(
+        self,
+        *,
+        resources=(),
+        allocations=(),
+        cache_allocations=(),
+        pinned_allocations=(),
+        events=(),
+        streams=(),
+    ):
         for resource in resources:
             if resource is not None and all(
                 retained is not resource for retained in self._resources
             ):
                 self._resources.append(resource)
-                self.retain_allocations(getattr(resource, "allocation_records", ()))
+        self.retain_allocations(allocations)
+        self._retain_typed_allocations(
+            self._cache_allocations,
+            cache_allocations,
+        )
+        self._retain_typed_allocations(
+            self._pinned_allocations,
+            pinned_allocations,
+        )
+        for event in events:
+            if event is not None:
+                self._events[id(event)] = event
+        for stream in streams:
+            if stream is not None:
+                self._streams[id(stream)] = stream
+
+    def retain_resources(self, resources):
+        for resource in resources:
+            if resource is None:
+                continue
+            records = tuple(getattr(resource, "allocation_records", ()))
+            kind = getattr(resource, "_terminal_resource_kind", None)
+            self.retain_snapshot(
+                resources=(resource,),
+                allocations=records,
+                cache_allocations=records if kind == "cache" else (),
+                pinned_allocations=records if kind == "pinned" else (),
+                events=tuple(getattr(resource, "retained_events", ())),
+                streams=tuple(getattr(resource, "retained_streams", ())),
+            )
 
     def _retained_resource_allocations(self, kind=None):
-        allocations = {}
-        for resource in self._resources:
-            if kind is not None and (
-                getattr(resource, "_terminal_resource_kind", None) != kind
-            ):
-                continue
-            for record in getattr(resource, "allocation_records", ()):
-                retained = allocations.get(record.identity)
-                if retained is None or record.capacity_bytes > retained.capacity_bytes:
-                    allocations[record.identity] = record
-        return allocations
+        if kind == "cache":
+            return dict(self._cache_allocations)
+        if kind == "pinned":
+            return dict(self._pinned_allocations)
+        return dict(self._allocations)
 
     def _retained_events(self):
-        return _unique(
-            (
-                *(event for owner in self._owners for event in owner.events),
-                *(
-                    event
-                    for resource in self._resources
-                    for event in getattr(resource, "retained_events", ())
-                ),
-            )
-        )
+        return tuple(self._events.values())
 
     def _retained_streams(self):
-        return _unique(
-            (
-                *(stream for owner in self._owners for stream in owner.streams),
-                *(
-                    stream
-                    for resource in self._resources
-                    for stream in getattr(resource, "retained_streams", ())
-                ),
-            )
-        )
+        return tuple(self._streams.values())
 
     def retained_resource_state(self):
         cache_allocations = self._retained_resource_allocations("cache")

@@ -137,6 +137,7 @@ class PinnedBufferPool:
         lanes=1,
         pinned_allocator=None,
         pageable_allocator=None,
+        _resource_recorder=None,
     ):
         if type(capacity_bytes) is not int or capacity_bytes < 0:
             raise ValueError("capacity_bytes must be a non-negative integer")
@@ -148,6 +149,8 @@ class PinnedBufferPool:
             pageable_allocator = _pageable_array
         if not callable(pinned_allocator) or not callable(pageable_allocator):
             raise TypeError("staging allocators must be callable")
+        if _resource_recorder is not None and not callable(_resource_recorder):
+            raise TypeError("resource recorder must be callable")
 
         pinned = True
         fallback_count = 0
@@ -174,6 +177,13 @@ class PinnedBufferPool:
         self._pageable_fallback_count = fallback_count
         self._pageable_fallback_bytes = fallback_bytes
         self._poisoned_error = None
+        self._resource_recorder = _resource_recorder
+        if self._resource_recorder is not None:
+            self._resource_recorder(
+                resource=self,
+                kind="pinned",
+                records=(record,),
+            )
 
     @property
     def capacity_bytes(self):
@@ -340,6 +350,7 @@ class PinnedBufferPool:
             self._slot._owner = None
             self._slot._nbytes = 0
             self._pending_bytes = 0
+        self._resource_recorder = None
         self._slot._pool = None
         self._closed = True
         if error is not None:

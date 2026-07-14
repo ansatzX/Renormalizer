@@ -274,11 +274,13 @@ class DeviceTensorCache:
 
     _terminal_resource_kind = "cache"
 
-    def __init__(self, capacity_bytes, *, allocator):
+    def __init__(self, capacity_bytes, *, allocator, _resource_recorder=None):
         if type(capacity_bytes) is not int or capacity_bytes < 0:
             raise ValueError("capacity_bytes must be a non-negative integer")
         if not callable(allocator):
             raise TypeError("allocator must be callable")
+        if _resource_recorder is not None and not callable(_resource_recorder):
+            raise TypeError("resource recorder must be callable")
         self._capacity_bytes = capacity_bytes
         self._allocator = allocator
         self._entries = {}
@@ -291,6 +293,18 @@ class DeviceTensorCache:
         self._cache_misses = 0
         self._poisoned_error = None
         self._closed = False
+        self._resource_recorder = _resource_recorder
+
+    def _set_resource_recorder(self, recorder):
+        if recorder is not None and not callable(recorder):
+            raise TypeError("resource recorder must be callable")
+        self._resource_recorder = recorder
+        if recorder is not None:
+            recorder(
+                resource=self,
+                kind="cache",
+                records=self.allocation_records,
+            )
 
     @property
     def capacity_bytes(self):
@@ -490,6 +504,8 @@ class DeviceTensorCache:
                 raise ValueError("contiguous cache allocation has a reverse axis")
             records = allocation_records((allocation.array, allocation.transfer_array))
             self._register_allocations(records)
+            if self._resource_recorder is not None:
+                self._resource_recorder(kind="cache", records=records)
             entry = _CacheEntry(spec, allocation, records)
             self._entries[identity] = entry
             self._peak_allocated_bytes = max(
@@ -541,6 +557,9 @@ class DeviceTensorCache:
         ):
             raise TypeError("cache readiness requires a transfer ticket")
         entry.readiness_ticket = ticket
+        publish = getattr(ticket, "_publish_completion", None)
+        if callable(publish):
+            publish()
         self._refresh_entry(entry)
 
     def _wait_for_ready(self, entry, waiter):
@@ -741,6 +760,7 @@ class DeviceTensorCache:
         self._owner_pending.clear()
         self._reservation = None
         self._allocator = None
+        self._resource_recorder = None
         self._closed = True
         if error is not None:
             raise error
