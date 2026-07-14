@@ -5937,6 +5937,310 @@ def test_after_real_reservation_is_exactly_fatal_retained(monkeypatch, row):
         _close_case(runtime, store)
 
 
+_CONSTRUCTION_RESOURCE_ROWS = (
+    "status_workspace",
+    "store_reservation",
+    "cache",
+    "cache_reservation",
+    "pool",
+    "scheduler",
+    "lease",
+)
+
+
+def _install_construction_recorder_failure(
+    monkeypatch,
+    provider,
+    *,
+    row,
+    when,
+    failure,
+    captured,
+    close_calls,
+):
+    tripped = []
+
+    def wrap_recorder(recorder):
+        def fail(**recorded):
+            resource = recorded.get("resource")
+            if resource is None or tripped:
+                return recorder(**recorded)
+            tripped.append(True)
+            captured.append(resource)
+            close = getattr(resource, "close", None)
+            if callable(close):
+
+                def observe_close(*args, **kwargs):
+                    close_calls.append(resource)
+                    return close(*args, **kwargs)
+
+                monkeypatch.setattr(resource, "close", observe_close)
+            if when == "before":
+                raise failure
+            recorder(**recorded)
+            raise failure
+
+        return fail
+
+    if row == "cache":
+        original = provider._lease_cache_recorder
+
+        def cache_recorder(record):
+            return wrap_recorder(original(record))
+
+        monkeypatch.setattr(provider, "_lease_cache_recorder", cache_recorder)
+        return tripped
+
+    original = provider._construction_resource_recorder
+
+    def construction_recorder(record, name):
+        recorder = original(record, name)
+        if name == row:
+            return wrap_recorder(recorder)
+        return recorder
+
+    monkeypatch.setattr(
+        provider,
+        "_construction_resource_recorder",
+        construction_recorder,
+    )
+    return tripped
+
+
+@pytest.mark.parametrize("row", _CONSTRUCTION_RESOURCE_ROWS)
+@pytest.mark.parametrize("when", ("before", "after"))
+@pytest.mark.parametrize("fatal", (False, True))
+def test_construction_resource_is_owned_before_recorder_returns(
+    monkeypatch,
+    row,
+    when,
+    fatal,
+):
+    class RecorderFatal(BaseException):
+        pass
+
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-construction-recorder-{}-{}-{}".format(
+            row,
+            when,
+            "fatal" if fatal else "healthy",
+        ),
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    failure = (
+        RecorderFatal("{} recorder {}-real".format(row, when))
+        if fatal
+        else RuntimeError("{} recorder {}-real".format(row, when))
+    )
+    captured = []
+    close_calls = []
+    tripped = _install_construction_recorder_failure(
+        monkeypatch,
+        provider,
+        row=row,
+        when=when,
+        failure=failure,
+        captured=captured,
+        close_calls=close_calls,
+    )
+    try:
+        with pytest.raises(BaseException) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is failure
+        assert tripped == [True]
+        assert len(captured) == 1
+        resource = captured[0]
+        if fatal:
+            assert close_calls == []
+            assert provider._provisional_resources is not None
+            assert any(
+                retained is resource
+                for retained in provider._provisional_resources.resources
+            )
+            assert any(
+                retained is resource
+                for retained in runtime._terminal_quarantine._resources
+            )
+        elif row == "lease":
+            assert close_calls == []
+            assert resource._closed is True
+            assert provider._provisional_resources is None
+        else:
+            assert close_calls == [resource]
+            assert provider._provisional_resources is None
+    finally:
+        _repair_test_construction_state(runtime._terminal_gate)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("row", ("cache", "lease"))
+@pytest.mark.parametrize("fatal", (False, True))
+def test_direct_constructor_after_real_wrapper_preserves_ownership(
+    monkeypatch,
+    row,
+    fatal,
+):
+    class ConstructorFatal(BaseException):
+        pass
+
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-direct-constructor-{}-{}".format(
+            row,
+            "fatal" if fatal else "healthy",
+        ),
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    failure = (
+        ConstructorFatal("{} factory failed after real".format(row))
+        if fatal
+        else RuntimeError("{} factory failed after real".format(row))
+    )
+    captured = []
+    close_calls = []
+
+    def capture(resource):
+        captured.append(resource)
+        close = resource.close
+
+        def observe_close(*args, **kwargs):
+            close_calls.append(resource)
+            return close(*args, **kwargs)
+
+        monkeypatch.setattr(resource, "close", observe_close)
+        return resource
+
+    if row == "cache":
+        original = provider._cache_factory
+
+        def fail_after_real(*args, **kwargs):
+            capture(original(*args, **kwargs))
+            raise failure
+
+        monkeypatch.setattr(provider, "_cache_factory", fail_after_real)
+    else:
+        original = providers_module.WorkingSetLease
+
+        def fail_after_real(*args, **kwargs):
+            capture(original(*args, **kwargs))
+            raise failure
+
+        monkeypatch.setattr(providers_module, "WorkingSetLease", fail_after_real)
+
+    try:
+        with pytest.raises(BaseException) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is failure
+        assert len(captured) == 1
+        resource = captured[0]
+        if fatal:
+            assert close_calls == []
+            assert provider._provisional_resources is not None
+            assert any(
+                retained is resource
+                for retained in provider._provisional_resources.resources
+            )
+        elif row == "lease":
+            assert close_calls == []
+            assert resource._closed is True
+            assert provider._provisional_resources is None
+        else:
+            assert close_calls == [resource]
+            assert provider._provisional_resources is None
+    finally:
+        _repair_test_construction_state(runtime._terminal_gate)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("when", ("before", "after"))
+def test_status_allocation_slot_precedes_fallible_recorder(
+    monkeypatch,
+    when,
+):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-status-allocation-recorder-{}".format(when),
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    gate = runtime._terminal_gate
+    recorder_entered = threading.Event()
+    release_recorder = threading.Event()
+    captured_records = []
+    recorder_failure = RuntimeError("status allocation recorder failed")
+    fatal_primary = RuntimeError("fatal during status allocation recorder")
+    original_factory = provider._construction_resource_recorder
+
+    def recorder_factory(record, name):
+        recorder = original_factory(record, name)
+        if name != "status_workspace":
+            return recorder
+        tripped = []
+
+        def fail(**captured):
+            records = tuple(captured.get("records", ()))
+            if captured.get("resource") is not None or not records or tripped:
+                return recorder(**captured)
+            tripped.append(True)
+            captured_records.extend(records)
+            if when == "after":
+                recorder(**captured)
+            recorder_entered.set()
+            assert release_recorder.wait(_TIMEOUT_S)
+            raise recorder_failure
+
+        return fail
+
+    monkeypatch.setattr(
+        provider,
+        "_construction_resource_recorder",
+        recorder_factory,
+    )
+    opener, open_results, open_errors, open_done = _start(
+        lambda: provider.open_working_set(request, plan, store, receipt)
+    )
+    fatal = None
+    try:
+        assert recorder_entered.wait(_TIMEOUT_S)
+        record = provider._provisional_resources
+        fatal, fatal_results, fatal_errors, fatal_done = _start(
+            lambda: runtime._enter_communicator_fatal(fatal_primary)
+        )
+        _wait_for_phase(runtime, _TerminalPhase.FATAL_PENDING)
+        release_recorder.set()
+        _join(opener, open_done)
+        _join(fatal, fatal_done)
+
+        assert open_results == []
+        assert open_errors == [fatal_primary]
+        assert fatal_results == [fatal_primary]
+        assert fatal_errors == []
+        identities = {retained.identity for retained in captured_records}
+        assert identities
+        assert identities.issubset(
+            {retained.identity for retained in record.allocations}
+        )
+        assert identities.issubset(
+            {
+                retained.identity
+                for retained in runtime._terminal_quarantine.allocations
+            }
+        )
+    finally:
+        release_recorder.set()
+        if opener.is_alive():
+            _join(opener, open_done)
+        if fatal is not None and fatal.is_alive():
+            _join(fatal, fatal_done)
+        _close_case(runtime, store)
+
+
 def _repair_test_abandoned_close_entry(gate):
     """Bound RED probes without adopting a departed production owner."""
     with gate._condition:
@@ -6136,3 +6440,205 @@ def test_after_real_runtime_close_entry_has_total_owner(
             if thread is not None and thread.is_alive():
                 _join(thread, done)
         runtime._closed = True
+
+
+@pytest.mark.parametrize("concurrent_fatal", (False, True))
+def test_before_real_runtime_close_admission_error_is_never_discarded(
+    monkeypatch,
+    concurrent_fatal,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    entry_error = RuntimeError("runtime close admission failed before real")
+    fatal_primary = RuntimeError("runtime close concurrent fatal primary")
+    admission_entered = threading.Event()
+    release_admission = threading.Event()
+    original_admit = gate.admit_runtime
+
+    def fail_before_real(operation):
+        if operation != "begin_runtime_close":
+            return original_admit(operation)
+        admission_entered.set()
+        assert release_admission.wait(_TIMEOUT_S)
+        raise entry_error
+
+    monkeypatch.setattr(gate, "admit_runtime", fail_before_real)
+    closer, close_results, close_errors, close_done = _start(runtime.close)
+    fatal = None
+    fatal_results = []
+    fatal_errors = []
+    fatal_done = None
+    try:
+        assert admission_entered.wait(_TIMEOUT_S)
+        if concurrent_fatal:
+            fatal, fatal_results, fatal_errors, fatal_done = _start(
+                lambda: runtime._enter_communicator_fatal(fatal_primary)
+            )
+            _wait_for_phase(runtime, _TerminalPhase.FATAL_PUBLISHED)
+        release_admission.set()
+        _join(closer, close_done)
+        if fatal is not None:
+            _join(fatal, fatal_done)
+
+        expected = fatal_primary if concurrent_fatal else entry_error
+        assert close_results == []
+        assert close_errors == [expected]
+        if fatal is not None:
+            assert fatal_results == [fatal_primary]
+            assert fatal_errors == []
+            assert entry_error in runtime._terminal_secondary_errors
+        assert runtime._closed is True
+        with gate._condition:
+            assert gate._phase is _TerminalPhase.RUNTIME_CLOSED
+            assert gate._fatal_transition.primary is expected
+            assert not gate._has_active_tokens()
+    finally:
+        release_admission.set()
+        for thread, done in ((closer, close_done), (fatal, fatal_done)):
+            if thread is not None and thread.is_alive():
+                _join(thread, done)
+        _repair_test_abandoned_close_entry(gate)
+        runtime._closed = True
+
+
+def test_runtime_close_active_token_drain_honors_terminal_deadline():
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    token_ready = threading.Event()
+    release_token = threading.Event()
+    token_released = threading.Event()
+
+    def hold_token():
+        token = gate.admit_runtime("bounded_runtime_close_token")
+        token_ready.set()
+        assert release_token.wait(_TIMEOUT_S)
+        gate.release(token)
+        token_released.set()
+
+    holder = threading.Thread(
+        target=hold_token,
+        name="task-18.3-bounded-runtime-close-token",
+        daemon=True,
+    )
+    holder.start()
+    assert token_ready.wait(_TIMEOUT_S)
+    request = gate.admit_runtime("bounded_runtime_close_request")
+    transition, elected = gate._freeze_runtime_close(request)
+    assert elected is True
+    try:
+        with pytest.raises(TimeoutError, match="admission drain"):
+            gate._drain_runtime_close(transition, timeout_s=0)
+    finally:
+        release_token.set()
+        assert token_released.wait(_TIMEOUT_S)
+        holder.join(_TIMEOUT_S)
+        assert not holder.is_alive()
+        _repair_test_abandoned_close_entry(gate)
+        runtime._closed = True
+
+
+@pytest.mark.parametrize("owner_boundary", ("lease_close", "runtime_close"))
+def test_runtime_close_departed_owner_converges_without_adoption(
+    owner_boundary,
+):
+    if owner_boundary == "lease_close":
+        runtime, _, _, store, provider, lease = _open_active_case(
+            store_id="terminal-departed-lease-close-owner"
+        )
+    else:
+        runtime = _runtime()
+        store = None
+        provider = None
+        lease = None
+    gate = runtime._terminal_gate
+    owner_ready = threading.Event()
+    transitions = []
+
+    def abandon_owner():
+        if owner_boundary == "lease_close":
+            transition, elected = gate.begin_lease_close(lease._epoch)
+        else:
+            request = gate.admit_runtime("departed_runtime_close_owner")
+            transition, elected = gate._freeze_runtime_close(request)
+        assert elected is True
+        transitions.append(transition)
+        owner_ready.set()
+
+    owner = threading.Thread(
+        target=abandon_owner,
+        name="task-18.3-departed-{}".format(owner_boundary),
+        daemon=True,
+    )
+    owner.start()
+    assert owner_ready.wait(_TIMEOUT_S)
+    owner.join(_TIMEOUT_S)
+    assert not owner.is_alive()
+    closer, close_results, close_errors, close_done = _start(runtime.close)
+    try:
+        assert close_done.wait(_TIMEOUT_S)
+        _join(closer, close_done)
+        assert close_results == []
+        assert len(close_errors) == 1
+        primary = close_errors[0]
+        assert "owner exited" in str(primary)
+        with gate._condition:
+            assert gate._phase is _TerminalPhase.RUNTIME_CLOSED
+            assert gate._fatal_transition.primary is primary
+            assert not gate._has_active_tokens()
+            assert transitions[0].owner_thread_id != threading.get_ident()
+    finally:
+        if closer.is_alive():
+            _repair_test_abandoned_close_entry(gate)
+            _join(closer, close_done)
+        if lease is not None:
+            reservation = lease._store_reservation
+            if reservation is not None and not reservation._closed:
+                reservation.close()
+        _repair_test_abandoned_close_entry(gate)
+        runtime._closed = True
+        if store is not None and not store.closed:
+            store.close()
+
+
+def test_direct_lease_close_joiner_fail_stops_departed_owner():
+    runtime, _, _, store, _, lease = _open_active_case(
+        store_id="terminal-direct-departed-lease-close-owner"
+    )
+    gate = runtime._terminal_gate
+    owner_ready = threading.Event()
+    transitions = []
+
+    def abandon_owner():
+        transition, elected = gate.begin_lease_close(lease._epoch)
+        assert elected is True
+        transitions.append(transition)
+        owner_ready.set()
+
+    owner = threading.Thread(
+        target=abandon_owner,
+        name="task-18.3-direct-departed-lease-close",
+        daemon=True,
+    )
+    owner.start()
+    assert owner_ready.wait(_TIMEOUT_S)
+    owner.join(_TIMEOUT_S)
+    assert not owner.is_alive()
+
+    try:
+        with pytest.raises(RuntimeError, match="owner exited") as caught:
+            lease.close()
+        primary = caught.value
+        with gate._condition:
+            assert gate._fatal_transition.primary is primary
+            assert gate._phase is _TerminalPhase.FATAL_PUBLISHED
+            assert gate._leases[lease._epoch].phase == "fatal_retained"
+            assert not gate._has_active_tokens()
+            assert transitions[0].owner_thread is owner
+    finally:
+        reservation = lease._store_reservation
+        if reservation is not None and not reservation._closed:
+            reservation.close()
+        runtime._closed = True
+        _repair_test_abandoned_close_entry(gate)
+        if not store.closed:
+            store.close()

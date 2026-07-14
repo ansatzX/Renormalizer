@@ -87,6 +87,7 @@ class _FatalPublicationReservation:
         "transition",
         "snapshot",
         "completion",
+        "diagnostics",
     )
 
     def __init__(
@@ -117,6 +118,15 @@ class _FatalPublicationReservation:
         self.transition = transition
         self.snapshot = None
         self.completion = None
+        self.diagnostics = ()
+
+    def retain_diagnostics(self, errors):
+        for error in tuple(errors):
+            if not isinstance(error, BaseException):
+                continue
+            if any(retained is error for retained in self.diagnostics):
+                continue
+            self.diagnostics = (*self.diagnostics, error)
 
 
 class _DeferredFatalPublication:
@@ -553,6 +563,20 @@ class CupyNcclCollective:
             except BaseException as diagnostic_error:
                 self._retain_fatal_secondary_direct(diagnostic_error)
 
+    def _collect_fatal_transition_secondaries(self, handler, transition):
+        if handler is None or transition is None:
+            return ()
+        try:
+            collector = getattr(handler, "secondaries", None)
+        except BaseException as diagnostic_error:
+            return (diagnostic_error,)
+        if not callable(collector):
+            return ()
+        try:
+            return tuple(collector(transition))
+        except BaseException as diagnostic_error:
+            return (diagnostic_error,)
+
     def _claim_fatal_hard_exit(self, error):
         if not isinstance(error, BaseException):
             raise TypeError("fatal hard-exit primary must be an exception")
@@ -926,6 +950,7 @@ class CupyNcclCollective:
         handler_override=None,
         transition=None,
         defer_completion=False,
+        diagnostics=(),
     ):
         active = getattr(self._fatal_publication_local, "reservation", None)
         if active is not None:
@@ -936,6 +961,9 @@ class CupyNcclCollective:
                     raise RuntimeError("communicator fatal transition changed")
                 if transition.primary is not active.primary:
                     raise RuntimeError("communicator fatal primary changed")
+            active.retain_diagnostics(diagnostics)
+            if error is not active.primary:
+                active.retain_diagnostics((error,))
             self._refresh_fatal_handler(
                 active,
                 fatal_owner=fatal_owner,
@@ -976,7 +1004,7 @@ class CupyNcclCollective:
                         "communicator fatal transition primary is invalid"
                     )
                 if error is not primary:
-                    self._dispatch_fatal_secondaries((error,))
+                    diagnostics = (*tuple(diagnostics), error)
                 outcome = self._observe_fatal_monitor_outcome()
                 if (
                     outcome is None
@@ -1011,6 +1039,7 @@ class CupyNcclCollective:
                 transition_handler=transition_handler,
                 transition=transition,
             )
+            reservation.retain_diagnostics(diagnostics)
         except BaseException as setup_error:
             with self._fatal_condition:
                 marker_installed = self._fatal_publication_failure is not None
@@ -1018,6 +1047,7 @@ class CupyNcclCollective:
                 setup_error,
                 transition_handler=transition_handler,
                 transition=transition,
+                diagnostics=diagnostics,
             )
             if marker_installed and setup_error is not primary:
                 raise
@@ -1046,6 +1076,7 @@ class CupyNcclCollective:
                 finally:
                     if attach_deferred_join:
                         del self._fatal_publication_local.reservation
+                    self._dispatch_fatal_secondaries(reservation.diagnostics)
             return
         publication_succeeded = False
         local_installed = False
@@ -1071,6 +1102,16 @@ class CupyNcclCollective:
             self._run_fatal_handler(reservation)
             self._publish_communicator_fatal_locked(primary)
             self._complete_fatal_handler(reservation)
+            transition_errors = self._collect_fatal_transition_secondaries(
+                reservation.transition_handler,
+                reservation.transition,
+            )
+            reservation.retain_diagnostics(transition_errors)
+            self._dispatch_fatal_secondaries(reservation.diagnostics)
+            self._dispatch_fatal_transition_secondaries(
+                reservation.transition_handler,
+                reservation.diagnostics,
+            )
             publication_succeeded = True
         except BaseException as error:
             with self._fatal_condition:
@@ -1540,6 +1581,16 @@ class CupyNcclCollective:
         if not marker_installed:
             terminalization_errors.extend(diagnostics)
             terminalization_errors.append(error)
+        else:
+            transition_errors = self._collect_fatal_transition_secondaries(
+                transition_handler,
+                transition,
+            )
+            self._dispatch_fatal_secondaries(transition_errors)
+            self._dispatch_fatal_transition_secondaries(
+                transition_handler,
+                transition_errors,
+            )
         if terminalization_errors:
             if must_exit:
                 try:
@@ -1560,6 +1611,7 @@ class CupyNcclCollective:
             error,
             transition_handler=reservation.transition_handler,
             transition=reservation.transition,
+            diagnostics=reservation.diagnostics,
         )
 
     @staticmethod
@@ -1790,6 +1842,7 @@ class CupyNcclCollective:
         join_existing=True,
         handler_override=None,
         transition=None,
+        diagnostics=(),
     ):
         with self._communicator_fatal_reservation(
             error,
@@ -1799,6 +1852,7 @@ class CupyNcclCollective:
             join_existing=join_existing,
             handler_override=handler_override,
             transition=transition,
+            diagnostics=diagnostics,
         ) as reservation:
             if reservation.started and not reservation.completion_deferred:
                 self._run_fatal_handler(reservation)
@@ -2373,8 +2427,28 @@ class CupyNcclCollective:
             aggregate |= _FATAL_CAPABILITY_ERROR
         store_proxy.barrier()
         if aggregate == 0:
-            self._fatal_control_initialized = True
-            self._start_fatal_monitor()
+            try:
+                monitor = self._start_fatal_monitor()
+                with self._fatal_condition:
+                    monitor_owned = (
+                        monitor is not None
+                        and self._fatal_monitor_thread is monitor
+                        and self._fatal_monitor_state
+                        in {"started", "completed"}
+                    )
+                if not monitor_owned:
+                    raise RuntimeError(
+                        "fatal monitor start returned without owned execution"
+                    )
+            except BaseException as start_error:
+                with self._fatal_condition:
+                    self._fatal_control_initialized = False
+                    self._fatal_condition.notify_all()
+                primary = self._terminalize_pre_owner_fatal_failure(start_error)
+                raise primary
+            with self._fatal_condition:
+                self._fatal_control_initialized = True
+                self._fatal_condition.notify_all()
         return aggregate
 
     def _bootstrap_status_or(self, local_code):

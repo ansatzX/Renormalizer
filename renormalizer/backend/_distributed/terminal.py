@@ -1,6 +1,6 @@
 """Resource-neutral coordination for distributed runtime terminal transitions."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import enum
 import math
 import threading
@@ -50,6 +50,7 @@ class _LeaseCloseTransition:
     gate_id: int
     epoch: int
     owner_thread_id: int
+    owner_thread: threading.Thread
     sequence: int
 
 
@@ -57,6 +58,7 @@ class _LeaseCloseTransition:
 class _RuntimeCloseTransition:
     gate_id: int
     owner_thread_id: int
+    owner_thread: threading.Thread
     sequence: int
 
 
@@ -281,6 +283,77 @@ class _LeaseConstructionTransaction:
     primary: BaseException | None = None
     result: object = _MISSING
     secondaries: tuple[BaseException, ...] = ()
+    resource_slots: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _LeaseConstructionResourceSnapshot:
+    name: str
+    resource: object
+    kind: str | None
+    records: tuple
+    events: tuple
+    streams: tuple
+
+
+class _LeaseConstructionResourceSlot:
+    """Gate-owned, query-free ownership published by one real constructor."""
+
+    def __init__(self, gate, transaction, name):
+        self._gate = gate
+        self._transaction = transaction
+        self.name = name
+        self._resource = None
+        self._kind = None
+        self._records = {}
+        self._events = {}
+        self._streams = {}
+
+    def publish(
+        self,
+        resource=None,
+        *,
+        kind=None,
+        records=(),
+        events=(),
+        streams=(),
+    ):
+        self._gate._publish_lease_construction_resource(
+            self,
+            resource=resource,
+            kind=kind,
+            records=records,
+            events=events,
+            streams=streams,
+        )
+
+    def snapshot(self):
+        return self._gate._snapshot_lease_construction_resource(self)
+
+    def clear(self):
+        self._gate._clear_lease_construction_resource(self)
+
+
+def _publish_lease_construction_resource(
+    slot,
+    resource=None,
+    *,
+    kind=None,
+    records=(),
+    events=(),
+    streams=(),
+):
+    if slot is None:
+        return
+    if not isinstance(slot, _LeaseConstructionResourceSlot):
+        raise TypeError("lease construction resource slot is invalid")
+    slot.publish(
+        resource,
+        kind=kind,
+        records=records,
+        events=events,
+        streams=streams,
+    )
 
 
 class _TerminalLifecycleGate:
@@ -300,10 +373,12 @@ class _TerminalLifecycleGate:
         self._fatal_snapshot = _MISSING
         self._fatal_publication_failure = _MISSING
         self._fatal_runtime_finalizer_state = "none"
-        self._fatal_runtime_finalizer_owner: int | None = None
+        self._fatal_runtime_finalizer_owner: threading.Thread | None = None
+        self._fatal_runtime_finalizer_thread: threading.Thread | None = None
         self._runtime_close_transition: _RuntimeCloseTransition | None = None
         self._runtime_close_commit_selected = False
         self._runtime_close_result = _MISSING
+        self._runtime_close_admission_rejections = {}
 
     @property
     def phase(self):
@@ -466,13 +541,39 @@ class _TerminalLifecycleGate:
         state = self._convertible_token_state(token)
         self._convert_token_state(state)
 
-    def _wait_until(self, predicate, timeout_s, message):
-        deadline = self._deadline(timeout_s)
+    def _wait_until_deadline(
+        self,
+        predicate,
+        deadline,
+        message,
+        *,
+        owner_thread=None,
+        owner_message=None,
+    ):
         while not predicate():
+            if owner_thread is not None and not owner_thread.is_alive():
+                raise RuntimeError(owner_message or "terminal owner exited")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(message)
             self._condition.wait(remaining)
+
+    def _wait_until(
+        self,
+        predicate,
+        timeout_s,
+        message,
+        *,
+        owner_thread=None,
+        owner_message=None,
+    ):
+        self._wait_until_deadline(
+            predicate,
+            self._deadline(timeout_s),
+            message,
+            owner_thread=owner_thread,
+            owner_message=owner_message,
+        )
 
     def _require_fatal_transition(self, transition):
         if not isinstance(transition, _FatalTransition):
@@ -501,7 +602,7 @@ class _TerminalLifecycleGate:
         return lease
 
     def _require_lease_close_owner(self, transition):
-        if transition.owner_thread_id != threading.get_ident():
+        if transition.owner_thread is not threading.current_thread():
             raise RuntimeError("only the elected lease close owner may run close steps")
 
     def _require_runtime_transition(self, transition):
@@ -514,9 +615,21 @@ class _TerminalLifecycleGate:
 
     def admit_runtime(self, operation: str) -> _ResourceAdmission:
         with self._condition:
-            self._raise_for_terminal_phase()
-            if self._has_closing_lease():
-                raise RuntimeError("lease is closing")
+            current_thread = threading.current_thread()
+            if operation == "begin_runtime_close":
+                self._runtime_close_admission_rejections.pop(
+                    current_thread, None
+                )
+            try:
+                self._raise_for_terminal_phase()
+                if self._has_closing_lease():
+                    raise RuntimeError("lease is closing")
+            except BaseException as error:
+                if operation == "begin_runtime_close":
+                    self._runtime_close_admission_rejections[
+                        current_thread
+                    ] = error
+                raise
             return self._new_token("runtime", None, operation)
 
     def admit_runtime_setup(self, operation: str) -> _ResourceAdmission:
@@ -526,13 +639,102 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("runtime setup requires no live lease")
             return self._new_token("runtime_setup", None, operation)
 
-    def _prepare_lease_construction(self, operation):
+    def _prepare_lease_construction(self, operation, *, resource_names=()):
         self._require_operation(operation)
-        return _LeaseConstructionTransaction(
+        transaction = _LeaseConstructionTransaction(
             gate_id=self._gate_id,
             operation=operation,
             owner_thread_id=threading.get_ident(),
         )
+        for name in tuple(resource_names):
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    "lease construction resource name must be non-empty"
+                )
+            if name in transaction.resource_slots:
+                raise ValueError("lease construction resource names must be unique")
+            transaction.resource_slots[name] = _LeaseConstructionResourceSlot(
+                self, transaction, name
+            )
+        return transaction
+
+    def _require_lease_construction_resource_slot(self, slot):
+        if not isinstance(slot, _LeaseConstructionResourceSlot):
+            raise TypeError("lease construction resource slot is required")
+        if slot._gate is not self:
+            raise RuntimeError(
+                "lease construction resource slot belongs to another terminal gate"
+            )
+        transaction = slot._transaction
+        retained = transaction.resource_slots.get(slot.name)
+        if retained is not slot:
+            raise RuntimeError("stale lease construction resource slot")
+        return transaction
+
+    @staticmethod
+    def _merge_construction_records(target, records):
+        for record in tuple(records):
+            identity = getattr(record, "identity", None)
+            capacity = getattr(record, "capacity_bytes", None)
+            if identity is None or capacity is None:
+                raise TypeError("construction allocation record is invalid")
+            retained = target.get(identity)
+            if retained is None or capacity > retained.capacity_bytes:
+                target[identity] = record
+
+    def _publish_lease_construction_resource(
+        self,
+        slot,
+        *,
+        resource=None,
+        kind=None,
+        records=(),
+        events=(),
+        streams=(),
+    ):
+        with self._condition:
+            transaction = self._require_lease_construction_resource_slot(slot)
+            self._require_lease_construction(transaction, active=True)
+            if resource is not None:
+                if slot._resource is not None and slot._resource is not resource:
+                    raise RuntimeError(
+                        "lease construction resource identity changed"
+                    )
+                slot._resource = resource
+            if kind is not None:
+                if not isinstance(kind, str) or not kind:
+                    raise ValueError("construction resource kind must be non-empty")
+                if slot._kind is not None and slot._kind != kind:
+                    raise RuntimeError("construction resource kind changed")
+                slot._kind = kind
+            self._merge_construction_records(slot._records, records)
+            for event in tuple(events):
+                if event is not None:
+                    slot._events[id(event)] = event
+            for stream in tuple(streams):
+                if stream is not None:
+                    slot._streams[id(stream)] = stream
+
+    def _snapshot_lease_construction_resource(self, slot):
+        with self._condition:
+            self._require_lease_construction_resource_slot(slot)
+            return _LeaseConstructionResourceSnapshot(
+                name=slot.name,
+                resource=slot._resource,
+                kind=slot._kind,
+                records=tuple(slot._records.values()),
+                events=tuple(slot._events.values()),
+                streams=tuple(slot._streams.values()),
+            )
+
+    def _clear_lease_construction_resource(self, slot):
+        with self._condition:
+            self._require_lease_construction_resource_slot(slot)
+            slot._resource = None
+            slot._kind = None
+            slot._records.clear()
+            slot._events.clear()
+            slot._streams.clear()
 
     def _require_lease_construction(self, transaction, *, active=False):
         if not isinstance(transaction, _LeaseConstructionTransaction):
@@ -844,6 +1046,7 @@ class _TerminalLifecycleGate:
                 gate_id=self._gate_id,
                 epoch=epoch,
                 owner_thread_id=threading.get_ident(),
+                owner_thread=threading.current_thread(),
                 sequence=self._sequence(),
             )
             lease.phase = "closing"
@@ -860,7 +1063,7 @@ class _TerminalLifecycleGate:
                 return None, False
             return (
                 transition,
-                transition.owner_thread_id == threading.get_ident(),
+                transition.owner_thread is threading.current_thread(),
             )
 
     def wait_for_lease_admissions(self, transition, timeout_s) -> None:
@@ -906,23 +1109,30 @@ class _TerminalLifecycleGate:
             lease = self._require_lease_transition(transition)
             self._require_no_held_admission("join lease close")
             deadline = self._deadline(timeout_s)
-            while lease.phase != "closed":
-                if self._phase in (
-                    _TerminalPhase.FATAL_PENDING,
-                    _TerminalPhase.FATAL_PUBLISHED,
-                ) or (
-                    self._phase is _TerminalPhase.RUNTIME_CLOSED
-                    and self._fatal_transition is not None
-                ):
-                    raise RuntimeError("fatal transition preempted lease close") from (
-                        self._fatal_transition.primary
-                        if self._fatal_transition is not None
-                        else None
+            self._wait_until_deadline(
+                lambda: (
+                    lease.phase == "closed"
+                    or self._phase
+                    in (
+                        _TerminalPhase.FATAL_PENDING,
+                        _TerminalPhase.FATAL_PUBLISHED,
                     )
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("lease close join timed out")
-                self._condition.wait(remaining)
+                    or (
+                        self._phase is _TerminalPhase.RUNTIME_CLOSED
+                        and self._fatal_transition is not None
+                    )
+                ),
+                deadline,
+                "lease close join timed out",
+                owner_thread=transition.owner_thread,
+                owner_message="lease close owner exited",
+            )
+            if lease.phase != "closed":
+                raise RuntimeError("fatal transition preempted lease close") from (
+                    self._fatal_transition.primary
+                    if self._fatal_transition is not None
+                    else None
+                )
             return lease.result
 
     def commit_lease_close(self, transition, finalizer) -> object:
@@ -1247,8 +1457,13 @@ class _TerminalLifecycleGate:
             self._require_no_held_admission("publish fatal")
             if self._has_active_tokens():
                 raise RuntimeError("fatal publication requires zero live admissions")
-            while self._fatal_runtime_finalizer_state == "pending":
-                self._condition.wait()
+            self._wait_until(
+                lambda: self._fatal_runtime_finalizer_state != "pending",
+                _TERMINAL_TIMEOUT_S,
+                "fatal runtime finalizer wait timed out",
+                owner_thread=self._fatal_runtime_finalizer_thread,
+                owner_message="fatal runtime finalizer owner exited",
+            )
             if self._fatal_publication_failure is not _MISSING:
                 raise self._fatal_publication_failure
             if self._phase is not _TerminalPhase.FATAL_PENDING:
@@ -1323,6 +1538,7 @@ class _TerminalLifecycleGate:
                 self._runtime_close_transition = _RuntimeCloseTransition(
                     gate_id=self._gate_id,
                     owner_thread_id=thread_id,
+                    owner_thread=threading.current_thread(),
                     sequence=self._sequence(),
                 )
                 self._phase = _TerminalPhase.RUNTIME_CLOSING
@@ -1342,12 +1558,36 @@ class _TerminalLifecycleGate:
                 return None, False
             return (
                 transition,
-                transition.owner_thread_id == threading.get_ident(),
+                transition.owner_thread is threading.current_thread(),
             )
 
-    def _drain_runtime_close(self, transition):
+    def _classify_runtime_close_admission_failure(self, error, token):
+        """Separate expected gate rejection from a fallible wrapper failure."""
+        if not isinstance(error, BaseException):
+            raise TypeError("runtime close entry failure must be an exception")
         with self._condition:
-            thread_id = threading.get_ident()
+            rejection = self._runtime_close_admission_rejections.pop(
+                threading.current_thread(), None
+            )
+            if rejection is error:
+                return None
+            if token is not None or self._fatal_transition is not None:
+                return error
+            if self._phase in (
+                _TerminalPhase.RUNTIME_CLOSING,
+                _TerminalPhase.RUNTIME_CLOSED,
+            ) or self._has_closing_lease():
+                return None
+            return error
+
+    def _drain_runtime_close(
+        self,
+        transition,
+        *,
+        timeout_s=_TERMINAL_TIMEOUT_S,
+    ):
+        with self._condition:
+            deadline = self._deadline(timeout_s)
             self._require_no_held_admission("drain runtime close")
             if isinstance(transition, _FatalTransition):
                 self._require_fatal_transition(transition)
@@ -1363,10 +1603,14 @@ class _TerminalLifecycleGate:
                 return self._runtime_close_transition
             self._require_runtime_transition(transition)
 
-            while self._has_active_tokens():
-                self._condition.wait()
-                if self._fatal_transition is not None:
-                    return self._fatal_transition
+            self._wait_until_deadline(
+                lambda: (
+                    not self._has_active_tokens()
+                    or self._fatal_transition is not None
+                ),
+                deadline,
+                "runtime close admission drain timed out",
+            )
             if self._fatal_transition is not None:
                 return self._fatal_transition
 
@@ -1375,12 +1619,19 @@ class _TerminalLifecycleGate:
                 if (
                     lease.phase == "closing"
                     and lease.transition is not None
-                    and lease.transition.owner_thread_id != thread_id
+                    and lease.transition.owner_thread
+                    is not threading.current_thread()
                 ):
-                    while lease.phase != "closed":
-                        self._condition.wait()
-                        if self._fatal_transition is not None:
-                            return self._fatal_transition
+                    self._wait_until_deadline(
+                        lambda: (
+                            lease.phase == "closed"
+                            or self._fatal_transition is not None
+                        ),
+                        deadline,
+                        "foreign lease close wait timed out",
+                        owner_thread=lease.transition.owner_thread,
+                        owner_message="lease close owner exited",
+                    )
             if self._fatal_transition is not None:
                 return self._fatal_transition
             return self._runtime_close_transition
@@ -1403,7 +1654,7 @@ class _TerminalLifecycleGate:
                     else None
                 )
             self._require_runtime_transition(transition)
-            if transition.owner_thread_id != threading.get_ident():
+            if transition.owner_thread is not threading.current_thread():
                 raise RuntimeError(
                     "only the elected runtime close owner may run close steps"
                 )
@@ -1434,7 +1685,7 @@ class _TerminalLifecycleGate:
                 raise self._fatal_transition.primary
             transition = self._runtime_close_transition
             self._require_runtime_transition(transition)
-            if transition.owner_thread_id != threading.get_ident():
+            if transition.owner_thread is not threading.current_thread():
                 raise RuntimeError(
                     "only the elected runtime close owner may run close steps"
                 )
@@ -1458,7 +1709,7 @@ class _TerminalLifecycleGate:
         """Make healthy runtime close irrevocable before destructive close work."""
         with self._condition:
             self._require_runtime_transition(transition)
-            if transition.owner_thread_id != threading.get_ident():
+            if transition.owner_thread is not threading.current_thread():
                 raise RuntimeError(
                     "only the elected runtime close owner may select close commit"
                 )
@@ -1482,7 +1733,12 @@ class _TerminalLifecycleGate:
             return transition
 
     def _commit_fatal_runtime_close(
-        self, transition, finalizer, *, may_finalize=True
+        self,
+        transition,
+        finalizer,
+        *,
+        may_finalize=True,
+        timeout_s=_TERMINAL_TIMEOUT_S,
     ):
         self._require_fatal_transition(transition)
         self._require_no_held_admission("commit runtime close")
@@ -1493,28 +1749,46 @@ class _TerminalLifecycleGate:
             self._runtime_close_result = self._fatal_snapshot
             self._condition.notify_all()
             return self._runtime_close_result
-        thread_id = threading.get_ident()
+        current_thread = threading.current_thread()
+        deadline = self._deadline(timeout_s)
         if may_finalize and self._fatal_runtime_finalizer_state == "none":
             self._fatal_runtime_finalizer_state = "pending"
-            self._fatal_runtime_finalizer_owner = thread_id
-        if self._fatal_runtime_finalizer_owner == thread_id:
-            while self._has_active_tokens():
-                self._condition.wait()
+            self._fatal_runtime_finalizer_owner = current_thread
+            self._fatal_runtime_finalizer_thread = current_thread
+        if self._fatal_runtime_finalizer_owner is current_thread:
+            self._wait_until_deadline(
+                lambda: not self._has_active_tokens(),
+                deadline,
+                "fatal runtime close admission drain timed out",
+            )
             finalizer()
             self._fatal_runtime_finalizer_state = "complete"
             self._condition.notify_all()
         else:
-            while (
-                self._fatal_runtime_finalizer_state == "pending"
-                and self._fatal_snapshot is _MISSING
-            ):
-                if self._fatal_publication_failure is not _MISSING:
-                    raise self._fatal_publication_failure
-                self._condition.wait()
-        while self._fatal_snapshot is _MISSING:
+            self._wait_until_deadline(
+                lambda: (
+                    self._fatal_runtime_finalizer_state != "pending"
+                    or self._fatal_snapshot is not _MISSING
+                    or self._fatal_publication_failure is not _MISSING
+                ),
+                deadline,
+                "fatal runtime finalizer join timed out",
+                owner_thread=self._fatal_runtime_finalizer_thread,
+                owner_message="fatal runtime finalizer owner exited",
+            )
             if self._fatal_publication_failure is not _MISSING:
                 raise self._fatal_publication_failure
-            self._condition.wait()
+        self._wait_until_deadline(
+            lambda: (
+                self._fatal_snapshot is not _MISSING
+                or self._fatal_publication_failure is not _MISSING
+            ),
+            deadline,
+            "fatal publication wait timed out",
+        )
+        if self._fatal_snapshot is _MISSING:
+            if self._fatal_publication_failure is not _MISSING:
+                raise self._fatal_publication_failure
         if self._phase is _TerminalPhase.RUNTIME_CLOSED:
             return self._runtime_close_result
         self._phase = _TerminalPhase.RUNTIME_CLOSED
@@ -1522,28 +1796,48 @@ class _TerminalLifecycleGate:
         self._condition.notify_all()
         return self._runtime_close_result
 
-    def commit_runtime_close(self, transition, finalizer):
+    def commit_runtime_close(
+        self,
+        transition,
+        finalizer,
+        *,
+        timeout_s=_TERMINAL_TIMEOUT_S,
+    ):
         if not callable(finalizer):
             raise TypeError("runtime close finalizer must be callable")
         with self._condition:
             if isinstance(transition, _FatalTransition):
-                return self._commit_fatal_runtime_close(transition, finalizer)
+                return self._commit_fatal_runtime_close(
+                    transition,
+                    finalizer,
+                    timeout_s=timeout_s,
+                )
             self._require_runtime_transition(transition)
-            if transition.owner_thread_id != threading.get_ident():
+            if transition.owner_thread is not threading.current_thread():
                 self._require_no_held_admission("join runtime close")
-                while self._phase is _TerminalPhase.RUNTIME_CLOSING:
-                    self._condition.wait()
+                self._wait_until(
+                    lambda: self._phase is not _TerminalPhase.RUNTIME_CLOSING,
+                    timeout_s,
+                    "runtime close join timed out",
+                    owner_thread=transition.owner_thread,
+                    owner_message="runtime close owner exited",
+                )
                 if self._phase is _TerminalPhase.RUNTIME_CLOSED:
                     return self._runtime_close_result
                 return self._commit_fatal_runtime_close(
-                    self._fatal_transition, lambda: None, may_finalize=False
+                    self._fatal_transition,
+                    lambda: None,
+                    may_finalize=False,
+                    timeout_s=timeout_s,
                 )
             if self._phase in (
                 _TerminalPhase.FATAL_PENDING,
                 _TerminalPhase.FATAL_PUBLISHED,
             ):
                 return self._commit_fatal_runtime_close(
-                    self._fatal_transition, finalizer
+                    self._fatal_transition,
+                    finalizer,
+                    timeout_s=timeout_s,
                 )
             if self._phase is _TerminalPhase.RUNTIME_CLOSED:
                 return self._runtime_close_result
@@ -1566,7 +1860,7 @@ class _TerminalLifecycleGate:
             raise TypeError("runtime close failure finalizer must be callable")
         with self._condition:
             self._require_runtime_transition(transition)
-            if transition.owner_thread_id != threading.get_ident():
+            if transition.owner_thread is not threading.current_thread():
                 raise RuntimeError(
                     "only the elected runtime close owner may fail close"
                 )
@@ -1598,12 +1892,13 @@ class _TerminalLifecycleGate:
             if self._phase is _TerminalPhase.RUNTIME_CLOSED:
                 return None
             self._require_no_held_admission("complete failed fatal runtime close")
-            thread_id = threading.get_ident()
+            current_thread = threading.current_thread()
             run_finalizer = self._fatal_runtime_finalizer_state == "none"
             if run_finalizer:
                 self._fatal_runtime_finalizer_state = "pending"
-                self._fatal_runtime_finalizer_owner = thread_id
-            elif self._fatal_runtime_finalizer_owner == thread_id:
+                self._fatal_runtime_finalizer_owner = current_thread
+                self._fatal_runtime_finalizer_thread = current_thread
+            elif self._fatal_runtime_finalizer_owner is current_thread:
                 run_finalizer = True
             secondary = None
             if run_finalizer:

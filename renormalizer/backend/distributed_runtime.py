@@ -159,7 +159,11 @@ class _RuntimeCommunicatorFatalHook:
         return self._runtime()._publish_communicator_fatal_transition(transition)
 
     def complete(self, transition, snapshot):
-        self._runtime()._terminal_gate.publish_fatal(transition, snapshot)
+        runtime = self._runtime()
+        runtime._terminal_gate.publish_fatal(transition, snapshot)
+
+    def secondaries(self, transition):
+        return self._runtime()._structured_terminal_secondaries(transition)
 
     def fail(self, transition, failure):
         self._runtime()._terminal_gate._fail_fatal_publication(
@@ -611,6 +615,21 @@ class CupyDistributedRuntime:
     )
     _terminal_error: object = field(default=None, init=False, repr=False)
     _terminal_secondary_errors: tuple = field(
+        default_factory=tuple, init=False, repr=False
+    )
+    _terminal_pending_owner_diagnostics: tuple = field(
+        default_factory=tuple, init=False, repr=False
+    )
+    _terminal_pending_direct_diagnostics: tuple = field(
+        default_factory=tuple, init=False, repr=False
+    )
+    _terminal_pending_collective_diagnostics: tuple = field(
+        default_factory=tuple, init=False, repr=False
+    )
+    _terminal_owner_diagnostic_dispatches: tuple = field(
+        default_factory=tuple, init=False, repr=False
+    )
+    _terminal_collective_diagnostic_dispatches: tuple = field(
         default_factory=tuple, init=False, repr=False
     )
     _terminal_gate: _TerminalLifecycleGate = field(
@@ -1072,7 +1091,7 @@ class CupyDistributedRuntime:
                     reservation, snapshot
                 )
 
-    def _remember_terminal_secondary_locked(
+    def _retain_terminal_secondary_locked(
         self,
         error,
         primary,
@@ -1081,71 +1100,242 @@ class CupyDistributedRuntime:
         record_collective=True,
     ):
         if not isinstance(error, BaseException):
-            return
+            return False
         if error is primary:
-            return
-        if any(
+            return False
+        retained = any(
             retained is error for retained in self._terminal_secondary_errors
+        )
+        if not retained:
+            self._terminal_secondary_errors = (
+                *self._terminal_secondary_errors,
+                error,
+            )
+        if owner is not None and not any(
+            retained_owner is owner and retained_error is error
+            for retained_owner, retained_error in (
+                self._terminal_pending_owner_diagnostics
+            )
+        ):
+            self._terminal_pending_owner_diagnostics = (
+                *self._terminal_pending_owner_diagnostics,
+                (owner, error),
+            )
+        if record_collective and not any(
+            retained_error is error
+            for retained_error in self._terminal_pending_collective_diagnostics
+        ):
+            self._terminal_pending_collective_diagnostics = (
+                *self._terminal_pending_collective_diagnostics,
+                error,
+            )
+        return not retained
+
+    def _retain_direct_terminal_diagnostic_locked(
+        self, target, method_name, error, primary
+    ):
+        if (
+            target is None
+            or not isinstance(error, BaseException)
+            or error is primary
         ):
             return
-        self._terminal_secondary_errors = (
-            *self._terminal_secondary_errors,
-            error,
+        if any(
+            retained_target is target and retained_error is error
+            for retained_target, _, retained_error in (
+                self._terminal_pending_direct_diagnostics
+            )
+        ):
+            return
+        self._terminal_pending_direct_diagnostics = (
+            *self._terminal_pending_direct_diagnostics,
+            (target, method_name, error),
         )
 
-        def retain_diagnostic_failure(diagnostic_error):
-            if (
-                not isinstance(diagnostic_error, BaseException)
-                or diagnostic_error is primary
-                or any(
-                    retained is diagnostic_error
-                    for retained in self._terminal_secondary_errors
+    def _fatal_outcome_installed(self, transition):
+        gate = self._terminal_gate
+        with gate._condition:
+            if transition is None or gate._fatal_transition is not transition:
+                return False
+            return (
+                gate._fatal_snapshot is not _TERMINAL_MISSING
+                or gate._fatal_publication_failure is not _TERMINAL_MISSING
+            )
+
+    def _dispatch_terminal_owner_secondaries(
+        self,
+        errors,
+        primary,
+        owner,
+        transition,
+    ):
+        if owner is None or not self._fatal_outcome_installed(transition):
+            return
+        for error in tuple(errors):
+            if not isinstance(error, BaseException) or error is primary:
+                continue
+            try:
+                call = getattr(owner, "_operator_call", None)
+            except BaseException as diagnostic_error:
+                with self._terminal_state_lock:
+                    self._retain_terminal_secondary_locked(
+                        diagnostic_error,
+                        primary,
+                        record_collective=False,
+                    )
+                continue
+            if call is None:
+                target = owner
+                method_name = "_remember_secondary"
+            else:
+                target = call
+                method_name = "record_secondary"
+            self._dispatch_terminal_direct_secondary(
+                target,
+                method_name,
+                error,
+                primary,
+                transition,
+            )
+
+    def _dispatch_terminal_direct_secondary(
+        self,
+        target,
+        method_name,
+        error,
+        primary,
+        transition,
+    ):
+        if target is None or not self._fatal_outcome_installed(transition):
+            return
+        if not isinstance(error, BaseException) or error is primary:
+            return
+        with self._terminal_state_lock:
+            if any(
+                retained_target is target and retained_error is error
+                for retained_target, retained_error in (
+                    self._terminal_owner_diagnostic_dispatches
                 )
             ):
                 return
-            self._terminal_secondary_errors = (
-                *self._terminal_secondary_errors,
-                diagnostic_error,
+            self._terminal_owner_diagnostic_dispatches = (
+                *self._terminal_owner_diagnostic_dispatches,
+                (target, error),
             )
-
         try:
-            call = (
-                None if owner is None else getattr(owner, "_operator_call", None)
-            )
-            record_secondary = (
-                None
-                if call is None
-                else getattr(call, "record_secondary", None)
-            )
-            if not callable(record_secondary) and owner is not None:
-                record_secondary = getattr(owner, "_remember_secondary", None)
+            recorder = getattr(target, method_name, None)
         except BaseException as diagnostic_error:
-            retain_diagnostic_failure(diagnostic_error)
-        else:
-            if callable(record_secondary):
-                try:
-                    record_secondary(error)
-                except BaseException as diagnostic_error:
-                    retain_diagnostic_failure(diagnostic_error)
-
-        if record_collective:
-            try:
-                collective = self._pending_fatal_collective
-                if collective is None:
-                    collective = self.collective
-                collective_recorder = (
-                    None
-                    if collective is None
-                    else getattr(collective, "_record_fatal_secondary", None)
+            with self._terminal_state_lock:
+                self._retain_terminal_secondary_locked(
+                    diagnostic_error,
+                    primary,
+                    record_collective=False,
                 )
+            return
+        if not callable(recorder):
+            return
+        try:
+            recorder(error)
+        except BaseException as diagnostic_error:
+            with self._terminal_state_lock:
+                self._retain_terminal_secondary_locked(
+                    diagnostic_error,
+                    primary,
+                    record_collective=False,
+                )
+
+    def _dispatch_terminal_collective_secondaries(
+        self,
+        errors,
+        primary,
+        transition,
+    ):
+        if not self._fatal_outcome_installed(transition):
+            return
+        with self._terminal_state_lock:
+            collective = self._pending_fatal_collective
+            if collective is None:
+                collective = self.collective
+        if collective is None:
+            return
+        for error in tuple(errors):
+            if not isinstance(error, BaseException) or error is primary:
+                continue
+            with self._terminal_state_lock:
+                if any(
+                    retained_collective is collective
+                    and retained_error is error
+                    for retained_collective, retained_error in (
+                        self._terminal_collective_diagnostic_dispatches
+                    )
+                ):
+                    continue
+                self._terminal_collective_diagnostic_dispatches = (
+                    *self._terminal_collective_diagnostic_dispatches,
+                    (collective, error),
+                )
+            try:
+                recorder = getattr(collective, "_record_fatal_secondary", None)
+                if callable(recorder):
+                    recorder(error)
             except BaseException as diagnostic_error:
-                retain_diagnostic_failure(diagnostic_error)
-            else:
-                if callable(collective_recorder):
-                    try:
-                        collective_recorder(error)
-                    except BaseException as diagnostic_error:
-                        retain_diagnostic_failure(diagnostic_error)
+                with self._terminal_state_lock:
+                    self._retain_terminal_secondary_locked(
+                        diagnostic_error,
+                        primary,
+                        record_collective=False,
+                    )
+
+    def _dispatch_terminal_secondaries_after_outcome(
+        self, transition, *, include_collective=False
+    ):
+        if not self._fatal_outcome_installed(transition):
+            return
+        primary = transition.primary
+        with self._terminal_state_lock:
+            context = self._pending_fatal_context
+            owner = None if context is None else context[2]
+            errors = tuple(self._terminal_secondary_errors)
+            owner_diagnostics = tuple(self._terminal_pending_owner_diagnostics)
+            direct_diagnostics = tuple(
+                self._terminal_pending_direct_diagnostics
+            )
+            collective_diagnostics = tuple(
+                self._terminal_pending_collective_diagnostics
+            )
+        self._dispatch_terminal_owner_secondaries(
+            errors,
+            primary,
+            owner,
+            transition,
+        )
+        for retained_owner, error in owner_diagnostics:
+            self._dispatch_terminal_owner_secondaries(
+                (error,),
+                primary,
+                retained_owner,
+                transition,
+            )
+        for target, method_name, error in direct_diagnostics:
+            self._dispatch_terminal_direct_secondary(
+                target,
+                method_name,
+                error,
+                primary,
+                transition,
+            )
+        if include_collective:
+            self._dispatch_terminal_collective_secondaries(
+                collective_diagnostics,
+                primary,
+                transition,
+            )
+
+    def _structured_terminal_secondaries(self, transition):
+        if not self._fatal_outcome_installed(transition):
+            return ()
+        with self._terminal_state_lock:
+            return tuple(self._terminal_pending_collective_diagnostics)
 
     def _record_structured_fatal_secondary(self, error):
         gate = self._terminal_gate
@@ -1154,15 +1344,13 @@ class CupyDistributedRuntime:
             if transition is None:
                 return
             primary = transition.primary
-            with self._terminal_state_lock:
-                context = self._pending_fatal_context
-                owner = None if context is None else context[2]
-                self._remember_terminal_secondary_locked(
-                    error,
-                    primary,
-                    owner,
-                    record_collective=False,
-                )
+        with self._terminal_state_lock:
+            self._retain_terminal_secondary_locked(
+                error,
+                primary,
+                record_collective=False,
+            )
+        self._dispatch_terminal_secondaries_after_outcome(transition)
 
     def _terminalize_fatal_publication_failure(
         self,
@@ -1180,11 +1368,7 @@ class CupyDistributedRuntime:
                 gate._fail_fatal_publication(transition, primary)
         try:
             with self._terminal_state_lock:
-                self._remember_terminal_secondary_locked(
-                    secondary,
-                    primary,
-                    owner,
-                )
+                self._retain_terminal_secondary_locked(secondary, primary)
         except BaseException as diagnostic_error:
             # The gate outcome is already terminal; diagnostics cannot replace it.
             try:
@@ -1202,6 +1386,12 @@ class CupyDistributedRuntime:
                         )
             except BaseException:
                 pass
+        self._dispatch_terminal_collective_secondaries(
+            tuple(self._terminal_pending_collective_diagnostics),
+            primary,
+            transition,
+        )
+        self._dispatch_terminal_secondaries_after_outcome(transition)
         return primary
 
     def _force_async_primary_locked(self, owner, primary):
@@ -1215,15 +1405,19 @@ class CupyDistributedRuntime:
         if call is not None and hasattr(call, "primary_error"):
             call.primary_error = primary
         for error in (owner_primary, call_primary):
-            self._remember_terminal_secondary_locked(error, primary)
-        if isinstance(owner_primary, BaseException) and owner_primary is not primary:
-            remember_secondary = getattr(owner, "_remember_secondary", None)
-            if callable(remember_secondary):
-                remember_secondary(owner_primary)
-        if isinstance(call_primary, BaseException) and call_primary is not primary:
-            record_secondary = getattr(call, "record_secondary", None)
-            if callable(record_secondary):
-                record_secondary(call_primary)
+            self._retain_terminal_secondary_locked(error, primary, owner)
+        self._retain_direct_terminal_diagnostic_locked(
+            owner,
+            "_remember_secondary",
+            owner_primary,
+            primary,
+        )
+        self._retain_direct_terminal_diagnostic_locked(
+            call,
+            "record_secondary",
+            call_primary,
+            primary,
+        )
 
     def _normalize_communicator_fatal(self, primary, owner):
         if not isinstance(primary, BaseException):
@@ -1269,7 +1463,7 @@ class CupyDistributedRuntime:
                 discovered,
             )
         for candidate in candidates:
-            self._remember_terminal_secondary_locked(candidate, primary, owner)
+            self._retain_terminal_secondary_locked(candidate, primary, owner)
         return primary, provider, lease, owner
 
     def _force_terminal_primary_locked(
@@ -1285,7 +1479,9 @@ class CupyDistributedRuntime:
             raise TypeError("terminal primary must be an exception")
         transition = self._terminal_gate._fatal_transition
         if transition is not None and transition.primary is not primary:
-            self._remember_terminal_secondary_locked(primary, transition.primary, owner)
+            self._retain_terminal_secondary_locked(
+                primary, transition.primary, owner
+            )
             primary = transition.primary
         self._force_async_primary_locked(owner, primary)
         if transition is not None and self._terminal_gate._phase in (
@@ -1306,7 +1502,7 @@ class CupyDistributedRuntime:
             None if lease is None else getattr(lease, "_poisoned_error", None),
         )
         for error in existing:
-            self._remember_terminal_secondary_locked(error, primary, owner)
+            self._retain_terminal_secondary_locked(error, primary, owner)
         self._terminal_quarantine.first_error = primary
         self._terminal_quarantine.retain_error(primary)
         if retain_owner and owner is not None:
@@ -1414,8 +1610,8 @@ class CupyDistributedRuntime:
                         election.recover_locked()
                         raise
                     if outcome.primary is not primary:
-                        self._remember_terminal_secondary_locked(
-                            primary, outcome.primary, owner
+                        self._retain_terminal_secondary_locked(
+                            primary, outcome.primary
                         )
                         primary = outcome.primary
                     if election.transition is None:
@@ -1504,6 +1700,7 @@ class CupyDistributedRuntime:
     ):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
+        candidate = primary
         if discovering_token is None:
             discovering_token = self._terminal_gate._current_thread_admission()
         deferred_primary = self._defer_current_active_broadcast_fatal(
@@ -1520,6 +1717,7 @@ class CupyDistributedRuntime:
             discovering_token=discovering_token,
         )
         primary = transition.primary
+        diagnostics = () if candidate is primary else (candidate,)
         with self._terminal_gate._condition:
             phase = self._terminal_gate._phase
         if phase in (
@@ -1572,6 +1770,7 @@ class CupyDistributedRuntime:
                 join_existing=True,
                 handler_override=hook,
                 transition=transition,
+                diagnostics=diagnostics,
             )
 
         thread_id = threading.get_ident()
@@ -1588,6 +1787,9 @@ class CupyDistributedRuntime:
             snapshot = self._publish_communicator_fatal_transition(transition)
             publish(snapshot)
             self._terminal_gate.publish_fatal(transition, snapshot)
+            self._dispatch_terminal_secondaries_after_outcome(
+                transition, include_collective=True
+            )
         except BaseException as publication_error:
             raise self._terminalize_fatal_publication_failure(
                 transition,
@@ -2640,7 +2842,7 @@ class CupyDistributedRuntime:
                 )
             except BaseException as clear_error:
                 with self._terminal_state_lock:
-                    self._remember_terminal_secondary_locked(
+                    self._retain_terminal_secondary_locked(
                         clear_error,
                         transition.primary,
                     )
@@ -2684,7 +2886,7 @@ class CupyDistributedRuntime:
                 )
             except BaseException as clear_error:
                 with self._terminal_state_lock:
-                    self._remember_terminal_secondary_locked(
+                    self._retain_terminal_secondary_locked(
                         clear_error,
                         transition.primary,
                     )
@@ -2703,7 +2905,7 @@ class CupyDistributedRuntime:
         )
         if secondary is not None:
             with self._terminal_state_lock:
-                self._remember_terminal_secondary_locked(
+                self._retain_terminal_secondary_locked(
                     secondary,
                     primary,
                 )
@@ -2722,7 +2924,7 @@ class CupyDistributedRuntime:
         )
         if error is not primary:
             with self._terminal_state_lock:
-                self._remember_terminal_secondary_locked(error, primary)
+                self._retain_terminal_secondary_locked(error, primary)
         if fatal_transition is None and commit_selected:
             secondary = gate._fail_selected_runtime_close(
                 transition,
@@ -2731,7 +2933,7 @@ class CupyDistributedRuntime:
             )
             if secondary is not None:
                 with self._terminal_state_lock:
-                    self._remember_terminal_secondary_locked(
+                    self._retain_terminal_secondary_locked(
                         secondary,
                         primary,
                     )
@@ -2744,7 +2946,7 @@ class CupyDistributedRuntime:
                 raise primary
             if publication_error is not primary:
                 with self._terminal_state_lock:
-                    self._remember_terminal_secondary_locked(
+                    self._retain_terminal_secondary_locked(
                         publication_error,
                         primary,
                     )
@@ -2911,8 +3113,12 @@ class CupyDistributedRuntime:
                 operation="begin_runtime_close",
                 epoch=None,
             )
-            if request is not None or not isinstance(caught, RuntimeError):
-                entry_error = caught
+            entry_error = (
+                self._terminal_gate._classify_runtime_close_admission_failure(
+                    caught,
+                    request,
+                )
+            )
         try:
             transition, elected = self._terminal_gate._freeze_runtime_close(request)
         except BaseException as caught:
@@ -2920,7 +3126,7 @@ class CupyDistributedRuntime:
                 entry_error = caught
             elif caught is not entry_error:
                 with self._terminal_state_lock:
-                    self._remember_terminal_secondary_locked(caught, entry_error)
+                    self._retain_terminal_secondary_locked(caught, entry_error)
             transition, elected = (
                 self._terminal_gate._recover_runtime_close_entry()
             )
@@ -2937,21 +3143,34 @@ class CupyDistributedRuntime:
             error = transition.primary
             if entry_error is not None and entry_error is not error:
                 with self._terminal_state_lock:
-                    self._remember_terminal_secondary_locked(
+                    self._retain_terminal_secondary_locked(
                         entry_error, error
                     )
             self._commit_fatal_runtime_close(transition, error)
             raise error
 
         if not elected:
-            transition = self._terminal_gate._drain_runtime_close(transition)
+            try:
+                transition = self._terminal_gate._drain_runtime_close(
+                    transition
+                )
+            except BaseException as caught:
+                self._fail_stop_elected_runtime_close(transition, caught)
             if isinstance(transition, _FatalTransition):
                 error = transition.primary
-                self._commit_fatal_runtime_close(transition, error)
+                try:
+                    self._commit_fatal_runtime_close(transition, error)
+                except BaseException as caught:
+                    if caught is error:
+                        raise
+                    self._fail_stop_elected_runtime_close(transition, caught)
                 raise error
-            result = self._terminal_gate.commit_runtime_close(
-                transition, lambda: None
-            )
+            try:
+                result = self._terminal_gate.commit_runtime_close(
+                    transition, lambda: None
+                )
+            except BaseException as caught:
+                self._fail_stop_elected_runtime_close(transition, caught)
             if isinstance(result, BaseException):
                 raise result
             if entry_error is not None:

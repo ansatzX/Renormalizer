@@ -15,6 +15,9 @@ from renormalizer.backend._distributed.async_owner import (
     wait_event as _wait_event,
 )
 from renormalizer.backend._distributed.pinned import StagingSlot
+from renormalizer.backend._distributed.terminal import (
+    _publish_lease_construction_resource,
+)
 
 
 def _sha256(payload):
@@ -231,6 +234,7 @@ class TransferScheduler:
         _resource_releaser=None,
         _admission_token=None,
         _admission_validator=None,
+        _construction_slot=None,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
         if not callable(getattr(store, "copy_into", None)):
@@ -309,6 +313,11 @@ class TransferScheduler:
         self.h2d_s = 0.0
         self.d2h_s = 0.0
         self.last_compute_event = None
+        _publish_lease_construction_resource(
+            _construction_slot,
+            self,
+            streams=(self._stream,),
+        )
         if self._resource_recorder is not None:
             self._resource_recorder(resource=self, streams=(self._stream,))
 

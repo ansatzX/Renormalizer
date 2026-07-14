@@ -9,6 +9,9 @@ from renormalizer.backend._distributed.async_owner import (
     allocation_record,
     require_async_owner,
 )
+from renormalizer.backend._distributed.terminal import (
+    _publish_lease_construction_resource,
+)
 
 
 def _pageable_array(nbytes):
@@ -141,6 +144,7 @@ class PinnedBufferPool:
         _resource_recorder=None,
         _admission_token=None,
         _admission_validator=None,
+        _construction_slot=None,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
         if type(capacity_bytes) is not int or capacity_bytes < 0:
@@ -182,6 +186,12 @@ class PinnedBufferPool:
         self._pageable_fallback_bytes = fallback_bytes
         self._poisoned_error = None
         self._resource_recorder = _resource_recorder
+        _publish_lease_construction_resource(
+            _construction_slot,
+            self,
+            kind="pinned",
+            records=(record,),
+        )
         if self._resource_recorder is not None:
             self._resource_recorder(
                 resource=self,

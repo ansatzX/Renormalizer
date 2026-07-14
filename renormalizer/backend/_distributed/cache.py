@@ -12,6 +12,9 @@ from renormalizer.backend._distributed.async_owner import (
     allocation_records,
     require_async_owner,
 )
+from renormalizer.backend._distributed.terminal import (
+    _publish_lease_construction_resource,
+)
 
 
 def _validate_identity(identity):
@@ -289,6 +292,7 @@ class DeviceTensorCache:
         _resource_recorder=None,
         _admission_token=None,
         _admission_validator=None,
+        _construction_slot=None,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
         if type(capacity_bytes) is not int or capacity_bytes < 0:
@@ -310,6 +314,18 @@ class DeviceTensorCache:
         self._poisoned_error = None
         self._closed = False
         self._resource_recorder = _resource_recorder
+        _publish_lease_construction_resource(
+            _construction_slot,
+            self,
+            kind="cache",
+        )
+        if self._resource_recorder is not None:
+            self._resource_recorder(
+                resource=self,
+                kind="cache",
+                records=(),
+                _replace_kind=True,
+            )
 
     def _set_resource_recorder(self, recorder):
         if recorder is not None and not callable(recorder):
@@ -386,6 +402,7 @@ class DeviceTensorCache:
         _resource_recorder=None,
         _admission_token=None,
         _admission_validator=None,
+        _construction_slot=None,
     ):
         _require_resource_admission(_admission_token, _admission_validator)
         if _resource_recorder is not None and not callable(_resource_recorder):
@@ -439,6 +456,10 @@ class DeviceTensorCache:
             self, normalized, required_bytes, self._allocated_bytes
         )
         self._reservation = reservation
+        _publish_lease_construction_resource(
+            _construction_slot,
+            reservation,
+        )
         if _resource_recorder is not None:
             _resource_recorder(resource=reservation)
         return reservation

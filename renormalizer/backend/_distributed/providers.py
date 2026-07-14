@@ -31,6 +31,7 @@ from renormalizer.backend._distributed.residency import (
 from renormalizer.backend._distributed.terminal import (
     _TerminalPhase,
     _TERMINAL_TIMEOUT_S,
+    _publish_lease_construction_resource,
 )
 from renormalizer.backend._distributed.transfer import (
     TransferScheduler,
@@ -38,6 +39,17 @@ from renormalizer.backend._distributed.transfer import (
 )
 from renormalizer.backend._execution.model import ExecutionBindings, ExecutionPlan
 from renormalizer.backend._execution.executor import _validate_array
+
+
+_LEASE_CONSTRUCTION_RESOURCE_NAMES = (
+    "status_workspace",
+    "store_reservation",
+    "cache",
+    "cache_reservation",
+    "pool",
+    "scheduler",
+    "lease",
+)
 
 
 def _run_total_elected_lease_close(
@@ -50,6 +62,13 @@ def _run_total_elected_lease_close(
     fail_stop,
 ):
     """Own every action after one lease-close election until a terminal result."""
+
+    def join_total(transition):
+        try:
+            return join(transition)
+        except BaseException as error:
+            return fail_stop(transition, error)
+
     try:
         transition, owns_close = gate.begin_lease_close(epoch)
     except BaseException as error:
@@ -57,10 +76,10 @@ def _run_total_elected_lease_close(
         if transition is not None and owns_close:
             return fail_stop(transition, error)
         if transition is not None:
-            return join(transition)
+            return join_total(transition)
         return begin_failure(error)
     if not owns_close:
-        return join(transition)
+        return join_total(transition)
     try:
         return elected(transition)
     except BaseException as error:
@@ -426,10 +445,11 @@ class WorkingSetMetrics:
 class _LeaseResourceRecord:
     """Strong, incrementally captured lease resources for query-free handoff."""
 
-    def __init__(self, epoch):
+    def __init__(self, epoch, *, construction_slots=None):
         self.epoch = epoch
         self._resources = []
         self._construction_resources = {}
+        self._construction_slots = dict(construction_slots or {})
         self._consumed_receipts = {}
         self._allocations = {}
         self._cache_allocations = {}
@@ -439,30 +459,53 @@ class _LeaseResourceRecord:
 
     @property
     def resources(self):
-        return tuple(self._resources)
+        retained = list(self._resources)
+        for snapshot in self._construction_slot_snapshots():
+            resource = snapshot.resource
+            if resource is not None and all(
+                existing is not resource for existing in retained
+            ):
+                retained.append(resource)
+        return tuple(retained)
 
     @property
     def allocations(self):
         records = dict(self._allocations)
         self._merge(records, self._cache_allocations.values())
         self._merge(records, self._pinned_allocations.values())
+        for snapshot in self._construction_slot_snapshots():
+            self._merge(records, snapshot.records)
         return tuple(records.values())
 
     @property
     def cache_allocations(self):
-        return tuple(self._cache_allocations.values())
+        records = dict(self._cache_allocations)
+        for snapshot in self._construction_slot_snapshots():
+            if snapshot.kind == "cache":
+                self._merge(records, snapshot.records)
+        return tuple(records.values())
 
     @property
     def pinned_allocations(self):
-        return tuple(self._pinned_allocations.values())
+        records = dict(self._pinned_allocations)
+        for snapshot in self._construction_slot_snapshots():
+            if snapshot.kind == "pinned":
+                self._merge(records, snapshot.records)
+        return tuple(records.values())
 
     @property
     def events(self):
-        return tuple(self._events.values())
+        retained = dict(self._events)
+        for snapshot in self._construction_slot_snapshots():
+            retained.update({id(event): event for event in snapshot.events})
+        return tuple(retained.values())
 
     @property
     def streams(self):
-        return tuple(self._streams.values())
+        retained = dict(self._streams)
+        for snapshot in self._construction_slot_snapshots():
+            retained.update({id(stream): stream for stream in snapshot.streams})
+        return tuple(retained.values())
 
     @property
     def consumed_receipts(self):
@@ -474,6 +517,29 @@ class _LeaseResourceRecord:
             retained = target.get(record.identity)
             if retained is None or record.capacity_bytes > retained.capacity_bytes:
                 target[record.identity] = record
+
+    def _construction_slot_snapshots(self):
+        return tuple(
+            slot.snapshot() for slot in self._construction_slots.values()
+        )
+
+    def _capture_construction_snapshot(self, snapshot):
+        resource = snapshot.resource
+        if resource is not None:
+            retained = self._construction_resources.get(snapshot.name)
+            if retained is not None and retained is not resource:
+                raise RuntimeError("construction resource identity changed")
+            self._construction_resources[snapshot.name] = resource
+            if all(existing is not resource for existing in self._resources):
+                self._resources.append(resource)
+        target = self._allocations
+        if snapshot.kind == "cache":
+            target = self._cache_allocations
+        elif snapshot.kind == "pinned":
+            target = self._pinned_allocations
+        self._merge(target, snapshot.records)
+        self._events.update({id(event): event for event in snapshot.events})
+        self._streams.update({id(stream): stream for stream in snapshot.streams})
 
     def capture(
         self,
@@ -527,6 +593,11 @@ class _LeaseResourceRecord:
         self.capture(resource)
 
     def construction_resource(self, name):
+        slot = self._construction_slots.get(name)
+        if slot is not None:
+            resource = slot.snapshot().resource
+            if resource is not None:
+                return resource
         return self._construction_resources.get(name)
 
     def restore_consumed_receipts(self, runtime):
@@ -541,6 +612,9 @@ class _LeaseResourceRecord:
         self._consumed_receipts.clear()
 
     def clear(self):
+        for slot in tuple(self._construction_slots.values()):
+            slot.clear()
+        self._construction_slots.clear()
         self._resources.clear()
         self._construction_resources.clear()
         self._consumed_receipts.clear()
@@ -560,6 +634,8 @@ class _LeaseResourceRecord:
         retained._pinned_allocations = dict(self._pinned_allocations)
         retained._events = dict(self._events)
         retained._streams = dict(self._streams)
+        for snapshot in self._construction_slot_snapshots():
+            retained._capture_construction_snapshot(snapshot)
         return retained
 
     def release(self, resource):
@@ -707,12 +783,23 @@ class _ActiveOperandLease:
         return False
 
 class _LeaseStatusWorkspace:
-    def __init__(self, device_status, host_status):
+    def __init__(
+        self,
+        device_status,
+        host_status,
+        *,
+        _construction_slot=None,
+    ):
         self.device_status = device_status
         self.host_status = host_status
         self._allocation_records = allocation_records((device_status, host_status))
         self._borrower = None
         self._closed = False
+        _publish_lease_construction_resource(
+            _construction_slot,
+            self,
+            records=self._allocation_records,
+        )
 
     @property
     def borrower(self):
@@ -826,6 +913,8 @@ class WorkingSetLease:
         profile_enabled,
         timer,
         peak_sampler,
+        _construction_slot=None,
+        _resource_recorder=None,
     ):
         self._provider = provider
         self._epoch = epoch
@@ -866,6 +955,11 @@ class WorkingSetLease:
         self._baseline_host_bytes = 0
         self._observed_device_peak_bytes = 0
         self._observed_host_peak_bytes = 0
+        _publish_lease_construction_resource(_construction_slot, self)
+        if _resource_recorder is not None:
+            if not callable(_resource_recorder):
+                raise TypeError("lease resource recorder must be callable")
+            _resource_recorder(resource=self)
         if profile_enabled:
             (
                 self._baseline_device_bytes,
@@ -1726,7 +1820,7 @@ class WorkingSetLease:
             provider._retain_terminal_lease(self, primary)
         except BaseException as retention_error:
             with runtime._terminal_state_lock:
-                runtime._remember_terminal_secondary_locked(
+                runtime._retain_terminal_secondary_locked(
                     retention_error,
                     primary,
                 )
@@ -1743,7 +1837,7 @@ class WorkingSetLease:
         )
         if error is not primary:
             with runtime._terminal_state_lock:
-                runtime._remember_terminal_secondary_locked(error, primary)
+                runtime._retain_terminal_secondary_locked(error, primary)
         try:
             primary = runtime._enter_communicator_fatal(primary)
         except BaseException as publication_error:
@@ -1752,7 +1846,7 @@ class WorkingSetLease:
                 raise primary
             if publication_error is not primary:
                 with runtime._terminal_state_lock:
-                    runtime._remember_terminal_secondary_locked(
+                    runtime._retain_terminal_secondary_locked(
                         publication_error,
                         primary,
                     )
@@ -1977,6 +2071,38 @@ class WorkingSetLease:
         self._closed = True
         return error
 
+    def _abort_construction_references(self, error):
+        self._children.clear()
+        self._active_operator_owner = None
+        self._active_operator_scope = None
+        self._dirty = None
+        self._dirty_allocation_records = ()
+        self._writeback_ticket = None
+        self._poisoned_error = error
+        self._entries = {}
+        self._current_lookup = {}
+        self._future_queue = []
+        self._prefetch_tickets = []
+        self.cache_identities = ()
+        self._cache_reservation = None
+        self._store_reservation = None
+        self.pool = None
+        self.scheduler = None
+        self._status_workspace = None
+        self.store = None
+        self.request = None
+        self.plan = None
+        self.receipt = None
+        self.context = None
+        self.backend = None
+        self._provider = None
+        self._peak_sampler = None
+        self._timer = None
+        self._started_at = None
+        self._profile_enabled = False
+        self._closing = False
+        self._closed = True
+
     def close(self, wait=True):
         if type(wait) is not bool:
             raise TypeError("wait must be a boolean")
@@ -2009,7 +2135,7 @@ class WorkingSetLease:
                 primary = transition.primary
                 if error is not primary:
                     with runtime._terminal_state_lock:
-                        runtime._remember_terminal_secondary_locked(
+                        runtime._retain_terminal_secondary_locked(
                             error, primary
                         )
             self._retain_terminal_lease_safely(provider, primary)
@@ -2214,6 +2340,7 @@ class ActiveWorkingSetProvider:
         _admission_token,
         _admission_validator,
         _resource_recorder,
+        _construction_slot=None,
     ):
         _require_resource_admission(
             _admission_token,
@@ -2255,16 +2382,26 @@ class ActiveWorkingSetProvider:
         local_code = 0
         try:
             device_status = self._allocate_status_device()
+            device_records = allocation_records((device_status,))
+            _publish_lease_construction_resource(
+                _construction_slot,
+                records=device_records,
+            )
             _resource_recorder(
-                records=allocation_records((device_status,)),
+                records=device_records,
             )
         except BaseException as error:
             local_error = error
             local_code |= 1
         try:
             host_status = self._allocate_status_host()
+            host_records = allocation_records((host_status,))
+            _publish_lease_construction_resource(
+                _construction_slot,
+                records=host_records,
+            )
             _resource_recorder(
-                records=allocation_records((host_status,)),
+                records=host_records,
             )
         except BaseException as error:
             if local_error is None:
@@ -2289,7 +2426,11 @@ class ActiveWorkingSetProvider:
                     "working-set status allocation failed"
                 ) from local_error
             raise ValueError("working-set status allocation failed")
-        workspace = _LeaseStatusWorkspace(device_status, host_status)
+        workspace = _LeaseStatusWorkspace(
+            device_status,
+            host_status,
+            _construction_slot=_construction_slot,
+        )
         _resource_recorder(resource=workspace)
         return workspace
 
@@ -2420,6 +2561,7 @@ class ActiveWorkingSetProvider:
         _admission_token,
         _admission_validator,
         _resource_recorder=None,
+        _construction_slot=None,
     ):
         _require_resource_admission(
             _admission_token,
@@ -2428,6 +2570,10 @@ class ActiveWorkingSetProvider:
         if not callable(_resource_recorder):
             raise TypeError("store reservation recorder must be callable")
         reservation = store.reserve(snapshot, dirty_ref=dirty_ref)
+        _publish_lease_construction_resource(
+            _construction_slot,
+            reservation,
+        )
         _resource_recorder(resource=reservation)
         return reservation
 
@@ -2497,6 +2643,8 @@ class ActiveWorkingSetProvider:
             status_workspace = record.construction_resource(
                 "status_workspace"
             )
+        constructed_cache = record.construction_resource("cache")
+        constructed_lease = record.construction_resource("lease")
         cleanup_error = None
         try:
             record.restore_consumed_receipts(self.runtime)
@@ -2506,6 +2654,7 @@ class ActiveWorkingSetProvider:
             scheduler,
             pool,
             cache_reservation,
+            constructed_cache,
             store_reservation,
             status_workspace,
         ):
@@ -2519,6 +2668,14 @@ class ActiveWorkingSetProvider:
                         _admission_token=token,
                         _admission_validator=_admission_validator,
                     )
+            except BaseException as caught:
+                if cleanup_error is None:
+                    cleanup_error = caught
+        if self._cache is constructed_cache:
+            self._cache = None
+        if constructed_lease is not None:
+            try:
+                constructed_lease._abort_construction_references(first_error)
             except BaseException as caught:
                 if cleanup_error is None:
                     cleanup_error = caught
@@ -2552,7 +2709,7 @@ class ActiveWorkingSetProvider:
             return
         runtime = self.runtime
         with runtime._terminal_state_lock:
-            runtime._remember_terminal_secondary_locked(error, primary)
+            runtime._retain_terminal_secondary_locked(error, primary)
 
     def _record_construction_outcome_secondaries(self, outcome):
         _, primary, _, secondaries = outcome
@@ -2743,7 +2900,10 @@ class ActiveWorkingSetProvider:
             raise ValueError("cache reservation does not match residency plan")
 
         gate = self.runtime._terminal_gate
-        transaction = gate._prepare_lease_construction("lease_construction")
+        transaction = gate._prepare_lease_construction(
+            "lease_construction",
+            resource_names=_LEASE_CONSTRUCTION_RESOURCE_NAMES,
+        )
         epoch = None
         construction_token = None
         construction_validator = None
@@ -2767,7 +2927,11 @@ class ActiveWorkingSetProvider:
                 scope="construction",
                 epoch=epoch,
             )
-            record = _LeaseResourceRecord(epoch)
+            construction_slots = transaction.resource_slots
+            record = _LeaseResourceRecord(
+                epoch,
+                construction_slots=construction_slots,
+            )
             self._provisional_resources = record
             cache_recorder = self._lease_cache_recorder(record)
             status_recorder = self._construction_resource_recorder(
@@ -2787,6 +2951,9 @@ class ActiveWorkingSetProvider:
             scheduler_recorder = self._construction_resource_recorder(
                 record, "scheduler"
             )
+            lease_recorder = self._construction_resource_recorder(
+                record, "lease"
+            )
             self.runtime.consume_residency_receipt(
                 receipt,
                 request,
@@ -2800,8 +2967,8 @@ class ActiveWorkingSetProvider:
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
                 _resource_recorder=status_recorder,
+                _construction_slot=construction_slots["status_workspace"],
             )
-            record.capture(status_workspace)
             self._raise_construction_transition_preemption()
             dirty_key = request.distributed_plan.execution_plan.output.key
             dirty_ref = dict(request.host_refs)[dirty_key]
@@ -2812,8 +2979,8 @@ class ActiveWorkingSetProvider:
                 _resource_recorder=store_recorder,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
+                _construction_slot=construction_slots["store_reservation"],
             )
-            record.capture(store_reservation)
             self._raise_construction_transition_preemption()
             if self._cache is None:
                 self._cache = self._cache_factory(
@@ -2822,6 +2989,7 @@ class ActiveWorkingSetProvider:
                     _resource_recorder=cache_recorder,
                     _admission_token=construction_token,
                     _admission_validator=construction_validator,
+                    _construction_slot=construction_slots["cache"],
                 )
             set_recorder = getattr(self._cache, "_set_resource_recorder", None)
             if callable(set_recorder):
@@ -2833,8 +3001,8 @@ class ActiveWorkingSetProvider:
                 _resource_recorder=cache_reservation_recorder,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
+                _construction_slot=construction_slots["cache_reservation"],
             )
-            record.capture(cache_reservation)
             self._raise_construction_transition_preemption()
             pool = self._pool_factory(
                 request.transfer_profile.rank_staging_bytes[self.runtime.rank],
@@ -2842,8 +3010,8 @@ class ActiveWorkingSetProvider:
                 _resource_recorder=pool_recorder,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
+                _construction_slot=construction_slots["pool"],
             )
-            record.capture(pool, kind="pinned")
             self._raise_construction_transition_preemption()
             from renormalizer.utils.log import PROFILING, get_logger
 
@@ -2871,8 +3039,8 @@ class ActiveWorkingSetProvider:
                 _resource_releaser=record.release,
                 _admission_token=construction_token,
                 _admission_validator=construction_validator,
+                _construction_slot=construction_slots["scheduler"],
             )
-            record.capture(scheduler)
             self._raise_construction_transition_preemption()
             if profile_enabled:
                 import psutil
@@ -2912,8 +3080,9 @@ class ActiveWorkingSetProvider:
                 profile_enabled=profile_enabled,
                 timer=timer,
                 peak_sampler=peak_sampler,
+                _construction_slot=construction_slots["lease"],
+                _resource_recorder=lease_recorder,
             )
-            record.capture(lease)
             lease.metrics.full_replica = bool(
                 plan.metadata()["full_replica_prediction"]
             )

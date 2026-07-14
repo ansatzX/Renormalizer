@@ -616,12 +616,36 @@ def _task_18_2_runtime(wrapper, backend):
     return runtime
 
 
+def _completed_test_monitor(wrapper):
+    thread = threading.Thread(
+        target=lambda: None,
+        name="renormalizer-test-completed-fatal-monitor-rank-{}".format(
+            wrapper.rank
+        ),
+        daemon=True,
+    )
+    with wrapper._fatal_condition:
+        wrapper._fatal_monitor_thread = thread
+        wrapper._fatal_monitor_state = "starting"
+    thread.start()
+    thread.join(_TASK_18_2_TIMEOUT_S)
+    assert not thread.is_alive()
+    with wrapper._fatal_condition:
+        wrapper._fatal_monitor_state = "completed"
+        wrapper._fatal_condition.notify_all()
+    return thread
+
+
 def _single_rank_task_18_2_runtime(monkeypatch, *, start_monitor=False):
     store = _SharedStore(1)
     raw_comm = _RawComm()
     wrapper, backend = _cpu_collective(0, 1, store, raw_comm)
     start_fatal_monitor = wrapper._start_fatal_monitor
-    monkeypatch.setattr(wrapper, "_start_fatal_monitor", lambda: None)
+    monkeypatch.setattr(
+        wrapper,
+        "_start_fatal_monitor",
+        lambda: _completed_test_monitor(wrapper),
+    )
     assert wrapper._bootstrap_fatal_control() == 0
     monkeypatch.setattr(wrapper, "_start_fatal_monitor", start_fatal_monitor)
     runtime = _task_18_2_runtime(wrapper, backend)
@@ -819,7 +843,11 @@ def test_remote_monitor_and_local_failure_join_one_transition(monkeypatch):
     wrappers = [pair[0] for pair in pairs]
     backends = [pair[1] for pair in pairs]
     for wrapper in wrappers:
-        monkeypatch.setattr(wrapper, "_start_fatal_monitor", lambda: None)
+        monkeypatch.setattr(
+            wrapper,
+            "_start_fatal_monitor",
+            lambda retained=wrapper: _completed_test_monitor(retained),
+        )
     _bootstrap_cpu_wrappers(wrappers)
     runtime = _task_18_2_runtime(wrappers[1], backends[1])
     gate = runtime._terminal_gate
@@ -1419,6 +1447,107 @@ def test_active_operator_primary_is_canonical_before_collective_publication(
     assert wrapper._fatal_secondary_errors == (later,)
 
 
+def test_runtime_owner_diagnostics_are_post_marker_unlocked_and_exact_once(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed.async_owner import AsyncResourceOwner
+
+    runtime, wrapper, backend, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    primary = RuntimeError("runtime diagnostic canonical primary")
+    owner_error = RuntimeError("runtime diagnostic owner secondary")
+    call_error = RuntimeError("runtime diagnostic call secondary")
+    discovered = RuntimeError("runtime diagnostic discovered secondary")
+    diagnostic_failure = RuntimeError("runtime diagnostic callback failure")
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    callback_observations = []
+
+    class OperatorCall:
+        def __init__(self):
+            self.primary_error = call_error
+            self.secondary_errors = []
+
+        def record_secondary(self, error):
+            callback_observations.append(
+                (
+                    error,
+                    gate.phase,
+                    wrapper._fatal_error,
+                    gate._condition._is_owned(),
+                    runtime._terminal_state_lock._is_owned(),
+                    wrapper._fatal_condition._is_owned(),
+                    wrapper._fatal_lock._is_owned(),
+                )
+            )
+            self.secondary_errors.append(error)
+            if not callback_entered.is_set():
+                callback_entered.set()
+                assert release_callback.wait(_TASK_18_2_TIMEOUT_S * 2)
+                raise diagnostic_failure
+
+    call = OperatorCall()
+    owner = AsyncResourceOwner("runtime-diagnostic-owner")
+    owner._operator_call = call
+    owner.mark_enqueued()
+    owner.force_quarantine(owner_error)
+    lease = SimpleNamespace(
+        _active_operator_owner=owner,
+        _status_workspace=None,
+        _poisoned_error=None,
+    )
+    provider = SimpleNamespace(_active_lease=lease, _terminal_error=None)
+    runtime._active_provider = provider
+    runtime._terminal_error = primary
+    backend._execution_terminal_error = primary
+
+    publisher, publish_results, publish_errors, publish_done = (
+        _start_task_18_2_call(
+            lambda: wrapper._enter_observed_fatal(
+                discovered,
+                wrapper.rank,
+                join_existing=True,
+            ),
+            name="task-18.3-runtime-diagnostic-publisher",
+        )
+    )
+    waiter = None
+    try:
+        assert callback_entered.wait(_TASK_18_2_TIMEOUT_S)
+        waiter, wait_results, wait_errors, wait_done = _start_task_18_2_call(
+            lambda: gate.wait_for_published(_TASK_18_2_TIMEOUT_S),
+            name="task-18.3-runtime-diagnostic-waiter",
+        )
+        assert wait_done.wait(_TASK_18_2_TIMEOUT_S)
+        _join_task_18_2_call(waiter, wait_done)
+        assert wait_results == [primary]
+        assert wait_errors == []
+    finally:
+        release_callback.set()
+        _join_task_18_2_call(publisher, publish_done)
+        if waiter is not None and waiter.is_alive():
+            _join_task_18_2_call(waiter, wait_done)
+
+    assert publish_results == [primary]
+    assert publish_errors == []
+    assert callback_observations
+    assert all(
+        observation[1:] == (
+            _TerminalPhase.FATAL_PUBLISHED,
+            primary,
+            False,
+            False,
+            False,
+            False,
+        )
+        for observation in callback_observations
+    )
+    dispatched = [observation[0] for observation in callback_observations]
+    for error in (owner_error, call_error, discovered):
+        assert sum(retained is error for retained in dispatched) == 1
+    assert diagnostic_failure in runtime._terminal_secondary_errors
+
+
 def test_preexisting_backend_poison_is_canonical_for_fatal_publication(
     monkeypatch,
 ):
@@ -1426,6 +1555,24 @@ def test_preexisting_backend_poison_is_canonical_for_fatal_publication(
     earlier = RuntimeError("preexisting backend terminal poison")
     later = RuntimeError("later communicator failure")
     backend._execution_terminal_error = earlier
+    diagnostic_observations = []
+    original_record_secondary = wrapper._record_fatal_secondary
+
+    def record_secondary(error):
+        diagnostic_observations.append(
+            (
+                error,
+                runtime._terminal_gate.phase,
+                wrapper._fatal_error,
+                runtime._terminal_gate._condition._is_owned(),
+                runtime._terminal_state_lock._is_owned(),
+                wrapper._fatal_condition._is_owned(),
+                wrapper._fatal_lock._is_owned(),
+            )
+        )
+        original_record_secondary(error)
+
+    monkeypatch.setattr(wrapper, "_record_fatal_secondary", record_secondary)
 
     result = runtime._enter_communicator_fatal(later)
     snapshot = runtime._terminal_gate.wait_for_published(_TASK_18_2_TIMEOUT_S)
@@ -1439,6 +1586,17 @@ def test_preexisting_backend_poison_is_canonical_for_fatal_publication(
     assert backend._execution_terminal_error is earlier
     assert runtime._terminal_quarantine.first_error is earlier
     assert wrapper._fatal_secondary_errors == (later,)
+    assert diagnostic_observations == [
+        (
+            later,
+            _TerminalPhase.FATAL_PUBLISHED,
+            earlier,
+            False,
+            False,
+            False,
+            False,
+        )
+    ]
 
 
 def test_quarantine_after_election_cannot_replace_canonical_primary(monkeypatch):
@@ -9340,6 +9498,88 @@ def test_fatal_monitor_thread_start_is_transactional(monkeypatch, start_mode):
             assert not worker.is_alive()
             assert wrapper._fatal_monitor_state == "completed"
             assert start_failure in wrapper._fatal_secondary_errors
+    finally:
+        release_monitor.set()
+        if worker is not None and worker.ident is not None:
+            worker.join(_TASK_18_2_TIMEOUT_S)
+
+
+@pytest.mark.parametrize("start_mode", ("before_real", "after_real"))
+def test_fatal_control_initialization_commits_only_with_owned_monitor(
+    monkeypatch,
+    start_mode,
+):
+    class MonitorStartFailure(BaseException):
+        pass
+
+    class FatalHardExit(BaseException):
+        pass
+
+    store = _SharedStore(1)
+    raw_comm = _RawComm()
+    wrapper, backend = _cpu_collective(0, 1, store, raw_comm)
+    runtime = _task_18_2_runtime(wrapper, backend)
+    gate = runtime._terminal_gate
+    start_failure = MonitorStartFailure(
+        "bootstrap monitor {} start".format(start_mode)
+    )
+    monitor_entered = threading.Event()
+    release_monitor = threading.Event()
+    hard_exits = []
+    original_start = threading.Thread.start
+
+    def hold_monitor():
+        monitor_entered.set()
+        assert release_monitor.wait(_TASK_18_2_TIMEOUT_S)
+
+    def fail_start(thread):
+        if not thread.name.startswith("renormalizer-fatal-monitor-rank-"):
+            return original_start(thread)
+        if start_mode == "before_real":
+            raise start_failure
+        original_start(thread)
+        assert monitor_entered.wait(_TASK_18_2_TIMEOUT_S)
+        raise start_failure
+
+    def hard_exit():
+        with wrapper._fatal_condition:
+            collective_marker = wrapper._fatal_publication_failure
+        with gate._condition:
+            gate_marker = gate._fatal_publication_failure
+        hard_exits.append((collective_marker, gate_marker))
+        raise FatalHardExit()
+
+    monkeypatch.setattr(wrapper, "_monitor_fatal_records", hold_monitor)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+    worker = None
+    try:
+        if start_mode == "before_real":
+            with pytest.raises(FatalHardExit):
+                wrapper._bootstrap_fatal_control()
+            assert wrapper._fatal_control_initialized is False
+            assert wrapper._fatal_monitor_thread is None
+            assert wrapper._fatal_monitor_state == "start_failed"
+            with wrapper._fatal_condition:
+                assert wrapper._fatal_publication_failure is start_failure
+            with gate._condition:
+                assert gate._fatal_transition.primary is start_failure
+                assert gate._fatal_publication_failure is start_failure
+            assert hard_exits == [(start_failure, start_failure)]
+            with pytest.raises(BaseException):
+                wrapper._bootstrap_fatal_control()
+        else:
+            assert wrapper._bootstrap_fatal_control() == 0
+            worker = wrapper._fatal_monitor_thread
+            assert worker is not None
+            assert wrapper._fatal_control_initialized is True
+            assert wrapper._fatal_monitor_state == "started"
+            assert start_failure in wrapper._fatal_secondary_errors
+            with wrapper._fatal_condition:
+                assert wrapper._fatal_publication_failure is None
+            with gate._condition:
+                assert gate._fatal_transition is None
+            assert hard_exits == []
     finally:
         release_monitor.set()
         if worker is not None and worker.ident is not None:
