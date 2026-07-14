@@ -637,6 +637,30 @@ class _TerminalLifecycleGate:
             self._condition.notify_all()
             return result
 
+    def _fail_elected_lease_close(self, transition, primary) -> None:
+        """Complete a failed elected close without invoking resource callbacks."""
+        if not isinstance(primary, BaseException):
+            raise TypeError("failed lease close primary must be an exception")
+        with self._condition:
+            lease = self._require_lease_transition(transition)
+            self._require_lease_close_owner(transition)
+            if self._has_active_tokens():
+                raise RuntimeError(
+                    "failed lease close completion requires zero live admissions"
+                )
+            if lease.phase == "closed":
+                if not lease.has_result or lease.result is not primary:
+                    raise RuntimeError("failed lease close primary changed")
+            elif lease.phase in {"closing", "fatal_retained"}:
+                lease.phase = "closed"
+                lease.result = primary
+                lease.has_result = True
+            else:
+                raise RuntimeError("lease close is not completable")
+            if self._live_epoch == transition.epoch:
+                self._live_epoch = None
+            self._condition.notify_all()
+
     def spawn_async(
         self, parent: _ResourceAdmission, owner_identity: object
     ) -> _ResourceAdmission:

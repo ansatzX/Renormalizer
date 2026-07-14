@@ -1074,33 +1074,107 @@ class CupyDistributedRuntime:
             return
         if error is primary:
             return
-        if not any(
+        if any(
             retained is error for retained in self._terminal_secondary_errors
         ):
+            return
+        self._terminal_secondary_errors = (
+            *self._terminal_secondary_errors,
+            error,
+        )
+
+        def retain_diagnostic_failure(diagnostic_error):
+            if (
+                not isinstance(diagnostic_error, BaseException)
+                or diagnostic_error is primary
+                or any(
+                    retained is diagnostic_error
+                    for retained in self._terminal_secondary_errors
+                )
+            ):
+                return
             self._terminal_secondary_errors = (
                 *self._terminal_secondary_errors,
-                error,
+                diagnostic_error,
             )
-        call = None if owner is None else getattr(owner, "_operator_call", None)
-        record_secondary = (
-            None if call is None else getattr(call, "record_secondary", None)
-        )
-        if callable(record_secondary):
-            record_secondary(error)
-        elif owner is not None:
-            remember_secondary = getattr(owner, "_remember_secondary", None)
-            if callable(remember_secondary):
-                remember_secondary(error)
-        collective = self._pending_fatal_collective
-        if collective is None:
-            collective = self.collective
-        record_collective = (
-            None
-            if collective is None
-            else getattr(collective, "_record_fatal_secondary", None)
-        )
-        if callable(record_collective):
-            record_collective(error)
+
+        try:
+            call = (
+                None if owner is None else getattr(owner, "_operator_call", None)
+            )
+            record_secondary = (
+                None
+                if call is None
+                else getattr(call, "record_secondary", None)
+            )
+            if not callable(record_secondary) and owner is not None:
+                record_secondary = getattr(owner, "_remember_secondary", None)
+        except BaseException as diagnostic_error:
+            retain_diagnostic_failure(diagnostic_error)
+        else:
+            if callable(record_secondary):
+                try:
+                    record_secondary(error)
+                except BaseException as diagnostic_error:
+                    retain_diagnostic_failure(diagnostic_error)
+
+        try:
+            collective = self._pending_fatal_collective
+            if collective is None:
+                collective = self.collective
+            record_collective = (
+                None
+                if collective is None
+                else getattr(collective, "_record_fatal_secondary", None)
+            )
+        except BaseException as diagnostic_error:
+            retain_diagnostic_failure(diagnostic_error)
+        else:
+            if callable(record_collective):
+                try:
+                    record_collective(error)
+                except BaseException as diagnostic_error:
+                    retain_diagnostic_failure(diagnostic_error)
+
+    def _terminalize_fatal_publication_failure(
+        self,
+        transition,
+        secondary=None,
+        *,
+        owner=None,
+    ):
+        """Install the gate outcome before best-effort diagnostic fan-out."""
+        primary = transition.primary
+        gate = self._terminal_gate
+        with gate._condition:
+            gate._require_fatal_transition(transition)
+            if gate._fatal_publication_failure is _TERMINAL_MISSING:
+                gate._fail_fatal_publication(transition, primary)
+        try:
+            with self._terminal_state_lock:
+                self._remember_terminal_secondary_locked(
+                    secondary,
+                    primary,
+                    owner,
+                )
+        except BaseException as diagnostic_error:
+            # The gate outcome is already terminal; diagnostics cannot replace it.
+            try:
+                with self._terminal_state_lock:
+                    if (
+                        diagnostic_error is not primary
+                        and not any(
+                            retained is diagnostic_error
+                            for retained in self._terminal_secondary_errors
+                        )
+                    ):
+                        self._terminal_secondary_errors = (
+                            *self._terminal_secondary_errors,
+                            diagnostic_error,
+                        )
+            except BaseException:
+                pass
+        return primary
 
     def _force_async_primary_locked(self, owner, primary):
         if owner is None:
@@ -1382,14 +1456,11 @@ class CupyDistributedRuntime:
                         ),
                     )
         except BaseException as error:
-            if owner is not None:
-                owner._remember_secondary(error)
-            with self._terminal_state_lock:
-                self._remember_terminal_secondary_locked(error, primary, owner)
-            self._terminal_gate._fail_fatal_publication(transition, primary)
-            if error is not primary:
-                raise primary
-            raise
+            raise self._terminalize_fatal_publication_failure(
+                transition,
+                error,
+                owner=owner,
+            )
         return primary
 
     def _enter_communicator_fatal_unchecked(
@@ -1482,17 +1553,11 @@ class CupyDistributedRuntime:
             publish(snapshot)
             self._terminal_gate.publish_fatal(transition, snapshot)
         except BaseException as publication_error:
-            with self._terminal_state_lock:
-                self._remember_terminal_secondary_locked(
-                    publication_error,
-                    transition.primary,
-                    owner,
-                )
-            self._terminal_gate._fail_fatal_publication(
+            raise self._terminalize_fatal_publication_failure(
                 transition,
-                transition.primary,
+                publication_error,
+                owner=owner,
             )
-            raise transition.primary
         return snapshot
 
     def _enter_communicator_fatal(
@@ -1515,15 +1580,20 @@ class CupyDistributedRuntime:
                     transition, primary
                 )
             )
-            if failure_was_recorded:
-                raise
             with self._terminal_state_lock:
-                self._remember_terminal_secondary_locked(
-                    publication_error,
-                    primary,
-                    owner,
-                )
-            self._terminal_gate._fail_fatal_publication(transition, primary)
+                collective = self._pending_fatal_collective
+                if collective is None:
+                    collective = self.collective
+            structured_fail_stop = failure_was_recorded and callable(
+                getattr(collective, "_begin_fatal_publication", None)
+            )
+            primary = self._terminalize_fatal_publication_failure(
+                transition,
+                None if structured_fail_stop else publication_error,
+                owner=owner,
+            )
+            if structured_fail_stop and publication_error is not primary:
+                raise
             raise primary
 
     def barrier(self):

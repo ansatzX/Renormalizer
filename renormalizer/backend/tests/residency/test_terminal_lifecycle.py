@@ -1,6 +1,7 @@
 import ast
 from contextlib import contextmanager
 from dataclasses import replace
+import inspect
 import threading
 import traceback
 
@@ -23,8 +24,10 @@ from renormalizer.backend._distributed.providers import (
     ActiveWorkingSetProvider,
     WorkingSetLease,
     _ActiveOperandLease,
+    _LeaseResourceRecord,
     _LeaseStatusWorkspace,
 )
+from renormalizer.backend._distributed import providers as providers_module
 from renormalizer.backend._distributed.terminal import (
     _FatalTransition,
     _MISSING,
@@ -2016,6 +2019,252 @@ def test_constructor_failure_rolls_back_under_exact_construction_token(
         _close_case(runtime, store)
 
 
+@pytest.mark.parametrize("failure_boundary", ("wait", "finalizer", "commit"))
+def test_construction_rollback_is_one_total_elected_transaction(
+    monkeypatch,
+    failure_boundary,
+):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-construction-rollback-{}".format(failure_boundary),
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    gate = runtime._terminal_gate
+    boundary_entered = threading.Event()
+    release_boundary = threading.Event()
+    joiner_started = threading.Event()
+    joiner_waiting = threading.Event()
+    status_arrays = []
+
+    class ConstructionPrimary(BaseException):
+        pass
+
+    class RollbackSecondary(BaseException):
+        pass
+
+    primary = ConstructionPrimary("status construction failed")
+    secondary = RollbackSecondary(
+        "construction rollback {} failed".format(failure_boundary)
+    )
+
+    original_device = provider._allocate_status_device
+    original_host = provider._allocate_status_host
+
+    def capture_device():
+        array = original_device()
+        status_arrays.append(array)
+        return array
+
+    def capture_host():
+        array = original_host()
+        status_arrays.append(array)
+        return array
+
+    def fail_status_bootstrap(_local_code):
+        raise primary
+
+    monkeypatch.setattr(provider, "_allocate_status_device", capture_device)
+    monkeypatch.setattr(provider, "_allocate_status_host", capture_host)
+    monkeypatch.setattr(
+        runtime.collective,
+        "_bootstrap_status_or",
+        fail_status_bootstrap,
+    )
+
+    if failure_boundary == "wait":
+        original_wait = gate.wait_for_lease_admissions
+        failed = [False]
+
+        def fail_wait(transition, timeout_s):
+            result = original_wait(transition, timeout_s)
+            if not failed[0]:
+                failed[0] = True
+                boundary_entered.set()
+                assert release_boundary.wait(_TIMEOUT_S)
+                raise secondary
+            return result
+
+        monkeypatch.setattr(gate, "wait_for_lease_admissions", fail_wait)
+    elif failure_boundary == "finalizer":
+        original_clear = _LeaseResourceRecord.clear
+        failed = [False]
+
+        def fail_clear(record):
+            result = original_clear(record)
+            if not failed[0]:
+                failed[0] = True
+                boundary_entered.set()
+                assert release_boundary.wait(_TIMEOUT_S)
+                raise secondary
+            return result
+
+        monkeypatch.setattr(_LeaseResourceRecord, "clear", fail_clear)
+    else:
+        original_commit = gate.commit_lease_close
+        failed = [False]
+
+        def fail_commit(transition, finalizer):
+            result = original_commit(transition, finalizer)
+            if not failed[0]:
+                failed[0] = True
+                boundary_entered.set()
+                assert release_boundary.wait(_TIMEOUT_S)
+                raise secondary
+            return result
+
+        monkeypatch.setattr(gate, "commit_lease_close", fail_commit)
+
+    original_join = gate.wait_for_lease_closed
+
+    def observe_join(*args, **kwargs):
+        joiner_waiting.set()
+        return original_join(*args, **kwargs)
+
+    monkeypatch.setattr(gate, "wait_for_lease_closed", observe_join)
+    rollback = provider._commit_construction_rollback
+    rollback_parameters = len(inspect.signature(rollback).parameters)
+    rollback_records = []
+
+    def commit_rollback(
+        epoch,
+        record,
+        immutable_primary=primary,
+        **kwargs,
+    ):
+        if all(retained is not record for retained in rollback_records):
+            rollback_records.append(record)
+        if rollback_parameters == 2:
+            result = rollback(epoch, record)
+        else:
+            result = rollback(epoch, record, immutable_primary, **kwargs)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(provider, "_commit_construction_rollback", commit_rollback)
+    owner, _, owner_errors, owner_done = _start(
+        lambda: provider.open_working_set(request, plan, store, receipt)
+    )
+    assert boundary_entered.wait(_TIMEOUT_S)
+    assert len(rollback_records) == 1
+    record = rollback_records[0]
+    assert record is not None
+    epoch = next(iter(gate._leases))
+    def join_rollback():
+        joiner_started.set()
+        return commit_rollback(epoch, record, primary)
+
+    joiner, _, joiner_errors, joiner_done = _start(join_rollback)
+    assert joiner_started.wait(_TIMEOUT_S)
+    recovered = False
+
+    try:
+        release_boundary.set()
+        assert owner_done.wait(_TIMEOUT_S)
+        if not joiner_done.wait(_TIMEOUT_S):
+            recovered = True
+            runtime._enter_communicator_fatal(primary)
+        assert joiner_done.wait(_TIMEOUT_S)
+        owner.join(_TIMEOUT_S)
+        joiner.join(_TIMEOUT_S)
+        assert not owner.is_alive()
+        assert not joiner.is_alive()
+
+        with gate._condition:
+            lease_state = gate._leases[epoch]
+            live_epoch = gate._live_epoch
+        retained_resources = runtime._terminal_quarantine._resources
+        retained_allocations = {
+            retained.identity: retained
+            for retained in runtime._terminal_quarantine.allocations
+        }
+        expected_allocations = {
+            allocation_record(array).identity: allocation_record(array)
+            for array in status_arrays
+        }
+
+        assert joiner_waiting.is_set()
+        assert recovered is False
+        assert owner_errors == [primary]
+        assert joiner_errors == [primary]
+        assert secondary in runtime._terminal_secondary_errors
+        assert lease_state.phase == "closed"
+        assert lease_state.result is primary
+        assert live_epoch is None
+        assert provider._active_lease is None
+        assert receipt in retained_resources
+        assert set(expected_allocations) <= set(retained_allocations)
+        assert all(
+            retained_allocations[identity].owner is expected.owner
+            for identity, expected in expected_allocations.items()
+        )
+    finally:
+        release_boundary.set()
+        if not owner_done.is_set():
+            owner_done.wait(_TIMEOUT_S)
+        if not joiner_done.is_set():
+            try:
+                runtime._enter_communicator_fatal(primary)
+            except BaseException:
+                pass
+            joiner_done.wait(_TIMEOUT_S)
+        for thread in (owner, joiner):
+            if thread.is_alive():
+                thread.join(_TIMEOUT_S)
+        _close_case(runtime, store)
+
+
+def test_every_lease_close_election_uses_the_total_owner_primitive():
+    with open(providers_module.__file__, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+
+    module_functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    classes = {
+        node.name: node for node in tree.body if isinstance(node, ast.ClassDef)
+    }
+
+    def method(class_name, method_name):
+        return next(
+            node
+            for node in classes[class_name].body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method_name
+        )
+
+    def calls_named(node, name):
+        return [
+            call
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and (
+                isinstance(call.func, ast.Name)
+                and call.func.id == name
+                or isinstance(call.func, ast.Attribute)
+                and call.func.attr == name
+            )
+        ]
+
+    runner = module_functions["_run_total_elected_lease_close"]
+    begin_calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if calls_named(node, "begin_lease_close"):
+                begin_calls.append(node.name)
+    assert begin_calls == ["_run_total_elected_lease_close"]
+    assert len(calls_named(runner, "begin_lease_close")) == 1
+    assert calls_named(method("WorkingSetLease", "close"), runner.name)
+    assert calls_named(
+        method("ActiveWorkingSetProvider", "_commit_construction_rollback"),
+        runner.name,
+    )
+
+
 def test_live_operations_and_state_use_exact_epoch_admissions(monkeypatch):
     runtime, request, plan, store, provider, lease = _open_active_case(
         store_id="terminal-live-admissions"
@@ -2723,6 +2972,194 @@ def test_counted_async_cancellation_winner_prevents_late_worker_claim(
         if lease_phase == "closing":
             gate.commit_lease_close(transition, lambda: None)
         runtime.close()
+
+
+@pytest.mark.parametrize("async_kind", ("ordinary", "close_owned"))
+@pytest.mark.parametrize(
+    "start_mode",
+    ("before_start", "after_start_before_claim", "after_claim"),
+)
+def test_counted_async_thread_start_is_transactional(
+    monkeypatch,
+    async_kind,
+    start_mode,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    epoch, construction = gate.begin_lease(
+        "{}_{}_construction".format(async_kind, start_mode)
+    )
+    gate.activate_lease(epoch, construction)
+    gate.release(construction)
+    transition = None
+    if async_kind == "ordinary":
+        parent = gate.admit_lease(epoch, "ordinary_start_parent")
+    else:
+        transition, elected = gate.begin_lease_close(epoch)
+        assert elected is True
+        parent = gate.admit_lease_close(transition, "close_start_parent")
+    admission = _CountedAsyncAdmission(gate, parent, object())
+    descendant = admission.token
+    gate.release(parent)
+
+    completion = _BlockingEvent()
+    quarantined = []
+    owner = AsyncResourceOwner(
+        "compute",
+        _async_admission=admission,
+        quarantine=quarantined.append,
+    )
+    owner.mark_enqueued()
+    owner.add_event(completion, completion=True)
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    claim_entered = threading.Event()
+    workers = []
+    cancel_calls = []
+    claim_calls = []
+    release_calls = []
+
+    class StartFailure(BaseException):
+        pass
+
+    primary = StartFailure(
+        "{} {} worker start failure".format(async_kind, start_mode)
+    )
+    original_worker_run = owner._run_counted_completion
+    original_thread_start = threading.Thread.start
+    original_cancel = gate.cancel_async
+    original_claim = gate.claim_async
+    original_release = gate.release
+
+    if start_mode == "after_start_before_claim":
+
+        def pause_worker(admitted):
+            worker_entered.set()
+            assert release_worker.wait(_TIMEOUT_S)
+            return original_worker_run(admitted)
+
+        monkeypatch.setattr(owner, "_run_counted_completion", pause_worker)
+    elif start_mode == "after_claim":
+        owner._async_requested.set()
+        admission.wake()
+
+    def record_cancel(*args, **kwargs):
+        cancelled = original_cancel(*args, **kwargs)
+        if cancelled:
+            cancel_calls.append(descendant.sequence)
+        return cancelled
+
+    def record_claim(*args, **kwargs):
+        claimed = original_claim(*args, **kwargs)
+        claim_calls.append(descendant.sequence)
+        claim_entered.set()
+        return claimed
+
+    def record_release(token):
+        result = original_release(token)
+        if token.sequence == descendant.sequence:
+            release_calls.append(descendant.sequence)
+        return result
+
+    def fail_thread_start(worker):
+        if worker.name != "renormalizer-async-completion":
+            return original_thread_start(worker)
+        workers.append(worker)
+        if start_mode == "before_start":
+            raise primary
+        original_thread_start(worker)
+        if start_mode == "after_start_before_claim":
+            assert worker_entered.wait(_TIMEOUT_S)
+        else:
+            assert claim_entered.wait(_TIMEOUT_S)
+        raise primary
+
+    monkeypatch.setattr(gate, "cancel_async", record_cancel)
+    monkeypatch.setattr(gate, "claim_async", record_claim)
+    monkeypatch.setattr(gate, "release", record_release)
+    monkeypatch.setattr(threading.Thread, "start", fail_thread_start)
+
+    caller_error = None
+    recovery_cancelled = False
+    token_status = None
+    done_before_recovery = None
+    worker_state = None
+    drain_errors = []
+    try:
+        try:
+            owner.arm_completion()
+        except BaseException as error:
+            try:
+                owner.fail(error)
+            except BaseException as terminal_error:
+                caller_error = terminal_error
+
+        release_worker.set()
+        completion.release.set()
+        worker = workers[0]
+        if worker.ident is not None:
+            worker.join(_TIMEOUT_S)
+            assert not worker.is_alive()
+        with gate._condition:
+            token_status = gate._tokens[descendant.sequence].status
+        done_before_recovery = owner._async_done.is_set()
+        worker_state = getattr(owner, "_async_worker_state", None)
+        if token_status == "active":
+            recovery_cancelled = admission.cancel()
+            owner._async_done.set()
+        if transition is None:
+            transition, elected = gate.begin_lease_close(epoch)
+            assert elected is True
+        drain, _, drain_errors, drain_done = _start(
+            lambda: gate.wait_for_lease_admissions(
+                transition,
+                _TIMEOUT_S,
+            )
+        )
+        _join(drain, drain_done)
+        gate.commit_lease_close(transition, lambda: None)
+    finally:
+        release_worker.set()
+        completion.release.set()
+        for worker in workers:
+            if worker.ident is not None and worker.is_alive():
+                worker.join(_TIMEOUT_S)
+        with gate._condition:
+            state = gate._tokens.get(descendant.sequence)
+            active = state is not None and state.status == "active"
+        if active:
+            try:
+                admission.cancel()
+            except BaseException:
+                pass
+        if gate._live_epoch is not None:
+            try:
+                if transition is None:
+                    transition, _ = gate.begin_lease_close(epoch)
+                gate.commit_lease_close(transition, lambda: None)
+            except BaseException:
+                pass
+        runtime.close()
+
+    assert caller_error is primary
+    assert recovery_cancelled is False
+    assert token_status == "released"
+    assert done_before_recovery is True
+    assert owner.state == "quarantined"
+    assert owner.error is primary
+    assert quarantined == [owner]
+    assert drain_errors == []
+    assert gate._live_epoch is None
+    if start_mode in {"before_start", "after_start_before_claim"}:
+        assert worker_state == "start_failed"
+        assert cancel_calls == [descendant.sequence]
+        assert claim_calls == []
+        assert release_calls == []
+    else:
+        assert worker_state == "terminal"
+        assert cancel_calls == []
+        assert claim_calls == [descendant.sequence]
+        assert release_calls == [descendant.sequence]
 
 
 def test_runtime_close_starts_preexisting_counted_descendant_before_gate_drain():
@@ -3662,6 +4099,207 @@ def test_elected_close_total_guard_includes_reference_finalizer_and_commit(
         assert gate._fatal_transition is None
         assert gate.phase is _TerminalPhase.RUNTIME_CLOSED
         assert runtime._terminal_error is primary
+
+
+@pytest.mark.parametrize("catch_layer", ("transition", "legacy", "outer"))
+def test_publication_failure_terminalizer_marks_before_diagnostics(
+    monkeypatch,
+    catch_layer,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    primary = RuntimeError("{} publication primary".format(catch_layer))
+
+    class PublishFailure(BaseException):
+        pass
+
+    class DiagnosticFailure(BaseException):
+        pass
+
+    publication_failure = PublishFailure(
+        "{} publication failure".format(catch_layer)
+    )
+    diagnostic_failure = DiagnosticFailure(
+        "{} diagnostic failure".format(catch_layer)
+    )
+    diagnostic_calls = []
+    marker_observations = []
+    close_commit_entered = threading.Event()
+
+    def fail_diagnostic(error):
+        diagnostic_calls.append(error)
+        with gate._condition:
+            transition = gate._fatal_transition
+            marker_observations.append(
+                transition is not None
+                and gate._fatal_publication_failure is transition.primary
+            )
+        raise diagnostic_failure
+
+    monkeypatch.setattr(
+        runtime.collective,
+        "_record_fatal_secondary",
+        fail_diagnostic,
+        raising=False,
+    )
+    if catch_layer == "transition":
+
+        def fail_transition(*_args, **_kwargs):
+            raise publication_failure
+
+        monkeypatch.setattr(gate, "wait_for_admissions", fail_transition)
+    elif catch_layer == "legacy":
+
+        def fail_legacy(*_args, **_kwargs):
+            raise publication_failure
+
+        monkeypatch.setattr(
+            runtime.collective,
+            "_publish_communicator_fatal",
+            fail_legacy,
+        )
+    else:
+        original_begin = runtime._begin_communicator_fatal
+
+        def fail_outer(*args, **kwargs):
+            original_begin(*args, **kwargs)
+            raise publication_failure
+
+        monkeypatch.setattr(runtime, "_begin_communicator_fatal", fail_outer)
+
+    original_commit = gate.commit_runtime_close
+
+    def observe_commit(transition, finalizer):
+        if isinstance(transition, _FatalTransition):
+            close_commit_entered.set()
+        return original_commit(transition, finalizer)
+
+    monkeypatch.setattr(gate, "commit_runtime_close", observe_commit)
+    publisher_error = None
+    closer = None
+    close_errors = []
+    marker_before_recovery = False
+    phase_before_recovery = None
+    try:
+        try:
+            runtime._enter_communicator_fatal(primary)
+        except BaseException as error:
+            publisher_error = error
+        closer, _, close_errors, close_done = _start(runtime.close)
+        assert close_commit_entered.wait(_TIMEOUT_S)
+        with gate._condition:
+            transition = gate._fatal_transition
+            marker_before_recovery = (
+                transition is not None
+                and gate._fatal_publication_failure is transition.primary
+            )
+            phase_before_recovery = gate._phase
+        if marker_before_recovery:
+            _join(closer, close_done)
+    finally:
+        with gate._condition:
+            transition = gate._fatal_transition
+            marker_recorded = (
+                transition is not None
+                and gate._fatal_publication_failure is transition.primary
+            )
+        if transition is not None and not marker_recorded:
+            gate._fail_fatal_publication(transition, transition.primary)
+        if closer is not None and closer.is_alive():
+            _join(closer, close_done)
+
+    assert publisher_error is primary
+    assert marker_before_recovery is True
+    assert phase_before_recovery is _TerminalPhase.RUNTIME_CLOSED
+    assert close_errors == [primary]
+    assert marker_observations == [True]
+    assert diagnostic_calls == [publication_failure]
+    assert publication_failure in runtime._terminal_secondary_errors
+    assert diagnostic_failure in runtime._terminal_secondary_errors
+
+
+@pytest.mark.parametrize("marker_preinstalled", (False, True))
+def test_publication_failure_terminalizer_is_idempotent(
+    monkeypatch,
+    marker_preinstalled,
+):
+    runtime = _runtime()
+    gate = runtime._terminal_gate
+    primary = RuntimeError("terminalizer primary")
+    secondary = RuntimeError("terminalizer secondary")
+    transition = gate.begin_fatal(primary)
+    calls = []
+    marker_calls = []
+    original_fail = gate._fail_fatal_publication
+
+    def record_marker(selected, failure):
+        marker_calls.append((selected, failure))
+        return original_fail(selected, failure)
+
+    monkeypatch.setattr(gate, "_fail_fatal_publication", record_marker)
+
+    def record_secondary(error):
+        calls.append(error)
+        assert gate._fatal_publication_failure is primary
+
+    monkeypatch.setattr(
+        runtime.collective,
+        "_record_fatal_secondary",
+        record_secondary,
+        raising=False,
+    )
+    if marker_preinstalled:
+        gate._fail_fatal_publication(transition, primary)
+
+    first = runtime._terminalize_fatal_publication_failure(
+        transition,
+        secondary,
+    )
+    second = runtime._terminalize_fatal_publication_failure(
+        transition,
+        secondary,
+    )
+
+    assert first is primary
+    assert second is primary
+    assert gate._fatal_publication_failure is primary
+    assert calls == [secondary]
+    assert marker_calls == [(transition, primary)]
+
+
+def test_structured_publication_hard_exit_remains_owned_by_collective():
+    class StructuredHardExit(BaseException):
+        pass
+
+    hard_exit = StructuredHardExit("structured fatal hard exit")
+
+    class StructuredCollective(_LoopbackCollective):
+        def __init__(self):
+            super().__init__(1)
+            self._fatal_publication_local = threading.local()
+            self.runtime = None
+
+        def _begin_fatal_publication(self, *_args, **_kwargs):
+            raise AssertionError("structured presence sentinel must not run")
+
+        def _publish_communicator_fatal(self, error, **kwargs):
+            transition = kwargs["transition"]
+            self.runtime._terminal_gate._fail_fatal_publication(
+                transition,
+                transition.primary,
+            )
+            raise hard_exit
+
+    collective = StructuredCollective()
+    runtime = _runtime(collective=collective)
+    collective.runtime = runtime
+    primary = RuntimeError("structured publication primary")
+
+    with pytest.raises(StructuredHardExit) as caught:
+        runtime._enter_communicator_fatal(primary)
+
+    assert caught.value is hard_exit
+    assert runtime._terminal_gate._fatal_publication_failure is primary
 
 
 @pytest.mark.parametrize(

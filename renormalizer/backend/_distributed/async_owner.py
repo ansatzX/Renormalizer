@@ -357,6 +357,7 @@ class AsyncResourceOwner:
         # always happen after releasing this lock.
         self._async_lock = threading.RLock()
         self._async_worker = None
+        self._async_worker_state = "none"
         self._async_done = threading.Event()
         self._async_requested = threading.Event()
         self._counted_quarantine_pending = False
@@ -464,11 +465,12 @@ class AsyncResourceOwner:
         with self._async_lock:
             if (
                 self._async_admission is None
-                or self._async_worker is not None
+                or self._async_worker_state != "none"
                 or not self._completion_armed
                 or self._completion_event is None
                 or self.state != "enqueued"
-                or self._async_admission_state != "installed"
+                or self._async_admission_state
+                not in {"installed", "cancelling"}
             ):
                 return
             admission = self._async_admission
@@ -479,11 +481,62 @@ class AsyncResourceOwner:
                 daemon=True,
             )
             self._async_worker = worker
+            self._async_worker_state = "starting"
             self._async_admission_state = "worker"
             if admission.close_owned:
                 self._async_start_pending = True
-        worker.start()
+        try:
+            worker.start()
+        except BaseException as error:
+            self._terminalize_counted_start_failure(worker, admission, error)
+            raise error
+        with self._async_lock:
+            if self._async_worker_state == "starting":
+                self._async_worker_state = "started"
         self._publish_counted_start_request()
+
+    def _terminalize_counted_start_failure(self, worker, admission, primary):
+        cancel = False
+        wake = None
+        with self._async_lock:
+            if (
+                self._async_worker is worker
+                and self._async_worker_state == "starting"
+            ):
+                self._async_worker_state = "start_failed"
+                self._async_admission_state = "cancelling"
+                self._async_start_pending = False
+                self._async_requested.set()
+                cancel = True
+            else:
+                self._async_start_pending = False
+                self._async_requested.set()
+                wake = self._async_admission
+
+        cancelled = False
+        if cancel:
+            try:
+                cancelled = admission.cancel()
+            except BaseException as error:
+                self._remember_secondary(error)
+            with self._async_lock:
+                if cancelled:
+                    self._async_admission_state = "cancelled"
+                    self._async_admission = None
+                    self._async_done.set()
+                else:
+                    wake = self._async_admission
+
+        if wake is not None:
+            try:
+                wake.wake()
+            except BaseException as error:
+                self._remember_secondary(error)
+        self._remember_error(primary)
+        try:
+            self._move_to_quarantine()
+        except BaseException as error:
+            self._remember_secondary(error)
 
     def _publish_counted_start_request(self):
         admission = None
@@ -491,6 +544,7 @@ class AsyncResourceOwner:
             if (
                 not self._async_start_pending
                 or self._async_worker is None
+                or self._async_worker_state != "started"
                 or self._async_completion_deferred
                 or self._async_requested.is_set()
                 or self._async_admission is None
@@ -528,6 +582,12 @@ class AsyncResourceOwner:
         self._watch_counted_completion()
 
     def _run_counted_completion(self, admission):
+        with self._async_lock:
+            if self._async_worker_state == "start_failed":
+                self._async_done.set()
+                return
+            if self._async_worker_state == "starting":
+                self._async_worker_state = "started"
         execution_requested = admission.wait_for_execution(self._async_requested)
 
         def complete(*, _admission_token, _admission_validator):
@@ -568,6 +628,8 @@ class AsyncResourceOwner:
             with self._async_lock:
                 if self._async_admission_state != "cancelled":
                     self._async_admission_state = "terminal"
+                if self._async_worker_state != "start_failed":
+                    self._async_worker_state = "terminal"
             self._async_done.set()
 
     def _resolve_counted_wait_failure(self, error):
@@ -593,10 +655,15 @@ class AsyncResourceOwner:
             worker = self._async_worker
             if admission is None:
                 return True
-            if worker is not None:
+            worker_state = self._async_worker_state
+            if worker_state in {"starting", "started", "terminal"}:
                 self._async_start_pending = False
                 self._async_requested.set()
-        if worker is not None:
+            elif worker_state == "start_failed":
+                return self._async_admission_state == "cancelled"
+            else:
+                self._async_admission_state = "cancelling"
+        if worker_state in {"starting", "started", "terminal"}:
             admission.wake()
             return False
 
@@ -612,7 +679,8 @@ class AsyncResourceOwner:
                 if self._async_worker is None:
                     self._async_done.set()
             else:
-                self._async_admission_state = "worker"
+                if self._async_worker_state != "none":
+                    self._async_admission_state = "worker"
                 self._async_start_pending = False
                 self._async_requested.set()
                 wake = self._async_admission
