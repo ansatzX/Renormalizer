@@ -357,6 +357,11 @@ class _RecoverableFatalElection:
                 self._repair_owner_locked()
             except BaseException as repair_error:
                 self._remember_recovery_error(repair_error)
+            try:
+                self._repair_gate_locked()
+            except BaseException as repair_error:
+                self._remember_recovery_error(repair_error)
+            self._repair_context_locked()
             raise
 
     def _select_outcome_locked(self):
