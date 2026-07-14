@@ -18,8 +18,14 @@ from renormalizer.backend._distributed.terminal import (
 )
 
 
-def _pageable_array(nbytes):
-    return np.empty(nbytes, dtype=np.uint8)
+def _pageable_array(nbytes, *, _construction_slot=None):
+    array = np.empty(nbytes, dtype=np.uint8)
+    _publish_lease_construction_resource_direct(
+        _construction_slot,
+        kind="pinned",
+        records=(allocation_record(array),),
+    )
+    return array
 
 
 def _validate_storage(value, nbytes):
@@ -248,7 +254,13 @@ class PinnedBufferPool:
             array, record = _validate_storage(array, capacity_bytes)
         except Exception:
             self._slot._array = None
-            array = pageable_allocator(capacity_bytes)
+            if _allocator_owns_construction_slot:
+                array = pageable_allocator(
+                    capacity_bytes,
+                    _construction_slot=_construction_slot,
+                )
+            else:
+                array = pageable_allocator(capacity_bytes)
             self._slot._array = array
             array, record = _validate_storage(array, capacity_bytes)
             pinned = False

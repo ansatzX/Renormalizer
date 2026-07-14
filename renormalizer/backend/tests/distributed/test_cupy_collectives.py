@@ -9934,6 +9934,39 @@ def test_fatal_origin_read_uses_bounded_store_get_with_inherited_deadline(
     assert calls == [(wrapper._fatal_key(0), deadline)]
 
 
+def test_structured_fatal_election_inherits_current_lifecycle_deadline(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed import collectives as collectives_module
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    deadline = time.monotonic() + _TASK_18_2_TIMEOUT_S
+    monkeypatch.setattr(gate, "_deadline", lambda _timeout_s: deadline)
+    request = gate.admit_runtime("begin_runtime_close")
+    close_transition, elected = gate._freeze_runtime_close(request)
+    assert elected is True
+    assert close_transition.deadline == deadline
+
+    primary = RuntimeError("structured election deadline")
+    transition = runtime._begin_communicator_fatal(primary)
+    with wrapper._fatal_condition:
+        retained_owner = wrapper._fatal_publication_owner_reservation
+    election = retained_owner.election
+
+    assert transition is election.prepared_transition
+    assert transition is gate._fatal_transition
+    assert transition.deadline == deadline
+    monkeypatch.setattr(
+        collectives_module.time,
+        "monotonic",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("structured fatal wait refreshed its deadline")
+        ),
+    )
+    assert wrapper._inherited_fatal_deadline() == deadline
+
+
 @pytest.mark.parametrize(
     "family",
     (

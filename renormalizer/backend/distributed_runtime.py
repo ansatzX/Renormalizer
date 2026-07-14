@@ -276,6 +276,7 @@ class _RecoverableFatalElection:
                     gate_id=self.gate._gate_id,
                     primary=self.primary,
                     sequence=self.gate._sequence(),
+                    deadline=self.gate._fatal_lifecycle_deadline_locked(),
                 )
             elif transition.primary is not self.primary:
                 raise RuntimeError("communicator fatal transition changed")

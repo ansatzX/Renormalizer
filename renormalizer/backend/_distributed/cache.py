@@ -352,6 +352,7 @@ class CacheReservation:
                 "lease_construction",
                 "acquire",
                 "load",
+                "operator_call",
                 "prefetch",
                 "resource_state",
             ),

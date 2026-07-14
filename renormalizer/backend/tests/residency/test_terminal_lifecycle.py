@@ -20,7 +20,9 @@ from renormalizer.backend._distributed.cache import (
     CacheReservation,
     DeviceTensorCache,
 )
+from renormalizer.backend._distributed.local_operator import DistributedLocalOperator
 from renormalizer.backend._distributed.pinned import PinnedBufferPool
+from renormalizer.backend._distributed import pinned as pinned_module
 from renormalizer.backend._distributed.residency import ResidencyPlanner
 from renormalizer.backend._distributed.providers import (
     ActiveWorkingSetProvider,
@@ -42,6 +44,7 @@ from renormalizer.backend._distributed.transfer import (
     TransferScheduler,
     TransferTicket,
 )
+from renormalizer.backend._execution.model import ExecutionBindings
 from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
 from renormalizer.backend.tests.residency.test_active_provider import (
     _LoopbackCollective,
@@ -8511,6 +8514,55 @@ def test_real_managed_descendant_guard_binds_operation_and_lease_epoch():
         _close_case(runtime, store)
 
 
+def test_real_managed_local_operator_accepts_exact_operator_call_context():
+    runtime, request, plan, store, _, lease = _open_managed_active_case(
+        store_id="terminal-managed-local-operator"
+    )
+    distributed = request.distributed_plan
+    operator = DistributedLocalOperator(
+        plan=distributed,
+        provider=lease,
+        collective=runtime.collective,
+        counters={},
+        backend=runtime.backend,
+        context=runtime.context,
+        source_bindings=ExecutionBindings(
+            {"input_0": dict(request.host_refs)["input_0"]}
+        ),
+        residency_request=request,
+        residency_plan=plan,
+        residency_receipt=lease.receipt,
+        mesh=runtime.mesh,
+    )
+    local_vector = runtime.backend.ones(
+        distributed.input_sharding.local_shape(runtime.rank),
+        dtype=np.float64,
+    )
+    try:
+        result = operator(local_vector)
+        assert result.shape == distributed.output_sharding.local_shape(
+            runtime.rank
+        )
+        assert lease._poisoned_error is None
+        assert runtime._terminal_gate._fatal_transition is None
+    finally:
+        _close_case(runtime, store)
+
+
+def test_real_managed_nonblocking_close_accepts_exact_close_progress_context():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-managed-close-progress"
+    )
+    try:
+        lease.close(wait=False)
+        assert lease._poisoned_error is None
+        assert lease._closed is False
+        assert runtime._terminal_gate._fatal_transition is None
+        assert runtime._terminal_gate._lease_state(lease._epoch).phase == "open"
+    finally:
+        _close_case(runtime, store)
+
+
 def test_managed_host_reservation_accepts_exact_lease_close_admission():
     runtime, _, _, store, _, lease = _open_managed_active_case(
         store_id="terminal-managed-host-reservation-close"
@@ -8673,6 +8725,60 @@ def test_provider_allocation_producer_publishes_before_after_real_wrapper(
         assert expected.issubset(
             {retained.identity for retained in snapshot.records}
         )
+    finally:
+        _repair_test_construction_state(runtime._terminal_gate)
+        _close_case(runtime, store)
+
+
+def test_pageable_fallback_producer_publishes_before_after_real_failure(
+    monkeypatch,
+):
+    class PageableProducerFailure(BaseException):
+        pass
+
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-pageable-fallback-producer",
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    failure = PageableProducerFailure("pageable producer wrapper failed")
+    observed = []
+    original_pageable = pinned_module._pageable_array
+
+    def fail_pinned(*_args, **_kwargs):
+        raise MemoryError("force pageable fallback")
+
+    def fail_after_real(nbytes, **kwargs):
+        allocated = original_pageable(nbytes, **kwargs)
+        observed.append(
+            (
+                allocated,
+                kwargs.get("_construction_slot"),
+                provider._provisional_resources,
+            )
+        )
+        raise failure
+
+    monkeypatch.setattr(provider, "_pinned_allocator", fail_pinned)
+    monkeypatch.setattr(pinned_module, "_pageable_array", fail_after_real)
+    try:
+        with pytest.raises(PageableProducerFailure) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is failure
+        assert len(observed) == 1
+        allocated, slot, record = observed[0]
+        assert slot is not None
+        assert record is not None
+        expected = allocation_record(allocated)
+        retained = {
+            candidate.identity: candidate
+            for candidate in record.pinned_allocations
+        }
+        assert expected.identity in retained
+        assert retained[expected.identity].owner is expected.owner
+        assert retained[expected.identity].capacity_bytes == expected.capacity_bytes
     finally:
         _repair_test_construction_state(runtime._terminal_gate)
         _close_case(runtime, store)

@@ -670,6 +670,22 @@ class _TerminalLifecycleGate:
             raise ValueError("admission timeout must be non-negative")
         return time.monotonic() + timeout_s
 
+    def _fatal_lifecycle_deadline_locked(self):
+        if (
+            self._fatal_transition is not None
+            and self._fatal_transition.deadline is not None
+        ):
+            return self._fatal_transition.deadline
+        if self._runtime_close_transition is not None:
+            return self._runtime_close_transition.deadline
+        if self._live_epoch is not None:
+            lease = self._leases[self._live_epoch]
+            if lease.transition is not None:
+                return lease.transition.deadline
+            if lease.construction is not None:
+                return lease.construction.deadline
+        return self._deadline(_TERMINAL_TIMEOUT_S)
+
     def _raise_for_terminal_phase(self):
         if self._phase in (
             _TerminalPhase.FATAL_PENDING,
@@ -1851,22 +1867,11 @@ class _TerminalLifecycleGate:
             raise RuntimeError("runtime close is committed")
         if self._fatal_transition is None:
             if prepared_transition is None:
-                deadline = None
-                if self._runtime_close_transition is not None:
-                    deadline = self._runtime_close_transition.deadline
-                elif self._live_epoch is not None:
-                    lease = self._leases[self._live_epoch]
-                    if lease.transition is not None:
-                        deadline = lease.transition.deadline
-                    elif lease.construction is not None:
-                        deadline = lease.construction.deadline
-                if deadline is None:
-                    deadline = self._deadline(_TERMINAL_TIMEOUT_S)
                 prepared_transition = _FatalTransition(
                     gate_id=self._gate_id,
                     primary=primary,
                     sequence=self._sequence(),
-                    deadline=deadline,
+                    deadline=self._fatal_lifecycle_deadline_locked(),
                 )
             if (
                 not isinstance(prepared_transition, _FatalTransition)
