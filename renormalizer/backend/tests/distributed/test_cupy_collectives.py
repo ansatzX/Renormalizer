@@ -5362,6 +5362,128 @@ def test_active_broadcast_validation_failure_self_defers_first_owner(monkeypatch
     assert hard_exits == []
 
 
+def test_active_broadcast_fatal_reservation_converts_discoverer_lease_admission(
+    monkeypatch,
+):
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    epoch, construction = gate.begin_lease("active-broadcast-fatal-reservation")
+    gate.activate_lease(epoch, construction)
+    gate.release(construction)
+    primary = RuntimeError("active broadcast fatal with lease admission")
+    self_waits = []
+    hard_exits = []
+    original_wait = gate.wait_for_admissions
+
+    def observe_self_wait(transition, timeout_s):
+        current = gate._current_thread_admission()
+        if current is not None:
+            with gate._condition:
+                state = gate._tokens[current.sequence]
+                if state.status == "active":
+                    self_waits.append(current)
+        return original_wait(transition, timeout_s)
+
+    def hard_exit():
+        hard_exits.append(threading.current_thread().name)
+        raise AssertionError("fatal reservation attempted a hard exit")
+
+    monkeypatch.setattr(gate, "wait_for_admissions", observe_self_wait)
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    def run_active_broadcast():
+        token = gate.admit_lease(epoch, "operator_call")
+        try:
+            with wrapper._active_broadcast_admission() as (_, agree):
+                with runtime._communicator_fatal_reservation(primary) as (
+                    canonical,
+                    reservation,
+                ):
+                    assert canonical is primary
+                    assert reservation.completion_deferred is True
+                    assert runtime._enter_communicator_fatal(primary) is primary
+                with pytest.raises(
+                    RuntimeError,
+                    match="collective fatal publication is pending",
+                ) as pending:
+                    agree(True)
+                assert pending.value.__cause__ is primary
+                raise primary
+        finally:
+            runtime._release_admission(token)
+
+    worker, results, errors, done = _start_task_18_2_call(
+        run_active_broadcast,
+        name="active-broadcast-fatal-with-lease-admission",
+    )
+    _join_task_18_2_call(worker, done)
+
+    assert results == []
+    assert errors == [primary]
+    assert self_waits == []
+    assert hard_exits == []
+    assert gate.wait_for_published(_TASK_18_2_TIMEOUT_S) is primary
+    assert wrapper._fatal_error is primary
+    assert runtime._terminal_error is primary
+
+
+def test_active_broadcast_backend_failure_converts_fallback_lease_admission(
+    monkeypatch,
+):
+    runtime, wrapper, backend, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    epoch, construction = gate.begin_lease("active-broadcast-backend-failure")
+    gate.activate_lease(epoch, construction)
+    gate.release(construction)
+    primary = RuntimeError("active broadcast backend failure with lease admission")
+    hard_exits = []
+
+    monkeypatch.setattr(wrapper, "_validate_array", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        backend,
+        "broadcast",
+        lambda *args, **kwargs: (_ for _ in ()).throw(primary),
+    )
+
+    def hard_exit():
+        hard_exits.append(threading.current_thread().name)
+        raise AssertionError("backend failure attempted a fatal hard exit")
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    def run_active_broadcast():
+        token = gate.admit_lease(epoch, "operator_call")
+        try:
+            with wrapper._active_broadcast_admission() as (broadcast, agree):
+                with pytest.raises(RuntimeError) as broadcast_error:
+                    broadcast(np.ones((2,), dtype=np.float64), root=0)
+                assert broadcast_error.value is primary
+                with gate._condition:
+                    assert gate._tokens[token.sequence].status == "converted"
+                with pytest.raises(
+                    RuntimeError,
+                    match="collective fatal publication is pending",
+                ) as pending:
+                    agree(True)
+                assert pending.value.__cause__ is primary
+                raise primary
+        finally:
+            runtime._release_admission(token)
+
+    worker, results, errors, done = _start_task_18_2_call(
+        run_active_broadcast,
+        name="active-broadcast-backend-failure-with-lease-admission",
+    )
+    _join_task_18_2_call(worker, done)
+
+    assert results == []
+    assert errors == [primary]
+    assert hard_exits == []
+    assert gate.wait_for_published(_TASK_18_2_TIMEOUT_S) is primary
+    assert wrapper._fatal_error is primary
+    assert runtime._terminal_error is primary
+
+
 def test_active_broadcast_validation_failure_joins_existing_owner(monkeypatch):
     runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
     primary = RuntimeError("existing active-B publication owner")
@@ -5489,6 +5611,9 @@ def test_real_operator_quarantine_stays_private_until_active_b_agreement(
         WorkingSetLease,
         _OperatorCall,
     )
+    from renormalizer.backend._distributed.terminal import (
+        _ManagedResourceAdmissionGuard,
+    )
     from renormalizer.backend._execution.model import ExecutionBindings
 
     runtime, wrapper, backend, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
@@ -5500,6 +5625,9 @@ def test_real_operator_quarantine_stays_private_until_active_b_agreement(
     legacy_calls = []
     hard_exits = []
     budget = SimpleNamespace(resolved_bytes=0)
+    epoch, construction = gate.begin_lease("real-operator-active-b")
+    gate.activate_lease(epoch, construction)
+    gate.release(construction)
     provider = ActiveWorkingSetProvider(
         runtime,
         device_budget_resolution=budget,
@@ -5509,12 +5637,19 @@ def test_real_operator_quarantine_stays_private_until_active_b_agreement(
     owner = AsyncResourceOwner(
         "real-operator-active-b",
         quarantine=provider._accept_async_quarantine,
+        _managed_guard=_ManagedResourceAdmissionGuard(gate),
+        _managed_epoch=epoch,
     )
-    owner.mark_enqueued()
+    setup_token = gate.admit_lease(epoch, "operator_call")
+    try:
+        owner.mark_enqueued()
+    finally:
+        gate.release(setup_token)
     call = _OperatorCall(owner, None, None)
     owner._operator_call = call
     lease = object.__new__(WorkingSetLease)
     lease._provider = provider
+    lease._epoch = epoch
     lease._poisoned_error = None
     lease._active_operator_owner = owner
     lease._status_workspace = None
@@ -5589,15 +5724,22 @@ def test_real_operator_quarantine_stays_private_until_active_b_agreement(
 
     monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
 
+    def run_operator():
+        token = gate.admit_lease(epoch, "operator_call")
+        try:
+            return operator._call_active(
+                np.ones((2,), dtype=np.float64),
+                lambda local_vector: nullcontext(call),
+            )
+        finally:
+            runtime._release_admission(token)
+
     worker, results, errors, done = _start_task_18_2_call(
-        lambda: operator._call_active(
-            np.ones((2,), dtype=np.float64),
-            lambda local_vector: nullcontext(call),
-        ),
+        run_operator,
         name="task-18.2-real-operator-deferred-quarantine",
     )
     try:
-        assert before_agree.wait(_TASK_18_2_TIMEOUT_S)
+        assert before_agree.wait(_TASK_18_2_TIMEOUT_S), errors
         assert gate.phase is _TerminalPhase.FATAL_PENDING
         assert owner.state == "quarantined"
         assert owner.error is primary

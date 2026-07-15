@@ -979,7 +979,7 @@ class DistributedLocalOperator:
                                     "detached",
                                     "quarantined",
                                 }:
-                                    call.owner.force_quarantine(primary)
+                                    call.owner._force_quarantine_terminal(primary)
                                 self.provider._enter_communicator_fatal(
                                     primary, call.owner
                                 )

@@ -2214,7 +2214,16 @@ class CupyNcclCollective:
         discovering_token=None,
     ):
         if admitted and hasattr(self._active_broadcast_local, "deferral"):
-            primary = self._defer_active_broadcast_fatal(error, origin_rank)
+            if discovering_token is None:
+                reference = self._terminal_gate_fallback
+                gate = None if reference is None else reference()
+                if gate is not None:
+                    discovering_token = gate._current_thread_admission()
+            primary = self._defer_active_broadcast_fatal(
+                error,
+                origin_rank,
+                discovering_token=discovering_token,
+            )
             if on_elected is not None:
                 on_elected(primary)
             return primary

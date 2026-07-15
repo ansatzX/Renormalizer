@@ -1120,7 +1120,11 @@ class CupyDistributedRuntime:
     def _communicator_fatal_reservation(self, primary):
         if not isinstance(primary, BaseException):
             raise TypeError("communicator fatal failure must be an exception")
-        deferred_primary = self._defer_current_active_broadcast_fatal(primary)
+        discovering_token = self._terminal_gate._current_thread_admission()
+        deferred_primary = self._defer_current_active_broadcast_fatal(
+            primary,
+            discovering_token=discovering_token,
+        )
         if deferred_primary is not None:
             primary = deferred_primary
         collective = self._fatal_collective()
