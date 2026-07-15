@@ -344,27 +344,38 @@ def _open_active_case(*, store_id):
 def _open_managed_active_case(*, store_id):
     runtime = _runtime()
     request, plan, store, _, _ = _active_case(runtime, store_id=store_id)
-    token = runtime._terminal_gate.admit_runtime_setup("provider_construct")
-    validator = runtime._exact_admission_validator(
-        token,
+    construct_token = runtime._terminal_gate.admit_runtime_setup(
+        "provider_construct"
+    )
+    construct_validator = runtime._exact_admission_validator(
+        construct_token,
         scope="runtime_setup",
         epoch=None,
+        operation="provider_construct",
     )
     provider = ActiveWorkingSetProvider(
         runtime,
         device_budget_resolution=request.device_budget,
         host_budget_resolution=request.host_budget,
         prefetch_depth=request.prefetch_depth,
-        _admission_token=token,
-        _admission_validator=validator,
+        _admission_token=construct_token,
+        _admission_validator=construct_validator,
         _standalone=False,
+    )
+    runtime._release_admission(construct_token)
+    install_token = runtime._terminal_gate.admit_runtime_setup("provider_install")
+    install_validator = runtime._exact_admission_validator(
+        install_token,
+        scope="runtime_setup",
+        epoch=None,
+        operation="provider_install",
     )
     runtime._install_active_provider(
         provider,
-        _admission_token=token,
-        _admission_validator=validator,
+        _admission_token=install_token,
+        _admission_validator=install_validator,
     )
-    runtime._release_admission(token)
+    runtime._release_admission(install_token)
     receipt = runtime.preflight_residency(request, plan)
     lease = provider.open_working_set(request, plan, store, receipt).__enter__()
     return runtime, request, plan, store, provider, lease
@@ -895,6 +906,7 @@ def test_every_matrix_row_enforces_exact_lower_admission_before_sentinel(
         token,
         scope=specification["scope"],
         epoch=token.epoch,
+        operation=row,
         parent_sequence=(
             token.parent_sequence
             if "parent_sequence" in specification
@@ -5582,6 +5594,7 @@ def test_private_provider_close_requires_exact_runtime_close_admission(
         token,
         scope="runtime_close",
         epoch=None,
+        operation=token.operation,
         transition_sequence=transition.sequence,
     )
     supplied = token
@@ -5684,6 +5697,7 @@ def test_private_provider_close_rejects_wrong_operation_before_mutation():
         token,
         scope="runtime_close",
         epoch=None,
+        operation=token.operation,
         transition_sequence=transition.sequence,
     )
     before = (
@@ -5731,6 +5745,7 @@ def test_private_provider_close_accepts_exact_elected_admission():
         token,
         scope="runtime_close",
         epoch=None,
+        operation=token.operation,
         transition_sequence=transition.sequence,
     )
     try:
@@ -7172,6 +7187,7 @@ def test_scheduler_slot_contains_partial_owner_and_stream_before_wrapper(
         token,
         scope="construction",
         epoch=epoch,
+        operation=token.operation,
     )
     failure = RuntimeError("scheduler slot wrapper failed before real")
     snapshots = []
@@ -7337,6 +7353,7 @@ def test_managed_resource_close_stops_on_first_internal_uncertainty(
         token,
         scope=scope,
         epoch=epoch,
+        operation=token.operation,
         transition_sequence=transition.sequence,
     )
     failure = RuntimeError("{} close uncertainty".format(resource_name))
@@ -7406,6 +7423,7 @@ def test_private_provider_close_retains_graph_on_cleanup_uncertainty(
         token,
         scope="runtime_close",
         epoch=None,
+        operation=token.operation,
         transition_sequence=transition.sequence,
     )
     before = (
@@ -7633,6 +7651,7 @@ def test_every_managed_resource_method_rejects_before_object_state_read(
         token,
         scope="runtime",
         epoch=None,
+        operation=token.operation,
     )
     if candidate_kind == "missing":
         candidate = None
@@ -8112,6 +8131,7 @@ def test_scheduler_stream_factory_publishes_before_after_real_wrapper():
         token,
         scope="construction",
         epoch=epoch,
+        operation=token.operation,
     )
     backend = _FakeCupyBackend()
     slot = transaction.resource_slots["scheduler"]
@@ -8404,6 +8424,7 @@ def test_real_managed_guard_rejects_active_noncanonical_admission(candidate):
             token,
             scope="runtime",
             epoch=None,
+            operation=token.operation,
         )
     else:
         token = gate.admit_lease(lease._epoch, "unrelated_managed_probe")
@@ -8411,6 +8432,7 @@ def test_real_managed_guard_rejects_active_noncanonical_admission(candidate):
             token,
             scope="lease",
             epoch=lease._epoch,
+            operation=token.operation,
         )
     before = (
         lease._status_workspace._closed,
@@ -8484,6 +8506,7 @@ def test_real_managed_descendant_guard_binds_operation_and_lease_epoch():
         runtime_token,
         scope="runtime",
         epoch=None,
+        operation=runtime_token.operation,
     )
     try:
         state = provider.runtime_resource_state(
@@ -8584,6 +8607,260 @@ def test_real_managed_local_operator_accepts_exact_operator_call_context():
         _close_case(runtime, store)
 
 
+def test_operator_nested_acquire_requires_exact_token_and_owning_thread():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-operator-token-thread-local"
+    )
+    request = _block_request(lease)
+    operator_entered = threading.Event()
+    run_nested = threading.Event()
+    nested_ready = threading.Event()
+    release_operator = threading.Event()
+    ordinary_ready = threading.Event()
+    release_ordinary = threading.Event()
+    operator_observed = []
+    ordinary_observed = []
+    nested_observed = []
+
+    def run_operator():
+        with lease._operator_call(np.ones(4, dtype=np.float64)) as call:
+            token = _current_token(runtime)
+            operator_observed.append((threading.get_ident(), token, call.owner))
+            operator_entered.set()
+            assert run_nested.wait(_TIMEOUT_S)
+            child = lease.acquire(request)
+            nested_observed.append(
+                (
+                    threading.get_ident(),
+                    child._admission_token,
+                    child._shared_call,
+                    child._compute_handle,
+                    lease._active_operator_owner,
+                )
+            )
+            child.close()
+            nested_ready.set()
+            assert release_operator.wait(_TIMEOUT_S)
+
+    def run_ordinary():
+        try:
+            child = lease.acquire(request)
+            handle = child._compute_handle
+            ordinary_observed.append(
+                (
+                    threading.get_ident(),
+                    child._admission_token,
+                    child._shared_call,
+                    None if handle is None else handle._owner,
+                    lease._active_operator_owner,
+                )
+            )
+            ordinary_ready.set()
+            assert release_ordinary.wait(_TIMEOUT_S)
+            child.close()
+        finally:
+            ordinary_ready.set()
+
+    operator, _, operator_errors, operator_done = _start(run_operator)
+    ordinary = None
+    ordinary_errors = []
+    ordinary_done = threading.Event()
+    try:
+        assert operator_entered.wait(_TIMEOUT_S)
+        ordinary, _, ordinary_errors, ordinary_done = _start(run_ordinary)
+        assert ordinary_ready.wait(_TIMEOUT_S)
+        release_ordinary.set()
+        _join(ordinary, ordinary_done)
+        run_nested.set()
+        assert nested_ready.wait(_TIMEOUT_S)
+        release_operator.set()
+        _join(operator, operator_done)
+    finally:
+        release_ordinary.set()
+        run_nested.set()
+        release_operator.set()
+        if ordinary is not None and ordinary.is_alive():
+            _join(ordinary, ordinary_done)
+        if operator.is_alive():
+            _join(operator, operator_done)
+        _close_case(runtime, store)
+
+    assert operator_errors == []
+    assert ordinary_errors == []
+    assert len(operator_observed) == 1
+    assert len(ordinary_observed) == 1
+    assert len(nested_observed) == 1
+    operator_thread, operator_token, operator_owner = operator_observed[0]
+    ordinary_thread, ordinary_token, shared, compute_owner, active_owner = (
+        ordinary_observed[0]
+    )
+    nested_thread, nested_token, nested_shared, nested_handle, nested_owner = (
+        nested_observed[0]
+    )
+    assert ordinary_thread != operator_thread
+    assert ordinary_token.operation == "acquire"
+    assert ordinary_token is not operator_token
+    assert shared is False
+    assert compute_owner is not None
+    assert compute_owner is not operator_owner
+    assert active_owner is operator_owner
+    assert nested_thread == operator_thread
+    assert nested_token is operator_token
+    assert nested_shared is True
+    assert nested_handle is None
+    assert nested_owner is operator_owner
+
+
+def test_child_close_rejects_schedule_writeback_before_state_mutation():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-child-close-exact-operation"
+    )
+    gate = runtime._terminal_gate
+    child = lease.acquire(_block_request(lease))
+    cache_leases = child._cache_leases
+    before = (
+        child._working_set,
+        child.bindings,
+        child._cache_leases,
+        child._compute_handle,
+        child._admission_token,
+        child._shared_call,
+        child._closed,
+        child in lease._children,
+        tuple(cache_lease._entry.refcount for cache_lease in cache_leases),
+    )
+    transition, elected = gate.begin_lease_close(lease._epoch)
+    assert elected is True
+    sibling = gate.admit_lease_close(transition, "schedule_writeback")
+    try:
+        with pytest.raises(RuntimeError, match="required operation"):
+            child.close(_admission_token=sibling)
+        assert (
+            child._working_set,
+            child.bindings,
+            child._cache_leases,
+            child._compute_handle,
+            child._admission_token,
+            child._shared_call,
+            child._closed,
+            child in lease._children,
+            tuple(cache_lease._entry.refcount for cache_lease in cache_leases),
+        ) == before
+    finally:
+        gate.release(sibling)
+        if not child._closed:
+            cleanup = gate.admit_lease_close(transition, "child_close")
+            try:
+                child.close(_admission_token=cleanup)
+            finally:
+                gate.release(cleanup)
+        _repair_test_abandoned_close_entry(gate)
+        runtime._closed = True
+        reservation = lease._store_reservation
+        if reservation is not None and not reservation._closed:
+            reservation._store._release_reservation(reservation)
+            reservation._closed = True
+        if not store.closed:
+            store.close()
+
+
+def test_preflight_admission_cannot_install_provider_before_mutation():
+    runtime = _runtime()
+    request, _, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-provider-install-exact-operation",
+    )
+    gate = runtime._terminal_gate
+    construct = gate.admit_runtime_setup("provider_construct")
+    construct_validator = runtime._exact_admission_validator(
+        construct,
+        scope="runtime_setup",
+        epoch=None,
+        operation="provider_construct",
+    )
+    provider = ActiveWorkingSetProvider(
+        runtime,
+        device_budget_resolution=request.device_budget,
+        host_budget_resolution=request.host_budget,
+        prefetch_depth=request.prefetch_depth,
+        _admission_token=construct,
+        _admission_validator=construct_validator,
+        _standalone=False,
+    )
+    gate.release(construct)
+    preflight = gate.admit_runtime_setup("preflight_residency")
+    preflight_validator = runtime._exact_admission_validator(
+        preflight,
+        scope="runtime_setup",
+        epoch=None,
+        operation="preflight_residency",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="required operation"):
+            runtime._install_active_provider(
+                provider,
+                _admission_token=preflight,
+                _admission_validator=preflight_validator,
+            )
+        assert runtime._active_provider is None
+    finally:
+        gate.release(preflight)
+
+    install = gate.admit_runtime_setup("provider_install")
+    install_validator = runtime._exact_admission_validator(
+        install,
+        scope="runtime_setup",
+        epoch=None,
+        operation="provider_install",
+    )
+    runtime._install_active_provider(
+        provider,
+        _admission_token=install,
+        _admission_validator=install_validator,
+    )
+    gate.release(install)
+    execution = gate.admit_runtime_setup("execution_config")
+    execution_validator = runtime._exact_admission_validator(
+        execution,
+        scope="runtime_setup",
+        epoch=None,
+        operation="execution_config",
+    )
+    try:
+        assert runtime._install_active_provider(
+            provider,
+            _admission_token=execution,
+            _admission_validator=execution_validator,
+        ) is provider
+        assert provider.matches_config(
+            request.device_budget,
+            request.host_budget,
+            request.prefetch_depth,
+            _admission_token=execution,
+            _admission_validator=execution_validator,
+        )
+    finally:
+        gate.release(execution)
+    budget = gate.admit_runtime_setup("budget_probe")
+    budget_validator = runtime._exact_admission_validator(
+        budget,
+        scope="runtime_setup",
+        epoch=None,
+        operation="budget_probe",
+    )
+    try:
+        resolution = runtime._resolve_budget(
+            "device",
+            1024,
+            _admission_token=budget,
+            _admission_validator=budget_validator,
+        )
+        assert resolution.resolved_bytes == 1024
+    finally:
+        gate.release(budget)
+        _close_case(runtime, store)
+
+
 def test_real_managed_nonblocking_close_accepts_exact_close_progress_context():
     runtime, _, _, store, _, lease = _open_managed_active_case(
         store_id="terminal-managed-close-progress"
@@ -8611,6 +8888,7 @@ def test_managed_host_reservation_accepts_exact_lease_close_admission():
         wrong,
         scope="lease_close",
         epoch=lease._epoch,
+        operation=wrong.operation,
         transition_sequence=transition.sequence,
     )
     try:
@@ -8629,6 +8907,7 @@ def test_managed_host_reservation_accepts_exact_lease_close_admission():
         token,
         scope="lease_close",
         epoch=lease._epoch,
+        operation=token.operation,
         transition_sequence=transition.sequence,
     )
     try:

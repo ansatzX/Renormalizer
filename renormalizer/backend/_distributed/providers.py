@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+import threading
 from types import MappingProxyType
 from typing import ContextManager, Protocol
 
@@ -707,8 +708,16 @@ class _ActiveOperandLease:
     def _capture_execution_allocation(self, array):
         if self._closed:
             raise RuntimeError("operand lease is closed")
-        owner = self._working_set._active_operator_owner
-        if owner is None:
+        context = self._working_set._operator_context_for_admission(
+            self._admission_token
+        )
+        if self._shared_call:
+            if context is None:
+                raise RuntimeError(
+                    "shared operand ownership requires its operator admission"
+                )
+            owner = context.owner
+        else:
             owner = self._compute_handle.owner
         owner.capture_arrays(array)
 
@@ -718,20 +727,9 @@ class _ActiveOperandLease:
         working_set = self._working_set
         working_set._raise_terminal_close_preemption()
         try:
-            current = _admission_token
-            if current is None:
-                current = (
-                    working_set._provider.runtime._terminal_gate
-                    ._current_thread_admission()
-                )
-            nested_operation = (
-                self._admission_token.operation
-                if current is self._admission_token
-                else None
-            )
             with working_set._child_close_admission(
                 _admission_token,
-                nested_operation=nested_operation,
+                creating_token=self._admission_token,
             ) as admitted_token:
                 validator = working_set._exact_admission_validator(
                     admitted_token
@@ -989,6 +987,14 @@ class _OperatorCall:
         return primary
 
 
+@dataclass(frozen=True)
+class _OperatorAdmissionContext:
+    owner: object
+    scope: object
+    admission: object
+    thread_id: int
+
+
 class WorkingSetLease:
     """Receipt-bound outer lease spanning one complete rank-local solve."""
 
@@ -1042,6 +1048,7 @@ class WorkingSetLease:
         self._active_operator_owner = None
         self._active_operator_scope = None
         self._active_operator_admission = None
+        self._operator_local = threading.local()
         self._dirty = None
         self._dirty_allocation_records = ()
         self._writeback_ticket = None
@@ -1118,11 +1125,8 @@ class WorkingSetLease:
             token,
             scope="lease",
             epoch=self._epoch,
+            operation=operation,
         )
-        if token.operation != operation:
-            raise RuntimeError(
-                "resource admission does not match the required operation"
-            )
         try:
             yield token
         finally:
@@ -1130,19 +1134,34 @@ class WorkingSetLease:
                 runtime._release_admission(token)
 
     @contextmanager
-    def _child_close_admission(self, token=None, *, nested_operation=None):
-        if token is not None and token.scope == "lease_close":
-            runtime = self._provider.runtime
+    def _child_close_admission(self, token=None, *, creating_token=None):
+        runtime = self._provider.runtime
+        gate = runtime._terminal_gate
+        current = token
+        if current is None:
+            current = gate._current_thread_admission()
+        if current is not None and current.scope == "lease_close":
             runtime._require_admission(
-                token,
+                current,
                 scope="lease_close",
                 epoch=self._epoch,
-                transition_sequence=token.transition_sequence,
+                operation="child_close",
+                transition_sequence=current.transition_sequence,
             )
-            yield token
+            yield current
             return
-        operation = "child_close" if nested_operation is None else nested_operation
-        with self._lease_admission(operation, token) as admitted:
+        if current is not None and current is creating_token:
+            runtime._require_admission(
+                current,
+                scope="lease",
+                epoch=self._epoch,
+                operation="child_close",
+                parent_operations=("acquire", "operator_call"),
+                sequence=creating_token.sequence,
+            )
+            yield current
+            return
+        with self._lease_admission("child_close", token) as admitted:
             yield admitted
 
     def _nested_lease_operation(self, token, default, parent_operations):
@@ -1152,6 +1171,8 @@ class WorkingSetLease:
             token,
             scope="lease",
             epoch=self._epoch,
+            operation=default,
+            parent_operations=tuple(parent_operations),
         )
         if token.operation in parent_operations:
             return token.operation
@@ -1181,9 +1202,33 @@ class WorkingSetLease:
             token,
             scope=token.scope,
             epoch=self._epoch,
+            operation=token.operation,
             parent_sequence=token.parent_sequence,
             transition_sequence=transition_sequence,
         )
+
+    def _operator_context_for_admission(self, token=None):
+        local = getattr(self, "_operator_local", None)
+        context = None if local is None else getattr(local, "context", None)
+        if context is None or context.thread_id != threading.get_ident():
+            return None
+        runtime = self._provider.runtime
+        if token is None:
+            token = runtime._terminal_gate._current_thread_admission()
+        if (
+            token is not context.admission
+            or token is not self._active_operator_admission
+            or context.owner is not self._active_operator_owner
+        ):
+            return None
+        runtime._require_admission(
+            token,
+            scope="lease",
+            epoch=self._epoch,
+            operation="operator_call",
+            sequence=context.admission.sequence,
+        )
+        return context
 
     def _handoff_published_terminal(self):
         provider = self._provider
@@ -1394,6 +1439,13 @@ class WorkingSetLease:
         self._active_operator_owner = owner
         self._active_operator_scope = scope
         self._active_operator_admission = _admission_token
+        context = _OperatorAdmissionContext(
+            owner,
+            scope,
+            _admission_token,
+            threading.get_ident(),
+        )
+        self._operator_local.context = context
         try:
             with scope:
                 yield call
@@ -1431,6 +1483,8 @@ class WorkingSetLease:
                         pass
                 raise
         finally:
+            if getattr(self._operator_local, "context", None) is context:
+                del self._operator_local.context
             self._active_operator_owner = None
             self._active_operator_scope = None
             self._active_operator_admission = None
@@ -1626,9 +1680,12 @@ class WorkingSetLease:
             break
 
     def acquire(self, request, *, _admission_token=None):
+        operator_context = self._operator_context_for_admission(
+            _admission_token
+        )
         operation = (
             "operator_call"
-            if self._active_operator_admission is not None
+            if operator_context is not None
             else "acquire"
         )
         with self._lease_admission(
@@ -1659,7 +1716,12 @@ class WorkingSetLease:
         leases = []
         child = None
         variable_key = request.distributed_plan.variable_key
-        call_owner = self._active_operator_owner
+        operator_context = self._operator_context_for_admission(
+            _admission_token
+        )
+        call_owner = (
+            None if operator_context is None else operator_context.owner
+        )
         try:
             for ref in request.execution_plan.inputs:
                 if ref.key == variable_key:
@@ -1951,6 +2013,7 @@ class WorkingSetLease:
                 token,
                 scope="lease_close",
                 epoch=transition.epoch,
+                operation=operation,
                 transition_sequence=transition.sequence,
             )
             result = callback(token, validator)
@@ -2567,15 +2630,13 @@ class ActiveWorkingSetProvider:
         if not _standalone and _admission_token is None:
             raise TypeError("managed provider construction requires admission")
         if _admission_token is not None:
-            if _admission_validator is None:
-                _admission_validator = runtime._exact_admission_validator(
-                    _admission_token,
-                    scope="runtime_setup",
-                    epoch=None,
-                )
-            _require_resource_admission(
+            _admission_validator = runtime._resolve_admission_validator(
                 _admission_token,
                 _admission_validator,
+                scope="runtime_setup",
+                epoch=None,
+                operation="provider_construct",
+                parent_operations=("execution_config",),
             )
         elif _admission_validator is not None:
             raise TypeError("provider construction admission token is required")
@@ -2699,17 +2760,37 @@ class ActiveWorkingSetProvider:
         parent = gate._current_thread_admission()
         if parent is None:
             raise RuntimeError("async scheduling requires a resource admission")
+        parent_operations = {
+            "h2d_completion": (
+                "load",
+                "prefetch",
+                "acquire",
+                "operator_call",
+            ),
+            "d2h_completion": ("schedule_writeback", "close_progress"),
+            "compute_completion": (
+                "operator_call",
+                "child_close",
+                "acquire",
+            ),
+        }.get(operation)
+        if parent_operations is None:
+            raise RuntimeError("unknown working-set async operation")
         if parent.scope == "lease":
             runtime._require_admission(
                 parent,
                 scope="lease",
                 epoch=epoch,
+                operation=parent_operations[0],
+                parent_operations=parent_operations[1:],
             )
         elif parent.scope == "lease_close":
             runtime._require_admission(
                 parent,
                 scope="lease_close",
                 epoch=epoch,
+                operation=parent_operations[0],
+                parent_operations=parent_operations[1:],
                 transition_sequence=parent.transition_sequence,
             )
         else:
@@ -3475,6 +3556,7 @@ class ActiveWorkingSetProvider:
                 construction_token,
                 scope="construction",
                 epoch=epoch,
+                operation="lease_construction",
             )
             construction_slots = transaction.resource_slots
             record = _LeaseResourceRecord(

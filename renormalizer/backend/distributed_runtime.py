@@ -87,6 +87,8 @@ class _ExactAdmissionValidator:
         *,
         scope,
         epoch,
+        operation,
+        parent_operations,
         parent_sequence,
         transition_sequence,
     ):
@@ -94,6 +96,8 @@ class _ExactAdmissionValidator:
         self._sequence = token.sequence
         self._scope = scope
         self._epoch = epoch
+        self._operation = operation
+        self._parent_operations = tuple(parent_operations)
         self._parent_sequence = parent_sequence
         self._transition_sequence = transition_sequence
 
@@ -102,6 +106,8 @@ class _ExactAdmissionValidator:
             token,
             scope=self._scope,
             epoch=self._epoch,
+            operation=self._operation,
+            parent_operations=self._parent_operations,
             sequence=self._sequence,
             parent_sequence=self._parent_sequence,
             transition_sequence=self._transition_sequence,
@@ -680,6 +686,8 @@ class CupyDistributedRuntime:
         *,
         scope,
         epoch,
+        operation,
+        parent_operations=(),
         sequence=_ADMISSION_UNSET,
         parent_sequence=_ADMISSION_UNSET,
         transition_sequence=None,
@@ -691,6 +699,13 @@ class CupyDistributedRuntime:
             if token.scope != scope or token.epoch != epoch:
                 raise RuntimeError(
                     "resource admission does not match the required runtime scope"
+                )
+            if (
+                token.operation != operation
+                and token.operation not in parent_operations
+            ):
+                raise RuntimeError(
+                    "resource admission does not match the required operation"
                 )
             if sequence is not _ADMISSION_UNSET and token.sequence != sequence:
                 raise RuntimeError(
@@ -715,6 +730,8 @@ class CupyDistributedRuntime:
         *,
         scope,
         epoch,
+        operation,
+        parent_operations=(),
         parent_sequence=None,
         transition_sequence=None,
     ):
@@ -722,6 +739,8 @@ class CupyDistributedRuntime:
             token,
             scope=scope,
             epoch=epoch,
+            operation=operation,
+            parent_operations=parent_operations,
             sequence=token.sequence,
             parent_sequence=parent_sequence,
             transition_sequence=transition_sequence,
@@ -731,6 +750,8 @@ class CupyDistributedRuntime:
             token,
             scope=scope,
             epoch=epoch,
+            operation=operation,
+            parent_operations=parent_operations,
             parent_sequence=parent_sequence,
             transition_sequence=transition_sequence,
         )
@@ -742,6 +763,8 @@ class CupyDistributedRuntime:
         *,
         scope,
         epoch,
+        operation,
+        parent_operations=(),
         parent_sequence=None,
         transition_sequence=None,
     ):
@@ -750,6 +773,18 @@ class CupyDistributedRuntime:
                 token,
                 scope=scope,
                 epoch=epoch,
+                operation=operation,
+                parent_operations=parent_operations,
+                parent_sequence=parent_sequence,
+                transition_sequence=transition_sequence,
+            )
+        else:
+            self._require_admission(
+                token,
+                scope=scope,
+                epoch=epoch,
+                operation=operation,
+                parent_operations=parent_operations,
                 parent_sequence=parent_sequence,
                 transition_sequence=transition_sequence,
             )
@@ -777,6 +812,8 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime_setup",
             epoch=None,
+            operation="provider_install",
+            parent_operations=("execution_config",),
         )
         existing = self._active_provider
         if existing is not None and existing is not provider:
@@ -796,6 +833,8 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime_setup",
             epoch=None,
+            operation="receipt_publish",
+            parent_operations=("preflight_residency",),
         )
         self._issued_receipts.clear()
         self._issued_receipts[id(receipt)] = receipt
@@ -1918,6 +1957,7 @@ class CupyDistributedRuntime:
                 token,
                 scope="runtime",
                 epoch=None,
+                operation="barrier_collective",
             )
             return self._barrier_collective(
                 _admission_token=token,
@@ -1937,6 +1977,7 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime",
             epoch=None,
+            operation="barrier_collective",
         )
         return self.collective.barrier()
 
@@ -1974,6 +2015,7 @@ class CupyDistributedRuntime:
             _admission_token,
             scope="runtime_setup",
             epoch=None,
+            operation="execution_config",
         )
         backend_metadata = _call_admitted_private(
             self._synchronize_active_backend,
@@ -2071,6 +2113,7 @@ class CupyDistributedRuntime:
             _admission_token,
             scope="runtime_setup",
             epoch=None,
+            operation="preflight_residency",
         )
         local_error = None
         try:
@@ -2371,6 +2414,8 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="construction",
             epoch=_admission_token.epoch,
+            operation="receipt_consume",
+            parent_operations=("lease_construction",),
         )
         self._require_usable()
         token = _admission_token
@@ -2434,6 +2479,13 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime_setup",
             epoch=None,
+            operation="preflight_control_allocation",
+            parent_operations=(
+                "preflight_residency",
+                "budget_probe",
+                "execution_config",
+                "execution_config_backend_sync",
+            ),
         )
         converter = getattr(self.backend, "asarray", None)
         if callable(converter):
@@ -2453,6 +2505,13 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime_setup",
             epoch=None,
+            operation="preflight_collective",
+            parent_operations=(
+                "preflight_residency",
+                "budget_probe",
+                "execution_config",
+                "execution_config_backend_sync",
+            ),
         )
         return self.collective.allreduce(value, op=op)
 
@@ -2488,6 +2547,8 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime_setup",
             epoch=None,
+            operation="budget_probe",
+            parent_operations=("execution_config",),
         )
         local_error = None
         encoded = 0
@@ -2579,6 +2640,8 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime_setup",
             epoch=None,
+            operation="budget_probe",
+            parent_operations=("execution_config",),
         )
         cached_name = "_auto_{}_budget".format(resource)
         cached = getattr(self, cached_name)
@@ -2682,6 +2745,8 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime_setup",
             epoch=None,
+            operation="budget_probe",
+            parent_operations=("execution_config",),
         )
         self._requested_budget_agrees(
             requested,
@@ -2726,6 +2791,8 @@ class CupyDistributedRuntime:
             _admission_validator,
             scope="runtime_setup",
             epoch=None,
+            operation="execution_config_backend_sync",
+            parent_operations=("execution_config",),
         )
         expected_name = getattr(self.backend, "name", None)
         expected_device = getattr(self.backend, "device", None)
@@ -3100,6 +3167,7 @@ class CupyDistributedRuntime:
                     provider_token,
                     scope="runtime_close",
                     epoch=None,
+                    operation="provider_close",
                     transition_sequence=transition.sequence,
                 )
                 provider_finalize = provider._close_for_runtime(
@@ -3125,6 +3193,7 @@ class CupyDistributedRuntime:
                         collective_token,
                         scope="runtime_close",
                         epoch=None,
+                        operation="collective_close",
                         transition_sequence=transition.sequence,
                     )
                     self._close_collective(
@@ -3432,6 +3501,7 @@ class CupyDistributedRuntime:
                     token,
                     scope=scope,
                     epoch=live_epoch if scope == "lease" else None,
+                    operation="resource_state",
                 )
                 with gate._condition:
                     current_epoch = gate._live_epoch
