@@ -11282,3 +11282,432 @@ def test_managed_staging_raw_array_requires_exact_checkout_capability():
         checkout.__exit__(None, None, None)
         gate.release(checkout_token)
         _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "detach_phase",
+    (
+        "completion",
+        "scheduler_prepare",
+        "scheduler_commit",
+        "release_callback",
+        "resource_release",
+    ),
+)
+def test_owner_quarantine_cannot_overtake_running_detach(
+    monkeypatch,
+    detach_phase,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-owner-detach-quarantine-serialization"
+    )
+    scheduler = lease.scheduler
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    phase_entered = threading.Event()
+    release_phase = threading.Event()
+    quarantine_attempted = threading.Event()
+    permit_quarantine = threading.Event()
+    quarantined = []
+    released = []
+
+    def complete():
+        if detach_phase == "completion":
+            phase_entered.set()
+            assert release_phase.wait(_TIMEOUT_S)
+
+    allocation = np.arange(8.0)
+    with lease._lease_admission("acquire"):
+        owner = scheduler._register_owner(
+            "compute",
+            arrays=(allocation,),
+            callback=complete,
+            defer_counted_admission=True,
+        )
+        owner.mark_enqueued()
+        scheduler._new_event(owner, completion=True)
+
+        def release_callback():
+            if detach_phase == "release_callback":
+                phase_entered.set()
+                assert release_phase.wait(_TIMEOUT_S)
+            released.append(allocation)
+
+        owner.add_release_callback(release_callback)
+        owner.arm_completion()
+    original_force = owner._force_quarantine_terminal
+    original_quarantine = owner._quarantine
+    original_detached = owner._detached
+    original_detached_commit = owner._detached_commit
+    original_resource_releaser = owner._resource_releaser
+
+    def observe_force(*args, **kwargs):
+        quarantine_attempted.set()
+        assert permit_quarantine.wait(_TIMEOUT_S)
+        return original_force(*args, **kwargs)
+
+    def observe_quarantine(candidate):
+        quarantined.append(candidate)
+        return original_quarantine(candidate)
+
+    def observe_detached(*args, **kwargs):
+        if detach_phase == "scheduler_prepare":
+            phase_entered.set()
+            assert release_phase.wait(_TIMEOUT_S)
+        return original_detached(*args, **kwargs)
+
+    def observe_detached_commit(*args, **kwargs):
+        if detach_phase == "scheduler_commit":
+            phase_entered.set()
+            assert release_phase.wait(_TIMEOUT_S)
+        return original_detached_commit(*args, **kwargs)
+
+    def observe_resource_release(*args, **kwargs):
+        if detach_phase == "resource_release":
+            phase_entered.set()
+            assert release_phase.wait(_TIMEOUT_S)
+        return original_resource_releaser(*args, **kwargs)
+
+    monkeypatch.setattr(owner, "_force_quarantine_terminal", observe_force)
+    monkeypatch.setattr(owner, "_quarantine", observe_quarantine)
+    monkeypatch.setattr(owner, "_detached", observe_detached)
+    monkeypatch.setattr(owner, "_detached_commit", observe_detached_commit)
+    monkeypatch.setattr(owner, "_resource_releaser", observe_resource_release)
+
+    def detach():
+        with lease._lease_admission("resource_state") as token:
+            return owner.reap(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    primary = RuntimeError("quarantine raced running detach")
+
+    def quarantine():
+        with lease._lease_admission("close_progress") as token:
+            return owner.force_quarantine(
+                primary,
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    detacher, _, detach_errors, detach_done = _start(detach)
+    quarantiner = None
+    try:
+        assert phase_entered.wait(_TIMEOUT_S)
+        quarantiner, _, quarantine_errors, quarantine_done = _start(quarantine)
+        assert quarantine_attempted.wait(_TIMEOUT_S)
+        acquired = owner._async_lock.acquire(blocking=False)
+        if acquired:
+            owner._async_lock.release()
+        assert acquired is False
+
+        permit_quarantine.set()
+        release_phase.set()
+        _join(detacher, detach_done)
+        _join(quarantiner, quarantine_done)
+
+        assert detach_errors == []
+        assert quarantine_errors == []
+        assert owner.state == "detached"
+        assert owner.error is None
+        assert released == [allocation]
+        assert quarantined == []
+        assert id(owner) not in scheduler._owners
+    finally:
+        permit_quarantine.set()
+        release_phase.set()
+        if detacher.is_alive():
+            _join(detacher, detach_done)
+        if quarantiner is not None and quarantiner.is_alive():
+            _join(quarantiner, quarantine_done)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("callback_failure", ("before_real", "after_real"))
+@pytest.mark.parametrize("resolution", ("retry", "quarantine", "fatal"))
+def test_scheduler_detach_uncertainty_stops_owner_cleanup(
+    monkeypatch,
+    callback_failure,
+    resolution,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-owner-detach-{}-{}".format(
+            callback_failure,
+            resolution,
+        )
+    )
+    scheduler = lease.scheduler
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    allocation = np.arange(16.0)
+    release_callbacks = []
+    resource_releases = []
+    with lease._lease_admission("acquire"):
+        owner = scheduler._register_owner(
+            "compute",
+            arrays=(allocation,),
+            defer_counted_admission=True,
+        )
+        owner.mark_enqueued()
+        event = scheduler._new_event(owner, completion=True)
+        owner.add_release_callback(lambda: release_callbacks.append(owner))
+        owner.arm_completion()
+    original_detached = owner._detached
+    original_releaser = owner._resource_releaser
+    primary = RuntimeError("scheduler detach {} failed".format(callback_failure))
+
+    def fail_detached(*args, **kwargs):
+        if callback_failure == "after_real":
+            original_detached(*args, **kwargs)
+        raise primary
+
+    def observe_release(resource):
+        resource_releases.append(resource)
+        return original_releaser(resource)
+
+    monkeypatch.setattr(owner, "_detached", fail_detached)
+    monkeypatch.setattr(owner, "_resource_releaser", observe_release)
+    retained_before = (
+        owner._arrays,
+        owner._allocations,
+        owner._resources,
+        owner._streams,
+        tuple(owner._events),
+        owner._completion_event,
+        tuple(owner._release_callbacks),
+        owner._resource_releaser,
+    )
+
+    def reap_owner():
+        with lease._lease_admission("resource_state") as token:
+            return owner.reap(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            reap_owner()
+        assert caught.value is primary
+        assert owner.state == "enqueued"
+        assert owner._detach_transition_state == "available"
+        assert (
+            owner._arrays,
+            owner._allocations,
+            owner._resources,
+            owner._streams,
+            tuple(owner._events),
+            owner._completion_event,
+            tuple(owner._release_callbacks),
+            owner._resource_releaser,
+        ) == retained_before
+        assert release_callbacks == []
+        assert resource_releases == []
+        assert scheduler._owners[id(owner)] is owner
+        assert event in scheduler._events
+
+        monkeypatch.setattr(owner, "_detached", original_detached)
+        if resolution == "retry":
+            with pytest.raises(RuntimeError) as retried:
+                reap_owner()
+            assert retried.value is primary
+            assert owner.state == "detached"
+            assert release_callbacks == [owner]
+            assert resource_releases == [owner]
+            assert id(owner) not in scheduler._owners
+        elif resolution == "quarantine":
+            with lease._lease_admission("close_progress") as token:
+                owner.force_quarantine(
+                    primary,
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
+            identity = allocation_record(allocation).identity
+            assert owner.state == "quarantined"
+            assert id(owner) not in scheduler._owners
+            assert scheduler._quarantined_owners == [owner]
+            assert identity in {
+                record.identity for record in owner._allocations
+            }
+            assert release_callbacks == []
+            assert resource_releases == []
+        else:
+            assert runtime._enter_communicator_fatal(primary) is primary
+            identity = allocation_record(allocation).identity
+            assert owner.state == "enqueued"
+            assert scheduler._owners[id(owner)] is owner
+            assert identity in {
+                record.identity for record in owner._allocations
+            }
+            assert identity in {
+                record.identity for record in lease._resource_record.allocations
+            }
+            assert identity in {
+                record.identity
+                for record in runtime._terminal_quarantine.allocations
+            }
+            assert release_callbacks == []
+            assert resource_releases == []
+    finally:
+        _close_case(runtime, store)
+
+
+def test_runtime_close_hands_off_retired_scheduler_counted_start(monkeypatch):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-runtime-close-retired-scheduler"
+    )
+    scheduler = lease.scheduler
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    child = lease.acquire(_block_request(lease))
+    child.close()
+    owner = next(iter(scheduler._owners.values()))
+    snapshot_taken = threading.Event()
+    release_snapshot = threading.Event()
+    start_calls = []
+    original_snapshot = runtime._runtime_close_snapshot
+    original_start = AsyncResourceOwner._start_counted_completion
+    intercepted = False
+
+    def pause_snapshot():
+        nonlocal intercepted
+        result = original_snapshot()
+        if not intercepted and result[2] is scheduler:
+            intercepted = True
+            snapshot_taken.set()
+            assert release_snapshot.wait(_TIMEOUT_S)
+        return result
+
+    def observe_start(candidate, *args, **kwargs):
+        if candidate is owner:
+            start_calls.append(candidate)
+        return original_start(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_runtime_close_snapshot", pause_snapshot)
+    monkeypatch.setattr(
+        AsyncResourceOwner,
+        "_start_counted_completion",
+        observe_start,
+    )
+    runtime_closer, _, runtime_errors, runtime_done = _start(runtime.close)
+    lease_closer = None
+    try:
+        assert snapshot_taken.wait(_TIMEOUT_S)
+        lease_closer, _, lease_errors, lease_done = _start(lease.close)
+        _join(lease_closer, lease_done)
+        assert lease_errors == []
+        assert lease.scheduler is None
+        assert owner.state == "detached"
+
+        release_snapshot.set()
+        _join(runtime_closer, runtime_done)
+        assert runtime_errors == []
+        assert start_calls == [owner]
+        assert runtime._closed is True
+        assert runtime._terminal_gate._fatal_transition is None
+    finally:
+        release_snapshot.set()
+        if runtime_closer.is_alive():
+            _join(runtime_closer, runtime_done)
+        if lease_closer is not None and lease_closer.is_alive():
+            _join(lease_closer, lease_done)
+        _close_case(runtime, store)
+
+
+def test_scheduler_two_owner_detach_updates_collections_atomically():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-scheduler-atomic-owner-removal"
+    )
+    scheduler = lease.scheduler
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    owners = []
+    with lease._lease_admission("acquire"):
+        for nbytes in (8, 16):
+            owner = scheduler._register_owner(
+                "h2d",
+                nbytes=nbytes,
+                defer_counted_admission=True,
+            )
+            owner.mark_enqueued()
+            scheduler._new_event(owner, completion=True)
+            owner.arm_completion()
+            owners.append(owner)
+
+    collection_read = threading.Barrier(2)
+
+    class CoordinatedEvents(list):
+        def __iter__(self):
+            if not hasattr(scheduler, "_collection_lock"):
+                collection_read.wait(timeout=_TIMEOUT_S)
+            return super().__iter__()
+
+    scheduler._events = CoordinatedEvents(scheduler._events)
+
+    def reap(candidate):
+        with lease._lease_admission("resource_state") as token:
+            return candidate.reap(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    workers = [_start(lambda candidate=owner: reap(candidate)) for owner in owners]
+    try:
+        for thread, _, _, done in workers:
+            _join(thread, done)
+        assert all(errors == [] for _, _, errors, _ in workers)
+        assert scheduler._owners == {}
+        assert scheduler._event_owners == {}
+        assert scheduler._events == []
+        assert scheduler.h2d_bytes == 24
+        assert all(owner.state == "detached" for owner in owners)
+    finally:
+        for thread, _, _, done in workers:
+            if thread.is_alive():
+                _join(thread, done)
+        _close_case(runtime, store)
+
+
+def test_lease_resource_record_release_cannot_recapture_stale_resource():
+    record = _LeaseResourceRecord(1)
+    release_property_entered = threading.Event()
+    release_property = threading.Event()
+
+    class Resource:
+        def __init__(self, value):
+            self.array = np.asarray([value], dtype=np.float64)
+            self.record = allocation_record(self.array)
+            self.block = False
+
+        @property
+        def allocation_records(self):
+            if self.block:
+                release_property_entered.set()
+                assert release_property.wait(_TIMEOUT_S)
+            return (self.record,)
+
+        retained_events = ()
+        retained_streams = ()
+
+    first = Resource(1.0)
+    stale = Resource(2.0)
+    concurrent = Resource(3.0)
+    record.capture(first)
+    record.capture(stale)
+    stale.block = True
+    releasing, _, release_errors, release_done = _start(
+        lambda: record.release(first)
+    )
+    try:
+        assert release_property_entered.wait(_TIMEOUT_S)
+        record.release(stale)
+        record.capture(concurrent)
+        release_property.set()
+        _join(releasing, release_done)
+
+        assert release_errors == []
+        assert record.resources == (concurrent,)
+        assert {item.identity for item in record.allocations} == {
+            concurrent.record.identity
+        }
+    finally:
+        release_property.set()
+        if releasing.is_alive():
+            _join(releasing, release_done)

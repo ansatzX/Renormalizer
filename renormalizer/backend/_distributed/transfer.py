@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 import hashlib
 import json
+import threading
 import weakref
 
 import numpy as np
@@ -413,6 +414,13 @@ class TransferTicket(AsyncCompletionHandle):
         self._owner.publish_counted_completion()
 
 
+@dataclass(frozen=True)
+class _OwnerDetachPreparation:
+    owner_identity: int
+    capability: object
+    event_identities: tuple
+
+
 class TransferScheduler:
     """Single-lane scheduler with one explicit transfer stream on CuPy."""
 
@@ -501,8 +509,12 @@ class TransferScheduler:
                 else elapsed_time_reader
             )
         self._tickets = []
+        # Lock order: async owner -> scheduler collections. Owner callbacks are
+        # invoked only from collection snapshots taken before releasing this lock.
+        self._collection_lock = threading.RLock()
         self._owners = {}
         self._owner_detach_capabilities = {}
+        self._owner_detach_preparations = {}
         self._events = []
         self._event_owners = {}
         self._quarantined_owners = []
@@ -589,7 +601,8 @@ class TransferScheduler:
             None,
             allowed_operations=("resource_state",),
         )
-        return len(self._tickets)
+        with self._collection_lock:
+            return len(self._tickets)
 
     @property
     def retained_event_count(self):
@@ -598,9 +611,10 @@ class TransferScheduler:
             None,
             allowed_operations=("resource_state",),
         )
-        return len(self._event_owners) + sum(
-            len(owner.events) for owner in self._quarantined_owners
-        )
+        with self._collection_lock:
+            event_owner_count = len(self._event_owners)
+            quarantined = tuple(self._quarantined_owners)
+        return event_owner_count + sum(len(owner.events) for owner in quarantined)
 
     @property
     def retained_streams(self):
@@ -615,12 +629,14 @@ class TransferScheduler:
                 "resource_state",
             ),
         )
-        owners = (*self._owners.values(), *self._quarantined_owners)
+        with self._collection_lock:
+            owners = (*self._owners.values(), *self._quarantined_owners)
+            primary_stream = self._stream
         return tuple(
             {
                 id(stream): stream
                 for stream in (
-                    self._stream,
+                    primary_stream,
                     *(stream for owner in owners for stream in owner.streams),
                 )
                 if stream is not None
@@ -640,12 +656,14 @@ class TransferScheduler:
                 "resource_state",
             ),
         )
-        owners = (*self._owners.values(), *self._quarantined_owners)
+        with self._collection_lock:
+            owners = (*self._owners.values(), *self._quarantined_owners)
+            events = tuple(self._events)
         return tuple(
             {
                 id(event): event
                 for event in (
-                    *self._events,
+                    *events,
                     *(event for owner in owners for event in owner.events),
                 )
             }.values()
@@ -670,7 +688,8 @@ class TransferScheduler:
                 "scheduler_complete",
             ),
         )
-        return self._poisoned_error is not None
+        with self._collection_lock:
+            return self._poisoned_error is not None
 
     @property
     def event_count(self):
@@ -695,12 +714,29 @@ class TransferScheduler:
         )
         return self.retained_event_count
 
+    def _last_compute_completion(
+        self,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "child_close", "operator_call"),
+        )
+        with self._collection_lock:
+            return self.last_compute_event
+
     def _require_usable(self):
-        if self._poisoned_error is not None:
+        with self._collection_lock:
+            poisoned_error = self._poisoned_error
+            closed = self._closed
+        if poisoned_error is not None:
             raise RuntimeError("transfer scheduler is terminal-poisoned") from (
-                self._poisoned_error
+                poisoned_error
             )
-        if self._closed:
+        if closed:
             raise RuntimeError("transfer scheduler is closed")
 
     def _require_admission(
@@ -728,8 +764,9 @@ class TransferScheduler:
         )
 
     def _poison(self, error):
-        if self._poisoned_error is None:
-            self._poisoned_error = error
+        with self._collection_lock:
+            if self._poisoned_error is None:
+                self._poisoned_error = error
 
     def _register_owner(
         self,
@@ -812,12 +849,24 @@ class TransferScheduler:
                 _admission_validator=_admission_validator,
             )
 
+        def commit_detached(owner, preparation):
+            scheduler = scheduler_ref()
+            if scheduler is not None:
+                scheduler._commit_owner_detached(
+                    owner,
+                    preparation,
+                    _detach_capability=detach_capability,
+                )
+
         def quarantined(owner):
             scheduler = scheduler_ref()
             if scheduler is not None:
                 scheduler._owner_quarantined(
                     owner,
                     _detach_capability=detach_capability,
+                    _resource_snapshot=owner._terminal_resource_snapshot(),
+                    _terminal_error=owner.error,
+                    _terminal_state=owner.state,
                 )
 
         async_admission = None
@@ -844,6 +893,7 @@ class TransferScheduler:
                 elapsed_reader=elapsed_reader,
                 drainer=drain,
                 detached=detached,
+                _detached_commit=commit_detached,
                 _detached_requires_admission=True,
                 quarantine=quarantined,
                 _async_admission=async_admission,
@@ -859,8 +909,9 @@ class TransferScheduler:
                 async_admission.cancel()
             raise
         holder["owner"] = owner
-        self._owners[id(owner)] = owner
-        self._owner_detach_capabilities[id(owner)] = detach_capability
+        with self._collection_lock:
+            self._owners[id(owner)] = owner
+            self._owner_detach_capabilities[id(owner)] = detach_capability
         owner._consume_counted_start_request()
         return owner
 
@@ -902,35 +953,83 @@ class TransferScheduler:
             allowed_operations=allowed_operations,
         )
         identity = id(owner)
-        if (
-            self._owners.get(identity) is not owner
-            or self._owner_detach_capabilities.get(identity)
-            is not _detach_capability
-        ):
-            raise RuntimeError(
-                "scheduler owner detach capability does not own this transition"
-            )
-        if owner.state != "detached":
-            raise RuntimeError("scheduler owner is not in its detached transition")
-        self._remove_owner_membership(owner)
+        event_identities = tuple(id(event) for event in owner._events)
+        with self._collection_lock:
+            if (
+                self._owners.get(identity) is not owner
+                or self._owner_detach_capabilities.get(identity)
+                is not _detach_capability
+            ):
+                raise RuntimeError(
+                    "scheduler owner detach capability does not own this transition"
+                )
+            preparation = self._owner_detach_preparations.get(identity)
+            if preparation is None:
+                preparation = _OwnerDetachPreparation(
+                    identity,
+                    _detach_capability,
+                    event_identities,
+                )
+                self._owner_detach_preparations[identity] = preparation
+            elif (
+                preparation.capability is not _detach_capability
+                or preparation.event_identities != event_identities
+            ):
+                raise RuntimeError("scheduler owner detach preparation changed")
+            return preparation
 
-    def _remove_owner_membership(self, owner):
-        self._owners.pop(id(owner), None)
-        self._owner_detach_capabilities.pop(id(owner), None)
-        identities = {id(event) for event in owner._events}
-        self._events = [event for event in self._events if id(event) not in identities]
-        for identity in identities:
-            self._event_owners.pop(identity, None)
+    def _commit_owner_detached(
+        self,
+        owner,
+        preparation,
+        *,
+        _detach_capability,
+    ):
+        identity = id(owner)
+        with self._collection_lock:
+            if (
+                not isinstance(preparation, _OwnerDetachPreparation)
+                or preparation.owner_identity != identity
+                or preparation.capability is not _detach_capability
+                or self._owner_detach_preparations.get(identity) is not preparation
+                or self._owners.get(identity) is not owner
+                or self._owner_detach_capabilities.get(identity)
+                is not _detach_capability
+            ):
+                raise RuntimeError("scheduler owner detach preparation is stale")
+            self._remove_owner_membership_locked(
+                owner,
+                preparation.event_identities,
+            )
+
+    def _remove_owner_membership_locked(self, owner, event_identities):
+        identity = id(owner)
+        self._owners.pop(identity, None)
+        self._owner_detach_capabilities.pop(identity, None)
+        self._owner_detach_preparations.pop(identity, None)
+        identities = frozenset(event_identities)
+        self._events[:] = [
+            event for event in self._events if id(event) not in identities
+        ]
+        for event_identity in identities:
+            self._event_owners.pop(event_identity, None)
         if (
             self.last_compute_event is not None
             and self.last_compute_event._owner is owner
         ):
             self.last_compute_event = None
 
-    def _retain_quarantined_owner(self, owner, detach_capability):
+    def _retain_quarantined_owner_locked(
+        self,
+        owner,
+        detach_capability,
+        resource_snapshot,
+        terminal_error,
+        terminal_state,
+    ):
         identity = id(owner)
         if (
-            owner.state != "quarantined"
+            terminal_state != "quarantined"
             or self._owners.get(identity) is not owner
             or self._owner_detach_capabilities.get(identity)
             is not detach_capability
@@ -938,41 +1037,67 @@ class TransferScheduler:
             raise RuntimeError(
                 "scheduler owner quarantine capability does not own this transition"
             )
-        self._poison(owner.error)
-        self._remove_owner_membership(owner)
+        if self._poisoned_error is None:
+            self._poisoned_error = terminal_error
+        event_identities = tuple(
+            id(event) for event in resource_snapshot["events"]
+        )
+        self._remove_owner_membership_locked(owner, event_identities)
         if all(retained is not owner for retained in self._quarantined_owners):
             self._quarantined_owners.append(owner)
-        snapshot = owner._terminal_resource_snapshot()
-        owns_pool_slot = any(
+        return any(
             type(resource) is StagingSlot and resource._pool is self.pool
-            for resource in snapshot["resources"]
+            for resource in resource_snapshot["resources"]
         )
-        if owns_pool_slot:
-            self.pool._poison(owner.error)
 
     def _notify_quarantined_owner(self, owner):
-        if self._quarantine is not None:
+        with self._collection_lock:
+            quarantine = self._quarantine
+        if quarantine is not None:
             try:
-                self._quarantine(owner)
+                quarantine(owner)
             except BaseException as error:
                 owner._remember_secondary(error)
 
-    def _owner_quarantined(self, owner, *, _detach_capability=None):
-        if self._quarantining:
-            self._retain_quarantined_owner(owner, _detach_capability)
-            return
-        self._quarantining = True
-        try:
-            other_owners = tuple(
-                retained for retained in self._owners.values() if retained is not owner
+    def _owner_quarantined(
+        self,
+        owner,
+        *,
+        _detach_capability=None,
+        _resource_snapshot,
+        _terminal_error,
+        _terminal_state,
+    ):
+        with self._collection_lock:
+            nested = self._quarantining
+            if not nested:
+                self._quarantining = True
+                other_owners = tuple(
+                    retained
+                    for retained in self._owners.values()
+                    if retained is not owner
+                )
+            else:
+                other_owners = ()
+            owns_pool_slot = self._retain_quarantined_owner_locked(
+                owner,
+                _detach_capability,
+                _resource_snapshot,
+                _terminal_error,
+                _terminal_state,
             )
-            self._retain_quarantined_owner(owner, _detach_capability)
+        if owns_pool_slot:
+            self.pool._poison(_terminal_error)
+        if nested:
+            return
+        try:
             for retained in other_owners:
-                retained.force_quarantine(owner.error)
+                retained.force_quarantine(_terminal_error)
             for retained in (owner, *other_owners):
                 self._notify_quarantined_owner(retained)
         finally:
-            self._quarantining = False
+            with self._collection_lock:
+                self._quarantining = False
 
     def _new_event(self, owner, *, completion=False):
         return self._new_event_from(owner, self._event_factory, completion=completion)
@@ -1001,8 +1126,11 @@ class TransferScheduler:
             factory=factory,
             completion=completion,
         )
-        self._events.append(event)
-        self._event_owners[id(event)] = owner
+        with self._collection_lock:
+            if self._owners.get(id(owner)) is not owner:
+                raise RuntimeError("transfer event owner is no longer active")
+            self._events.append(event)
+            self._event_owners[id(event)] = owner
         if not callable(getattr(event, "record", None)):
             raise TypeError("transfer event must provide record()")
         if (
@@ -1144,7 +1272,8 @@ class TransferScheduler:
             defer_counted_completion=True,
         )
         ticket = TransferTicket(owner)
-        self._tickets.append(ticket)
+        with self._collection_lock:
+            self._tickets.append(ticket)
         try:
             if _checkout_capability is None:
                 slot.retain_until(owner)
@@ -1182,8 +1311,9 @@ class TransferScheduler:
             try:
                 owner.fail(error)
             finally:
-                if ticket in self._tickets:
-                    self._tickets.remove(ticket)
+                with self._collection_lock:
+                    if ticket in self._tickets:
+                        self._tickets.remove(ticket)
         return ticket
 
     def wait_for_h2d(
@@ -1199,7 +1329,8 @@ class TransferScheduler:
             allowed_operations=("acquire", "load", "operator_call"),
         )
         self._require_usable()
-        owner = self._event_owners.get(id(event))
+        with self._collection_lock:
+            owner = self._event_owners.get(id(event))
         if owner is not None:
             if owner.reap():
                 return
@@ -1318,10 +1449,12 @@ class TransferScheduler:
         if not isinstance(handle, AsyncCompletionHandle):
             raise TypeError("compute completion requires an AsyncCompletionHandle")
         owner = handle.owner
+        with self._collection_lock:
+            active_owner = self._owners.get(id(owner))
         if (
             owner.kind != "compute"
             or owner.state != "enqueued"
-            or self._owners.get(id(owner)) is not owner
+            or active_owner is not owner
         ):
             raise RuntimeError("compute owner is not active")
         owner.capture_arrays(*arrays)
@@ -1340,7 +1473,8 @@ class TransferScheduler:
             owner.watch_counted_completion()
         except BaseException as error:
             owner.fail(error)
-        self.last_compute_event = handle
+        with self._collection_lock:
+            self.last_compute_event = handle
         return handle
 
     def writeback_d2h(
@@ -1407,7 +1541,8 @@ class TransferScheduler:
             ),
         )
         ticket = TransferTicket(owner)
-        self._tickets.append(ticket)
+        with self._collection_lock:
+            self._tickets.append(ticket)
         try:
             if _checkout_capability is None:
                 slot.retain_until(owner)
@@ -1450,8 +1585,9 @@ class TransferScheduler:
             try:
                 owner.fail(error)
             finally:
-                if ticket in self._tickets:
-                    self._tickets.remove(ticket)
+                with self._collection_lock:
+                    if ticket in self._tickets:
+                        self._tickets.remove(ticket)
         return ticket
 
     @staticmethod
@@ -1515,24 +1651,33 @@ class TransferScheduler:
         )
         self._require_usable()
         errors = []
-        for owner in tuple(self._owners.values()):
+        with self._collection_lock:
+            owners = tuple(self._owners.values())
+        for owner in owners:
             try:
                 owner.reap(_wait_for_counted=_wait_for_counted)
             except BaseException as error:
                 if self._managed:
                     raise
                 errors.append(error)
-        self._tickets = [ticket for ticket in self._tickets if not ticket.completed]
+        with self._collection_lock:
+            tickets = tuple(self._tickets)
+        completed = {id(ticket) for ticket in tickets if ticket.completed}
+        with self._collection_lock:
+            self._tickets[:] = [
+                ticket for ticket in self._tickets if id(ticket) not in completed
+            ]
         if errors:
             raise errors[0]
 
     def _account_owner(self, owner):
-        if owner.direction == "h2d":
-            self.h2d_bytes += owner.nbytes
-            self.h2d_s += owner.elapsed_s
-        elif owner.direction == "d2h":
-            self.d2h_bytes += owner.nbytes
-            self.d2h_s += owner.elapsed_s
+        with self._collection_lock:
+            if owner.direction == "h2d":
+                self.h2d_bytes += owner.nbytes
+                self.h2d_s += owner.elapsed_s
+            elif owner.direction == "d2h":
+                self.d2h_bytes += owner.nbytes
+                self.d2h_s += owner.elapsed_s
 
     def complete_all(
         self,
@@ -1556,7 +1701,9 @@ class TransferScheduler:
         )
         self._require_usable()
         errors = []
-        for owner in tuple(self._owners.values()):
+        with self._collection_lock:
+            owners = tuple(self._owners.values())
+        for owner in owners:
             try:
                 if owner.completion_event is None:
                     owner.drain(_deadline=_deadline)
@@ -1566,23 +1713,34 @@ class TransferScheduler:
                 if self._managed:
                     raise
                 errors.append(error)
-        self._tickets = [ticket for ticket in self._tickets if not ticket.completed]
+        with self._collection_lock:
+            tickets = tuple(self._tickets)
+        completed = {id(ticket) for ticket in tickets if ticket.completed}
+        with self._collection_lock:
+            self._tickets[:] = [
+                ticket for ticket in self._tickets if id(ticket) not in completed
+            ]
         if errors:
             raise errors[0]
 
     def _start_counted_completions(self, *, _close_transition=None):
         if self._managed_guard is not None:
-            self._managed_guard.request_counted_starts(
+            requested = self._managed_guard.request_counted_starts(
                 _close_transition,
                 epoch=self._managed_epoch,
             )
-        for owner in tuple(self._owners.values()):
+            if requested is None:
+                return False
+        with self._collection_lock:
+            owners = tuple(self._owners.values())
+        for owner in owners:
             if self._managed_guard is None:
                 owner._start_counted_completion()
             else:
                 owner._consume_counted_start_request(
                     _close_transition=_close_transition,
                 )
+        return True
 
     def close(
         self,
@@ -1600,12 +1758,15 @@ class TransferScheduler:
             _deadline,
             "transfer scheduler lifecycle timed out before close",
         )
-        if self._closed:
-            if self._poisoned_error is not None:
-                raise self._poisoned_error
+        with self._collection_lock:
+            closed = self._closed
+            poisoned_error = self._poisoned_error
+        if closed:
+            if poisoned_error is not None:
+                raise poisoned_error
             return
         error = None
-        if self._poisoned_error is None:
+        if poisoned_error is None:
             try:
                 self.complete_all(
                     _admission_token=_admission_token,
@@ -1617,38 +1778,39 @@ class TransferScheduler:
                     raise
                 error = caught
         else:
-            error = self._poisoned_error
+            error = poisoned_error
             if self._managed:
                 raise error
         _remaining_lifecycle_time(
             _deadline,
             "transfer scheduler lifecycle timed out before destructive close",
         )
-        self._tickets.clear()
-        self._owners.clear()
-        self._owner_detach_capabilities.clear()
-        self._events.clear()
-        self._event_owners.clear()
-        self._stream = None
-        self.last_compute_event = None
-        self._cupy = None
-        self.store = None
-        self.backend = None
-        self.pool = None
-        self.reservation = None
-        self._event_factory = None
-        self._timer = None
-        self._timing_event_factory = None
-        self._elapsed_time_reader = None
-        self._quarantine = None
-        self._async_admission_factory = None
-        self._resource_recorder = None
-        self._resource_releaser = None
-        self._closed = True
-        if self._poisoned_error is None:
-            self._profile_enabled = False
-        else:
-            if error is None:
+        with self._collection_lock:
+            self._tickets.clear()
+            self._owners.clear()
+            self._owner_detach_capabilities.clear()
+            self._owner_detach_preparations.clear()
+            self._events.clear()
+            self._event_owners.clear()
+            self._stream = None
+            self.last_compute_event = None
+            self._cupy = None
+            self.store = None
+            self.backend = None
+            self.pool = None
+            self.reservation = None
+            self._event_factory = None
+            self._timer = None
+            self._timing_event_factory = None
+            self._elapsed_time_reader = None
+            self._quarantine = None
+            self._async_admission_factory = None
+            self._resource_recorder = None
+            self._resource_releaser = None
+            self._closed = True
+            if self._poisoned_error is None:
+                self._profile_enabled = False
+            elif error is None:
                 error = self._poisoned_error
         if error is not None:
             raise error

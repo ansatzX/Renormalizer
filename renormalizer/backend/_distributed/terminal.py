@@ -1719,7 +1719,27 @@ class _TerminalLifecycleGate:
     def _request_counted_async_starts(self, transition, *, epoch):
         """Latch close-owned start intent without retaining async resources."""
         with self._condition:
-            self._require_managed_close_transition(transition, epoch=epoch)
+            if isinstance(transition, _RuntimeCloseTransition):
+                self._require_runtime_transition(transition)
+                if transition.owner_thread is not threading.current_thread():
+                    raise RuntimeError(
+                        "managed resource runtime close owner changed"
+                    )
+                if self._phase is not _TerminalPhase.RUNTIME_CLOSING:
+                    raise RuntimeError(
+                        "managed resource runtime close transition is stale"
+                    )
+                if epoch is not None and self._live_epoch != epoch:
+                    lease = self._leases.get(epoch)
+                    if lease is not None and lease.phase == "closed":
+                        # The lease-close owner already latched and drained this
+                        # epoch after runtime close captured its scheduler.
+                        return None
+                    raise RuntimeError(
+                        "managed resource runtime close lease epoch changed"
+                    )
+            else:
+                self._require_managed_close_transition(transition, epoch=epoch)
             requested = 0
             for state in self._tokens.values():
                 token = state.token

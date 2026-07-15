@@ -458,6 +458,10 @@ class _LeaseResourceRecord:
 
     def __init__(self, epoch, *, construction_slots=None):
         self.epoch = epoch
+        # Lock order: async owner -> scheduler -> resource record ->
+        # construction slot. Resource property callbacks run without this lock.
+        self._lock = threading.RLock()
+        self._generation = 0
         self._resources = []
         self._construction_resources = {}
         self._construction_slots = dict(construction_slots or {})
@@ -470,7 +474,8 @@ class _LeaseResourceRecord:
 
     @property
     def resources(self):
-        retained = list(self._resources)
+        with self._lock:
+            retained = list(self._resources)
         for snapshot in self._construction_slot_snapshots():
             resource = snapshot.resource
             if resource is not None and all(
@@ -481,16 +486,18 @@ class _LeaseResourceRecord:
 
     @property
     def allocations(self):
-        records = dict(self._allocations)
-        self._merge(records, self._cache_allocations.values())
-        self._merge(records, self._pinned_allocations.values())
+        with self._lock:
+            records = dict(self._allocations)
+            self._merge(records, self._cache_allocations.values())
+            self._merge(records, self._pinned_allocations.values())
         for snapshot in self._construction_slot_snapshots():
             self._merge(records, snapshot.records)
         return tuple(records.values())
 
     @property
     def cache_allocations(self):
-        records = dict(self._cache_allocations)
+        with self._lock:
+            records = dict(self._cache_allocations)
         for snapshot in self._construction_slot_snapshots():
             if snapshot.kind == "cache":
                 self._merge(records, snapshot.records)
@@ -498,7 +505,8 @@ class _LeaseResourceRecord:
 
     @property
     def pinned_allocations(self):
-        records = dict(self._pinned_allocations)
+        with self._lock:
+            records = dict(self._pinned_allocations)
         for snapshot in self._construction_slot_snapshots():
             if snapshot.kind == "pinned":
                 self._merge(records, snapshot.records)
@@ -506,21 +514,24 @@ class _LeaseResourceRecord:
 
     @property
     def events(self):
-        retained = dict(self._events)
+        with self._lock:
+            retained = dict(self._events)
         for snapshot in self._construction_slot_snapshots():
             retained.update({id(event): event for event in snapshot.events})
         return tuple(retained.values())
 
     @property
     def streams(self):
-        retained = dict(self._streams)
+        with self._lock:
+            retained = dict(self._streams)
         for snapshot in self._construction_slot_snapshots():
             retained.update({id(stream): stream for stream in snapshot.streams})
         return tuple(retained.values())
 
     @property
     def consumed_receipts(self):
-        return tuple(self._consumed_receipts.values())
+        with self._lock:
+            return tuple(self._consumed_receipts.values())
 
     @staticmethod
     def _merge(target, records):
@@ -530,11 +541,20 @@ class _LeaseResourceRecord:
                 target[record.identity] = record
 
     def _construction_slot_snapshots(self):
-        return tuple(
-            slot.snapshot() for slot in self._construction_slots.values()
-        )
+        while True:
+            with self._lock:
+                generation = self._generation
+                slots = tuple(self._construction_slots.values())
+            snapshots = tuple(slot.snapshot() for slot in slots)
+            with self._lock:
+                if (
+                    generation == self._generation
+                    and slots == tuple(self._construction_slots.values())
+                ):
+                    return snapshots
 
     def _capture_construction_snapshot(self, snapshot):
+        """Merge one already captured slot snapshot while holding _lock."""
         resource = snapshot.resource
         if resource is not None:
             retained = self._construction_resources.get(snapshot.name)
@@ -562,21 +582,44 @@ class _LeaseResourceRecord:
         streams=(),
         _replace_kind=False,
     ):
+        records = tuple(records)
+        events = tuple(events)
+        streams = tuple(streams)
+        if resource is not None and not _replace_kind:
+            records = (*records, *getattr(resource, "allocation_records", ()))
+            events = (*events, *getattr(resource, "retained_events", ()))
+            streams = (*streams, *getattr(resource, "retained_streams", ()))
+        with self._lock:
+            self._capture_locked(
+                resource,
+                kind=kind,
+                records=records,
+                events=events,
+                streams=streams,
+                replace_kind=_replace_kind,
+            )
+            self._generation += 1
+
+    def _capture_locked(
+        self,
+        resource,
+        *,
+        kind,
+        records,
+        events,
+        streams,
+        replace_kind,
+    ):
         if resource is not None and all(
             retained is not resource for retained in self._resources
         ):
             self._resources.append(resource)
-        records = tuple(records)
-        if resource is not None and not _replace_kind:
-            records = (*records, *getattr(resource, "allocation_records", ()))
-            events = (*tuple(events), *getattr(resource, "retained_events", ()))
-            streams = (*tuple(streams), *getattr(resource, "retained_streams", ()))
         if kind == "cache":
-            if _replace_kind:
+            if replace_kind:
                 self._cache_allocations.clear()
             self._merge(self._cache_allocations, records)
         elif kind == "pinned":
-            if _replace_kind:
+            if replace_kind:
                 self._pinned_allocations.clear()
             self._merge(self._pinned_allocations, records)
         else:
@@ -589,96 +632,172 @@ class _LeaseResourceRecord:
                 self._streams[id(stream)] = stream
 
     def capture_consumed_receipt(self, receipt):
-        self._consumed_receipts[id(receipt)] = receipt
-        self.capture(receipt)
+        records = tuple(getattr(receipt, "allocation_records", ()))
+        events = tuple(getattr(receipt, "retained_events", ()))
+        streams = tuple(getattr(receipt, "retained_streams", ()))
+        with self._lock:
+            self._consumed_receipts[id(receipt)] = receipt
+            self._capture_locked(
+                receipt,
+                kind=None,
+                records=records,
+                events=events,
+                streams=streams,
+                replace_kind=False,
+            )
+            self._generation += 1
 
     def capture_construction_resource(self, name, resource):
         if not isinstance(name, str) or not name:
             raise ValueError("construction resource name must be non-empty")
         if resource is None:
             raise TypeError("construction resource is required")
-        retained = self._construction_resources.get(name)
-        if retained is not None and retained is not resource:
-            raise RuntimeError("construction resource identity changed")
-        self._construction_resources[name] = resource
-        self.capture(resource)
+        records = tuple(getattr(resource, "allocation_records", ()))
+        events = tuple(getattr(resource, "retained_events", ()))
+        streams = tuple(getattr(resource, "retained_streams", ()))
+        with self._lock:
+            retained = self._construction_resources.get(name)
+            if retained is not None and retained is not resource:
+                raise RuntimeError("construction resource identity changed")
+            self._construction_resources[name] = resource
+            self._capture_locked(
+                resource,
+                kind=None,
+                records=records,
+                events=events,
+                streams=streams,
+                replace_kind=False,
+            )
+            self._generation += 1
 
     def construction_resource(self, name):
-        slot = self._construction_slots.get(name)
+        with self._lock:
+            slot = self._construction_slots.get(name)
         if slot is not None:
             resource = slot.snapshot().resource
             if resource is not None:
                 return resource
-        return self._construction_resources.get(name)
+        with self._lock:
+            return self._construction_resources.get(name)
 
     def restore_consumed_receipts(self, runtime):
-        for identity, receipt in tuple(self._consumed_receipts.items()):
-            issued = runtime._issued_receipts.get(identity)
-            if issued is not None and issued is not receipt:
-                raise RuntimeError("consumed residency receipt identity changed")
-            runtime._issued_receipts[identity] = receipt
-            self._resources = [
-                resource for resource in self._resources if resource is not receipt
-            ]
-        self._consumed_receipts.clear()
+        with self._lock:
+            for identity, receipt in tuple(self._consumed_receipts.items()):
+                issued = runtime._issued_receipts.get(identity)
+                if issued is not None and issued is not receipt:
+                    raise RuntimeError("consumed residency receipt identity changed")
+                runtime._issued_receipts[identity] = receipt
+                self._resources = [
+                    resource
+                    for resource in self._resources
+                    if resource is not receipt
+                ]
+            self._consumed_receipts.clear()
+            self._generation += 1
 
     def clear(self):
-        for slot in tuple(self._construction_slots.values()):
-            slot.clear()
-        self._construction_slots.clear()
-        self._resources.clear()
-        self._construction_resources.clear()
-        self._consumed_receipts.clear()
-        self._allocations.clear()
-        self._cache_allocations.clear()
-        self._pinned_allocations.clear()
-        self._events.clear()
-        self._streams.clear()
+        with self._lock:
+            for slot in tuple(self._construction_slots.values()):
+                slot.clear()
+            self._construction_slots.clear()
+            self._resources.clear()
+            self._construction_resources.clear()
+            self._consumed_receipts.clear()
+            self._allocations.clear()
+            self._cache_allocations.clear()
+            self._pinned_allocations.clear()
+            self._events.clear()
+            self._streams.clear()
+            self._generation += 1
 
     def snapshot(self):
+        while True:
+            with self._lock:
+                generation = self._generation
+                resources = list(self._resources)
+                construction_resources = dict(self._construction_resources)
+                consumed_receipts = dict(self._consumed_receipts)
+                allocations = dict(self._allocations)
+                cache_allocations = dict(self._cache_allocations)
+                pinned_allocations = dict(self._pinned_allocations)
+                events = dict(self._events)
+                streams = dict(self._streams)
+                slots = tuple(self._construction_slots.values())
+            slot_snapshots = tuple(slot.snapshot() for slot in slots)
+            with self._lock:
+                if (
+                    generation == self._generation
+                    and slots == tuple(self._construction_slots.values())
+                ):
+                    break
         retained = type(self)(self.epoch)
-        retained._resources = list(self._resources)
-        retained._construction_resources = dict(self._construction_resources)
-        retained._consumed_receipts = dict(self._consumed_receipts)
-        retained._allocations = dict(self._allocations)
-        retained._cache_allocations = dict(self._cache_allocations)
-        retained._pinned_allocations = dict(self._pinned_allocations)
-        retained._events = dict(self._events)
-        retained._streams = dict(self._streams)
-        for snapshot in self._construction_slot_snapshots():
-            retained._capture_construction_snapshot(snapshot)
+        with retained._lock:
+            retained._resources = resources
+            retained._construction_resources = construction_resources
+            retained._consumed_receipts = consumed_receipts
+            retained._allocations = allocations
+            retained._cache_allocations = cache_allocations
+            retained._pinned_allocations = pinned_allocations
+            retained._events = events
+            retained._streams = streams
+            for slot_snapshot in slot_snapshots:
+                retained._capture_construction_snapshot(slot_snapshot)
         return retained
 
     def release(self, resource):
-        self._resources = [
-            retained for retained in self._resources if retained is not resource
-        ]
-        self._construction_resources = {
-            name: retained
-            for name, retained in self._construction_resources.items()
-            if retained is not resource
-        }
-        self._allocations.clear()
-        self._cache_allocations.clear()
-        self._pinned_allocations.clear()
-        self._events.clear()
-        self._streams.clear()
-        for retained in tuple(self._resources):
-            records = getattr(retained, "allocation_records", None)
-            if records is None:
-                records = getattr(retained, "allocations", ())
-            events = getattr(retained, "retained_events", None)
-            if events is None:
-                events = getattr(retained, "events", ())
-            streams = getattr(retained, "retained_streams", None)
-            if streams is None:
-                streams = getattr(retained, "streams", ())
-            self.capture(
-                records=tuple(records),
-                kind=getattr(retained, "_terminal_resource_kind", None),
-                events=tuple(events),
-                streams=tuple(streams),
-            )
+        while True:
+            with self._lock:
+                generation = self._generation
+                remaining = tuple(
+                    retained
+                    for retained in self._resources
+                    if retained is not resource
+                )
+            captured = []
+            for retained in remaining:
+                records = getattr(retained, "allocation_records", None)
+                if records is None:
+                    records = getattr(retained, "allocations", ())
+                events = getattr(retained, "retained_events", None)
+                if events is None:
+                    events = getattr(retained, "events", ())
+                streams = getattr(retained, "retained_streams", None)
+                if streams is None:
+                    streams = getattr(retained, "streams", ())
+                captured.append(
+                    (
+                        retained,
+                        tuple(records),
+                        getattr(retained, "_terminal_resource_kind", None),
+                        tuple(events),
+                        tuple(streams),
+                    )
+                )
+            with self._lock:
+                if generation != self._generation:
+                    continue
+                self._resources[:] = remaining
+                self._construction_resources = {
+                    name: retained
+                    for name, retained in self._construction_resources.items()
+                    if retained is not resource
+                }
+                self._allocations.clear()
+                self._cache_allocations.clear()
+                self._pinned_allocations.clear()
+                self._events.clear()
+                self._streams.clear()
+                for retained, records, kind, events, streams in captured:
+                    self._capture_locked(
+                        None,
+                        kind=kind,
+                        records=records,
+                        events=events,
+                        streams=streams,
+                        replace_kind=False,
+                    )
+                self._generation += 1
+                return
 
 
 class _ActiveOperandLease:
@@ -811,7 +930,10 @@ class _ActiveOperandLease:
                 if error is None:
                     error = caught
                 if working_set.scheduler.poisoned:
-                    event = working_set.scheduler.last_compute_event
+                    event = working_set.scheduler._last_compute_completion(
+                        _admission_token=admission_token,
+                        _admission_validator=admission_validator,
+                    )
             for lease in leases:
                 if not getattr(lease, "_closed", False):
                     try:
@@ -2643,17 +2765,19 @@ class _LeaseResourceRecordGraphSnapshot:
 
     @classmethod
     def capture(cls, record):
-        slots = tuple(record._construction_slots.values())
-        return cls(
-            record,
-            _ObjectGraphSnapshot.capture(record),
-            tuple(_ObjectGraphSnapshot.capture(slot) for slot in slots),
-        )
+        with record._lock:
+            slots = tuple(record._construction_slots.values())
+            return cls(
+                record,
+                _ObjectGraphSnapshot.capture(record),
+                tuple(_ObjectGraphSnapshot.capture(slot) for slot in slots),
+            )
 
     def restore(self):
-        self.record_state.restore()
-        for slot_state in self.slot_states:
-            slot_state.restore()
+        with self.record._lock:
+            self.record_state.restore()
+            for slot_state in self.slot_states:
+                slot_state.restore()
 
 
 @dataclass(frozen=True)

@@ -325,6 +325,7 @@ class AsyncResourceOwner:
         elapsed_reader=None,
         drainer=None,
         detached=None,
+        _detached_commit=None,
         quarantine=None,
         _async_admission=None,
         _resource_recorder=None,
@@ -346,6 +347,7 @@ class AsyncResourceOwner:
             (elapsed_reader, "elapsed_reader"),
             (drainer, "drainer"),
             (detached, "detached"),
+            (_detached_commit, "detached commit"),
             (quarantine, "quarantine"),
             (_resource_recorder, "resource recorder"),
             (_resource_releaser, "resource releaser"),
@@ -384,6 +386,7 @@ class AsyncResourceOwner:
         self._elapsed_reader = elapsed_reader
         self._drainer = drainer
         self._detached = detached
+        self._detached_commit = _detached_commit
         self._quarantine = quarantine
         self._release_callbacks = []
         self._completion_armed = False
@@ -392,8 +395,8 @@ class AsyncResourceOwner:
         self._resource_releaser = _resource_releaser
         self._managed_guard = _managed_guard
         self._managed_epoch = _managed_epoch
-        # Lock order: owner state -> no other lock. Gate/admission calls and waits
-        # always happen after releasing this lock.
+        # Terminal lock order is owner -> scheduler -> resource record. The
+        # exact admission is established before terminal-transition election.
         self._async_lock = threading.RLock()
         self._async_worker = None
         self._async_worker_state = "none"
@@ -408,6 +411,8 @@ class AsyncResourceOwner:
         self._async_quarantine_requested = False
         self._detach_transition_capability = object()
         self._detach_transition_state = "available"
+        self._detach_completion_done = False
+        self._detach_scheduler_receipt = None
         if self._resource_recorder is not None:
             self._resource_recorder(
                 resource=self,
@@ -1247,17 +1252,19 @@ class AsyncResourceOwner:
     def _remember_error(self, error):
         if not isinstance(error, BaseException):
             raise TypeError("async owner failure must be an exception")
-        if self.error is None:
-            self.error = error
+        with self._async_lock:
+            if self.error is None:
+                self.error = error
 
     def _remember_secondary(self, error):
         if not isinstance(error, BaseException):
             raise TypeError("async owner secondary failure must be an exception")
-        if error is self.error or any(
-            retained is error for retained in self.secondary_errors
-        ):
-            return
-        self.secondary_errors = (*self.secondary_errors, error)
+        with self._async_lock:
+            if error is self.error or any(
+                retained is error for retained in self.secondary_errors
+            ):
+                return
+            self.secondary_errors = (*self.secondary_errors, error)
 
     def _drain(self):
         if self._drainer is not None:
@@ -1374,112 +1381,142 @@ class AsyncResourceOwner:
                 raise RuntimeError("async owner state cannot enter detach")
             if terminal_state == "completed" and self.state != "enqueued":
                 raise RuntimeError("only an enqueued async owner can complete")
+            prior_state = self.state
             self._detach_transition_state = "running"
-        callback_token = _admission_token
-        callback_validator = _admission_validator
-        if admission is not None and callback_token is None:
-            callback_token = admission
+            callback_token = _admission_token
+            callback_validator = _admission_validator
+            if admission is not None and callback_token is None:
+                callback_token = admission
 
-            def validate_callback_admission(candidate, expected=admission):
-                if candidate is not expected:
-                    raise RuntimeError(
-                        "async detach admission changed before callback"
+                def validate_callback_admission(candidate, expected=admission):
+                    if candidate is not expected:
+                        raise RuntimeError(
+                            "async detach admission changed before callback"
+                        )
+                    return candidate
+
+                callback_validator = validate_callback_admission
+
+            self.state = terminal_state
+            first_error = self.error
+            if self._completion_armed and not self._detach_completion_done:
+                try:
+                    self._run_completion(
+                        _admission_token=_admission_token,
+                        _admission_validator=_admission_validator,
                     )
-                return candidate
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                        self.error = error
+                    else:
+                        self._remember_secondary(error)
+                finally:
+                    self._detach_completion_done = True
 
-            callback_validator = validate_callback_admission
+            if self._async_quarantine_requested:
+                self.state = prior_state
+                self._detach_transition_state = "available"
+                self._move_to_quarantine()
+                if self.error is not None:
+                    raise self.error
+                return False
 
-        self.state = terminal_state
-        first_error = self.error
-        if self._completion_armed:
             try:
-                self._run_completion(
-                    _admission_token=_admission_token,
-                    _admission_validator=_admission_validator,
-                )
+                if self._detached is not None:
+                    if self._detached_requires_admission:
+                        receipt = self._detached(
+                            self,
+                            _admission_token=callback_token,
+                            _admission_validator=callback_validator,
+                        )
+                    else:
+                        receipt = self._detached(self)
+                    self._detach_scheduler_receipt = receipt
             except BaseException as error:
                 if first_error is None:
                     first_error = error
                     self.error = error
                 else:
                     self._remember_secondary(error)
+                self.state = prior_state
+                self._detach_transition_state = "available"
+                raise first_error
 
-        self.state = "detached"
-        for callback in tuple(self._release_callbacks):
-            try:
-                callback()
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-                    self.error = error
-                else:
-                    self._remember_secondary(error)
-        if self._detached is not None:
-            try:
-                if self._detached_requires_admission:
-                    self._detached(
-                        self,
-                        _admission_token=callback_token,
-                        _admission_validator=callback_validator,
-                    )
-                else:
-                    self._detached(self)
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-                    self.error = error
-                else:
-                    self._remember_secondary(error)
+            if self._detached_commit is not None:
+                self._detached_commit(self, self._detach_scheduler_receipt)
 
-        if self._resource_releaser is not None:
-            try:
-                self._resource_releaser(self)
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-                    self.error = error
-                else:
-                    self._remember_secondary(error)
+            for callback in tuple(self._release_callbacks):
+                try:
+                    callback()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                        self.error = error
+                    else:
+                        self._remember_secondary(error)
 
-        self._arrays = ()
-        self._allocations = ()
-        self._resources = ()
-        self._streams = ()
-        self._events = []
-        self._completion_event = None
-        self._callback = None
-        self._accounting = None
-        self._timer = None
-        self._started_at = None
-        self._elapsed_reader = None
-        self._drainer = None
-        self._detached = None
-        self._detached_requires_admission = False
-        self._quarantine = None
-        self._resource_recorder = None
-        self._resource_releaser = None
-        self._release_callbacks = []
-        self._completion_armed = False
-        with self._async_lock:
+            if self._resource_releaser is not None:
+                try:
+                    self._resource_releaser(self)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                        self.error = error
+                    else:
+                        self._remember_secondary(error)
+            self.state = "detached"
+            self._arrays = ()
+            self._allocations = ()
+            self._resources = ()
+            self._streams = ()
+            self._events = []
+            self._completion_event = None
+            self._callback = None
+            self._accounting = None
+            self._timer = None
+            self._started_at = None
+            self._elapsed_reader = None
+            self._drainer = None
+            self._detached = None
+            self._detached_commit = None
+            self._detached_requires_admission = False
+            self._quarantine = None
+            self._resource_recorder = None
+            self._resource_releaser = None
+            self._release_callbacks = []
+            self._completion_armed = False
+            self._detach_scheduler_receipt = None
             self._detach_transition_capability = None
             self._detach_transition_state = "complete"
-        if first_error is not None:
-            raise first_error
-        return True
+            if first_error is not None:
+                raise first_error
+            return True
 
     def _move_to_quarantine(self):
         with self._async_lock:
             if self.state in {"detached", "quarantined"}:
                 return False
+            if self._detach_transition_state == "running":
+                self._async_quarantine_requested = True
+                return False
+            if self._detach_transition_state == "quarantining":
+                return False
+            if self._detach_transition_state != "available":
+                raise RuntimeError(
+                    "async owner terminal transition cannot enter quarantine"
+                )
+            self._detach_transition_state = "quarantining"
             self.state = "quarantined"
+            quarantine = self._quarantine
+            if quarantine is not None:
+                quarantine(self)
             self._detach_transition_capability = None
             self._detach_transition_state = "complete"
-            quarantine = self._quarantine
             self._detached = None
+            self._detached_commit = None
             self._quarantine = None
-        if quarantine is not None:
-            quarantine(self)
-        return True
+            return True
 
     def force_quarantine(
         self,
@@ -1514,17 +1551,19 @@ class AsyncResourceOwner:
         )
 
     def _force_quarantine_terminal(self, error, *, secondary_errors=()):
-        self._remember_error(error)
-        for secondary_error in secondary_errors:
-            self._remember_secondary(secondary_error)
-        if self.state == "quarantined":
-            return
-        if self.state == "detached":
-            return
         with self._async_lock:
+            if self.state == "detached":
+                return False
+            self._remember_error(error)
+            for secondary_error in secondary_errors:
+                self._remember_secondary(secondary_error)
+            if self.state == "quarantined":
+                return False
             self._async_quarantine_requested = True
+            if self._detach_transition_state == "running":
+                return False
         self._cancel_unclaimed_async()
-        self._move_to_quarantine()
+        return self._move_to_quarantine()
 
     def fail(
         self,
