@@ -899,6 +899,9 @@ class TransferScheduler:
                 _detached_requires_admission=True,
                 quarantine=quarantined,
                 _async_admission=async_admission,
+                _counted_admission_factory=self._async_admission_factory,
+                _counted_operation="{}_completion".format(kind),
+                _counted_parent_operations=allowed_operations,
                 _resource_recorder=self._resource_recorder,
                 _resource_releaser=self._resource_releaser,
                 _defer_async_completion=defer_counted_completion,
@@ -1569,7 +1572,20 @@ class TransferScheduler:
 
         reservation = self.reservation
         store = self.store
-        completion_capability = object()
+        completion_capability = None
+        if reservation is not None:
+            from renormalizer.backend._distributed.residency import (
+                _HostTensorReservation,
+            )
+
+            if isinstance(reservation, _HostTensorReservation):
+                completion_capability = (
+                    reservation._issue_completion_capability(
+                        destination_ref,
+                        _admission_token=_admission_token,
+                        _admission_validator=_admission_validator,
+                    )
+                )
 
         def commit(*, _admission_token=None, _admission_validator=None):
             return self._commit_writeback(

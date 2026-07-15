@@ -25,6 +25,8 @@ from renormalizer.backend._distributed.local_operator import DistributedLocalOpe
 from renormalizer.backend._distributed.pinned import PinnedBufferPool, StagingSlot
 from renormalizer.backend._distributed import pinned as pinned_module
 from renormalizer.backend._distributed.residency import (
+    HostTensorError,
+    HostTensorStore,
     ResidencyPlanner,
     _HostTensorReservation,
 )
@@ -11723,17 +11725,13 @@ def test_dirty_writeback_completion_uncertainty_is_recoverable(
     scheduler = lease.scheduler
     events = iter((_ManualEvent(done=True), _ManualEvent(done=True)))
     scheduler._event_factory = lambda: next(events)
-    admission_factory = scheduler._async_admission_factory
-    scheduler._async_admission_factory = None
-    try:
-        with lease._lease_admission("close_progress") as token:
-            assert lease._schedule_writeback(
-                _admission_token=token,
-                _admission_validator=lease._exact_admission_validator(token),
-                _wait_for_staging=False,
-            )
-    finally:
-        scheduler._async_admission_factory = admission_factory
+    assert scheduler._async_admission_factory is not None
+    with lease._lease_admission("close_progress") as token:
+        assert lease._schedule_writeback(
+            _admission_token=token,
+            _admission_validator=lease._exact_admission_validator(token),
+            _wait_for_staging=False,
+        )
 
     ticket = lease._writeback_ticket
     owner = ticket._owner
@@ -11777,30 +11775,26 @@ def test_dirty_writeback_completion_uncertainty_is_recoverable(
         record.identity for record in owner._allocations
     }
 
-    def complete_once():
-        admission = None
-        with lease._lease_admission("close_progress"):
-            admission = lease._spawn_async_admission(
-                object(),
-                "d2h_completion",
+    def reap_ticket():
+        with lease._lease_admission("close_progress") as token:
+            return ticket.reap(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
             )
-        try:
-            return admission.run(
-                "d2h_completion",
-                lambda *, _admission_token, _admission_validator: owner._detach(
-                    "completed",
-                    _admission_token=_admission_token,
-                    _admission_validator=_admission_validator,
-                    _transition_capability=owner._detach_transition_capability,
-                ),
-            )
-        finally:
-            admission.cancel()
 
     try:
+        first_admission = owner._async_admission
+        first_worker = owner._async_worker
         with pytest.raises(RuntimeError) as caught:
-            complete_once()
+            reap_ticket()
         assert caught.value is primary
+        assert first_admission is not None
+        assert first_worker is not None
+        assert owner._async_admission is first_admission
+        assert owner._async_worker is first_worker
+        assert owner._async_admission_state == "terminal"
+        assert owner._async_worker_state == "terminal"
+        assert owner._async_done.is_set()
         assert owner.error is primary
         assert owner.state == "enqueued"
         assert owner._detach_transition_state == "available"
@@ -11843,8 +11837,10 @@ def test_dirty_writeback_completion_uncertainty_is_recoverable(
 
         if resolution == "retry":
             with pytest.raises(RuntimeError) as retried:
-                complete_once()
+                reap_ticket()
             assert retried.value is primary
+            assert owner._async_admission is not first_admission
+            assert owner._async_worker is not first_worker
             updated = store.ref("output")
             assert updated.version == original_ref.version + 1
             assert store._namespace_revision == original_revision + 1
@@ -11892,7 +11888,180 @@ def test_dirty_writeback_completion_uncertainty_is_recoverable(
                 assert store._namespace_revision == original_revision + 1
                 np.testing.assert_array_equal(store.read(updated), dirty)
     finally:
+        if owner.state == "enqueued":
+            with lease._lease_admission("close_progress") as token:
+                owner.force_quarantine(
+                    primary,
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
         _close_case(runtime, store)
+
+
+def test_counted_completion_retry_consumes_concurrent_close_start_latch(
+    monkeypatch,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-writeback-retry-close-latch"
+    )
+    lease.mark_dirty("output", np.arange(4.0) + 41.0)
+    scheduler = lease.scheduler
+    events = iter((_ManualEvent(done=True), _ManualEvent(done=True)))
+    scheduler._event_factory = lambda: next(events)
+    with lease._lease_admission("close_progress") as token:
+        assert lease._schedule_writeback(
+            _admission_token=token,
+            _admission_validator=lease._exact_admission_validator(token),
+            _wait_for_staging=False,
+        )
+    ticket = lease._writeback_ticket
+    owner = ticket._owner
+    reservation = lease._store_reservation
+    original_commit = reservation.commit
+    primary = RuntimeError("counted retry callback failed before commit")
+    callback_calls = []
+
+    def fail_once(ref, value, **kwargs):
+        callback_calls.append(ref)
+        if len(callback_calls) == 1:
+            raise primary
+        return original_commit(ref, value, **kwargs)
+
+    monkeypatch.setattr(reservation, "commit", fail_once)
+
+    def reap_ticket():
+        with lease._lease_admission("close_progress") as token:
+            return ticket.reap(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    with pytest.raises(RuntimeError) as first:
+        reap_ticket()
+    assert first.value is primary
+    assert owner.state == "enqueued"
+
+    original_factory = owner._counted_admission_factory
+    retry_created = threading.Event()
+    release_factory = threading.Event()
+    spawned = []
+    worker_runs = []
+    original_worker_run = owner._run_counted_completion
+
+    def pause_after_spawn(capability, operation):
+        admission = original_factory(capability, operation)
+        spawned.append(admission)
+        retry_created.set()
+        assert release_factory.wait(_TIMEOUT_S)
+        return admission
+
+    def observe_worker(admission):
+        worker_runs.append(admission)
+        return original_worker_run(admission)
+
+    monkeypatch.setattr(owner, "_counted_admission_factory", pause_after_spawn)
+    monkeypatch.setattr(owner, "_run_counted_completion", observe_worker)
+    retry, _, retry_errors, retry_done = _start(reap_ticket)
+    closer = None
+    try:
+        assert retry_created.wait(_TIMEOUT_S)
+        closer, _, close_errors, close_done = _start(lease.close)
+        gate = runtime._terminal_gate
+        retry_admission = spawned[0]
+        with gate._condition:
+            assert gate._condition.wait_for(
+                lambda: gate._tokens[
+                    retry_admission.token.sequence
+                ].async_start_requested,
+                timeout=_TIMEOUT_S,
+            )
+        release_factory.set()
+        _join(retry, retry_done)
+        _join(closer, close_done)
+
+        assert retry_errors == [primary]
+        assert close_errors == [primary]
+        assert len(callback_calls) == 2
+        assert callback_calls[0] == callback_calls[1]
+        assert worker_runs == [retry_admission]
+        assert owner.state == "detached"
+        with gate._condition:
+            assert gate._tokens[retry_admission.token.sequence].status == "released"
+            assert not gate._has_active_tokens()
+    finally:
+        release_factory.set()
+        if retry.is_alive():
+            _join(retry, retry_done)
+        if closer is not None and closer.is_alive():
+            _join(closer, close_done)
+        _close_case(runtime, store)
+
+
+def test_writeback_completion_capability_rejects_cross_reservation_and_ref():
+    store_a = HostTensorStore(store_id="terminal-completion-capability-a")
+    dirty_a = store_a.put("dirty", np.zeros(4, dtype=np.float64))
+    other_a = store_a.put("other", np.ones(4, dtype=np.float64))
+    reservation_a = store_a.reserve(store_a.snapshot(), dirty_ref=dirty_a)
+    store_b = HostTensorStore(store_id="terminal-completion-capability-b")
+    dirty_b = store_b.put("dirty", np.zeros(4, dtype=np.float64))
+    reservation_b = store_b.reserve(store_b.snapshot(), dirty_ref=dirty_b)
+    try:
+        capability_a = reservation_a._issue_completion_capability(dirty_a)
+        capability_b = reservation_b._issue_completion_capability(dirty_b)
+        before_a = (
+            store_a.ref("dirty"),
+            store_a.ref("other"),
+            store_a._namespace_revision,
+            reservation_a._committed,
+        )
+        before_b = (
+            store_b.ref("dirty"),
+            store_b._namespace_revision,
+            reservation_b._committed,
+        )
+
+        with pytest.raises(HostTensorError, match="completion capability"):
+            reservation_b.commit(
+                dirty_b,
+                np.arange(4.0),
+                _completion_capability=capability_a,
+            )
+        assert (
+            store_b.ref("dirty"),
+            store_b._namespace_revision,
+            reservation_b._committed,
+        ) == before_b
+
+        with pytest.raises(HostTensorError, match="completion capability"):
+            reservation_a.commit(
+                other_a,
+                np.arange(4.0),
+                _completion_capability=capability_a,
+            )
+        assert (
+            store_a.ref("dirty"),
+            store_a.ref("other"),
+            store_a._namespace_revision,
+            reservation_a._committed,
+        ) == before_a
+
+        updated_a = reservation_a.commit(
+            dirty_a,
+            np.arange(4.0),
+            _completion_capability=capability_a,
+        )
+        updated_b = reservation_b.commit(
+            dirty_b,
+            np.arange(4.0) + 1.0,
+            _completion_capability=capability_b,
+        )
+        assert updated_a.version == dirty_a.version + 1
+        assert updated_b.version == dirty_b.version + 1
+    finally:
+        reservation_a.close()
+        reservation_b.close()
+        store_a.close()
+        store_b.close()
 
 
 def test_runtime_close_hands_off_retired_scheduler_counted_start(monkeypatch):

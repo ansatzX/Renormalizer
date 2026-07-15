@@ -441,6 +441,29 @@ class HostTensorStore:
         with self._lock:
             self._reservations.pop(id(reservation), None)
 
+    def _issue_reservation_completion_capability(self, reservation, ref):
+        with self._lock:
+            self._require_open()
+            retained = self._reservations.get(id(reservation))
+            if retained is not reservation or reservation._closed:
+                raise HostTensorError("host tensor reservation is closed")
+            if reservation._committed:
+                raise HostTensorError("host tensor reservation already committed")
+            if ref != reservation._dirty_ref:
+                raise HostTensorError(
+                    "completion capability source is not owned by this reservation"
+                )
+            capability = reservation._commit_capability
+            if capability is None:
+                capability = _HostTensorCompletionCapability(reservation, ref)
+                reservation._commit_capability = capability
+                reservation._commit_source_ref = ref
+            elif reservation._commit_source_ref != ref:
+                raise HostTensorError(
+                    "completion capability source does not match its reservation"
+                )
+            return capability
+
     def _commit_reservation(
         self,
         reservation,
@@ -454,13 +477,21 @@ class HostTensorStore:
             retained = self._reservations.get(id(reservation))
             if retained is not reservation:
                 raise HostTensorError("host tensor reservation is closed")
+            if completion_capability is not None and not (
+                isinstance(
+                    completion_capability,
+                    _HostTensorCompletionCapability,
+                )
+                and completion_capability.reservation is reservation
+                and completion_capability.source_ref == ref
+                and reservation._commit_capability is completion_capability
+                and reservation._commit_source_ref == ref
+            ):
+                raise HostTensorError(
+                    "completion capability does not own this reservation source"
+                )
             if reservation._committed:
-                if (
-                    completion_capability is not None
-                    and reservation._commit_capability
-                    is completion_capability
-                    and reservation._commit_source_ref == ref
-                ):
+                if completion_capability is not None:
                     return reservation._commit_result
                 raise HostTensorError("host tensor reservation already committed")
             if self._snapshot_locked() != reservation._snapshot:
@@ -488,10 +519,8 @@ class HostTensorStore:
             )
             self._namespace_revision += 1
             reservation._promote(
-                ref,
                 updated,
                 self._snapshot_locked(),
-                completion_capability=completion_capability,
             )
             return updated
 
@@ -582,6 +611,12 @@ class HostTensorStore:
         return False
 
 
+@dataclass(frozen=True)
+class _HostTensorCompletionCapability:
+    reservation: object = field(repr=False)
+    source_ref: object
+
+
 class _HostTensorReservation:
     def __init__(
         self,
@@ -654,20 +689,28 @@ class _HostTensorReservation:
             raise HostTensorError("host tensor reservation is closed")
         return self._snapshot
 
-    def _promote(
-        self,
-        source_ref,
-        updated,
-        snapshot,
-        *,
-        completion_capability,
-    ):
+    def _promote(self, updated, snapshot):
         self._dirty_ref = updated
         self._snapshot = snapshot
         self._committed = True
-        self._commit_capability = completion_capability
-        self._commit_source_ref = source_ref
         self._commit_result = updated
+
+    def _issue_completion_capability(
+        self,
+        ref,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_scopes=("lease", "lease_close"),
+            allowed_operations=("close_progress", "schedule_writeback"),
+        )
+        if self._closed:
+            raise HostTensorError("host tensor reservation is closed")
+        return self._store._issue_reservation_completion_capability(self, ref)
 
     def commit(
         self,

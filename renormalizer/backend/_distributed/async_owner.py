@@ -242,6 +242,9 @@ class _CountedAsyncAdmission:
             else self._operation
         )
 
+    def _current_thread_parent_admission(self):
+        return self._gate._current_thread_admission()
+
     def run(self, operation, callback):
         # Admission state may enter the gate lock; it never enters an owner lock.
         with self._state_lock:
@@ -328,6 +331,9 @@ class AsyncResourceOwner:
         _detached_commit=None,
         quarantine=None,
         _async_admission=None,
+        _counted_admission_factory=None,
+        _counted_operation=None,
+        _counted_parent_operations=(),
         _resource_recorder=None,
         _resource_releaser=None,
         _defer_async_completion=False,
@@ -351,9 +357,29 @@ class AsyncResourceOwner:
             (quarantine, "quarantine"),
             (_resource_recorder, "resource recorder"),
             (_resource_releaser, "resource releaser"),
+            (_counted_admission_factory, "counted admission factory"),
         ):
             if value is not None and not callable(value):
                 raise TypeError("{} must be callable".format(name))
+        if _counted_admission_factory is not None and (
+            not isinstance(_counted_operation, str) or not _counted_operation
+        ):
+            raise ValueError(
+                "counted admission factory requires an async operation"
+            )
+        try:
+            counted_parent_operations = tuple(_counted_parent_operations)
+        except TypeError as error:
+            raise TypeError(
+                "counted parent operations must be iterable"
+            ) from error
+        if any(
+            not isinstance(operation, str) or not operation
+            for operation in counted_parent_operations
+        ):
+            raise ValueError(
+                "counted parent operations must be non-empty strings"
+            )
 
         self.kind = kind
         self.direction = kind if kind in {"h2d", "d2h"} else None
@@ -391,6 +417,9 @@ class AsyncResourceOwner:
         self._release_callbacks = []
         self._completion_armed = False
         self._async_admission = _async_admission
+        self._counted_admission_factory = _counted_admission_factory
+        self._counted_operation = _counted_operation
+        self._counted_parent_operations = counted_parent_operations
         self._resource_recorder = _resource_recorder
         self._resource_releaser = _resource_releaser
         self._managed_guard = _managed_guard
@@ -1041,6 +1070,79 @@ class AsyncResourceOwner:
                     self._async_worker_state = "terminal"
             self._async_done.set()
 
+    def _install_counted_completion_retry(self, current_admission):
+        if current_admission is None:
+            with self._async_lock:
+                retained_admission = self._async_admission
+            resolve_current = getattr(
+                retained_admission,
+                "_current_thread_parent_admission",
+                None,
+            )
+            if callable(resolve_current):
+                current_admission = resolve_current()
+        with self._async_lock:
+            if (
+                self._counted_admission_factory is None
+                or (
+                    current_admission is not None
+                    and current_admission.operation
+                    not in self._counted_parent_operations
+                )
+                or self._completion_callback_done
+                or self.state != "enqueued"
+                or self._async_quarantine_requested
+                or self._async_worker_state != "terminal"
+                or self._async_admission_state != "terminal"
+                or not self._async_done.is_set()
+            ):
+                return False
+            factory = self._counted_admission_factory
+            operation = self._counted_operation
+            self._async_worker_state = "retry_installing"
+            self._async_admission_state = "retry_installing"
+
+        try:
+            admission = factory(object(), operation)
+        except BaseException as error:
+            with self._async_lock:
+                if self._async_worker_state == "retry_installing":
+                    self._async_worker_state = "terminal"
+                if self._async_admission_state == "retry_installing":
+                    self._async_admission_state = "terminal"
+            self._remember_secondary(error)
+            raise
+
+        cancel = False
+        with self._async_lock:
+            if (
+                self._async_worker_state != "retry_installing"
+                or self._async_admission_state != "retry_installing"
+                or self.state != "enqueued"
+                or self._async_quarantine_requested
+            ):
+                cancel = True
+            else:
+                self._async_admission = admission
+                self._async_admission_state = "installed"
+                self._async_worker = None
+                self._async_worker_state = "none"
+                self._async_start_pending = False
+                self._async_requested.clear()
+                self._async_done.clear()
+
+        if cancel:
+            try:
+                admission.cancel()
+            except BaseException as error:
+                self._remember_secondary(error)
+            return False
+
+        consumed = self._consume_counted_start_request()
+        if not consumed:
+            self._start_counted_completion()
+        return True
+
     def _resolve_counted_wait_failure(
         self,
         error,
@@ -1133,7 +1235,7 @@ class AsyncResourceOwner:
         join_started=True,
         _deadline=None,
     ):
-        self._require_admission(
+        current_admission = self._require_admission(
             allowed_operations=(
                 "acquire",
                 "cache_wait",
@@ -1153,6 +1255,7 @@ class AsyncResourceOwner:
         )
         if self._async_admission is None:
             return None
+        self._install_counted_completion_retry(current_admission)
         if (
             not wait
             and not self._async_requested.is_set()
@@ -1499,6 +1602,9 @@ class AsyncResourceOwner:
             self._resource_releaser = None
             self._release_callbacks = []
             self._completion_armed = False
+            self._counted_admission_factory = None
+            self._counted_operation = None
+            self._counted_parent_operations = ()
             self._detach_scheduler_receipt = None
             self._detach_transition_capability = None
             self._detach_transition_state = "complete"
@@ -1529,6 +1635,9 @@ class AsyncResourceOwner:
             self._detached = None
             self._detached_commit = None
             self._quarantine = None
+            self._counted_admission_factory = None
+            self._counted_operation = None
+            self._counted_parent_operations = ()
             return True
 
     def force_quarantine(
