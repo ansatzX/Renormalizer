@@ -5484,6 +5484,60 @@ def test_active_broadcast_backend_failure_converts_fallback_lease_admission(
     assert runtime._terminal_error is primary
 
 
+def test_active_broadcast_validation_failure_converts_fallback_lease_admission(
+    monkeypatch,
+):
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    epoch, construction = gate.begin_lease("active-broadcast-validation-failure")
+    gate.activate_lease(epoch, construction)
+    gate.release(construction)
+    validation_errors = []
+    hard_exits = []
+
+    def hard_exit():
+        hard_exits.append(threading.current_thread().name)
+        raise AssertionError("validation failure attempted a fatal hard exit")
+
+    monkeypatch.setattr(wrapper, "_fatal_hard_exit", hard_exit)
+
+    def run_active_broadcast():
+        token = gate.admit_lease(epoch, "operator_call")
+        try:
+            with wrapper._active_broadcast_admission() as (broadcast, agree):
+                with pytest.raises(
+                    ValueError, match="root 1 is out of range"
+                ) as caught:
+                    broadcast(np.ones((2,), dtype=np.float64), root=1)
+                primary = caught.value
+                validation_errors.append(primary)
+                with gate._condition:
+                    assert gate._tokens[token.sequence].status == "converted"
+                with pytest.raises(
+                    RuntimeError,
+                    match="collective fatal publication is pending",
+                ) as pending:
+                    agree(True)
+                assert pending.value.__cause__ is primary
+                raise primary
+        finally:
+            runtime._release_admission(token)
+
+    worker, results, errors, done = _start_task_18_2_call(
+        run_active_broadcast,
+        name="active-broadcast-validation-failure-with-lease-admission",
+    )
+    _join_task_18_2_call(worker, done)
+
+    primary = validation_errors[0]
+    assert results == []
+    assert hard_exits == []
+    assert errors == [primary]
+    assert gate.wait_for_published(_TASK_18_2_TIMEOUT_S) is primary
+    assert wrapper._fatal_error is primary
+    assert runtime._terminal_error is primary
+
+
 def test_active_broadcast_validation_failure_joins_existing_owner(monkeypatch):
     runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
     primary = RuntimeError("existing active-B publication owner")
