@@ -11703,6 +11703,198 @@ def test_scheduler_detach_commit_uncertainty_is_recoverable(
         _close_case(runtime, store)
 
 
+@pytest.mark.parametrize("callback_failure", ("before_real", "after_real"))
+@pytest.mark.parametrize("resolution", ("retry", "quarantine"))
+def test_dirty_writeback_completion_uncertainty_is_recoverable(
+    monkeypatch,
+    callback_failure,
+    resolution,
+):
+    runtime, _, _, store, provider, lease = _open_managed_active_case(
+        store_id="terminal-writeback-completion-{}-{}".format(
+            callback_failure,
+            resolution,
+        )
+    )
+    dirty = np.arange(4.0) + 37.0
+    original_ref = store.ref("output")
+    original_revision = store._namespace_revision
+    lease.mark_dirty("output", dirty)
+    scheduler = lease.scheduler
+    events = iter((_ManualEvent(done=True), _ManualEvent(done=True)))
+    scheduler._event_factory = lambda: next(events)
+    admission_factory = scheduler._async_admission_factory
+    scheduler._async_admission_factory = None
+    try:
+        with lease._lease_admission("close_progress") as token:
+            assert lease._schedule_writeback(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+                _wait_for_staging=False,
+            )
+    finally:
+        scheduler._async_admission_factory = admission_factory
+
+    ticket = lease._writeback_ticket
+    owner = ticket._owner
+    reservation = lease._store_reservation
+    original_commit = reservation.commit
+    primary = RuntimeError(
+        "dirty writeback completion {} failed".format(callback_failure)
+    )
+    callback_calls = []
+
+    def uncertain_commit(ref, value, **kwargs):
+        callback_calls.append((ref, value))
+        if len(callback_calls) == 1:
+            if callback_failure == "after_real":
+                original_commit(ref, value, **kwargs)
+            raise primary
+        return original_commit(ref, value, **kwargs)
+
+    monkeypatch.setattr(reservation, "commit", uncertain_commit)
+    retained_before = (
+        owner._arrays,
+        owner._allocations,
+        owner._resources,
+        owner._streams,
+        tuple(owner._events),
+        owner._completion_event,
+        owner._callback,
+        owner._accounting,
+        tuple(owner._release_callbacks),
+        owner._resource_releaser,
+        owner._detached,
+        owner._detached_commit,
+        owner._quarantine,
+        dict(scheduler._owners),
+        tuple(scheduler._events),
+        dict(scheduler._event_owners),
+        lease.pool._slot._owner,
+        lease.pool._pending_bytes,
+    )
+    retained_identities = {
+        record.identity for record in owner._allocations
+    }
+
+    def complete_once():
+        admission = None
+        with lease._lease_admission("close_progress"):
+            admission = lease._spawn_async_admission(
+                object(),
+                "d2h_completion",
+            )
+        try:
+            return admission.run(
+                "d2h_completion",
+                lambda *, _admission_token, _admission_validator: owner._detach(
+                    "completed",
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                    _transition_capability=owner._detach_transition_capability,
+                ),
+            )
+        finally:
+            admission.cancel()
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            complete_once()
+        assert caught.value is primary
+        assert owner.error is primary
+        assert owner.state == "enqueued"
+        assert owner._detach_transition_state == "available"
+        assert owner._detach_completion_done is False
+        assert owner._detach_scheduler_receipt is None
+        assert (
+            owner._arrays,
+            owner._allocations,
+            owner._resources,
+            owner._streams,
+            tuple(owner._events),
+            owner._completion_event,
+            owner._callback,
+            owner._accounting,
+            tuple(owner._release_callbacks),
+            owner._resource_releaser,
+            owner._detached,
+            owner._detached_commit,
+            owner._quarantine,
+            dict(scheduler._owners),
+            tuple(scheduler._events),
+            dict(scheduler._event_owners),
+            lease.pool._slot._owner,
+            lease.pool._pending_bytes,
+        ) == retained_before
+        assert id(owner) not in scheduler._owner_detach_preparations
+        assert retained_identities <= {
+            record.identity for record in lease._resource_record.allocations
+        }
+        if callback_failure == "before_real":
+            assert reservation._committed is False
+            assert store.ref("output") == original_ref
+            assert store._namespace_revision == original_revision
+        else:
+            updated = store.ref("output")
+            assert reservation._committed is True
+            assert updated.version == original_ref.version + 1
+            assert store._namespace_revision == original_revision + 1
+            np.testing.assert_array_equal(store.read(updated), dirty)
+
+        if resolution == "retry":
+            with pytest.raises(RuntimeError) as retried:
+                complete_once()
+            assert retried.value is primary
+            updated = store.ref("output")
+            assert updated.version == original_ref.version + 1
+            assert store._namespace_revision == original_revision + 1
+            np.testing.assert_array_equal(store.read(updated), dirty)
+            assert reservation._committed is True
+            assert len(callback_calls) == 2
+            assert owner.state == "detached"
+            assert owner._detach_transition_state == "complete"
+            assert owner._detach_completion_done is True
+            assert id(owner) not in scheduler._owners
+            assert scheduler._owner_detach_preparations == {}
+            assert lease.pool._pending_bytes == 0
+            assert lease.pool._slot._owner is None
+        else:
+            with lease._lease_admission("close_progress") as token:
+                owner.force_quarantine(
+                    primary,
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
+            assert len(callback_calls) == 1
+            assert owner.state == "quarantined"
+            assert owner._detach_transition_state == "complete"
+            assert scheduler._quarantined_owners == [owner]
+            assert id(owner) not in scheduler._owners
+            assert retained_identities <= {
+                record.identity for record in owner._allocations
+            }
+            assert retained_identities <= {
+                record.identity
+                for record in provider._terminal_quarantine.allocations
+            }
+            assert retained_identities <= {
+                record.identity
+                for record in runtime._terminal_quarantine.allocations
+            }
+            if callback_failure == "before_real":
+                assert reservation._committed is False
+                assert store.ref("output") == original_ref
+                assert store._namespace_revision == original_revision
+            else:
+                updated = store.ref("output")
+                assert reservation._committed is True
+                assert updated.version == original_ref.version + 1
+                assert store._namespace_revision == original_revision + 1
+                np.testing.assert_array_equal(store.read(updated), dirty)
+    finally:
+        _close_case(runtime, store)
+
+
 def test_runtime_close_hands_off_retired_scheduler_counted_start(monkeypatch):
     runtime, _, _, store, _, lease = _open_managed_active_case(
         store_id="terminal-runtime-close-retired-scheduler"

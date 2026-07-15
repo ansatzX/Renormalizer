@@ -1569,6 +1569,7 @@ class TransferScheduler:
 
         reservation = self.reservation
         store = self.store
+        completion_capability = object()
 
         def commit(*, _admission_token=None, _admission_validator=None):
             return self._commit_writeback(
@@ -1578,6 +1579,7 @@ class TransferScheduler:
                 staging,
                 _admission_token=_admission_token,
                 _admission_validator=_admission_validator,
+                _completion_capability=completion_capability,
             )
 
         timing = {}
@@ -1661,6 +1663,7 @@ class TransferScheduler:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _completion_capability=None,
     ):
         _require_resource_admission(
             _admission_token,
@@ -1677,6 +1680,7 @@ class TransferScheduler:
                     staging,
                     _admission_token=_admission_token,
                     _admission_validator=_admission_validator,
+                    _completion_capability=_completion_capability,
                 )
             return reservation.commit(destination_ref, staging)
         return store.update(

@@ -411,6 +411,7 @@ class AsyncResourceOwner:
         self._async_quarantine_requested = False
         self._detach_transition_capability = object()
         self._detach_transition_state = "available"
+        self._completion_callback_done = callback is None
         self._detach_completion_done = False
         self._detach_scheduler_receipt = None
         if self._resource_recorder is not None:
@@ -1224,6 +1225,8 @@ class AsyncResourceOwner:
             if self.error is not None:
                 raise self.error
             return True
+        if self.error is not None and self._async_done.is_set():
+            raise self.error
         return False
 
     def mark_enqueued(
@@ -1305,8 +1308,8 @@ class AsyncResourceOwner:
                 self.error = error
             else:
                 self._remember_secondary(error)
-        try:
-            if self._callback is not None:
+        if not self._completion_callback_done:
+            try:
                 if self._callback_requires_admission:
                     self.result = self._callback(
                         _admission_token=_admission_token,
@@ -1314,12 +1317,14 @@ class AsyncResourceOwner:
                     )
                 else:
                     self.result = self._callback()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-                self.error = error
-            else:
-                self._remember_secondary(error)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                    self.error = error
+                else:
+                    self._remember_secondary(error)
+                raise first_error
+            self._completion_callback_done = True
         try:
             if self._accounting is not None and not self.accounted:
                 self._accounting(self)
@@ -1411,7 +1416,11 @@ class AsyncResourceOwner:
                         self.error = error
                     else:
                         self._remember_secondary(error)
-                finally:
+                    if not self._completion_callback_done:
+                        self.state = prior_state
+                        self._detach_transition_state = "available"
+                        raise first_error
+                if self._completion_callback_done:
                     self._detach_completion_done = True
 
             if self._async_quarantine_requested:

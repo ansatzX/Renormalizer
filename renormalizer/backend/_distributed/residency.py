@@ -441,13 +441,27 @@ class HostTensorStore:
         with self._lock:
             self._reservations.pop(id(reservation), None)
 
-    def _commit_reservation(self, reservation, ref, value):
+    def _commit_reservation(
+        self,
+        reservation,
+        ref,
+        value,
+        *,
+        completion_capability=None,
+    ):
         with self._lock:
             self._require_open()
             retained = self._reservations.get(id(reservation))
             if retained is not reservation:
                 raise HostTensorError("host tensor reservation is closed")
             if reservation._committed:
+                if (
+                    completion_capability is not None
+                    and reservation._commit_capability
+                    is completion_capability
+                    and reservation._commit_source_ref == ref
+                ):
+                    return reservation._commit_result
                 raise HostTensorError("host tensor reservation already committed")
             if self._snapshot_locked() != reservation._snapshot:
                 raise HostTensorError(
@@ -473,7 +487,12 @@ class HostTensorStore:
                 "host tensor store bytes",
             )
             self._namespace_revision += 1
-            reservation._promote(updated, self._snapshot_locked())
+            reservation._promote(
+                ref,
+                updated,
+                self._snapshot_locked(),
+                completion_capability=completion_capability,
+            )
             return updated
 
     def validate(self, ref):
@@ -577,6 +596,9 @@ class _HostTensorReservation:
         self._snapshot = snapshot
         self._dirty_ref = dirty_ref
         self._committed = False
+        self._commit_capability = None
+        self._commit_source_ref = None
+        self._commit_result = None
         self._closed = False
         self._managed_guard = _managed_guard
         self._managed_epoch = _managed_epoch
@@ -632,10 +654,20 @@ class _HostTensorReservation:
             raise HostTensorError("host tensor reservation is closed")
         return self._snapshot
 
-    def _promote(self, updated, snapshot):
+    def _promote(
+        self,
+        source_ref,
+        updated,
+        snapshot,
+        *,
+        completion_capability,
+    ):
         self._dirty_ref = updated
         self._snapshot = snapshot
         self._committed = True
+        self._commit_capability = completion_capability
+        self._commit_source_ref = source_ref
+        self._commit_result = updated
 
     def commit(
         self,
@@ -644,6 +676,7 @@ class _HostTensorReservation:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _completion_capability=None,
     ):
         self._require_admission(
             _admission_token,
@@ -653,7 +686,12 @@ class _HostTensorReservation:
         )
         if self._closed:
             raise HostTensorError("host tensor reservation is closed")
-        return self._store._commit_reservation(self, ref, value)
+        return self._store._commit_reservation(
+            self,
+            ref,
+            value,
+            completion_capability=_completion_capability,
+        )
 
     def close(
         self,
@@ -679,6 +717,9 @@ class _HostTensorReservation:
             self._store = None
             self._snapshot = None
             self._dirty_ref = None
+            self._commit_capability = None
+            self._commit_source_ref = None
+            self._commit_result = None
             self._closed = True
 
     def __enter__(self):
