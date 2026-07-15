@@ -861,6 +861,7 @@ class TransferScheduler:
         holder["owner"] = owner
         self._owners[id(owner)] = owner
         self._owner_detach_capabilities[id(owner)] = detach_capability
+        owner._consume_counted_start_request()
         return owner
 
     def _owner_detached(
@@ -1571,14 +1572,17 @@ class TransferScheduler:
 
     def _start_counted_completions(self, *, _close_transition=None):
         if self._managed_guard is not None:
-            self._managed_guard.require_close_transition(
+            self._managed_guard.request_counted_starts(
                 _close_transition,
-                epoch=lambda _transition: self._managed_epoch,
+                epoch=self._managed_epoch,
             )
         for owner in tuple(self._owners.values()):
-            owner._start_counted_completion(
-                _close_transition=_close_transition,
-            )
+            if self._managed_guard is None:
+                owner._start_counted_completion()
+            else:
+                owner._consume_counted_start_request(
+                    _close_transition=_close_transition,
+                )
 
     def close(
         self,

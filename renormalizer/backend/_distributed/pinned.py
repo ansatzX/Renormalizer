@@ -99,6 +99,10 @@ class StagingSlot:
 
     @property
     def array(self):
+        if self._managed_guard is not None:
+            raise TypeError(
+                "managed staging array requires capability-checked admission"
+            )
         self._require_admission(
             allowed_operations=(
                 "acquire",
@@ -111,6 +115,34 @@ class StagingSlot:
                 "schedule_writeback",
             )
         )
+        if self._array is None:
+            raise RuntimeError("staging slot is closed")
+        return self._array
+
+    def _checkout_array(
+        self,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+        _checkout_capability=None,
+    ):
+        admission = self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "close_progress",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
+        self._require_checkout_capability(admission, _checkout_capability)
+        if not self._checked_out:
+            raise RuntimeError("staging slot is not checked out")
         if self._array is None:
             raise RuntimeError("staging slot is closed")
         return self._array
@@ -188,21 +220,11 @@ class StagingSlot:
         _admission_validator=None,
         _checkout_capability=None,
     ):
-        admission = self._require_admission(
-            _admission_token,
-            _admission_validator,
-            allowed_operations=(
-                "acquire",
-                "close_progress",
-                "load",
-                "operator_call",
-                "prefetch",
-                "schedule_writeback",
-            ),
+        array = self._checkout_array(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+            _checkout_capability=_checkout_capability,
         )
-        self._require_checkout_capability(admission, _checkout_capability)
-        if not self._checked_out:
-            raise RuntimeError("staging slot is not checked out")
         if order not in {"C", "F"}:
             raise ValueError("staging view order must be 'C' or 'F'")
         dtype = np.dtype(dtype)
@@ -214,7 +236,7 @@ class StagingSlot:
         return np.ndarray(
             shape=shape,
             dtype=dtype,
-            buffer=self.array,
+            buffer=array,
             offset=0,
             order=order,
         )
@@ -227,26 +249,16 @@ class StagingSlot:
         _admission_validator=None,
         _checkout_capability=None,
     ):
-        admission = self._require_admission(
-            _admission_token,
-            _admission_validator,
-            allowed_operations=(
-                "acquire",
-                "close_progress",
-                "load",
-                "operator_call",
-                "prefetch",
-                "schedule_writeback",
-            ),
+        array = self._checkout_array(
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+            _checkout_capability=_checkout_capability,
         )
-        self._require_checkout_capability(admission, _checkout_capability)
-        if not self._checked_out:
-            raise RuntimeError("staging slot is not checked out")
         if self._owner is not None:
             raise RuntimeError("staging slot already has a completion owner")
         owner = require_async_owner(completion, "staging lifetime transfer")
         self._owner = owner
-        owner.capture_allocations(self.array)
+        owner.capture_allocations(array)
         owner.capture_resources(self)
         owner.add_release_callback(
             lambda pool=self._pool, slot=self, retained=owner: pool._owner_detached(

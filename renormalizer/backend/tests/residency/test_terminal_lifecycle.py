@@ -9796,11 +9796,14 @@ def test_async_detach_proves_admission_before_owner_or_scheduler_mutation(
         store_id="terminal-detach-before-mutation-{}".format(candidate)
     )
     gate = runtime._terminal_gate
+    lease.scheduler._event_factory = lambda: _ManualEvent(done=True)
     with lease._lease_admission("acquire"):
         owner = lease.scheduler._register_owner(
             "compute",
         )
         owner.mark_enqueued()
+        lease.scheduler._new_event(owner, completion=True)
+        owner.arm_completion()
 
     def snapshot():
         return (
@@ -9832,16 +9835,11 @@ def test_async_detach_proves_admission_before_owner_or_scheduler_mutation(
         if sibling is not None:
             gate.release(sibling)
         if owner.state != "detached":
-            admission = owner._async_admission
-
-            def detach(*, _admission_token, _admission_validator):
-                owner._detach(
-                    "drained",
-                    _admission_token=_admission_token,
-                    _admission_validator=_admission_validator,
+            with lease._lease_admission("resource_state") as token:
+                owner.reap(
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
                 )
-
-            admission.run("compute_completion", detach)
         _close_case(runtime, store)
 
 
@@ -10177,8 +10175,7 @@ def test_scheduler_owner_detach_proves_admission_before_membership_mutation(
 
         with lease._lease_admission("resource_state") as token:
             validator = lease._exact_admission_validator(token)
-            assert owner._detach(
-                "drained",
+            assert owner.reap(
                 _admission_token=token,
                 _admission_validator=validator,
             )
@@ -10197,8 +10194,7 @@ def test_scheduler_owner_detach_proves_admission_before_membership_mutation(
             scheduler._event_owners.clear()
             scheduler._event_owners.update(before[2])
             with lease._lease_admission("resource_state") as token:
-                owner._detach(
-                    "drained",
+                owner.reap(
                     _admission_token=token,
                     _admission_validator=lease._exact_admission_validator(token),
                 )
@@ -10740,8 +10736,7 @@ def test_scheduler_detach_requires_exact_owner_capability():
                 assert snapshot() == before
 
         with lease._lease_admission("resource_state") as token:
-            assert owner._detach(
-                "drained",
+            assert owner.reap(
                 _admission_token=token,
                 _admission_validator=lease._exact_admission_validator(token),
             )
@@ -10756,8 +10751,7 @@ def test_scheduler_detach_requires_exact_owner_capability():
             scheduler._event_owners.clear()
             scheduler._event_owners.update(before[2])
             with lease._lease_admission("resource_state") as token:
-                owner._detach(
-                    "drained",
+                owner.reap(
                     _admission_token=token,
                     _admission_validator=lease._exact_admission_validator(token),
                 )
@@ -10887,9 +10881,7 @@ def test_staging_checkout_capability_is_invalid_after_generation_advance():
         )
         try:
             with pytest.raises(RuntimeError, match="capability"):
-                slot.view(
-                    (1,),
-                    np.dtype(np.float64),
+                slot._checkout_array(
                     _checkout_capability=stale,
                     _admission_token=token,
                     _admission_validator=validator,
@@ -10901,6 +10893,14 @@ def test_staging_checkout_capability_is_invalid_after_generation_advance():
                 lease.pool._checked_out_bytes,
             ) == before
             assert first_slot is slot
+            assert (
+                slot._checkout_array(
+                    _checkout_capability=second._checkout_capability,
+                    _admission_token=token,
+                    _admission_validator=validator,
+                )
+                is slot._array
+            )
             view = slot.view(
                 (1,),
                 np.dtype(np.float64),
@@ -10912,3 +10912,373 @@ def test_staging_checkout_capability_is_invalid_after_generation_advance():
         finally:
             second.__exit__(None, None, None)
     _close_case(runtime, store)
+
+
+def test_lease_close_latches_counted_start_before_scheduler_owner_publication(
+    monkeypatch,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-counted-owner-publication-lease-close"
+    )
+    scheduler = lease.scheduler
+    gate = runtime._terminal_gate
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    owner_constructed = threading.Event()
+    release_constructor = threading.Event()
+    owner_published = threading.Event()
+    close_scan_complete = threading.Event()
+    release_close_scan = threading.Event()
+    cleanup_rescan = threading.Event()
+    start_requested = threading.Event()
+    owners = []
+    start_calls = []
+    original_init = AsyncResourceOwner.__init__
+    original_register = scheduler._register_owner
+    original_scan = scheduler._start_counted_completions
+    original_start = AsyncResourceOwner._start_counted_completion
+
+    def pause_owner_construction(self, kind, *args, **kwargs):
+        original_init(self, kind, *args, **kwargs)
+        if kind == "h2d" and not owners:
+            owners.append(self)
+            owner_constructed.set()
+            assert release_constructor.wait(_TIMEOUT_S)
+
+    def observe_registration(*args, **kwargs):
+        owner = original_register(*args, **kwargs)
+        if owner is owners[0]:
+            owner_published.set()
+        return owner
+
+    def observe_scan(*args, **kwargs):
+        result = original_scan(*args, **kwargs)
+        if not close_scan_complete.is_set():
+            close_scan_complete.set()
+            assert release_close_scan.wait(_TIMEOUT_S)
+            if cleanup_rescan.is_set():
+                return original_scan(*args, **kwargs)
+        return result
+
+    def observe_start(self, *args, **kwargs):
+        if owners and self is owners[0]:
+            start_calls.append(self)
+            start_requested.set()
+        return original_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncResourceOwner, "__init__", pause_owner_construction)
+    monkeypatch.setattr(scheduler, "_register_owner", observe_registration)
+    monkeypatch.setattr(scheduler, "_start_counted_completions", observe_scan)
+    monkeypatch.setattr(
+        AsyncResourceOwner,
+        "_start_counted_completion",
+        observe_start,
+    )
+    identity = lease.cache_identities[0]
+    prefetch, _, prefetch_errors, prefetch_done = _start(
+        lambda: lease._load_identity(identity, prefetch=True)
+    )
+    closer = None
+    try:
+        assert owner_constructed.wait(_TIMEOUT_S)
+        closer, _, close_errors, close_done = _start(lease.close)
+        assert close_scan_complete.wait(_TIMEOUT_S)
+        assert id(owners[0]) not in scheduler._owners
+
+        release_constructor.set()
+        assert owner_published.wait(_TIMEOUT_S)
+        assert start_requested.is_set()
+        release_close_scan.set()
+
+        _join(prefetch, prefetch_done)
+        _join(closer, close_done)
+        assert prefetch_errors == []
+        assert close_errors == []
+        assert start_calls == [owners[0]]
+        assert owners[0].state == "detached"
+        assert id(owners[0]) not in scheduler._owners
+        with gate._condition:
+            assert not gate._has_active_tokens()
+    finally:
+        release_constructor.set()
+        if owners and not start_requested.is_set():
+            cleanup_rescan.set()
+        release_close_scan.set()
+        if prefetch.is_alive():
+            _join(prefetch, prefetch_done)
+        if closer is not None and closer.is_alive():
+            _join(closer, close_done)
+        _close_case(runtime, store)
+
+
+def test_runtime_close_latches_dirty_owner_start_before_scheduler_publication(
+    monkeypatch,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-counted-owner-publication-runtime-close"
+    )
+    scheduler = lease.scheduler
+    gate = runtime._terminal_gate
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    lease.mark_dirty("output", np.arange(4.0))
+    owner_constructed = threading.Event()
+    release_constructor = threading.Event()
+    owner_published = threading.Event()
+    runtime_scan_complete = threading.Event()
+    release_runtime_scan = threading.Event()
+    cleanup_rescan = threading.Event()
+    start_requested = threading.Event()
+    owners = []
+    start_calls = []
+    original_init = AsyncResourceOwner.__init__
+    original_register = scheduler._register_owner
+    original_scan = scheduler._start_counted_completions
+    original_start = AsyncResourceOwner._start_counted_completion
+
+    def pause_owner_construction(self, kind, *args, **kwargs):
+        original_init(self, kind, *args, **kwargs)
+        if kind == "d2h" and not owners:
+            owners.append(self)
+            owner_constructed.set()
+            assert release_constructor.wait(_TIMEOUT_S)
+
+    def observe_registration(*args, **kwargs):
+        owner = original_register(*args, **kwargs)
+        if owner is owners[0]:
+            owner_published.set()
+        return owner
+
+    def observe_scan(*args, **kwargs):
+        result = original_scan(*args, **kwargs)
+        if not runtime_scan_complete.is_set():
+            runtime_scan_complete.set()
+            assert release_runtime_scan.wait(_TIMEOUT_S)
+            if cleanup_rescan.is_set():
+                return original_scan(*args, **kwargs)
+        return result
+
+    def observe_start(self, *args, **kwargs):
+        if owners and self is owners[0]:
+            start_calls.append(self)
+            start_requested.set()
+        return original_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncResourceOwner, "__init__", pause_owner_construction)
+    monkeypatch.setattr(scheduler, "_register_owner", observe_registration)
+    monkeypatch.setattr(scheduler, "_start_counted_completions", observe_scan)
+    monkeypatch.setattr(
+        AsyncResourceOwner,
+        "_start_counted_completion",
+        observe_start,
+    )
+    progress, _, progress_errors, progress_done = _start(
+        lambda: lease.close(wait=False)
+    )
+    closer = None
+    try:
+        assert owner_constructed.wait(_TIMEOUT_S)
+        closer, _, close_errors, close_done = _start(runtime.close)
+        assert runtime_scan_complete.wait(_TIMEOUT_S)
+        assert id(owners[0]) not in scheduler._owners
+
+        release_constructor.set()
+        assert owner_published.wait(_TIMEOUT_S)
+        assert start_requested.is_set()
+        release_runtime_scan.set()
+
+        _join(progress, progress_done)
+        _join(closer, close_done)
+        assert progress_errors == []
+        assert close_errors == []
+        assert start_calls == [owners[0]]
+        assert owners[0].state == "detached"
+        assert id(owners[0]) not in scheduler._owners
+        with gate._condition:
+            assert not gate._has_active_tokens()
+    finally:
+        release_constructor.set()
+        if owners and not start_requested.is_set():
+            cleanup_rescan.set()
+        release_runtime_scan.set()
+        if progress.is_alive():
+            _join(progress, progress_done)
+        if closer is not None and closer.is_alive():
+            _join(closer, close_done)
+        _close_case(runtime, store)
+
+
+def test_counted_start_overlap_after_owner_insert_is_consumed_exactly_once(
+    monkeypatch,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-counted-owner-publication-overlap"
+    )
+    scheduler = lease.scheduler
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    publication_inserted = threading.Event()
+    release_publication = threading.Event()
+    start_requested = threading.Event()
+    owners = []
+    start_calls = []
+    original_consume = AsyncResourceOwner._consume_counted_start_request
+    original_start = AsyncResourceOwner._start_counted_completion
+
+    def pause_publication(self, *args, **kwargs):
+        if (
+            self.kind == "h2d"
+            and kwargs.get("_close_transition") is None
+            and not publication_inserted.is_set()
+        ):
+            owners.append(self)
+            publication_inserted.set()
+            assert release_publication.wait(_TIMEOUT_S)
+        return original_consume(self, *args, **kwargs)
+
+    def observe_start(self, *args, **kwargs):
+        if owners and self is owners[0]:
+            start_calls.append(self)
+            start_requested.set()
+        return original_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        AsyncResourceOwner,
+        "_consume_counted_start_request",
+        pause_publication,
+    )
+    monkeypatch.setattr(
+        AsyncResourceOwner,
+        "_start_counted_completion",
+        observe_start,
+    )
+    identity = lease.cache_identities[0]
+    prefetch, _, prefetch_errors, prefetch_done = _start(
+        lambda: lease._load_identity(identity, prefetch=True)
+    )
+    closer = None
+    try:
+        assert publication_inserted.wait(_TIMEOUT_S)
+        assert id(owners[0]) in scheduler._owners
+        closer, _, close_errors, close_done = _start(lease.close)
+        assert start_requested.wait(_TIMEOUT_S)
+        release_publication.set()
+
+        _join(prefetch, prefetch_done)
+        _join(closer, close_done)
+        assert prefetch_errors == []
+        assert close_errors == []
+        assert start_calls == [owners[0]]
+        assert owners[0].state == "detached"
+        assert id(owners[0]) not in scheduler._owners
+    finally:
+        release_publication.set()
+        if prefetch.is_alive():
+            _join(prefetch, prefetch_done)
+        if closer is not None and closer.is_alive():
+            _join(closer, close_done)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("operation", ("resource_state", "acquire"))
+def test_async_owner_direct_detach_requires_owner_transition_capability(
+    operation,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-owner-transition-capability-{}".format(operation)
+    )
+    scheduler = lease.scheduler
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    with lease._lease_admission("acquire"):
+        owner = scheduler._register_owner(
+            "compute",
+            defer_counted_admission=True,
+        )
+        owner.mark_enqueued()
+        event = scheduler._new_event(owner, completion=True)
+
+    def snapshot():
+        return (
+            owner.state,
+            owner.error,
+            tuple(owner._events),
+            owner._completion_event,
+            tuple(owner._release_callbacks),
+            dict(scheduler._owners),
+            tuple(scheduler._events),
+            dict(scheduler._event_owners),
+        )
+
+    before = snapshot()
+    try:
+        with lease._lease_admission(operation) as token:
+            with pytest.raises(RuntimeError, match="transition capability"):
+                owner._detach(
+                    "completed",
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
+        assert snapshot() == before
+
+        with lease._lease_admission("resource_state") as token:
+            assert owner.reap(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+        assert owner.state == "detached"
+        assert id(owner) not in scheduler._owners
+        assert event not in scheduler._events
+    finally:
+        _close_case(runtime, store)
+
+
+def test_managed_staging_raw_array_requires_exact_checkout_capability():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-staging-raw-checkout-capability"
+    )
+    gate = runtime._terminal_gate
+    checkout_token = gate.admit_lease(lease._epoch, "acquire")
+    checkout_validator = lease._exact_admission_validator(checkout_token)
+    checkout = lease.pool.checkout(
+        8,
+        _admission_token=checkout_token,
+        _admission_validator=checkout_validator,
+    )
+    slot = checkout.__enter__()
+    capability = checkout._checkout_capability
+    foreign_errors = []
+
+    def foreign_access():
+        with lease._lease_admission("acquire") as token:
+            try:
+                slot._checkout_array(
+                    _checkout_capability=capability,
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
+            except BaseException as error:
+                foreign_errors.append(error)
+
+    foreign = None
+    try:
+        with pytest.raises((TypeError, RuntimeError), match="capability"):
+            _ = slot.array
+        assert (
+            slot._checkout_array(
+                _checkout_capability=capability,
+                _admission_token=checkout_token,
+                _admission_validator=checkout_validator,
+            )
+            is slot._array
+        )
+        foreign, _, thread_errors, foreign_done = _start(foreign_access)
+        _join(foreign, foreign_done)
+        assert thread_errors == []
+        assert len(foreign_errors) == 1
+        assert isinstance(foreign_errors[0], RuntimeError)
+        assert "capability" in str(foreign_errors[0])
+        assert slot._checked_out is True
+        assert slot._checkout_capability is capability
+    finally:
+        if foreign is not None and foreign.is_alive():
+            _join(foreign, foreign_done)
+        checkout.__exit__(None, None, None)
+        gate.release(checkout_token)
+        _close_case(runtime, store)

@@ -208,6 +208,12 @@ class _ManagedResourceAdmissionGuard:
             epoch = epoch(transition)
         return gate._require_managed_close_transition(transition, epoch=epoch)
 
+    def request_counted_starts(self, transition, *, epoch):
+        return self.gate._request_counted_async_starts(
+            transition,
+            epoch=epoch,
+        )
+
 
 def _require_managed_resource_admission(
     guard,
@@ -501,6 +507,8 @@ class _TokenState:
     async_capability: object = _MISSING
     async_operation: object = _MISSING
     async_claimed: bool = False
+    async_start_requested: bool = False
+    async_start_consumed: bool = False
 
 
 @dataclass
@@ -1707,6 +1715,51 @@ class _TerminalLifecycleGate:
             if self._live_epoch == transition.epoch:
                 self._live_epoch = None
             self._condition.notify_all()
+
+    def _request_counted_async_starts(self, transition, *, epoch):
+        """Latch close-owned start intent without retaining async resources."""
+        with self._condition:
+            self._require_managed_close_transition(transition, epoch=epoch)
+            requested = 0
+            for state in self._tokens.values():
+                token = state.token
+                if (
+                    state.status != "active"
+                    or state.async_capability is _MISSING
+                    or token.parent_sequence is None
+                    or token.epoch != epoch
+                    or state.async_start_consumed
+                ):
+                    continue
+                if not state.async_start_requested:
+                    state.async_start_requested = True
+                    requested += 1
+            if requested:
+                self._condition.notify_all()
+            return requested
+
+    def _consume_counted_async_start(self, sequence, capability):
+        """Consume one gate-owned start latch after owner publication."""
+        if type(sequence) is not int or sequence <= 0:
+            raise TypeError("counted async admission sequence is required")
+        with self._condition:
+            state = self._tokens.get(sequence)
+            if state is None or state.status != "active":
+                return False
+            if (
+                state.async_capability is not capability
+                or state.token.parent_sequence is None
+            ):
+                raise RuntimeError(
+                    "counted async start capability does not match admission"
+                )
+            if (
+                not state.async_start_requested
+                or state.async_start_consumed
+            ):
+                return False
+            state.async_start_consumed = True
+            return True
 
     def spawn_async(
         self,

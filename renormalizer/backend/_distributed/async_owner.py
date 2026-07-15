@@ -223,6 +223,17 @@ class _CountedAsyncAdmission:
     def close_owned(self):
         return self.token.scope == "lease_close"
 
+    def consume_start_request(self):
+        with self._state_lock:
+            if self._state in {"cancelled", "released"}:
+                return False
+            sequence = self._token.sequence
+            capability = self._capability
+        return self._gate._consume_counted_async_start(
+            sequence,
+            capability,
+        )
+
     @property
     def operation(self):
         return (
@@ -395,6 +406,8 @@ class AsyncResourceOwner:
             "uninstalled" if _async_admission is None else "installed"
         )
         self._async_quarantine_requested = False
+        self._detach_transition_capability = object()
+        self._detach_transition_state = "available"
         if self._resource_recorder is not None:
             self._resource_recorder(
                 resource=self,
@@ -864,9 +877,39 @@ class AsyncResourceOwner:
             admission = self._async_admission
         admission.wake()
 
-    def _start_counted_completion(self, *, _close_transition=None):
-        if self._managed_guard is not None:
+    def _consume_counted_start_request(self, *, _close_transition=None):
+        with self._async_lock:
+            admission = self._async_admission
+        if admission is None:
             if _close_transition is None:
+                return False
+            self._start_counted_completion(
+                _close_transition=_close_transition,
+            )
+            return True
+        if not admission.consume_start_request():
+            return False
+        with self._async_lock:
+            if (
+                self._async_admission is not admission
+                or self._async_admission_state == "cancelled"
+            ):
+                return False
+        self._start_counted_completion(_latched_admission=admission)
+        return True
+
+    def _start_counted_completion(
+        self,
+        *,
+        _close_transition=None,
+        _latched_admission=None,
+    ):
+        if self._managed_guard is not None:
+            if _latched_admission is not None:
+                with self._async_lock:
+                    if self._async_admission is not _latched_admission:
+                        return False
+            elif _close_transition is None:
                 self._require_admission(
                     allowed_operations=(
                         "child_close",
@@ -885,6 +928,7 @@ class AsyncResourceOwner:
                 self._async_start_pending = True
         self._watch_counted_completion()
         self._publish_counted_start_request()
+        return True
 
     def publish_counted_completion(
         self,
@@ -958,7 +1002,11 @@ class AsyncResourceOwner:
             try:
                 wait_event(self._completion_event)
             except BaseException as error:
-                self._resolve_counted_wait_failure(error)
+                self._resolve_counted_wait_failure(
+                    error,
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
                 return
             if self.state in {"detached", "quarantined"}:
                 return
@@ -967,6 +1015,7 @@ class AsyncResourceOwner:
                     "completed",
                     _admission_token=_admission_token,
                     _admission_validator=_admission_validator,
+                    _transition_capability=self._detach_transition_capability,
                 )
             except BaseException:
                 # _detach records callback/accounting failures before raising them.
@@ -986,7 +1035,13 @@ class AsyncResourceOwner:
                     self._async_worker_state = "terminal"
             self._async_done.set()
 
-    def _resolve_counted_wait_failure(self, error):
+    def _resolve_counted_wait_failure(
+        self,
+        error,
+        *,
+        _admission_token,
+        _admission_validator,
+    ):
         if self.error is None:
             self._remember_error(error)
         else:
@@ -999,7 +1054,12 @@ class AsyncResourceOwner:
             return
         if self.state not in {"detached", "quarantined"}:
             try:
-                self._detach("drained")
+                self._detach(
+                    "drained",
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                    _transition_capability=self._detach_transition_capability,
+                )
             except BaseException:
                 pass
 
@@ -1272,6 +1332,7 @@ class AsyncResourceOwner:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _transition_capability=None,
     ):
         admission = self._require_admission(
             _admission_token,
@@ -1296,6 +1357,24 @@ class AsyncResourceOwner:
                 "scheduler_complete",
             ),
         )
+        if terminal_state not in {"completed", "drained"}:
+            raise ValueError("async owner terminal state is invalid")
+        with self._async_lock:
+            if (
+                self._detach_transition_capability is None
+                or _transition_capability
+                is not self._detach_transition_capability
+            ):
+                raise RuntimeError(
+                    "async owner transition capability does not own detach"
+                )
+            if self._detach_transition_state != "available":
+                raise RuntimeError("async owner detach transition is not available")
+            if self.state not in {"new", "enqueued"}:
+                raise RuntimeError("async owner state cannot enter detach")
+            if terminal_state == "completed" and self.state != "enqueued":
+                raise RuntimeError("only an enqueued async owner can complete")
+            self._detach_transition_state = "running"
         callback_token = _admission_token
         callback_validator = _admission_validator
         if admission is not None and callback_token is None:
@@ -1310,8 +1389,6 @@ class AsyncResourceOwner:
 
             callback_validator = validate_callback_admission
 
-        if terminal_state not in {"completed", "drained"}:
-            raise ValueError("async owner terminal state is invalid")
         self.state = terminal_state
         first_error = self.error
         if self._completion_armed:
@@ -1383,6 +1460,9 @@ class AsyncResourceOwner:
         self._resource_releaser = None
         self._release_callbacks = []
         self._completion_armed = False
+        with self._async_lock:
+            self._detach_transition_capability = None
+            self._detach_transition_state = "complete"
         if first_error is not None:
             raise first_error
         return True
@@ -1392,6 +1472,8 @@ class AsyncResourceOwner:
             if self.state in {"detached", "quarantined"}:
                 return False
             self.state = "quarantined"
+            self._detach_transition_capability = None
+            self._detach_transition_state = "complete"
             quarantine = self._quarantine
             self._detached = None
             self._quarantine = None
@@ -1484,7 +1566,12 @@ class AsyncResourceOwner:
         self._cancel_unclaimed_async()
         if self.state == "new":
             try:
-                self._detach("drained")
+                self._detach(
+                    "drained",
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                    _transition_capability=self._detach_transition_capability,
+                )
             except BaseException:
                 pass
             raise self.error
@@ -1495,7 +1582,12 @@ class AsyncResourceOwner:
             self._move_to_quarantine()
             raise self.error
         try:
-            self._detach("drained")
+            self._detach(
+                "drained",
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+                _transition_capability=self._detach_transition_capability,
+            )
         except BaseException:
             pass
         raise self.error
@@ -1546,10 +1638,19 @@ class AsyncResourceOwner:
         try:
             complete = event_complete(self._completion_event)
         except BaseException as error:
-            return self.fail(error)
+            return self.fail(
+                error,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
         if not complete:
             return False
-        return self._detach("completed")
+        return self._detach(
+            "completed",
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+            _transition_capability=self._detach_transition_capability,
+        )
 
     def wait(
         self,
@@ -1602,8 +1703,17 @@ class AsyncResourceOwner:
                 "async completion lifecycle timed out during event wait",
             )
         except BaseException as error:
-            return self.fail(error)
-        return self._detach("completed")
+            return self.fail(
+                error,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
+        return self._detach(
+            "completed",
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+            _transition_capability=self._detach_transition_capability,
+        )
 
     def drain(
         self,
@@ -1643,7 +1753,12 @@ class AsyncResourceOwner:
             self._remember_error(error)
             self._move_to_quarantine()
             raise self.error
-        return self._detach("drained")
+        return self._detach(
+            "drained",
+            _admission_token=_admission_token,
+            _admission_validator=_admission_validator,
+            _transition_capability=self._detach_transition_capability,
+        )
 
     def take_result(
         self,
