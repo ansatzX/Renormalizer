@@ -1061,6 +1061,7 @@ class AsyncResourceOwner:
                 "pool_reap",
                 "prefetch",
                 "reap",
+                "resource_state",
                 "schedule_writeback",
                 "scheduler_close",
                 "scheduler_complete",
@@ -1108,6 +1109,7 @@ class AsyncResourceOwner:
                 "pool_reap",
                 "prefetch",
                 "reap",
+                "resource_state",
                 "schedule_writeback",
                 "scheduler_close",
                 "scheduler_complete",
@@ -1252,6 +1254,29 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            ),
+        )
         if terminal_state not in {"completed", "drained"}:
             raise ValueError("async owner terminal state is invalid")
         self.state = terminal_state
@@ -1454,6 +1479,7 @@ class AsyncResourceOwner:
                 "pool_reap",
                 "prefetch",
                 "reap",
+                "resource_state",
                 "schedule_writeback",
                 "scheduler_close",
                 "scheduler_complete",

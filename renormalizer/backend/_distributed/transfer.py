@@ -1361,6 +1361,7 @@ class TransferScheduler:
                 "pool_reap",
                 "prefetch",
                 "reap",
+                "resource_state",
                 "schedule_writeback",
                 "scheduler_close",
                 "scheduler_complete",
@@ -1397,7 +1398,11 @@ class TransferScheduler:
         self._require_admission(
             _admission_token,
             _admission_validator,
-            allowed_operations=("scheduler_close", "scheduler_complete"),
+            allowed_operations=(
+                "lease_construction",
+                "scheduler_close",
+                "scheduler_complete",
+            ),
         )
         _remaining_lifecycle_time(
             _deadline,

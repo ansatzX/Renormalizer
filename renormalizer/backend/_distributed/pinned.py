@@ -56,6 +56,7 @@ class StagingSlot:
         self._nbytes = 0
         self._owner = None
         self._checked_out = False
+        self._checkout_admission = None
 
     def _require_admission(
         self,
@@ -391,7 +392,11 @@ class PinnedBufferPool:
             None,
             None,
             allowed_operations=(
+                "acquire",
+                "child_close",
                 "lease_construction",
+                "mark_dirty",
+                "operator_call",
                 "observe_peaks",
                 "resource_state",
             ),
@@ -580,7 +585,7 @@ class PinnedBufferPool:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(
+        admission = self._require_admission(
             _admission_token,
             _admission_validator,
             allowed_operations=(
@@ -601,6 +606,7 @@ class PinnedBufferPool:
             raise RuntimeError("no staging slot is available")
         slot._checked_out = True
         slot._nbytes = nbytes
+        slot._checkout_admission = admission
         self._checked_out_bytes = nbytes
         self._peak_checked_out_bytes = max(self._peak_checked_out_bytes, nbytes)
         return slot
@@ -612,20 +618,24 @@ class PinnedBufferPool:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(
+        admission = self._require_admission(
             _admission_token,
             _admission_validator,
             allowed_operations=(
                 "acquire",
-                "child_close",
                 "load",
                 "operator_call",
                 "prefetch",
                 "schedule_writeback",
             ),
         )
+        if self._managed and slot._checkout_admission is not admission:
+            raise RuntimeError(
+                "staging slot release does not own its checkout admission"
+            )
         if slot is not self._slot or not slot._checked_out:
             raise RuntimeError("staging slot is not owned by this checkout")
+        slot._checkout_admission = None
         slot._checked_out = False
         self._checked_out_bytes = 0
         owner = slot._owner
@@ -708,7 +718,15 @@ class PinnedBufferPool:
         self._require_admission(
             _admission_token,
             _admission_validator,
-            allowed_operations=("lease_construction", "pool_close"),
+            allowed_operations=(
+                "acquire",
+                "lease_construction",
+                "load",
+                "operator_call",
+                "pool_close",
+                "prefetch",
+                "schedule_writeback",
+            ),
         )
         _remaining_lifecycle_time(
             _deadline,

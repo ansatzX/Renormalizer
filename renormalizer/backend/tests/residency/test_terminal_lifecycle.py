@@ -348,6 +348,13 @@ def _open_active_case(*, store_id):
 def _open_managed_active_case(*, store_id):
     runtime = _runtime()
     request, plan, store, _, _ = _active_case(runtime, store_id=store_id)
+    provider = _install_managed_provider(runtime, request)
+    receipt = runtime.preflight_residency(request, plan)
+    lease = provider.open_working_set(request, plan, store, receipt).__enter__()
+    return runtime, request, plan, store, provider, lease
+
+
+def _install_managed_provider(runtime, request):
     construct_token = runtime._terminal_gate.admit_runtime_setup(
         "provider_construct"
     )
@@ -380,9 +387,7 @@ def _open_managed_active_case(*, store_id):
         _admission_validator=install_validator,
     )
     runtime._release_admission(install_token)
-    receipt = runtime.preflight_residency(request, plan)
-    lease = provider.open_working_set(request, plan, store, receipt).__enter__()
-    return runtime, request, plan, store, provider, lease
+    return provider
 
 
 def _close_case(runtime, store):
@@ -7965,6 +7970,7 @@ def test_real_managed_descendants_reject_wrong_and_stale_admissions():
             tuple(lease.scheduler._events),
         ) == before
 
+        checkout.__exit__(None, None, None)
         gate.release(token)
         token = None
         stale = replace(wrong, sequence=wrong.sequence - 1000)
@@ -7989,17 +7995,14 @@ def test_real_managed_descendants_reject_wrong_and_stale_admissions():
                 _admission_token=cleanup_token,
                 _admission_validator=cleanup_validator,
             )
-            lease.pool._release(
-                slot,
-                _admission_token=cleanup_token,
-                _admission_validator=cleanup_validator,
-            )
             owner.reap(
                 _admission_token=cleanup_token,
                 _admission_validator=cleanup_validator,
             )
     finally:
         if token is not None:
+            if slot._checked_out:
+                checkout.__exit__(None, None, None)
             gate.release(token)
         _close_case(runtime, store)
 
@@ -9723,3 +9726,383 @@ def test_every_managed_lower_helper_declares_operations_explicitly():
                 missing.append("{}:{}".format(path, call.lineno))
 
     assert missing == []
+
+
+def test_managed_activation_exception_rolls_back_without_terminal_publication(
+    monkeypatch,
+):
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-managed-activation-rollback",
+    )
+    provider = _install_managed_provider(runtime, request)
+    receipt = runtime.preflight_residency(request, plan)
+    primary = RuntimeError("managed activation failed")
+    created = {}
+
+    def capture_factory(attribute, name):
+        original = getattr(provider, attribute)
+
+        def factory(*args, **kwargs):
+            resource = original(*args, **kwargs)
+            created[name] = resource
+            return resource
+
+        monkeypatch.setattr(provider, attribute, factory)
+
+    capture_factory("_provision_status_workspace", "status")
+    capture_factory("_cache_factory", "cache")
+    capture_factory("_pool_factory", "pool")
+    capture_factory("_scheduler_factory", "scheduler")
+    original_reserve = store.reserve
+
+    def reserve(*args, **kwargs):
+        reservation = original_reserve(*args, **kwargs)
+        created["store"] = reservation
+        return reservation
+
+    monkeypatch.setattr(store, "reserve", reserve)
+    monkeypatch.setattr(
+        provider,
+        "_activate_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(primary),
+    )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            provider.open_working_set(request, plan, store, receipt)
+        assert caught.value is primary
+        assert set(created) == {"status", "cache", "pool", "scheduler", "store"}
+        assert all(resource._closed for resource in created.values())
+        assert store._reservations == {}
+        gate = runtime._terminal_gate
+        with gate._condition:
+            assert gate._phase is _TerminalPhase.HEALTHY
+            assert gate._fatal_transition is None
+            assert gate._live_epoch is None
+            assert not gate._has_active_tokens()
+        assert runtime._terminal_secondary_errors == ()
+        assert provider._active_lease is None
+        assert provider._provisional_resources is None
+    finally:
+        _repair_test_construction_state(runtime._terminal_gate)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("candidate", ("missing", "sibling"))
+def test_async_detach_proves_admission_before_owner_or_scheduler_mutation(
+    candidate,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-detach-before-mutation-{}".format(candidate)
+    )
+    gate = runtime._terminal_gate
+    with lease._lease_admission("acquire"):
+        owner = lease.scheduler._register_owner(
+            "compute",
+        )
+        owner.mark_enqueued()
+
+    def snapshot():
+        return (
+            dict(owner.__dict__),
+            dict(lease.scheduler._owners),
+            tuple(lease.scheduler._events),
+            dict(lease.scheduler._event_owners),
+            tuple(lease._resource_record.resources),
+            tuple(lease._resource_record.allocations),
+        )
+
+    before = snapshot()
+    sibling = None
+    try:
+        if candidate == "missing":
+            with pytest.raises(TypeError, match="admission"):
+                owner._detach("drained")
+        else:
+            sibling = gate.admit_lease(lease._epoch, "mark_dirty")
+            sibling_validator = lease._exact_admission_validator(sibling)
+            with pytest.raises(RuntimeError, match="operation"):
+                owner._detach(
+                    "drained",
+                    _admission_token=sibling,
+                    _admission_validator=sibling_validator,
+                )
+        assert snapshot() == before
+    finally:
+        if sibling is not None:
+            gate.release(sibling)
+        if owner.state != "detached":
+            admission = owner._async_admission
+
+            def detach(*, _admission_token, _admission_validator):
+                owner._detach(
+                    "drained",
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
+
+            admission.run("compute_completion", detach)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("foreign_operation", ("child_close", "acquire"))
+def test_pinned_release_requires_exact_checkout_admission_identity(
+    foreign_operation,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-pinned-release-owner-{}".format(foreign_operation)
+    )
+    gate = runtime._terminal_gate
+    checkout_token = gate.admit_lease(lease._epoch, "acquire")
+    checkout_validator = lease._exact_admission_validator(checkout_token)
+    checkout = lease.pool.checkout(
+        8,
+        _admission_token=checkout_token,
+        _admission_validator=checkout_validator,
+    )
+    slot = checkout.__enter__()
+
+    def snapshot():
+        return (
+            slot._checked_out,
+            slot._nbytes,
+            slot._owner,
+            lease.pool._checked_out_bytes,
+            lease.pool._pending_bytes,
+        )
+
+    before = snapshot()
+
+    def foreign_release():
+        with lease._lease_admission(foreign_operation) as token:
+            lease.pool._release(
+                slot,
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    worker, _, errors, done = _start(foreign_release)
+    try:
+        _join(worker, done)
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert snapshot() == before
+    finally:
+        if slot._checked_out:
+            checkout.__exit__(None, None, None)
+        gate.release(checkout_token)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("family", ("compute_completion", "h2d_completion"))
+def test_semantic_async_cannot_directly_close_unrelated_cache_lease(family):
+    runtime, _, _, store, provider, lease = _open_managed_active_case(
+        store_id="terminal-cache-direct-close-{}".format(family)
+    )
+    identity = lease.cache_identities[0]
+    admission = None
+    cache_lease = None
+    try:
+        with lease._lease_admission("acquire") as parent:
+            validator = lease._exact_admission_validator(parent)
+            cache_lease = provider._cache.acquire(
+                identity,
+                _admission_token=parent,
+                _admission_validator=validator,
+            )
+            admission = lease._spawn_async_admission(object(), family)
+        entry = cache_lease._entry
+        before = (cache_lease._entry, cache_lease._closed, entry.refcount)
+
+        def close(*, _admission_token, _admission_validator):
+            cache_lease.close(
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
+
+        with pytest.raises(RuntimeError, match="operation"):
+            admission.run(family, close)
+        assert (cache_lease._entry, cache_lease._closed, entry.refcount) == before
+    finally:
+        if admission is not None:
+            admission.cancel()
+        if cache_lease is not None and not cache_lease._closed:
+            with lease._lease_admission("acquire") as token:
+                cache_lease.close(
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("acquire", "child_close", "load", "operator_call", "prefetch"),
+)
+def test_direct_cache_lease_close_accepts_exact_lease_operation(operation):
+    runtime, _, _, store, provider, lease = _open_managed_active_case(
+        store_id="terminal-cache-direct-close-positive-{}".format(operation)
+    )
+    identity = lease.cache_identities[0]
+    cache_lease = None
+    try:
+        with lease._lease_admission("acquire") as token:
+            cache_lease = provider._cache.acquire(
+                identity,
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+        entry = cache_lease._entry
+        with lease._lease_admission(operation) as token:
+            cache_lease.close(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+        assert cache_lease._closed is True
+        assert cache_lease._entry is None
+        assert entry.refcount == 0
+    finally:
+        _close_case(runtime, store)
+
+
+def test_runtime_resource_state_reaps_scheduler_on_healthy_open_lease():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-resource-state-scheduler-reap"
+    )
+    try:
+        state = runtime.resource_state()
+        assert state["active_leases"] == 1
+        assert state["cache_bytes"] >= 0
+        assert state["pinned_bytes"] == lease.pool._capacity_bytes
+        assert state["stream_count"] == 0
+        assert state["event_count"] == 0
+    finally:
+        _close_case(runtime, store)
+
+
+def test_profiling_managed_operation_flows_authorize_peak_reads(monkeypatch):
+    from renormalizer.utils import profiling
+    from renormalizer.utils.log import DEBUG, PROFILING, init_log
+
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-profiled-managed-contracts",
+    )
+    provider = _install_managed_provider(runtime, request)
+    receipt = runtime.preflight_residency(request, plan)
+    observed = []
+    lease = None
+    init_log(PROFILING)
+    monkeypatch.setattr(profiling, "record", lambda *_args, **_kwargs: None)
+    try:
+        lease = provider.open_working_set(request, plan, store, receipt).__enter__()
+        original_observe = lease._observe_peaks
+
+        def observe(*args, **kwargs):
+            observed.append(_current_token(runtime).operation)
+            return original_observe(*args, **kwargs)
+
+        monkeypatch.setattr(lease, "_observe_peaks", observe)
+        with lease._operator_call(np.ones(4, dtype=np.float64)):
+            with lease.acquire(_block_request(lease)):
+                pass
+        with lease.acquire(_block_request(lease)):
+            pass
+        lease.mark_dirty("output", np.arange(4.0))
+        lease.close()
+        assert {"operator_call", "acquire", "child_close", "mark_dirty"}.issubset(
+            observed
+        )
+        assert "observe_peaks" in observed
+        assert lease._poisoned_error is None
+        assert runtime._terminal_gate._fatal_transition is None
+    finally:
+        init_log(DEBUG)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("acquire", "load", "operator_call", "prefetch"),
+)
+def test_pending_h2d_staging_wait_accepts_exact_transfer_operation(operation):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-pending-h2d-wait-{}".format(operation)
+    )
+    wait_entered = threading.Event()
+    release_wait = threading.Event()
+
+    class BlockingEvent:
+        @staticmethod
+        def query():
+            return False
+
+        @staticmethod
+        def synchronize():
+            wait_entered.set()
+            assert release_wait.wait(_TIMEOUT_S)
+
+    owner = None
+    with lease._lease_admission("load") as token:
+        validator = lease._exact_admission_validator(token)
+        checkout = lease.pool.checkout(
+            8,
+            _admission_token=token,
+            _admission_validator=validator,
+        )
+        with checkout as slot:
+            owner = lease.scheduler._register_owner(
+                "h2d",
+            )
+            owner.mark_enqueued()
+            owner.add_event(BlockingEvent(), completion=True)
+            slot.retain_until(owner)
+            owner.arm_completion()
+    assert lease.pool._pending_bytes == 8
+    before = (
+        lease.pool._slot._owner,
+        lease.pool._slot._nbytes,
+        lease.pool._pending_bytes,
+        dict(lease.scheduler._owners),
+        owner.state,
+    )
+    with lease._lease_admission("mark_dirty") as sibling:
+        with pytest.raises(RuntimeError, match="operation"):
+            lease.pool.wait_for_slot(
+                _admission_token=sibling,
+                _admission_validator=lease._exact_admission_validator(sibling),
+            )
+    assert wait_entered.is_set() is False
+    assert (
+        lease.pool._slot._owner,
+        lease.pool._slot._nbytes,
+        lease.pool._pending_bytes,
+        dict(lease.scheduler._owners),
+        owner.state,
+    ) == before
+
+    def wait_for_staging():
+        with lease._lease_admission(operation) as token:
+            lease._wait_for_staging(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    worker, _, errors, done = _start(wait_for_staging)
+    try:
+        assert wait_entered.wait(_TIMEOUT_S)
+        assert done.is_set() is False
+        release_wait.set()
+        _join(worker, done)
+        assert errors == []
+        assert owner.state == "detached"
+        assert lease.pool._pending_bytes == 0
+        assert lease.pool._slot._owner is None
+        assert id(owner) not in lease.scheduler._owners
+    finally:
+        release_wait.set()
+        if worker.is_alive():
+            _join(worker, done)
+        _close_case(runtime, store)

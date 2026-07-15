@@ -296,7 +296,13 @@ class CacheEntryLease:
         self._require_admission(
             _admission_token,
             _admission_validator,
-            allowed_operations=("acquire", "load", "operator_call", "prefetch"),
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "operator_call",
+                "prefetch",
+            ),
         )
         if self._closed:
             return
@@ -324,8 +330,6 @@ class CacheEntryLease:
             allowed_operations=(
                 "acquire",
                 "child_close",
-                "compute_completion",
-                "h2d_completion",
                 "load",
                 "prefetch",
                 "operator_call",
@@ -602,9 +606,13 @@ class DeviceTensorCache:
             None,
             None,
             allowed_operations=(
+                "acquire",
                 "cache_lifetime_reconcile",
+                "child_close",
                 "lease_construction",
+                "mark_dirty",
                 "observe_peaks",
+                "operator_call",
                 "provider_close",
                 "resource_state",
             ),
@@ -1119,7 +1127,11 @@ class DeviceTensorCache:
         self._require_admission(
             _admission_token,
             _admission_validator,
-            allowed_operations=("cache_wait", "provider_close"),
+            allowed_operations=(
+                "cache_wait",
+                "lease_construction",
+                "provider_close",
+            ),
         )
         _remaining_lifecycle_time(
             _deadline,
