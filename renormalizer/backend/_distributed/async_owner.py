@@ -1060,7 +1060,13 @@ class AsyncResourceOwner:
         )
         self._start_counted_completion()
 
-    def _prepare_counted_completion(self, *, wait, _deadline=None):
+    def _prepare_counted_completion(
+        self,
+        *,
+        wait,
+        join_started=True,
+        _deadline=None,
+    ):
         self._require_admission(
             allowed_operations=(
                 "acquire",
@@ -1104,7 +1110,7 @@ class AsyncResourceOwner:
             self._async_requested.set()
             self._async_admission.wake()
         return self._counted_completion_result(
-            wait=True,
+            wait=wait or join_started,
             _deadline=_deadline,
         )
 
@@ -1499,6 +1505,7 @@ class AsyncResourceOwner:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _wait_for_counted=True,
     ):
         self._require_admission(
             _admission_token,
@@ -1520,7 +1527,12 @@ class AsyncResourceOwner:
                 "scheduler_complete",
             ),
         )
-        counted = self._prepare_counted_completion(wait=False)
+        if type(_wait_for_counted) is not bool:
+            raise TypeError("counted completion wait mode must be a boolean")
+        counted = self._prepare_counted_completion(
+            wait=False,
+            join_started=_wait_for_counted,
+        )
         if counted is not None:
             return counted
         if self.state == "quarantined":

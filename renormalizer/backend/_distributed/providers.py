@@ -1102,6 +1102,7 @@ class WorkingSetLease:
         self._writeback_invalidated = False
         self._poisoned_error = None
         self.metrics = WorkingSetMetrics()
+        self._progress_owner_lock = threading.Lock()
         self._closing = False
         self._closed = False
         self._profile_enabled = profile_enabled
@@ -1347,12 +1348,19 @@ class WorkingSetLease:
             if lookup not in self._current_lookup:
                 raise ValueError("operand placement is outside the working-set plan")
 
-    def _wait_for_staging(self, *, _admission_token, _admission_validator):
+    def _wait_for_staging(
+        self,
+        *,
+        _admission_token,
+        _admission_validator,
+        _deadline=None,
+    ):
         if self.pool.pending_bytes:
             started = self._timer() if self._profile_enabled else None
             self.pool.wait_for_slot(
                 _admission_token=_admission_token,
                 _admission_validator=_admission_validator,
+                _deadline=_deadline,
             )
             self.scheduler.reap_completed(
                 _admission_token=_admission_token,
@@ -1609,16 +1617,18 @@ class WorkingSetLease:
                 _admission_token=_admission_token,
                 _admission_validator=validator,
             )
-            with self.pool.checkout(
+            checkout = self.pool.checkout(
                 spec.nbytes,
                 _admission_token=_admission_token,
                 _admission_validator=validator,
-            ) as slot:
+            )
+            with checkout as slot:
                 ticket = self.scheduler.stage_h2d(
                     TransferSource(ref, local_slice, lease.reverse_axis),
                     lease.transfer_array,
                     slot,
                     cache_lease=lease,
+                    _checkout_capability=checkout._checkout_capability,
                     _admission_token=_admission_token,
                     _admission_validator=validator,
                 )
@@ -1912,6 +1922,7 @@ class WorkingSetLease:
         *,
         _admission_token,
         _admission_validator,
+        _wait_for_counted=True,
     ):
         _require_resource_admission(
             _admission_token,
@@ -1924,6 +1935,7 @@ class WorkingSetLease:
             self.scheduler.reap_completed(
                 _admission_token=_admission_token,
                 _admission_validator=validator,
+                _wait_for_counted=_wait_for_counted,
             )
         except BaseException as caught:
             error = caught
@@ -1931,6 +1943,7 @@ class WorkingSetLease:
             self.pool.reap_completed(
                 _admission_token=_admission_token,
                 _admission_validator=validator,
+                _wait_for_counted=_wait_for_counted,
             )
         except BaseException as caught:
             if error is None:
@@ -1939,6 +1952,7 @@ class WorkingSetLease:
             self._provider.cache.reap_completed(
                 _admission_token=_admission_token,
                 _admission_validator=validator,
+                _wait_for_counted=_wait_for_counted,
             )
         except BaseException as caught:
             if error is None:
@@ -1952,30 +1966,124 @@ class WorkingSetLease:
         *,
         _admission_token,
         _admission_validator,
+        _wait_for_staging=True,
+        _deadline=None,
     ):
         _require_resource_admission(
             _admission_token,
             _admission_validator,
         )
         if self._dirty is None or self._writeback_ticket is not None:
-            return
+            return False
         ref, array = self._dirty
-        self._wait_for_staging(
-            _admission_token=_admission_token,
-            _admission_validator=_admission_validator,
-        )
-        with self.pool.checkout(
+        if _wait_for_staging:
+            self._wait_for_staging(
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+                _deadline=_deadline,
+            )
+        checkout = self.pool.checkout(
             int(array.nbytes),
             _admission_token=_admission_token,
             _admission_validator=_admission_validator,
-        ) as slot:
-            self._writeback_ticket = self.scheduler.writeback_d2h(
+            _nonblocking=not _wait_for_staging,
+        )
+        with checkout as slot:
+            if slot is None:
+                return False
+            ticket = self.scheduler.writeback_d2h(
                 array,
                 ref,
                 slot,
+                _checkout_capability=checkout._checkout_capability,
                 _admission_token=_admission_token,
                 _admission_validator=_admission_validator,
             )
+            self._writeback_ticket = ticket
+        return True
+
+    def _nonblocking_progress_preemption(self):
+        if self._closing or self._closed:
+            return "closing"
+        provider = self._provider
+        runtime = None if provider is None else provider.runtime
+        if runtime is None:
+            return "closing"
+        gate = runtime._terminal_gate
+        if gate._phase in (
+            _TerminalPhase.FATAL_PENDING,
+            _TerminalPhase.FATAL_PUBLISHED,
+            _TerminalPhase.RUNTIME_CLOSED,
+        ):
+            return "terminal"
+        lease_state = gate._leases.get(self._epoch)
+        if (
+            gate._phase is _TerminalPhase.RUNTIME_CLOSING
+            or lease_state is None
+            or lease_state.phase != "open"
+        ):
+            return "closing"
+        return None
+
+    def _run_nonblocking_progress(self):
+        if self._closing or self._closed:
+            return
+        if not self._progress_owner_lock.acquire(blocking=False):
+            return
+        try:
+            preemption = self._nonblocking_progress_preemption()
+            if preemption == "closing":
+                return
+            self._handoff_published_terminal()
+            try:
+                with self._lease_admission("close_progress") as token:
+                    validator = self._exact_admission_validator(token)
+                    self._reap_completed_admitted(
+                        _admission_token=token,
+                        _admission_validator=validator,
+                        _wait_for_counted=False,
+                    )
+                    self._schedule_writeback(
+                        _admission_token=token,
+                        _admission_validator=validator,
+                        _wait_for_staging=False,
+                    )
+            except BaseException as error:
+                preemption = self._nonblocking_progress_preemption()
+                if preemption == "closing":
+                    return
+                if preemption == "terminal":
+                    self._handoff_published_terminal()
+                self._poison(error)
+        finally:
+            self._progress_owner_lock.release()
+
+    def _run_elected_close_owned(
+        self,
+        transition,
+        *,
+        provider,
+        runtime,
+        defer_references,
+    ):
+        remaining = _remaining_lifecycle_time(
+            transition.deadline,
+            "lease close lifecycle timed out before progress ownership",
+        )
+        timeout = _TERMINAL_TIMEOUT_S if remaining is None else remaining
+        if not self._progress_owner_lock.acquire(timeout=timeout):
+            raise TimeoutError(
+                "lease close lifecycle timed out waiting for progress owner"
+            )
+        try:
+            return self._run_elected_close(
+                transition,
+                provider=provider,
+                runtime=runtime,
+                defer_references=defer_references,
+            )
+        finally:
+            self._progress_owner_lock.release()
 
     @staticmethod
     def _close_store_reservation(
@@ -2184,6 +2292,7 @@ class WorkingSetLease:
                 lambda token, validator: self._schedule_writeback(
                     _admission_token=token,
                     _admission_validator=validator,
+                    _deadline=transition.deadline,
                 ),
             )
         run_step(
@@ -2409,23 +2518,9 @@ class WorkingSetLease:
             raise TypeError("runtime prepare mode must be a boolean")
         if self._closed:
             return
-        self._handoff_published_terminal()
         if not wait:
-            try:
-                with self._lease_admission("close_progress") as token:
-                    validator = self._exact_admission_validator(token)
-                    self._schedule_writeback(
-                        _admission_token=token,
-                        _admission_validator=validator,
-                    )
-                    self._reap_completed_admitted(
-                        _admission_token=token,
-                        _admission_validator=validator,
-                    )
-                return
-            except BaseException as caught:
-                self._poison(caught)
-                return
+            return self._run_nonblocking_progress()
+        self._handoff_published_terminal()
 
         provider = self._provider
         runtime = provider.runtime
@@ -2461,7 +2556,7 @@ class WorkingSetLease:
 
         def elected(transition):
             self._closing = True
-            return self._run_elected_close(
+            return self._run_elected_close_owned(
                 transition,
                 provider=provider,
                 runtime=runtime,

@@ -9578,7 +9578,7 @@ def test_managed_lower_helper_admission_matrix(
         before = (lease.pool._slot._checked_out, lease.pool._checked_out_bytes)
 
         def invoke(token, validator):
-            return lease.pool._checkout(
+            return lease.pool.checkout(
                 1,
                 _admission_token=token,
                 _admission_validator=validator,
@@ -9635,12 +9635,10 @@ def test_managed_lower_helper_admission_matrix(
             exact_validator = lease._exact_admission_validator(exact)
             result = invoke(exact, exact_validator)
             if helper == "pool_checkout":
+                slot = result.__enter__()
                 assert snapshot() != before
-                lease.pool._release(
-                    result,
-                    _admission_token=exact,
-                    _admission_validator=exact_validator,
-                )
+                assert slot is lease.pool._slot
+                result.__exit__(None, None, None)
             elif helper == "cache_contains":
                 assert type(result) is bool
             elif helper == "scheduler_compute":
@@ -9879,6 +9877,7 @@ def test_pinned_release_requires_exact_checkout_admission_identity(
         with lease._lease_admission(foreign_operation) as token:
             lease.pool._release(
                 slot,
+                _checkout_capability=checkout._checkout_capability,
                 _admission_token=token,
                 _admission_validator=lease._exact_admission_validator(token),
             )
@@ -10059,7 +10058,12 @@ def test_pending_h2d_staging_wait_accepts_exact_transfer_operation(operation):
             )
             owner.mark_enqueued()
             owner.add_event(BlockingEvent(), completion=True)
-            slot.retain_until(owner)
+            slot.retain_until(
+                owner,
+                _checkout_capability=checkout._checkout_capability,
+                _admission_token=token,
+                _admission_validator=validator,
+            )
             owner.arm_completion()
     assert lease.pool._pending_bytes == 8
     before = (
@@ -10178,12 +10182,10 @@ def test_scheduler_owner_detach_proves_admission_before_membership_mutation(
                 _admission_token=token,
                 _admission_validator=validator,
             )
-        assert callback_admissions == [
-            {
-                "_admission_token": token,
-                "_admission_validator": validator,
-            }
-        ]
+        assert len(callback_admissions) == 1
+        assert callback_admissions[0]["_admission_token"] is token
+        assert callback_admissions[0]["_admission_validator"] is validator
+        assert callback_admissions[0]["_detach_capability"] is not None
         assert id(owner) not in scheduler._owners
         assert event not in scheduler._events
         assert id(event) not in scheduler._event_owners
@@ -10341,6 +10343,7 @@ def test_pending_prefetch_nonblocking_close_progresses_without_poison():
         assert id(owner) not in lease.scheduler._owners
         assert lease.pool._pending_bytes == 0
         assert lease.pool._slot._owner is None
+        lease.close(wait=False)
         assert provider._cache._entries[identity].state == "ready"
         assert runtime._terminal_gate._fatal_transition is None
     finally:
@@ -10418,3 +10421,494 @@ def test_dirty_writeback_nonblocking_close_progresses_without_poison():
         if progress.is_alive():
             _join(progress, progress_done)
         _close_case(runtime, store)
+
+
+def test_mixed_prefetch_dirty_nonblocking_progress_never_waits_for_staging(
+    monkeypatch,
+):
+    runtime, _, _, store, provider, lease = _open_managed_active_case(
+        store_id="terminal-close-progress-mixed-prefetch-dirty"
+    )
+    prefetch_event = _BlockingManualEvent()
+    writeback_event = _BlockingManualEvent()
+    events = iter(
+        (prefetch_event, _ManualEvent(done=True), writeback_event)
+    )
+    lease.scheduler._event_factory = lambda: next(events)
+    identity = lease.cache_identities[0]
+    prefetch, _, prefetch_errors, prefetch_done = _start(
+        lambda: lease._load_identity(identity, prefetch=True)
+    )
+    progress = None
+    progress_returned = threading.Event()
+    first_boundary = threading.Event()
+    staging_wait_entered = threading.Event()
+    release_staging_wait = threading.Event()
+    original_wait = lease.pool.wait_for_slot
+
+    def block_staging_wait(*args, **kwargs):
+        staging_wait_entered.set()
+        first_boundary.set()
+        assert release_staging_wait.wait(_TIMEOUT_S)
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(lease.pool, "wait_for_slot", block_staging_wait)
+    try:
+        _join(prefetch, prefetch_done)
+        assert prefetch_errors == []
+        prefetch_ticket = lease._prefetch_tickets[0]
+        prefetch_owner = prefetch_ticket._owner
+        pending_bytes = lease.pool._pending_bytes
+        lease.mark_dirty("output", np.arange(4.0))
+
+        def progress_once():
+            lease.close(wait=False)
+            progress_returned.set()
+            first_boundary.set()
+
+        progress, _, progress_errors, progress_done = _start(progress_once)
+        assert first_boundary.wait(_TIMEOUT_S)
+        assert progress_returned.is_set()
+        assert staging_wait_entered.is_set() is False
+        _join(progress, progress_done)
+        assert progress_errors == []
+        assert lease._poisoned_error is None
+        assert lease._writeback_ticket is None
+        assert lease.pool._pending_bytes == pending_bytes
+        assert lease.pool._slot._owner is prefetch_owner
+        assert provider._cache._entries[identity].state == "loading"
+
+        prefetch_event.complete()
+        lease.close(wait=False)
+        assert prefetch_owner._async_done.wait(_TIMEOUT_S)
+        prefetch_owner._async_worker.join(_TIMEOUT_S)
+        assert not prefetch_owner._async_worker.is_alive()
+        lease.close(wait=False)
+        writeback_ticket = lease._writeback_ticket
+        assert writeback_ticket is not None
+        writeback_owner = writeback_ticket._owner
+        assert lease.pool._slot._owner is writeback_owner
+
+        writeback_event.complete()
+        lease.close(wait=False)
+        assert writeback_owner._async_done.wait(_TIMEOUT_S)
+        writeback_owner._async_worker.join(_TIMEOUT_S)
+        assert not writeback_owner._async_worker.is_alive()
+        lease.close(wait=False)
+        assert lease._store_reservation._committed is True
+        assert lease.pool._pending_bytes == 0
+        assert lease.pool._slot._owner is None
+        assert id(prefetch_owner) not in lease.scheduler._owners
+        assert id(writeback_owner) not in lease.scheduler._owners
+        assert runtime._terminal_gate._fatal_transition is None
+    finally:
+        release_staging_wait.set()
+        prefetch_event.complete()
+        writeback_event.complete()
+        if prefetch.is_alive():
+            _join(prefetch, prefetch_done)
+        if progress is not None and progress.is_alive():
+            _join(progress, progress_done)
+        _close_case(runtime, store)
+
+
+def test_nonblocking_progress_does_not_join_counted_completion(monkeypatch):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-close-progress-no-worker-join"
+    )
+    event = _BlockingManualEvent()
+    lease.scheduler._event_factory = lambda: event
+    identity = lease.cache_identities[0]
+    prefetch, _, prefetch_errors, prefetch_done = _start(
+        lambda: lease._load_identity(identity, prefetch=True)
+    )
+    progress = None
+    release_completion = threading.Event()
+    completion_entered = threading.Event()
+    progress_returned = threading.Event()
+    try:
+        _join(prefetch, prefetch_done)
+        assert prefetch_errors == []
+        owner = lease._prefetch_tickets[0]._owner
+        original_completion = owner._run_completion
+
+        def block_completion(*args, **kwargs):
+            completion_entered.set()
+            assert release_completion.wait(_TIMEOUT_S)
+            return original_completion(*args, **kwargs)
+
+        monkeypatch.setattr(owner, "_run_completion", block_completion)
+        event.complete()
+
+        def progress_once():
+            lease.close(wait=False)
+            progress_returned.set()
+
+        progress, _, progress_errors, progress_done = _start(progress_once)
+        assert completion_entered.wait(_TIMEOUT_S)
+        assert progress_returned.wait(_TIMEOUT_S)
+        _join(progress, progress_done)
+        assert progress_errors == []
+        assert owner._async_done.is_set() is False
+        assert lease._poisoned_error is None
+    finally:
+        release_completion.set()
+        event.complete()
+        if prefetch.is_alive():
+            _join(prefetch, prefetch_done)
+        if progress is not None and progress.is_alive():
+            _join(progress, progress_done)
+        _close_case(runtime, store)
+
+
+def test_concurrent_nonblocking_progress_has_one_writeback_publisher(
+    monkeypatch,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-close-progress-single-publisher"
+    )
+    lease.mark_dirty("output", np.arange(4.0))
+    completion = _BlockingManualEvent()
+    events = iter((_ManualEvent(done=True), completion))
+    lease.scheduler._event_factory = lambda: next(events)
+    publication_entered = threading.Event()
+    release_publication = threading.Event()
+    original_writeback = lease.scheduler.writeback_d2h
+    published = []
+
+    def delay_publication(*args, **kwargs):
+        ticket = original_writeback(*args, **kwargs)
+        published.append(ticket)
+        publication_entered.set()
+        assert release_publication.wait(_TIMEOUT_S)
+        return ticket
+
+    monkeypatch.setattr(lease.scheduler, "writeback_d2h", delay_publication)
+    first, _, first_errors, first_done = _start(
+        lambda: lease.close(wait=False)
+    )
+    second = None
+    try:
+        assert publication_entered.wait(_TIMEOUT_S)
+        assert lease._writeback_ticket is None
+        second, _, second_errors, second_done = _start(
+            lambda: lease.close(wait=False)
+        )
+        _join(second, second_done)
+        assert second_errors == []
+        assert lease._poisoned_error is None
+        assert len(published) == 1
+        assert lease._writeback_ticket is None
+
+        release_publication.set()
+        _join(first, first_done)
+        assert first_errors == []
+        assert lease._writeback_ticket is published[0]
+        assert lease.pool._slot._owner is published[0]._owner
+    finally:
+        release_publication.set()
+        completion.complete()
+        if first.is_alive():
+            _join(first, first_done)
+        if second is not None and second.is_alive():
+            _join(second, second_done)
+        _close_case(runtime, store)
+
+
+def test_nonblocking_progress_yields_to_elected_close_owner(monkeypatch):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-close-progress-elected-owner"
+    )
+    elected_entered = threading.Event()
+    release_elected = threading.Event()
+    original_start = lease.scheduler._start_counted_completions
+
+    def block_elected_start(*args, **kwargs):
+        elected_entered.set()
+        assert release_elected.wait(_TIMEOUT_S)
+        return original_start(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lease.scheduler,
+        "_start_counted_completions",
+        block_elected_start,
+    )
+    elected, _, elected_errors, elected_done = _start(lease.close)
+    progress = None
+    try:
+        assert elected_entered.wait(_TIMEOUT_S)
+        progress, _, progress_errors, progress_done = _start(
+            lambda: lease.close(wait=False)
+        )
+        _join(progress, progress_done)
+        assert progress_errors == []
+        assert lease._poisoned_error is None
+        assert elected_done.is_set() is False
+        assert runtime._terminal_gate._fatal_transition is None
+
+        release_elected.set()
+        _join(elected, elected_done)
+        assert elected_errors == []
+        assert lease._closed is True
+    finally:
+        release_elected.set()
+        if elected.is_alive():
+            _join(elected, elected_done)
+        if progress is not None and progress.is_alive():
+            _join(progress, progress_done)
+        _close_case(runtime, store)
+
+
+def test_nonblocking_progress_yields_after_close_election_before_owner(
+    monkeypatch,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-close-progress-election-gap"
+    )
+    gate = runtime._terminal_gate
+    election_installed = threading.Event()
+    release_election = threading.Event()
+    original_begin = gate.begin_lease_close
+
+    def begin_then_pause(*args, **kwargs):
+        result = original_begin(*args, **kwargs)
+        election_installed.set()
+        assert release_election.wait(_TIMEOUT_S)
+        return result
+
+    monkeypatch.setattr(gate, "begin_lease_close", begin_then_pause)
+    elected, _, elected_errors, elected_done = _start(lease.close)
+    progress = None
+    try:
+        assert election_installed.wait(_TIMEOUT_S)
+        assert lease._closing is False
+        progress, _, progress_errors, progress_done = _start(
+            lambda: lease.close(wait=False)
+        )
+        _join(progress, progress_done)
+        assert progress_errors == []
+        assert lease._poisoned_error is None
+        assert elected_done.is_set() is False
+
+        release_election.set()
+        _join(elected, elected_done)
+        assert elected_errors == []
+        assert lease._closed is True
+    finally:
+        release_election.set()
+        if elected.is_alive():
+            _join(elected, elected_done)
+        if progress is not None and progress.is_alive():
+            _join(progress, progress_done)
+        _close_case(runtime, store)
+
+
+def test_scheduler_detach_requires_exact_owner_capability():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-scheduler-detach-owner-capability"
+    )
+    scheduler = lease.scheduler
+    with lease._lease_admission("acquire"):
+        owner = scheduler._register_owner(
+            "compute",
+            defer_counted_admission=True,
+        )
+        owner.mark_enqueued()
+        event = scheduler._new_event(owner, completion=True)
+
+    def snapshot():
+        return (
+            dict(scheduler._owners),
+            tuple(scheduler._events),
+            dict(scheduler._event_owners),
+            owner.state,
+            tuple(owner._events),
+        )
+
+    before = snapshot()
+    try:
+        with lease._lease_admission("resource_state") as token:
+            validator = lease._exact_admission_validator(token)
+            for capability in (None, object()):
+                with pytest.raises(RuntimeError, match="capability"):
+                    scheduler._owner_detached(
+                        owner,
+                        _detach_capability=capability,
+                        _admission_token=token,
+                        _admission_validator=validator,
+                    )
+                assert snapshot() == before
+
+        with lease._lease_admission("resource_state") as token:
+            assert owner._detach(
+                "drained",
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+        assert id(owner) not in scheduler._owners
+        assert event not in scheduler._events
+        assert id(event) not in scheduler._event_owners
+    finally:
+        if owner.state != "detached":
+            scheduler._owners.clear()
+            scheduler._owners.update(before[0])
+            scheduler._events[:] = before[1]
+            scheduler._event_owners.clear()
+            scheduler._event_owners.update(before[2])
+            with lease._lease_admission("resource_state") as token:
+                owner._detach(
+                    "drained",
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize("action", ("retain", "release", "view"))
+def test_staging_slot_requires_exact_checkout_capability(action):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-staging-checkout-capability-{}".format(action)
+    )
+    gate = runtime._terminal_gate
+    checkout_token = gate.admit_lease(lease._epoch, "acquire")
+    checkout_validator = lease._exact_admission_validator(checkout_token)
+    checkout = lease.pool.checkout(
+        8,
+        _admission_token=checkout_token,
+        _admission_validator=checkout_validator,
+    )
+    slot = checkout.__enter__()
+    owner = AsyncResourceOwner("staging")
+
+    def snapshot():
+        return (
+            slot._checked_out,
+            slot._nbytes,
+            slot._owner,
+            slot._checkout_admission,
+            lease.pool._checked_out_bytes,
+            lease.pool._pending_bytes,
+            owner._resources,
+            owner._allocations,
+            tuple(owner._release_callbacks),
+        )
+
+    before = snapshot()
+    foreign = None
+    try:
+        if action == "retain":
+            foreign_errors = []
+
+            def invoke_foreign():
+                with lease._lease_admission("acquire") as token:
+                    try:
+                        slot.retain_until(
+                            owner,
+                            _checkout_capability=(
+                                checkout._checkout_capability
+                            ),
+                            _admission_token=token,
+                            _admission_validator=(
+                                lease._exact_admission_validator(token)
+                            ),
+                        )
+                    except BaseException as error:
+                        foreign_errors.append(error)
+
+            foreign, _, thread_errors, foreign_done = _start(invoke_foreign)
+            _join(foreign, foreign_done)
+            assert thread_errors == []
+            assert len(foreign_errors) == 1
+            assert isinstance(foreign_errors[0], RuntimeError)
+            assert "capability" in str(foreign_errors[0])
+            invoke = None
+        elif action == "release":
+            invoke = lambda: lease.pool._release(
+                slot,
+                _admission_token=checkout_token,
+                _admission_validator=checkout_validator,
+            )
+        else:
+            invoke = lambda: slot.view(
+                (1,),
+                np.dtype(np.float64),
+                _admission_token=checkout_token,
+                _admission_validator=checkout_validator,
+            )
+        if invoke is not None:
+            with pytest.raises(RuntimeError, match="capability"):
+                invoke()
+        assert snapshot() == before
+    finally:
+        if foreign is not None and foreign.is_alive():
+            _join(foreign, foreign_done)
+        if slot._owner is owner:
+            slot._owner = None
+            owner._resources = ()
+            owner._allocations = ()
+            owner._release_callbacks = []
+        if slot._checked_out:
+            try:
+                checkout.__exit__(None, None, None)
+            except BaseException:
+                slot._checkout_admission = None
+                slot._checked_out = False
+                lease.pool._checked_out_bytes = 0
+                lease.pool._finalize_slot()
+        gate.release(checkout_token)
+        _close_case(runtime, store)
+
+
+def test_staging_checkout_capability_is_invalid_after_generation_advance():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-staging-checkout-stale-generation"
+    )
+    with lease._lease_admission("acquire") as token:
+        validator = lease._exact_admission_validator(token)
+        first = lease.pool.checkout(
+            8,
+            _admission_token=token,
+            _admission_validator=validator,
+        )
+        first_slot = first.__enter__()
+        stale = first._checkout_capability
+        first.__exit__(None, None, None)
+        second = lease.pool.checkout(
+            8,
+            _admission_token=token,
+            _admission_validator=validator,
+        )
+        slot = second.__enter__()
+        before = (
+            slot._checked_out,
+            slot._owner,
+            slot._checkout_capability,
+            lease.pool._checked_out_bytes,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="capability"):
+                slot.view(
+                    (1,),
+                    np.dtype(np.float64),
+                    _checkout_capability=stale,
+                    _admission_token=token,
+                    _admission_validator=validator,
+                )
+            assert (
+                slot._checked_out,
+                slot._owner,
+                slot._checkout_capability,
+                lease.pool._checked_out_bytes,
+            ) == before
+            assert first_slot is slot
+            view = slot.view(
+                (1,),
+                np.dtype(np.float64),
+                _checkout_capability=second._checkout_capability,
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+            assert view.nbytes == 8
+        finally:
+            second.__exit__(None, None, None)
+    _close_case(runtime, store)

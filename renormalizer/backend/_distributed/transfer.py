@@ -280,6 +280,7 @@ class AsyncCompletionHandle:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _wait_for_counted=True,
     ):
         self._require_admission(
             _admission_token,
@@ -301,6 +302,7 @@ class AsyncCompletionHandle:
         return self._owner.reap(
             _admission_token=_admission_token,
             _admission_validator=_admission_validator,
+            _wait_for_counted=_wait_for_counted,
         )
 
     def wait(
@@ -500,6 +502,7 @@ class TransferScheduler:
             )
         self._tickets = []
         self._owners = {}
+        self._owner_detach_capabilities = {}
         self._events = []
         self._event_owners = {}
         self._quarantined_owners = []
@@ -757,6 +760,7 @@ class TransferScheduler:
             allowed_operations=allowed_operations,
         )
         scheduler_ref = weakref.ref(self)
+        detach_capability = object()
         cupy = self._cupy
         device_index = getattr(self.backend, "_device_index", None)
         holder = {}
@@ -792,6 +796,30 @@ class TransferScheduler:
             if scheduler is not None:
                 scheduler._account_owner(owner)
 
+        def detached(
+            owner,
+            *,
+            _admission_token=None,
+            _admission_validator=None,
+        ):
+            scheduler = scheduler_ref()
+            if scheduler is None:
+                return None
+            return scheduler._owner_detached(
+                owner,
+                _detach_capability=detach_capability,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
+
+        def quarantined(owner):
+            scheduler = scheduler_ref()
+            if scheduler is not None:
+                scheduler._owner_quarantined(
+                    owner,
+                    _detach_capability=detach_capability,
+                )
+
         async_admission = None
         if (
             self._async_admission_factory is not None
@@ -815,9 +843,9 @@ class TransferScheduler:
                 started_at=started_at,
                 elapsed_reader=elapsed_reader,
                 drainer=drain,
-                detached=self._owner_detached,
+                detached=detached,
                 _detached_requires_admission=True,
-                quarantine=self._owner_quarantined,
+                quarantine=quarantined,
                 _async_admission=async_admission,
                 _resource_recorder=self._resource_recorder,
                 _resource_releaser=self._resource_releaser,
@@ -832,12 +860,14 @@ class TransferScheduler:
             raise
         holder["owner"] = owner
         self._owners[id(owner)] = owner
+        self._owner_detach_capabilities[id(owner)] = detach_capability
         return owner
 
     def _owner_detached(
         self,
         owner,
         *,
+        _detach_capability=None,
         _admission_token=None,
         _admission_validator=None,
     ):
@@ -870,7 +900,22 @@ class TransferScheduler:
             _admission_validator,
             allowed_operations=allowed_operations,
         )
+        identity = id(owner)
+        if (
+            self._owners.get(identity) is not owner
+            or self._owner_detach_capabilities.get(identity)
+            is not _detach_capability
+        ):
+            raise RuntimeError(
+                "scheduler owner detach capability does not own this transition"
+            )
+        if owner.state != "detached":
+            raise RuntimeError("scheduler owner is not in its detached transition")
+        self._remove_owner_membership(owner)
+
+    def _remove_owner_membership(self, owner):
         self._owners.pop(id(owner), None)
+        self._owner_detach_capabilities.pop(id(owner), None)
         identities = {id(event) for event in owner._events}
         self._events = [event for event in self._events if id(event) not in identities]
         for identity in identities:
@@ -881,9 +926,19 @@ class TransferScheduler:
         ):
             self.last_compute_event = None
 
-    def _retain_quarantined_owner(self, owner):
+    def _retain_quarantined_owner(self, owner, detach_capability):
+        identity = id(owner)
+        if (
+            owner.state != "quarantined"
+            or self._owners.get(identity) is not owner
+            or self._owner_detach_capabilities.get(identity)
+            is not detach_capability
+        ):
+            raise RuntimeError(
+                "scheduler owner quarantine capability does not own this transition"
+            )
         self._poison(owner.error)
-        self._owner_detached(owner)
+        self._remove_owner_membership(owner)
         if all(retained is not owner for retained in self._quarantined_owners):
             self._quarantined_owners.append(owner)
         snapshot = owner._terminal_resource_snapshot()
@@ -901,16 +956,16 @@ class TransferScheduler:
             except BaseException as error:
                 owner._remember_secondary(error)
 
-    def _owner_quarantined(self, owner):
+    def _owner_quarantined(self, owner, *, _detach_capability=None):
         if self._quarantining:
-            self._retain_quarantined_owner(owner)
+            self._retain_quarantined_owner(owner, _detach_capability)
             return
         self._quarantining = True
         try:
             other_owners = tuple(
                 retained for retained in self._owners.values() if retained is not owner
             )
-            self._retain_quarantined_owner(owner)
+            self._retain_quarantined_owner(owner, _detach_capability)
             for retained in other_owners:
                 retained.force_quarantine(owner.error)
             for retained in (owner, *other_owners):
@@ -986,8 +1041,25 @@ class TransferScheduler:
             return "F"
         return "C"
 
-    def _host_view(self, slot, shape, dtype, *, order="C"):
-        return slot.view(tuple(shape), np.dtype(dtype), order=order)
+    def _host_view(
+        self,
+        slot,
+        shape,
+        dtype,
+        *,
+        order="C",
+        checkout_capability=None,
+        admission_token=None,
+        admission_validator=None,
+    ):
+        kwargs = {}
+        if checkout_capability is not None:
+            kwargs = {
+                "_checkout_capability": checkout_capability,
+                "_admission_token": admission_token,
+                "_admission_validator": admission_validator,
+            }
+        return slot.view(tuple(shape), np.dtype(dtype), order=order, **kwargs)
 
     def _copy_h2d(self, destination, staging):
         runtime = getattr(self._cupy.cuda, "runtime", None)
@@ -1025,6 +1097,7 @@ class TransferScheduler:
         slot,
         *,
         cache_lease=None,
+        _checkout_capability=None,
         _admission_token=None,
         _admission_validator=None,
     ):
@@ -1040,6 +1113,9 @@ class TransferScheduler:
             destination.shape,
             destination.dtype,
             order=self._transfer_order(destination),
+            checkout_capability=_checkout_capability,
+            admission_token=_admission_token,
+            admission_validator=_admission_validator,
         )
         copy_destination = (
             staging if reverse_axis is None else np.flip(staging, axis=reverse_axis)
@@ -1069,7 +1145,15 @@ class TransferScheduler:
         ticket = TransferTicket(owner)
         self._tickets.append(ticket)
         try:
-            slot.retain_until(owner)
+            if _checkout_capability is None:
+                slot.retain_until(owner)
+            else:
+                slot.retain_until(
+                    owner,
+                    _checkout_capability=_checkout_capability,
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
             self.store.copy_into(ref, copy_destination, local_slice)
             if self._cupy is None:
                 event = self._new_event(owner, completion=True)
@@ -1264,6 +1348,7 @@ class TransferScheduler:
         destination_ref,
         slot,
         *,
+        _checkout_capability=None,
         _admission_token=None,
         _admission_validator=None,
     ):
@@ -1273,7 +1358,14 @@ class TransferScheduler:
             allowed_operations=("close_progress", "schedule_writeback"),
         )
         self._require_usable()
-        staging = self._host_view(slot, source.shape, source.dtype)
+        staging = self._host_view(
+            slot,
+            source.shape,
+            source.dtype,
+            checkout_capability=_checkout_capability,
+            admission_token=_admission_token,
+            admission_validator=_admission_validator,
+        )
         if tuple(source.shape) != tuple(destination_ref.shape):
             raise ValueError("dirty source shape does not match destination ref")
         start = self._timer() if self._timer is not None else None
@@ -1316,7 +1408,15 @@ class TransferScheduler:
         ticket = TransferTicket(owner)
         self._tickets.append(ticket)
         try:
-            slot.retain_until(owner)
+            if _checkout_capability is None:
+                slot.retain_until(owner)
+            else:
+                slot.retain_until(
+                    owner,
+                    _checkout_capability=_checkout_capability,
+                    _admission_token=_admission_token,
+                    _admission_validator=_admission_validator,
+                )
             if self._cupy is None:
                 owner.mark_enqueued()
                 compute_event = self._new_event(owner)
@@ -1391,6 +1491,7 @@ class TransferScheduler:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _wait_for_counted=True,
     ):
         self._require_admission(
             _admission_token,
@@ -1415,7 +1516,7 @@ class TransferScheduler:
         errors = []
         for owner in tuple(self._owners.values()):
             try:
-                owner.reap()
+                owner.reap(_wait_for_counted=_wait_for_counted)
             except BaseException as error:
                 if self._managed:
                     raise
@@ -1521,6 +1622,7 @@ class TransferScheduler:
         )
         self._tickets.clear()
         self._owners.clear()
+        self._owner_detach_capabilities.clear()
         self._events.clear()
         self._event_owners.clear()
         self._stream = None

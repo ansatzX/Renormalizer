@@ -1,6 +1,8 @@
 """Fixed-capacity host staging storage with completion-safe reuse."""
 
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
+import threading
 
 import numpy as np
 
@@ -45,6 +47,13 @@ def _validate_storage(value, nbytes):
     return value, record
 
 
+@dataclass(frozen=True)
+class _StagingCheckoutCapability:
+    admission: object
+    thread_id: int
+    generation: int
+
+
 class StagingSlot:
     """One exclusive view onto a pool-owned fixed allocation."""
 
@@ -57,6 +66,7 @@ class StagingSlot:
         self._owner = None
         self._checked_out = False
         self._checkout_admission = None
+        self._checkout_capability = None
 
     def _require_admission(
         self,
@@ -73,6 +83,19 @@ class StagingSlot:
             allowed_operations=allowed_operations,
             epoch=lambda _token: self._pool._managed_epoch,
         )
+
+    def _require_checkout_capability(self, admission, capability):
+        if self._managed_guard is None:
+            return
+        if not isinstance(capability, _StagingCheckoutCapability):
+            raise RuntimeError("staging checkout capability is required")
+        if (
+            self._checkout_capability is not capability
+            or capability.admission is not admission
+            or capability.thread_id != threading.get_ident()
+            or capability.generation != self._pool._slot_generation
+        ):
+            raise RuntimeError("staging checkout capability does not own the slot")
 
     @property
     def array(self):
@@ -163,8 +186,9 @@ class StagingSlot:
         order="C",
         _admission_token=None,
         _admission_validator=None,
+        _checkout_capability=None,
     ):
-        self._require_admission(
+        admission = self._require_admission(
             _admission_token,
             _admission_validator,
             allowed_operations=(
@@ -176,6 +200,7 @@ class StagingSlot:
                 "schedule_writeback",
             ),
         )
+        self._require_checkout_capability(admission, _checkout_capability)
         if not self._checked_out:
             raise RuntimeError("staging slot is not checked out")
         if order not in {"C", "F"}:
@@ -200,8 +225,9 @@ class StagingSlot:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _checkout_capability=None,
     ):
-        self._require_admission(
+        admission = self._require_admission(
             _admission_token,
             _admission_validator,
             allowed_operations=(
@@ -213,6 +239,7 @@ class StagingSlot:
                 "schedule_writeback",
             ),
         )
+        self._require_checkout_capability(admission, _checkout_capability)
         if not self._checked_out:
             raise RuntimeError("staging slot is not checked out")
         if self._owner is not None:
@@ -229,20 +256,35 @@ class StagingSlot:
 
 
 class _SlotCheckout(AbstractContextManager):
-    def __init__(self, pool, nbytes, admission_token, admission_validator):
+    def __init__(
+        self,
+        pool,
+        nbytes,
+        admission_token,
+        admission_validator,
+        checkout_capability,
+        *,
+        nonblocking,
+    ):
         self._pool = pool
         self._nbytes = nbytes
         self._admission_token = admission_token
         self._admission_validator = admission_validator
+        self._checkout_capability = checkout_capability
+        self._nonblocking = nonblocking
         self._slot = None
+        self._entered = False
 
     def __enter__(self):
-        if self._slot is not None:
+        if self._entered:
             raise RuntimeError("staging checkout is already entered")
+        self._entered = True
         self._slot = self._pool._checkout(
             self._nbytes,
             _admission_token=self._admission_token,
             _admission_validator=self._admission_validator,
+            _checkout_capability=self._checkout_capability,
+            _nonblocking=self._nonblocking,
         )
         return self._slot
 
@@ -253,12 +295,15 @@ class _SlotCheckout(AbstractContextManager):
                     self._slot,
                     _admission_token=self._admission_token,
                     _admission_validator=self._admission_validator,
+                    _checkout_capability=self._checkout_capability,
+                    _wait_for_counted=not self._nonblocking,
                 )
             except BaseException:
                 if exc_value is None:
                     raise
             finally:
                 self._slot = None
+        self._entered = False
         return False
 
 
@@ -312,6 +357,7 @@ class PinnedBufferPool:
         self._closed = False
         self._checked_out_bytes = 0
         self._pending_bytes = 0
+        self._slot_generation = 0
         self._peak_checked_out_bytes = 0
         self._pageable_fallback_count = 0
         self._pageable_fallback_bytes = 0
@@ -558,37 +604,7 @@ class PinnedBufferPool:
         *,
         _admission_token=None,
         _admission_validator=None,
-    ):
-        self._require_admission(
-            _admission_token,
-            _admission_validator,
-            allowed_operations=(
-                "acquire",
-                "close_progress",
-                "load",
-                "operator_call",
-                "prefetch",
-                "schedule_writeback",
-            ),
-        )
-        self._require_usable()
-        if type(nbytes) is not int or nbytes <= 0:
-            raise ValueError("checkout nbytes must be a positive integer")
-        if nbytes > self._capacity_bytes:
-            raise MemoryError("staging checkout exceeds fixed pool capacity")
-        return _SlotCheckout(
-            self,
-            nbytes,
-            _admission_token,
-            _admission_validator,
-        )
-
-    def _checkout(
-        self,
-        nbytes,
-        *,
-        _admission_token=None,
-        _admission_validator=None,
+        _nonblocking=False,
     ):
         admission = self._require_admission(
             _admission_token,
@@ -602,17 +618,78 @@ class PinnedBufferPool:
                 "schedule_writeback",
             ),
         )
+        if type(_nonblocking) is not bool:
+            raise TypeError("nonblocking checkout mode must be a boolean")
+        self._require_usable()
+        if type(nbytes) is not int or nbytes <= 0:
+            raise ValueError("checkout nbytes must be a positive integer")
+        if nbytes > self._capacity_bytes:
+            raise MemoryError("staging checkout exceeds fixed pool capacity")
+        capability = _StagingCheckoutCapability(
+            admission=admission,
+            thread_id=threading.get_ident(),
+            generation=self._slot_generation + 1,
+        )
+        return _SlotCheckout(
+            self,
+            nbytes,
+            _admission_token,
+            _admission_validator,
+            capability,
+            nonblocking=_nonblocking,
+        )
+
+    def _checkout(
+        self,
+        nbytes,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+        _checkout_capability=None,
+        _nonblocking=False,
+    ):
+        admission = self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "close_progress",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
+        if type(_nonblocking) is not bool:
+            raise TypeError("nonblocking checkout mode must be a boolean")
+        if self._managed:
+            capability = _checkout_capability
+            if not isinstance(capability, _StagingCheckoutCapability):
+                raise RuntimeError("staging checkout capability is required")
+            if (
+                capability.admission is not admission
+                or capability.thread_id != threading.get_ident()
+                or capability.generation != self._slot_generation + 1
+            ):
+                raise RuntimeError(
+                    "staging checkout capability does not own this checkout"
+                )
         self._require_usable()
         self.reap_completed(
             _admission_token=_admission_token,
             _admission_validator=_admission_validator,
+            _wait_for_counted=not _nonblocking,
         )
         slot = self._slot
         if slot._checked_out or slot._owner is not None:
+            if _nonblocking:
+                return None
             raise RuntimeError("no staging slot is available")
+        self._slot_generation += 1
         slot._checked_out = True
         slot._nbytes = nbytes
         slot._checkout_admission = admission
+        slot._checkout_capability = _checkout_capability
         self._checked_out_bytes = nbytes
         self._peak_checked_out_bytes = max(self._peak_checked_out_bytes, nbytes)
         return slot
@@ -623,6 +700,8 @@ class PinnedBufferPool:
         *,
         _admission_token=None,
         _admission_validator=None,
+        _checkout_capability=None,
+        _wait_for_counted=True,
     ):
         admission = self._require_admission(
             _admission_token,
@@ -636,14 +715,13 @@ class PinnedBufferPool:
                 "schedule_writeback",
             ),
         )
-        if self._managed and slot._checkout_admission is not admission:
-            raise RuntimeError(
-                "staging slot release does not own its checkout admission"
-            )
+        slot._require_checkout_capability(admission, _checkout_capability)
         if slot is not self._slot or not slot._checked_out:
             raise RuntimeError("staging slot is not owned by this checkout")
+        slot._checkout_capability = None
         slot._checkout_admission = None
         slot._checked_out = False
+        self._slot_generation += 1
         self._checked_out_bytes = 0
         owner = slot._owner
         if owner is None:
@@ -661,7 +739,7 @@ class PinnedBufferPool:
         if owner.kind != "staging":
             return
         try:
-            owner.reap()
+            owner.reap(_wait_for_counted=_wait_for_counted)
         except BaseException:
             if owner.quarantined:
                 self._owner_quarantined(owner)
@@ -675,6 +753,7 @@ class PinnedBufferPool:
         _admission_token=None,
         _admission_validator=None,
         _deadline=None,
+        _wait_for_counted=True,
     ):
         self._require_admission(
             _admission_token,
@@ -703,7 +782,7 @@ class PinnedBufferPool:
         if owner is None:
             return
         try:
-            owner.reap()
+            owner.reap(_wait_for_counted=_wait_for_counted)
         except BaseException:
             if owner.quarantined:
                 self._owner_quarantined(owner)

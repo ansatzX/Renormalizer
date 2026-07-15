@@ -966,7 +966,7 @@ class DeviceTensorCache:
         entry.refcount += 1
         return CacheEntryLease(self, entry, cache_hit=cache_hit)
 
-    def _refresh_entry(self, entry):
+    def _refresh_entry(self, entry, *, wait_for_counted=True):
         if entry.state != "loading" or entry.readiness_ticket is None:
             return
         ticket = entry.readiness_ticket
@@ -978,7 +978,12 @@ class DeviceTensorCache:
                     raise ticket.error
                 completed = True
             else:
-                completed = bool(ticket.reap())
+                if wait_for_counted:
+                    completed = bool(ticket.reap())
+                else:
+                    completed = bool(
+                        ticket.reap(_wait_for_counted=False)
+                    )
         except BaseException as error:
             if getattr(ticket, "terminal_poisoned", False):
                 entry.state = "failed"
@@ -1071,6 +1076,7 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
         _deadline=None,
+        _wait_for_counted=True,
     ):
         self._require_admission(
             _admission_token,
@@ -1100,7 +1106,7 @@ class DeviceTensorCache:
             dict.fromkeys(retained[0] for retained in self._owner_pending)
         ):
             try:
-                owner.reap()
+                owner.reap(_wait_for_counted=_wait_for_counted)
             except BaseException as error:
                 if owner.quarantined:
                     self._poison(error)
@@ -1109,7 +1115,10 @@ class DeviceTensorCache:
                 errors.append(error)
         for entry in tuple(self._entries.values()):
             try:
-                self._refresh_entry(entry)
+                self._refresh_entry(
+                    entry,
+                    wait_for_counted=_wait_for_counted,
+                )
             except BaseException as error:
                 if self._managed:
                     raise
