@@ -52,6 +52,7 @@ from renormalizer.backend._execution.model import ExecutionBindings
 from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
 from renormalizer.backend.tests.residency.test_active_provider import (
     _LoopbackCollective,
+    _ManualEvent,
     _active_case,
     _block_request,
     _explicit_budget,
@@ -10105,4 +10106,315 @@ def test_pending_h2d_staging_wait_accepts_exact_transfer_operation(operation):
         release_wait.set()
         if worker.is_alive():
             _join(worker, done)
+        _close_case(runtime, store)
+
+
+class _BlockingManualEvent(_ManualEvent):
+    def __init__(self):
+        super().__init__(done=False)
+        self.wait_entered = threading.Event()
+        self.release_wait = threading.Event()
+
+    def synchronize(self):
+        self.wait_entered.set()
+        assert self.release_wait.wait(_TIMEOUT_S)
+        self.done = True
+
+    def complete(self):
+        self.done = True
+        self.release_wait.set()
+
+
+@pytest.mark.parametrize("candidate", ("missing", "sibling"))
+def test_scheduler_owner_detach_proves_admission_before_membership_mutation(
+    candidate,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-scheduler-detach-{}".format(candidate)
+    )
+    scheduler = lease.scheduler
+    original_detached = scheduler._owner_detached
+    callback_admissions = []
+
+    def observe_detached(owner, **kwargs):
+        callback_admissions.append(kwargs)
+        return original_detached(owner, **kwargs)
+
+    scheduler._owner_detached = observe_detached
+    with lease._lease_admission("acquire"):
+        owner = scheduler._register_owner(
+            "compute",
+            defer_counted_admission=True,
+        )
+        owner.mark_enqueued()
+        event = scheduler._new_event(owner, completion=True)
+
+    def snapshot():
+        return (
+            dict(scheduler._owners),
+            tuple(scheduler._events),
+            dict(scheduler._event_owners),
+            scheduler.last_compute_event,
+            owner.state,
+            tuple(owner._events),
+            owner._completion_event,
+        )
+
+    before = snapshot()
+    try:
+        if candidate == "missing":
+            with pytest.raises(TypeError, match="admission"):
+                original_detached(owner)
+        else:
+            with lease._lease_admission("mark_dirty"):
+                with pytest.raises(RuntimeError, match="operation"):
+                    original_detached(owner)
+        assert snapshot() == before
+
+        with lease._lease_admission("resource_state") as token:
+            validator = lease._exact_admission_validator(token)
+            assert owner._detach(
+                "drained",
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+        assert callback_admissions == [
+            {
+                "_admission_token": token,
+                "_admission_validator": validator,
+            }
+        ]
+        assert id(owner) not in scheduler._owners
+        assert event not in scheduler._events
+        assert id(event) not in scheduler._event_owners
+    finally:
+        if owner.state != "detached":
+            scheduler._owners.clear()
+            scheduler._owners.update(before[0])
+            scheduler._events[:] = before[1]
+            scheduler._event_owners.clear()
+            scheduler._event_owners.update(before[2])
+            with lease._lease_admission("resource_state") as token:
+                owner._detach(
+                    "drained",
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("acquire", "load", "operator_call", "prefetch"),
+)
+def test_load_error_cleanup_waits_under_exact_creating_operation(
+    monkeypatch,
+    operation,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-load-cleanup-{}".format(operation)
+    )
+    event = _BlockingManualEvent()
+    lease.scheduler._event_factory = lambda: event
+    primary = RuntimeError("{} readiness publication failed".format(operation))
+    captured = {}
+    cleanup_admitted = threading.Event()
+    original_stage = lease.scheduler.stage_h2d
+    original_install = CacheEntryLease.install_readiness
+    original_owner_wait = AsyncResourceOwner.wait
+
+    def capture_stage(*args, **kwargs):
+        ticket = original_stage(*args, **kwargs)
+        captured["ticket"] = ticket
+        captured["owner"] = ticket._owner
+        return ticket
+
+    def fail_after_install(cache_lease, ticket, *args, **kwargs):
+        original_install(cache_lease, ticket, *args, **kwargs)
+        raise primary
+
+    def observe_owner_wait(owner, *args, **kwargs):
+        if owner is captured.get("owner"):
+            cleanup_admitted.set()
+        return original_owner_wait(owner, *args, **kwargs)
+
+    monkeypatch.setattr(lease.scheduler, "stage_h2d", capture_stage)
+    monkeypatch.setattr(CacheEntryLease, "install_readiness", fail_after_install)
+    monkeypatch.setattr(AsyncResourceOwner, "wait", observe_owner_wait)
+    identity = lease.cache_identities[0]
+
+    def load():
+        with lease._lease_admission(operation) as token:
+            return lease._load_identity_admitted(
+                identity,
+                prefetch=operation == "prefetch",
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    worker, _, errors, done = _start(load)
+    try:
+        assert cleanup_admitted.wait(_TIMEOUT_S)
+        assert event.wait_entered.wait(_TIMEOUT_S)
+        owner = captured["owner"]
+        ticket = captured["ticket"]
+        before = (
+            owner.state,
+            dict(lease.scheduler._owners),
+            lease.pool._slot._owner,
+            lease.pool._pending_bytes,
+            owner._async_done.is_set(),
+        )
+        with lease._lease_admission("mark_dirty") as sibling:
+            with pytest.raises(RuntimeError, match="operation"):
+                ticket.wait(
+                    _admission_token=sibling,
+                    _admission_validator=lease._exact_admission_validator(sibling),
+                )
+        assert (
+            owner.state,
+            dict(lease.scheduler._owners),
+            lease.pool._slot._owner,
+            lease.pool._pending_bytes,
+            owner._async_done.is_set(),
+        ) == before
+
+        event.complete()
+        _join(worker, done)
+        assert errors == [primary]
+        assert owner.state == "detached"
+        assert id(owner) not in lease.scheduler._owners
+        assert lease.pool._slot._owner is None
+        assert lease.pool._pending_bytes == 0
+        assert lease._poisoned_error is primary
+    finally:
+        event.complete()
+        if worker.is_alive():
+            _join(worker, done)
+        _close_case(runtime, store)
+
+
+def test_pending_prefetch_nonblocking_close_progresses_without_poison():
+    runtime, _, _, store, provider, lease = _open_managed_active_case(
+        store_id="terminal-close-progress-prefetch"
+    )
+    event = _BlockingManualEvent()
+    lease.scheduler._event_factory = lambda: event
+    identity = lease.cache_identities[0]
+    prefetch, _, prefetch_errors, prefetch_done = _start(
+        lambda: lease._load_identity(identity, prefetch=True)
+    )
+    progress = None
+    progress_done = threading.Event()
+    progress_errors = []
+    try:
+        _join(prefetch, prefetch_done)
+        assert prefetch_errors == []
+        assert event.done is False
+        assert len(lease._prefetch_tickets) == 1
+        ticket = lease._prefetch_tickets[0]
+        owner = ticket._owner
+        pending_bytes = lease.pool._pending_bytes
+        assert pending_bytes > 0
+        assert lease.pool._slot._owner is owner
+        assert lease.scheduler._owners[id(owner)] is owner
+
+        progress, _, progress_errors, progress_done = _start(
+            lambda: lease.close(wait=False)
+        )
+        _join(progress, progress_done)
+        assert progress_errors == []
+        assert lease._poisoned_error is None
+        assert owner.state == "enqueued"
+        assert lease.pool._pending_bytes == pending_bytes
+        assert lease.pool._slot._owner is owner
+        assert lease.scheduler._owners[id(owner)] is owner
+        assert provider._cache._entries[identity].state == "loading"
+
+        event.complete()
+        lease.close(wait=False)
+        assert owner._async_done.wait(_TIMEOUT_S)
+        owner._async_worker.join(_TIMEOUT_S)
+        assert not owner._async_worker.is_alive()
+        assert lease._poisoned_error is None
+        assert owner.state == "detached"
+        assert id(owner) not in lease.scheduler._owners
+        assert lease.pool._pending_bytes == 0
+        assert lease.pool._slot._owner is None
+        assert provider._cache._entries[identity].state == "ready"
+        assert runtime._terminal_gate._fatal_transition is None
+    finally:
+        event.complete()
+        if prefetch.is_alive():
+            _join(prefetch, prefetch_done)
+        if progress is not None and progress.is_alive():
+            _join(progress, progress_done)
+        _close_case(runtime, store)
+
+
+def test_dirty_writeback_nonblocking_close_progresses_without_poison():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-close-progress-writeback"
+    )
+    lease.mark_dirty("output", np.arange(4.0))
+    completion = _BlockingManualEvent()
+    events = iter((_ManualEvent(done=True), completion))
+    lease.scheduler._event_factory = lambda: next(events)
+    dirty = lease._dirty
+    reservation = lease._store_reservation
+    progress, _, progress_errors, progress_done = _start(
+        lambda: lease.close(wait=False)
+    )
+    try:
+        _join(progress, progress_done)
+        assert progress_errors == []
+        assert lease._poisoned_error is None
+        ticket = lease._writeback_ticket
+        assert ticket is not None
+        owner = ticket._owner
+        pending_bytes = lease.pool._pending_bytes
+        assert pending_bytes == dirty[1].nbytes
+        assert lease._dirty == dirty
+        assert reservation._committed is False
+        assert completion.done is False
+        assert lease.pool._slot._owner is owner
+        assert lease.scheduler._owners[id(owner)] is owner
+
+        before = (
+            lease.pool._slot._owner,
+            lease.pool._slot._nbytes,
+            lease.pool._pending_bytes,
+            dict(lease.scheduler._owners),
+            owner.state,
+        )
+        with lease._lease_admission("mark_dirty") as sibling:
+            with pytest.raises(RuntimeError, match="operation"):
+                lease.pool.wait_for_slot(
+                    _admission_token=sibling,
+                    _admission_validator=lease._exact_admission_validator(sibling),
+                )
+        assert (
+            lease.pool._slot._owner,
+            lease.pool._slot._nbytes,
+            lease.pool._pending_bytes,
+            dict(lease.scheduler._owners),
+            owner.state,
+        ) == before
+
+        completion.complete()
+        lease.close(wait=False)
+        assert owner._async_done.wait(_TIMEOUT_S)
+        owner._async_worker.join(_TIMEOUT_S)
+        assert not owner._async_worker.is_alive()
+        assert lease._poisoned_error is None
+        assert reservation._committed is True
+        assert owner.state == "detached"
+        assert id(owner) not in lease.scheduler._owners
+        assert lease.pool._pending_bytes == 0
+        assert lease.pool._slot._owner is None
+        assert runtime._terminal_gate._fatal_transition is None
+    finally:
+        completion.complete()
+        if progress.is_alive():
+            _join(progress, progress_done)
         _close_case(runtime, store)

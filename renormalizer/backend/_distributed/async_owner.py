@@ -320,6 +320,7 @@ class AsyncResourceOwner:
         _resource_releaser=None,
         _defer_async_completion=False,
         _callback_requires_admission=False,
+        _detached_requires_admission=False,
         _managed_guard=None,
         _managed_epoch=None,
     ):
@@ -360,6 +361,9 @@ class AsyncResourceOwner:
         self._callback = callback
         self._callback_requires_admission = bool(
             _callback_requires_admission
+        )
+        self._detached_requires_admission = bool(
+            _detached_requires_admission
         )
         self._accounting = accounting
         self._timer = timer
@@ -521,6 +525,7 @@ class AsyncResourceOwner:
                 "acquire",
                 "cache_wait",
                 "child_close",
+                "close_progress",
                 "compute_completion",
                 "d2h_completion",
                 "emit_profile",
@@ -544,6 +549,7 @@ class AsyncResourceOwner:
                 "acquire",
                 "cache_wait",
                 "child_close",
+                "close_progress",
                 "compute_completion",
                 "d2h_completion",
                 "h2d_completion",
@@ -617,6 +623,7 @@ class AsyncResourceOwner:
             _admission_validator,
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -641,6 +648,7 @@ class AsyncResourceOwner:
             allowed_operations=(
                 "acquire",
                 "child_close",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -663,6 +671,7 @@ class AsyncResourceOwner:
             allowed_operations=(
                 "acquire",
                 "child_close",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -689,6 +698,7 @@ class AsyncResourceOwner:
             allowed_operations=(
                 "acquire",
                 "child_close",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -721,6 +731,7 @@ class AsyncResourceOwner:
             allowed_operations=(
                 "acquire",
                 "child_close",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -745,6 +756,7 @@ class AsyncResourceOwner:
             allowed_operations=(
                 "acquire",
                 "child_close",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -1155,6 +1167,7 @@ class AsyncResourceOwner:
             allowed_operations=(
                 "acquire",
                 "child_close",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -1254,7 +1267,7 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(
+        admission = self._require_admission(
             _admission_token,
             _admission_validator,
             allowed_operations=(
@@ -1277,6 +1290,20 @@ class AsyncResourceOwner:
                 "scheduler_complete",
             ),
         )
+        callback_token = _admission_token
+        callback_validator = _admission_validator
+        if admission is not None and callback_token is None:
+            callback_token = admission
+
+            def validate_callback_admission(candidate, expected=admission):
+                if candidate is not expected:
+                    raise RuntimeError(
+                        "async detach admission changed before callback"
+                    )
+                return candidate
+
+            callback_validator = validate_callback_admission
+
         if terminal_state not in {"completed", "drained"}:
             raise ValueError("async owner terminal state is invalid")
         self.state = terminal_state
@@ -1306,7 +1333,14 @@ class AsyncResourceOwner:
                     self._remember_secondary(error)
         if self._detached is not None:
             try:
-                self._detached(self)
+                if self._detached_requires_admission:
+                    self._detached(
+                        self,
+                        _admission_token=callback_token,
+                        _admission_validator=callback_validator,
+                    )
+                else:
+                    self._detached(self)
             except BaseException as error:
                 if first_error is None:
                     first_error = error
@@ -1337,6 +1371,7 @@ class AsyncResourceOwner:
         self._elapsed_reader = None
         self._drainer = None
         self._detached = None
+        self._detached_requires_admission = False
         self._quarantine = None
         self._resource_recorder = None
         self._resource_releaser = None

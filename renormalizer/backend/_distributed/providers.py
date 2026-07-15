@@ -1638,7 +1638,10 @@ class WorkingSetLease:
             )
             if ticket is not None and not terminal:
                 try:
-                    ticket.wait()
+                    ticket.wait(
+                        _admission_token=_admission_token,
+                        _admission_validator=validator,
+                    )
                 except BaseException:
                     pass
             if not terminal:

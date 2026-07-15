@@ -199,6 +199,7 @@ class AsyncCompletionHandle:
                 "acquire",
                 "cache_wait",
                 "child_close",
+                "close_progress",
                 "compute_completion",
                 "d2h_completion",
                 "emit_profile",
@@ -222,6 +223,7 @@ class AsyncCompletionHandle:
                 "acquire",
                 "cache_wait",
                 "child_close",
+                "close_progress",
                 "compute_completion",
                 "d2h_completion",
                 "h2d_completion",
@@ -244,6 +246,7 @@ class AsyncCompletionHandle:
                 "acquire",
                 "cache_wait",
                 "child_close",
+                "close_progress",
                 "compute_completion",
                 "d2h_completion",
                 "h2d_completion",
@@ -285,6 +288,7 @@ class AsyncCompletionHandle:
                 "acquire",
                 "cache_wait",
                 "child_close",
+                "close_progress",
                 "load",
                 "operator_call",
                 "pool_reap",
@@ -310,8 +314,12 @@ class AsyncCompletionHandle:
             _admission_token,
             _admission_validator,
             allowed_operations=(
+                "acquire",
                 "cache_wait",
+                "load",
+                "operator_call",
                 "pool_reap",
+                "prefetch",
                 "scheduler_complete",
             ),
         )
@@ -808,6 +816,7 @@ class TransferScheduler:
                 elapsed_reader=elapsed_reader,
                 drainer=drain,
                 detached=self._owner_detached,
+                _detached_requires_admission=True,
                 quarantine=self._owner_quarantined,
                 _async_admission=async_admission,
                 _resource_recorder=self._resource_recorder,
@@ -825,15 +834,50 @@ class TransferScheduler:
         self._owners[id(owner)] = owner
         return owner
 
-    def _owner_detached(self, owner):
+    def _owner_detached(
+        self,
+        owner,
+        *,
+        _admission_token=None,
+        _admission_validator=None,
+    ):
+        allowed_operations = (
+            "acquire",
+            "cache_wait",
+            "child_close",
+            "close_progress",
+            "compute_completion",
+            "d2h_completion",
+            "h2d_completion",
+            "load",
+            "operator_call",
+            "pool_close",
+            "pool_reap",
+            "prefetch",
+            "reap",
+            "resource_state",
+            "schedule_writeback",
+            "scheduler_close",
+            "scheduler_complete",
+        )
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=allowed_operations,
+        )
+        owner._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=allowed_operations,
+        )
         self._owners.pop(id(owner), None)
-        identities = {id(event) for event in owner.events}
+        identities = {id(event) for event in owner._events}
         self._events = [event for event in self._events if id(event) not in identities]
         for identity in identities:
             self._event_owners.pop(identity, None)
         if (
             self.last_compute_event is not None
-            and self.last_compute_event.owner is owner
+            and self.last_compute_event._owner is owner
         ):
             self.last_compute_event = None
 

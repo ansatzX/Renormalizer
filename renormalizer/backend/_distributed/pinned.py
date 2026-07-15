@@ -79,6 +79,7 @@ class StagingSlot:
         self._require_admission(
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "d2h_completion",
                 "h2d_completion",
                 "load",
@@ -168,6 +169,7 @@ class StagingSlot:
             _admission_validator,
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -204,6 +206,7 @@ class StagingSlot:
             _admission_validator,
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -441,6 +444,7 @@ class PinnedBufferPool:
             None,
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -560,6 +564,7 @@ class PinnedBufferPool:
             _admission_validator,
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -590,6 +595,7 @@ class PinnedBufferPool:
             _admission_validator,
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -623,6 +629,7 @@ class PinnedBufferPool:
             _admission_validator,
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "load",
                 "operator_call",
                 "prefetch",
@@ -720,6 +727,7 @@ class PinnedBufferPool:
             _admission_validator,
             allowed_operations=(
                 "acquire",
+                "close_progress",
                 "lease_construction",
                 "load",
                 "operator_call",
