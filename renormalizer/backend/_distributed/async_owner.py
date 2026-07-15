@@ -1110,8 +1110,9 @@ class AsyncResourceOwner:
                     self._async_worker_state = "terminal"
                 if self._async_admission_state == "retry_installing":
                     self._async_admission_state = "terminal"
-            self._remember_secondary(error)
-            raise
+                self._remember_secondary(error)
+                self._counted_quarantine_pending = True
+            return False
 
         cancel = False
         with self._async_lock:

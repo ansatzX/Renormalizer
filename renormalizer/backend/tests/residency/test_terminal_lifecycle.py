@@ -11997,6 +11997,123 @@ def test_counted_completion_retry_consumes_concurrent_close_start_latch(
         _close_case(runtime, store)
 
 
+def test_counted_completion_retry_hands_off_when_close_wins_before_spawn(
+    monkeypatch,
+):
+    runtime, _, _, store, provider, lease = _open_managed_active_case(
+        store_id="terminal-writeback-retry-close-before-spawn"
+    )
+    dirty = np.arange(4.0) + 43.0
+    original_ref = store.ref("output")
+    original_revision = store._namespace_revision
+    lease.mark_dirty("output", dirty)
+    scheduler = lease.scheduler
+    events = iter((_ManualEvent(done=True), _ManualEvent(done=True)))
+    scheduler._event_factory = lambda: next(events)
+    with lease._lease_admission("close_progress") as token:
+        assert lease._schedule_writeback(
+            _admission_token=token,
+            _admission_validator=lease._exact_admission_validator(token),
+            _wait_for_staging=False,
+        )
+    ticket = lease._writeback_ticket
+    owner = ticket._owner
+    reservation = lease._store_reservation
+    original_commit = reservation.commit
+    primary = RuntimeError("counted retry callback failed before close")
+    callback_calls = []
+
+    def fail_once(ref, value, **kwargs):
+        callback_calls.append(ref)
+        if len(callback_calls) == 1:
+            raise primary
+        return original_commit(ref, value, **kwargs)
+
+    monkeypatch.setattr(reservation, "commit", fail_once)
+
+    def reap_ticket():
+        with lease._lease_admission("close_progress") as token:
+            return ticket.reap(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    with pytest.raises(RuntimeError) as first:
+        reap_ticket()
+    assert first.value is primary
+    assert owner.state == "enqueued"
+    retained_identities = {
+        record.identity for record in owner._allocations
+    }
+
+    original_factory = owner._counted_admission_factory
+    factory_entered = threading.Event()
+    release_factory = threading.Event()
+    worker_runs = []
+    original_worker_run = owner._run_counted_completion
+
+    def pause_before_spawn(capability, operation):
+        factory_entered.set()
+        assert release_factory.wait(_TIMEOUT_S)
+        return original_factory(capability, operation)
+
+    def observe_worker(admission):
+        worker_runs.append(admission)
+        return original_worker_run(admission)
+
+    monkeypatch.setattr(owner, "_counted_admission_factory", pause_before_spawn)
+    monkeypatch.setattr(owner, "_run_counted_completion", observe_worker)
+    retry, _, retry_errors, retry_done = _start(reap_ticket)
+    closer = None
+    try:
+        assert factory_entered.wait(_TIMEOUT_S)
+        closer, _, close_errors, close_done = _start(lease.close)
+        gate = runtime._terminal_gate
+        with gate._condition:
+            assert gate._condition.wait_for(
+                lambda: gate._leases[lease._epoch].phase == "closing",
+                timeout=_TIMEOUT_S,
+            )
+        assert close_done.is_set() is False
+        release_factory.set()
+        _join(retry, retry_done)
+        _join(closer, close_done)
+
+        assert retry_errors == [primary]
+        assert close_errors == [primary]
+        assert callback_calls == [original_ref]
+        assert worker_runs == []
+        assert owner.error is primary
+        assert owner.state == "quarantined"
+        assert reservation._committed is False
+        assert store.ref("output") == original_ref
+        assert store._namespace_revision == original_revision
+        assert any(
+            str(error) == "lease is closing"
+            for error in owner.secondary_errors
+        )
+        assert retained_identities <= {
+            record.identity for record in owner._allocations
+        }
+        assert retained_identities <= {
+            record.identity
+            for record in provider._terminal_quarantine.allocations
+        }
+        assert retained_identities <= {
+            record.identity
+            for record in runtime._terminal_quarantine.allocations
+        }
+        with gate._condition:
+            assert not gate._has_active_tokens()
+    finally:
+        release_factory.set()
+        if retry.is_alive():
+            _join(retry, retry_done)
+        if closer is not None and closer.is_alive():
+            _join(closer, close_done)
+        _close_case(runtime, store)
+
+
 def test_writeback_completion_capability_rejects_cross_reservation_and_ref():
     store_a = HostTensorStore(store_id="terminal-completion-capability-a")
     dirty_a = store_a.put("dirty", np.zeros(4, dtype=np.float64))
