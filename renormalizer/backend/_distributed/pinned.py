@@ -253,6 +253,12 @@ class PinnedBufferPool:
             self._slot._array = array
             array, record = _validate_storage(array, capacity_bytes)
         except Exception:
+            if (
+                _allocator_owns_construction_slot
+                and _construction_slot is not None
+                and _construction_slot.snapshot().records
+            ):
+                raise
             self._slot._array = None
             if _allocator_owns_construction_slot:
                 array = pageable_allocator(

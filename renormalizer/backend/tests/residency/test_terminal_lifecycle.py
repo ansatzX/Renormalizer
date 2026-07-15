@@ -8514,6 +8514,41 @@ def test_real_managed_descendant_guard_binds_operation_and_lease_epoch():
         _close_case(runtime, store)
 
 
+def test_mark_dirty_rejects_canonical_resource_state_before_mutation():
+    runtime, request, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-mark-dirty-exact-operation"
+    )
+    gate = runtime._terminal_gate
+    output = runtime.backend.zeros((4,), dtype=np.float64)
+    before = (
+        lease._dirty,
+        lease._dirty_allocation_records,
+        dict(lease._resource_record._allocations),
+    )
+    token = gate.admit_lease(lease._epoch, "resource_state")
+    try:
+        with pytest.raises(RuntimeError, match="required operation"):
+            lease.mark_dirty(
+                "output",
+                output,
+                _admission_token=token,
+            )
+        assert (
+            lease._dirty,
+            lease._dirty_allocation_records,
+            dict(lease._resource_record._allocations),
+        ) == before
+    finally:
+        gate.release(token)
+
+    try:
+        lease.mark_dirty("output", output)
+        assert lease._dirty == (dict(request.host_refs)["output"], output)
+        assert lease._dirty_allocation_records == (allocation_record(output),)
+    finally:
+        _close_case(runtime, store)
+
+
 def test_real_managed_local_operator_accepts_exact_operator_call_context():
     runtime, request, plan, store, _, lease = _open_managed_active_case(
         store_id="terminal-managed-local-operator"
@@ -8780,6 +8815,65 @@ def test_pageable_fallback_producer_publishes_before_after_real_failure(
         assert retained[expected.identity].owner is expected.owner
         assert retained[expected.identity].capacity_bytes == expected.capacity_bytes
     finally:
+        _repair_test_construction_state(runtime._terminal_gate)
+        _close_case(runtime, store)
+
+
+def test_pinned_after_real_provider_failure_does_not_fallback_or_lose_owner(
+    monkeypatch,
+):
+    class AfterRealPinnedFailure(Exception):
+        pass
+
+    runtime = _runtime()
+    request, plan, store, _, _ = _active_case(
+        runtime,
+        store_id="terminal-pinned-after-real-no-fallback",
+    )
+    receipt = runtime.preflight_residency(request, plan)
+    provider = _provider(runtime, request)
+    failure = AfterRealPinnedFailure("pinned producer wrapper failed after return")
+    original_pinned = provider._pinned_allocator
+    original_pageable = pinned_module._pageable_array
+    observed = []
+    pageable_allocations = []
+    opened = []
+
+    def fail_after_real(*args, **kwargs):
+        allocated = original_pinned(*args, **kwargs)
+        slot = kwargs["_construction_slot"]
+        observed.append((allocation_record(allocated), slot.snapshot()))
+        raise failure
+
+    def allocate_pageable(*args, **kwargs):
+        allocated = original_pageable(*args, **kwargs)
+        pageable_allocations.append(allocation_record(allocated))
+        return allocated
+
+    monkeypatch.setattr(provider, "_pinned_allocator", fail_after_real)
+    monkeypatch.setattr(pinned_module, "_pageable_array", allocate_pageable)
+    try:
+        with pytest.raises(AfterRealPinnedFailure) as caught:
+            opened.append(
+                provider.open_working_set(request, plan, store, receipt).__enter__()
+            )
+        assert caught.value is failure
+        assert pageable_allocations == []
+        assert len(observed) == 1
+        physical, snapshot = observed[0]
+        retained = {
+            candidate.identity: candidate for candidate in snapshot.records
+        }
+        assert tuple(retained) == (physical.identity,)
+        assert retained[physical.identity].owner is physical.owner
+        assert retained[physical.identity].capacity_bytes == physical.capacity_bytes
+        assert physical.capacity_bytes == request.transfer_profile.rank_staging_bytes[0]
+    finally:
+        for lease in opened:
+            try:
+                lease.close()
+            except BaseException:
+                pass
         _repair_test_construction_state(runtime._terminal_gate)
         _close_case(runtime, store)
 

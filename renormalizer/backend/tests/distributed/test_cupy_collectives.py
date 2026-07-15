@@ -14,6 +14,7 @@ import pytest
 from renormalizer.backend._distributed.context import DistributedContext
 from renormalizer.backend._distributed.terminal import (
     _FatalTransition,
+    _TERMINAL_TIMEOUT_S,
     _TerminalPhase,
 )
 
@@ -9965,6 +9966,66 @@ def test_structured_fatal_election_inherits_current_lifecycle_deadline(
         ),
     )
     assert wrapper._inherited_fatal_deadline() == deadline
+
+
+def test_structured_fatal_election_ignores_expired_committed_construction_deadline(
+    monkeypatch,
+):
+    from renormalizer.backend._distributed import collectives as collectives_module
+
+    runtime, wrapper, _, _, _ = _single_rank_task_18_2_runtime(monkeypatch)
+    gate = runtime._terminal_gate
+    transaction = gate._prepare_lease_construction("lease_construction")
+    _, token = gate.begin_lease(
+        "lease_construction",
+        _transaction=transaction,
+    )
+    result = object()
+    assert gate._commit_lease_construction(
+        transaction,
+        result,
+        lambda: None,
+        lambda _primary: None,
+    ) is result
+    assert transaction.state == "committed"
+    assert gate._current_thread_admission() is None
+
+    expired = time.monotonic() - 1.0
+    transaction.deadline = expired
+    fresh = time.monotonic() + _TASK_18_2_TIMEOUT_S
+    requested = []
+
+    def new_deadline(timeout_s):
+        requested.append(timeout_s)
+        return fresh
+
+    monkeypatch.setattr(gate, "_deadline", new_deadline)
+    primary = RuntimeError("structured election after committed construction")
+    transition = runtime._begin_communicator_fatal(primary)
+    with wrapper._fatal_condition:
+        retained_owner = wrapper._fatal_publication_owner_reservation
+    election = retained_owner.election
+
+    assert requested == [pytest.approx(_TERMINAL_TIMEOUT_S)]
+    assert transition is election.prepared_transition
+    assert transition is gate._fatal_transition
+    assert transition.deadline == fresh
+    assert transition.deadline != expired
+    monkeypatch.setattr(
+        gate,
+        "_deadline",
+        lambda _timeout_s: (_ for _ in ()).throw(
+            AssertionError("structured fatal lifecycle refreshed its deadline")
+        ),
+    )
+    monkeypatch.setattr(
+        collectives_module.time,
+        "monotonic",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("structured fatal wait refreshed its deadline")
+        ),
+    )
+    assert wrapper._inherited_fatal_deadline() == fresh
 
 
 @pytest.mark.parametrize(

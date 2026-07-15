@@ -682,12 +682,20 @@ class _LeaseResourceRecord:
 
 class _ActiveOperandLease:
     def __init__(
-        self, working_set, bindings, cache_leases, compute_handle, *, shared_call=False
+        self,
+        working_set,
+        bindings,
+        cache_leases,
+        compute_handle,
+        *,
+        admission_token,
+        shared_call=False,
     ):
         self._working_set = working_set
         self.bindings = bindings
         self._cache_leases = tuple(cache_leases)
         self._compute_handle = compute_handle
+        self._admission_token = admission_token
         self._shared_call = shared_call
         self._closed = False
 
@@ -710,8 +718,20 @@ class _ActiveOperandLease:
         working_set = self._working_set
         working_set._raise_terminal_close_preemption()
         try:
+            current = _admission_token
+            if current is None:
+                current = (
+                    working_set._provider.runtime._terminal_gate
+                    ._current_thread_admission()
+                )
+            nested_operation = (
+                self._admission_token.operation
+                if current is self._admission_token
+                else None
+            )
             with working_set._child_close_admission(
-                _admission_token
+                _admission_token,
+                nested_operation=nested_operation,
             ) as admitted_token:
                 validator = working_set._exact_admission_validator(
                     admitted_token
@@ -774,6 +794,7 @@ class _ActiveOperandLease:
             self.bindings = None
             self._cache_leases = ()
             self._compute_handle = None
+            self._admission_token = None
             self._shared_call = False
             self._working_set = None
             self._closed = True
@@ -1020,6 +1041,7 @@ class WorkingSetLease:
         self._children = set()
         self._active_operator_owner = None
         self._active_operator_scope = None
+        self._active_operator_admission = None
         self._dirty = None
         self._dirty_allocation_records = ()
         self._writeback_ticket = None
@@ -1097,6 +1119,10 @@ class WorkingSetLease:
             scope="lease",
             epoch=self._epoch,
         )
+        if token.operation != operation:
+            raise RuntimeError(
+                "resource admission does not match the required operation"
+            )
         try:
             yield token
         finally:
@@ -1104,7 +1130,7 @@ class WorkingSetLease:
                 runtime._release_admission(token)
 
     @contextmanager
-    def _child_close_admission(self, token=None):
+    def _child_close_admission(self, token=None, *, nested_operation=None):
         if token is not None and token.scope == "lease_close":
             runtime = self._provider.runtime
             runtime._require_admission(
@@ -1115,8 +1141,21 @@ class WorkingSetLease:
             )
             yield token
             return
-        with self._lease_admission("child_close", token) as admitted:
+        operation = "child_close" if nested_operation is None else nested_operation
+        with self._lease_admission(operation, token) as admitted:
             yield admitted
+
+    def _nested_lease_operation(self, token, default, parent_operations):
+        if token is None:
+            return default
+        self._provider.runtime._require_admission(
+            token,
+            scope="lease",
+            epoch=self._epoch,
+        )
+        if token.operation in parent_operations:
+            return token.operation
+        return default
 
     def _spawn_async_admission(self, capability, operation):
         return self._provider._spawn_async_admission(
@@ -1354,6 +1393,7 @@ class WorkingSetLease:
             raise primary
         self._active_operator_owner = owner
         self._active_operator_scope = scope
+        self._active_operator_admission = _admission_token
         try:
             with scope:
                 yield call
@@ -1393,11 +1433,17 @@ class WorkingSetLease:
         finally:
             self._active_operator_owner = None
             self._active_operator_scope = None
+            self._active_operator_admission = None
 
     def _load_identity(
         self, identity, *, prefetch=False, _admission_token=None
     ):
         operation = "prefetch" if prefetch else "load"
+        operation = self._nested_lease_operation(
+            _admission_token,
+            operation,
+            {"acquire", "operator_call"},
+        )
         with self._lease_admission(operation, _admission_token) as admission_token:
             validator = self._exact_admission_validator(admission_token)
             return self._load_identity_admitted(
@@ -1539,8 +1585,13 @@ class WorkingSetLease:
             ) from self._poisoned_error
 
     def _prefetch_one(self, *, _admission_token=None):
+        operation = self._nested_lease_operation(
+            _admission_token,
+            "prefetch",
+            {"acquire", "operator_call"},
+        )
         with self._lease_admission(
-            "prefetch", _admission_token
+            operation, _admission_token
         ) as admission_token:
             validator = self._exact_admission_validator(admission_token)
             return self._prefetch_one_admitted(
@@ -1575,8 +1626,13 @@ class WorkingSetLease:
             break
 
     def acquire(self, request, *, _admission_token=None):
+        operation = (
+            "operator_call"
+            if self._active_operator_admission is not None
+            else "acquire"
+        )
         with self._lease_admission(
-            "acquire", _admission_token
+            operation, _admission_token
         ) as admission_token:
             validator = self._exact_admission_validator(admission_token)
             return self._acquire_admitted(
@@ -1655,6 +1711,7 @@ class WorkingSetLease:
                 bindings,
                 leases,
                 compute_handle,
+                admission_token=_admission_token,
                 shared_call=call_owner is not None,
             )
             self._children.add(child)
@@ -1662,7 +1719,10 @@ class WorkingSetLease:
         except BaseException:
             if child is not None:
                 try:
-                    child.close(_admission_token=_admission_token)
+                    child._close_admitted(
+                        _admission_token,
+                        validator,
+                    )
                 except BaseException:
                     pass
             else:
@@ -2160,6 +2220,7 @@ class WorkingSetLease:
         self._children.clear()
         self._active_operator_owner = None
         self._active_operator_scope = None
+        self._active_operator_admission = None
         self._dirty = None
         self._dirty_allocation_records = ()
         self._writeback_ticket = None
@@ -2194,6 +2255,7 @@ class WorkingSetLease:
         self._children.clear()
         self._active_operator_owner = None
         self._active_operator_scope = None
+        self._active_operator_admission = None
         self._dirty = None
         self._dirty_allocation_records = ()
         self._writeback_ticket = None
@@ -2244,7 +2306,10 @@ class WorkingSetLease:
                         _admission_token=token,
                         _admission_validator=validator,
                     )
-                    self.reap_completed(_admission_token=token)
+                    self._reap_completed_admitted(
+                        _admission_token=token,
+                        _admission_validator=validator,
+                    )
                 return
             except BaseException as caught:
                 self._poison(caught)

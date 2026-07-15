@@ -676,13 +676,20 @@ class _TerminalLifecycleGate:
             and self._fatal_transition.deadline is not None
         ):
             return self._fatal_transition.deadline
-        if self._runtime_close_transition is not None:
+        if (
+            self._phase is _TerminalPhase.RUNTIME_CLOSING
+            and self._runtime_close_transition is not None
+        ):
             return self._runtime_close_transition.deadline
         if self._live_epoch is not None:
             lease = self._leases[self._live_epoch]
-            if lease.transition is not None:
+            if lease.phase == "closing" and lease.transition is not None:
                 return lease.transition.deadline
-            if lease.construction is not None:
+            if (
+                lease.phase == "constructing"
+                and lease.construction is not None
+                and lease.construction.state == "active"
+            ):
                 return lease.construction.deadline
         return self._deadline(_TERMINAL_TIMEOUT_S)
 
