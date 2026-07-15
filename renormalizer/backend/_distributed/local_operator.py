@@ -831,7 +831,7 @@ class DistributedLocalOperator:
                 call.record_primary(error)
 
         if call is not None and (
-            call.owner.quarantined
+            call.owner.state == "quarantined"
             or self.provider._provider._terminal_error is not None
             or self.provider._provider.runtime._terminal_error is not None
             or getattr(self.collective, "_fatal_error", None) is not None
