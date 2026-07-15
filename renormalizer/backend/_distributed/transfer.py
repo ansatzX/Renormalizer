@@ -414,11 +414,12 @@ class TransferTicket(AsyncCompletionHandle):
         self._owner.publish_counted_completion()
 
 
-@dataclass(frozen=True)
+@dataclass
 class _OwnerDetachPreparation:
     owner_identity: int
     capability: object
     event_identities: tuple
+    state: str = "prepared"
 
 
 class TransferScheduler:
@@ -852,11 +853,12 @@ class TransferScheduler:
         def commit_detached(owner, preparation):
             scheduler = scheduler_ref()
             if scheduler is not None:
-                scheduler._commit_owner_detached(
+                return scheduler._commit_owner_detached(
                     owner,
                     preparation,
                     _detach_capability=detach_capability,
                 )
+            return preparation
 
         def quarantined(owner):
             scheduler = scheduler_ref()
@@ -955,11 +957,20 @@ class TransferScheduler:
         identity = id(owner)
         event_identities = tuple(id(event) for event in owner._events)
         with self._collection_lock:
-            if (
-                self._owners.get(identity) is not owner
-                or self._owner_detach_capabilities.get(identity)
-                is not _detach_capability
+            active = (
+                self._owners.get(identity) is owner
+                and self._owner_detach_capabilities.get(identity)
+                is _detach_capability
+            )
+            prior_preparation = owner._detach_scheduler_receipt
+            if not active and self._committed_owner_detach_matches_locked(
+                owner,
+                prior_preparation,
+                _detach_capability,
+                event_identities,
             ):
+                return prior_preparation
+            if not active:
                 raise RuntimeError(
                     "scheduler owner detach capability does not own this transition"
                 )
@@ -974,6 +985,7 @@ class TransferScheduler:
             elif (
                 preparation.capability is not _detach_capability
                 or preparation.event_identities != event_identities
+                or preparation.state != "prepared"
             ):
                 raise RuntimeError("scheduler owner detach preparation changed")
             return preparation
@@ -987,10 +999,20 @@ class TransferScheduler:
     ):
         identity = id(owner)
         with self._collection_lock:
+            if self._committed_owner_detach_matches_locked(
+                owner,
+                preparation,
+                _detach_capability,
+                preparation.event_identities
+                if isinstance(preparation, _OwnerDetachPreparation)
+                else (),
+            ):
+                return preparation
             if (
                 not isinstance(preparation, _OwnerDetachPreparation)
                 or preparation.owner_identity != identity
                 or preparation.capability is not _detach_capability
+                or preparation.state != "prepared"
                 or self._owner_detach_preparations.get(identity) is not preparation
                 or self._owners.get(identity) is not owner
                 or self._owner_detach_capabilities.get(identity)
@@ -1001,6 +1023,36 @@ class TransferScheduler:
                 owner,
                 preparation.event_identities,
             )
+            preparation.state = "committed"
+            return preparation
+
+    def _committed_owner_detach_matches_locked(
+        self,
+        owner,
+        preparation,
+        detach_capability,
+        event_identities,
+    ):
+        if (
+            not isinstance(preparation, _OwnerDetachPreparation)
+            or preparation.owner_identity != id(owner)
+            or preparation.capability is not detach_capability
+            or preparation.event_identities != tuple(event_identities)
+            or preparation.state != "committed"
+            or id(owner) in self._owners
+            or id(owner) in self._owner_detach_capabilities
+            or id(owner) in self._owner_detach_preparations
+        ):
+            return False
+        identities = frozenset(event_identities)
+        if any(id(event) in identities for event in self._events):
+            return False
+        if any(identity in self._event_owners for identity in identities):
+            return False
+        return not (
+            self.last_compute_event is not None
+            and self.last_compute_event._owner is owner
+        )
 
     def _remove_owner_membership_locked(self, owner, event_identities):
         identity = id(owner)
@@ -1028,21 +1080,31 @@ class TransferScheduler:
         terminal_state,
     ):
         identity = id(owner)
-        if (
-            terminal_state != "quarantined"
-            or self._owners.get(identity) is not owner
-            or self._owner_detach_capabilities.get(identity)
-            is not detach_capability
-        ):
+        active = (
+            self._owners.get(identity) is owner
+            and self._owner_detach_capabilities.get(identity)
+            is detach_capability
+        )
+        event_identities = tuple(
+            id(event) for event in resource_snapshot["events"]
+        )
+        preparation = owner._detach_scheduler_receipt
+        committed = self._committed_owner_detach_matches_locked(
+            owner,
+            preparation,
+            detach_capability,
+            event_identities,
+        )
+        if terminal_state != "quarantined" or not (active or committed):
             raise RuntimeError(
                 "scheduler owner quarantine capability does not own this transition"
             )
         if self._poisoned_error is None:
             self._poisoned_error = terminal_error
-        event_identities = tuple(
-            id(event) for event in resource_snapshot["events"]
-        )
-        self._remove_owner_membership_locked(owner, event_identities)
+        if active:
+            self._remove_owner_membership_locked(owner, event_identities)
+        if isinstance(preparation, _OwnerDetachPreparation):
+            preparation.state = "quarantined"
         if all(retained is not owner for retained in self._quarantined_owners):
             self._quarantined_owners.append(owner)
         return any(

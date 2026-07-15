@@ -11551,6 +11551,158 @@ def test_scheduler_detach_uncertainty_stops_owner_cleanup(
         _close_case(runtime, store)
 
 
+@pytest.mark.parametrize("callback_failure", ("before_real", "after_real"))
+@pytest.mark.parametrize("resolution", ("retry", "quarantine"))
+def test_scheduler_detach_commit_uncertainty_is_recoverable(
+    monkeypatch,
+    callback_failure,
+    resolution,
+):
+    runtime, _, _, store, provider, lease = _open_managed_active_case(
+        store_id="terminal-owner-detach-commit-{}-{}".format(
+            callback_failure,
+            resolution,
+        )
+    )
+    scheduler = lease.scheduler
+    scheduler._event_factory = lambda: _ManualEvent(done=True)
+    allocation = np.arange(24.0)
+    release_callbacks = []
+    resource_releases = []
+    with lease._lease_admission("acquire"):
+        owner = scheduler._register_owner(
+            "compute",
+            arrays=(allocation,),
+            defer_counted_admission=True,
+        )
+        owner.mark_enqueued()
+        event = scheduler._new_event(owner, completion=True)
+        owner.add_release_callback(lambda: release_callbacks.append(owner))
+        owner.arm_completion()
+    original_commit = owner._detached_commit
+    original_releaser = owner._resource_releaser
+    primary = RuntimeError(
+        "scheduler detach commit {} failed".format(callback_failure)
+    )
+
+    def fail_commit(*args, **kwargs):
+        if callback_failure == "after_real":
+            original_commit(*args, **kwargs)
+        raise primary
+
+    def observe_release(resource):
+        resource_releases.append(resource)
+        return original_releaser(resource)
+
+    monkeypatch.setattr(owner, "_detached_commit", fail_commit)
+    monkeypatch.setattr(owner, "_resource_releaser", observe_release)
+    retained_before = (
+        owner._arrays,
+        owner._allocations,
+        owner._resources,
+        owner._streams,
+        tuple(owner._events),
+        owner._completion_event,
+        tuple(owner._release_callbacks),
+        owner._detached,
+        owner._detached_commit,
+        owner._quarantine,
+        owner._resource_releaser,
+    )
+    allocation_identity = allocation_record(allocation).identity
+
+    def reap_owner():
+        with lease._lease_admission("resource_state") as token:
+            return owner.reap(
+                _admission_token=token,
+                _admission_validator=lease._exact_admission_validator(token),
+            )
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            reap_owner()
+        assert caught.value is primary
+        assert owner.error is primary
+        assert owner.state == "enqueued"
+        assert owner._detach_transition_state == "available"
+        assert (
+            owner._arrays,
+            owner._allocations,
+            owner._resources,
+            owner._streams,
+            tuple(owner._events),
+            owner._completion_event,
+            tuple(owner._release_callbacks),
+            owner._detached,
+            owner._detached_commit,
+            owner._quarantine,
+            owner._resource_releaser,
+        ) == retained_before
+        assert release_callbacks == []
+        assert resource_releases == []
+        assert allocation_identity in {
+            record.identity for record in owner._allocations
+        }
+        assert allocation_identity in {
+            record.identity for record in lease._resource_record.allocations
+        }
+        if callback_failure == "before_real":
+            assert scheduler._owners[id(owner)] is owner
+            assert event in scheduler._events
+        else:
+            assert id(owner) not in scheduler._owners
+            assert event not in scheduler._events
+
+        monkeypatch.setattr(owner, "_detached_commit", original_commit)
+        if resolution == "retry":
+            with pytest.raises(RuntimeError) as retried:
+                reap_owner()
+            assert retried.value is primary
+            assert owner.state == "detached"
+            assert owner._detach_transition_state == "complete"
+            assert release_callbacks == [owner]
+            assert resource_releases == [owner]
+            assert owner._arrays == ()
+            assert owner._allocations == ()
+            assert owner._release_callbacks == []
+            assert id(owner) not in scheduler._owners
+            assert event not in scheduler._events
+            assert id(owner) not in scheduler._owner_detach_preparations
+        else:
+            with lease._lease_admission("close_progress") as token:
+                owner.force_quarantine(
+                    primary,
+                    _admission_token=token,
+                    _admission_validator=lease._exact_admission_validator(token),
+                )
+            assert owner.state == "quarantined"
+            assert owner._detach_transition_state == "complete"
+            assert scheduler._quarantined_owners == [owner]
+            assert id(owner) not in scheduler._owners
+            assert event not in scheduler._events
+            assert id(owner) not in scheduler._owner_detach_preparations
+            assert allocation_identity in {
+                record.identity for record in owner._allocations
+            }
+            assert allocation_identity in {
+                record.identity for record in lease._resource_record.allocations
+            }
+            assert allocation_identity in {
+                record.identity
+                for record in provider._terminal_quarantine.allocations
+            }
+            assert allocation_identity in {
+                record.identity
+                for record in runtime._terminal_quarantine.allocations
+            }
+            assert tuple(owner._release_callbacks) == retained_before[6]
+            assert owner._resource_releaser is retained_before[10]
+            assert release_callbacks == []
+            assert resource_releases == []
+    finally:
+        _close_case(runtime, store)
+
+
 def test_runtime_close_hands_off_retired_scheduler_counted_start(monkeypatch):
     runtime, _, _, store, _, lease = _open_managed_active_case(
         store_id="terminal-runtime-close-retired-scheduler"

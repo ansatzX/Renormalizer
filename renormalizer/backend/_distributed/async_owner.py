@@ -1433,6 +1433,13 @@ class AsyncResourceOwner:
                     else:
                         receipt = self._detached(self)
                     self._detach_scheduler_receipt = receipt
+                if self._detached_commit is not None:
+                    receipt = self._detached_commit(
+                        self,
+                        self._detach_scheduler_receipt,
+                    )
+                    if receipt is not None:
+                        self._detach_scheduler_receipt = receipt
             except BaseException as error:
                 if first_error is None:
                     first_error = error
@@ -1442,9 +1449,6 @@ class AsyncResourceOwner:
                 self.state = prior_state
                 self._detach_transition_state = "available"
                 raise first_error
-
-            if self._detached_commit is not None:
-                self._detached_commit(self, self._detach_scheduler_receipt)
 
             for callback in tuple(self._release_callbacks):
                 try:
