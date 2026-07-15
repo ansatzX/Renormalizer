@@ -139,38 +139,124 @@ class AsyncCompletionHandle:
         self._managed_guard = owner._managed_guard
         self._managed_epoch = owner._managed_epoch
 
-    def _require_admission(self, token=None, validator=None):
+    def _require_admission(
+        self,
+        token=None,
+        validator=None,
+        *,
+        allowed_operations=(),
+    ):
         return _require_managed_resource_admission(
             self._managed_guard,
             token,
             validator,
             allowed_scopes=("lease", "lease_close"),
+            allowed_operations=allowed_operations,
             epoch=lambda _token: self._managed_epoch,
         )
 
     @property
     def owner(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return self._owner
 
     @property
     def event(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return self._owner.completion_event
 
     @property
     def completed(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "emit_profile",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return self._owner.completed
 
     @property
     def error(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return self._owner.error
 
     @property
     def terminal_poisoned(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return self._owner.quarantined
 
     def owned_events(
@@ -179,7 +265,11 @@ class AsyncCompletionHandle:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("resource_state",),
+        )
         return self._owner.events
 
     def reap(
@@ -188,7 +278,22 @@ class AsyncCompletionHandle:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+                "scheduler_complete",
+            ),
+        )
         return self._owner.reap(
             _admission_token=_admission_token,
             _admission_validator=_admission_validator,
@@ -201,7 +306,15 @@ class AsyncCompletionHandle:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "cache_wait",
+                "pool_reap",
+                "scheduler_complete",
+            ),
+        )
         return self._owner.wait(
             _deadline=_deadline,
             _admission_token=_admission_token,
@@ -209,15 +322,15 @@ class AsyncCompletionHandle:
         )
 
     def query(self):
-        self._require_admission()
+        self._require_admission(allowed_operations=("reap",))
         return self.reap()
 
     def synchronize(self):
-        self._require_admission()
+        self._require_admission(allowed_operations=("scheduler_complete",))
         return self.wait()
 
     def close(self):
-        self._require_admission()
+        self._require_admission(allowed_operations=("scheduler_complete",))
         return self.wait()
 
 
@@ -230,32 +343,40 @@ class TransferTicket(AsyncCompletionHandle):
 
     @property
     def direction(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("emit_profile", "resource_state", "scheduler_complete")
+        )
         return self._owner.direction
 
     @property
     def nbytes(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("emit_profile", "resource_state", "scheduler_complete")
+        )
         return self._owner.nbytes
 
     @property
     def elapsed_s(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("emit_profile", "resource_state", "scheduler_complete")
+        )
         return self._owner.elapsed_s
 
     @property
     def result(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("resource_state", "scheduler_complete")
+        )
         return self._owner.result
 
     @property
     def _accounted(self):
-        self._require_admission()
+        self._require_admission(allowed_operations=("scheduler_complete",))
         return self._owner.accounted
 
     @_accounted.setter
     def _accounted(self, value):
-        self._require_admission()
+        self._require_admission(allowed_operations=("scheduler_complete",))
         self._owner.accounted = bool(value)
 
     def take_result(
@@ -264,7 +385,11 @@ class TransferTicket(AsyncCompletionHandle):
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("scheduler_complete",),
+        )
         return self._owner.take_result(
             _admission_token=_admission_token,
             _admission_validator=_admission_validator,
@@ -436,24 +561,49 @@ class TransferScheduler:
 
     @property
     def stream_count(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "lease_construction",
+                "resource_state",
+            ),
+        )
         return int(self._stream is not None)
 
     @property
     def pending_ticket_count(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("resource_state",),
+        )
         return len(self._tickets)
 
     @property
     def retained_event_count(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("resource_state",),
+        )
         return len(self._event_owners) + sum(
             len(owner.events) for owner in self._quarantined_owners
         )
 
     @property
     def retained_streams(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "lease_construction",
+                "resource_state",
+            ),
+        )
         owners = (*self._owners.values(), *self._quarantined_owners)
         return tuple(
             {
@@ -468,7 +618,17 @@ class TransferScheduler:
 
     @property
     def retained_events(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "lease_construction",
+                "resource_state",
+            ),
+        )
         owners = (*self._owners.values(), *self._quarantined_owners)
         return tuple(
             {
@@ -482,12 +642,28 @@ class TransferScheduler:
 
     @property
     def poisoned(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            ),
+        )
         return self._poisoned_error is not None
 
     @property
     def event_count(self):
-        self._require_admission(None, None)
+        self._require_admission(None, None, allowed_operations=("resource_state",))
         self.reap_completed()
         return self.retained_event_count
 
@@ -497,7 +673,11 @@ class TransferScheduler:
         _admission_token,
         _admission_validator,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("resource_state",),
+        )
         self.reap_completed(
             _admission_token=_admission_token,
             _admission_validator=_admission_validator,
@@ -517,7 +697,7 @@ class TransferScheduler:
         token,
         validator,
         *,
-        allowed_operations=None,
+        allowed_operations=(),
     ):
         guard = getattr(self, "_managed_guard", None)
         if (
@@ -556,7 +736,18 @@ class TransferScheduler:
         defer_counted_completion=False,
         defer_counted_admission=False,
     ):
-        self._require_admission(None, None)
+        allowed_operations = {
+            "compute": ("acquire", "child_close", "operator_call"),
+            "d2h": ("close_progress", "schedule_writeback"),
+            "h2d": ("acquire", "load", "operator_call", "prefetch"),
+        }.get(kind)
+        if allowed_operations is None:
+            raise RuntimeError("unknown managed async owner family")
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=allowed_operations,
+        )
         scheduler_ref = weakref.ref(self)
         cupy = self._cupy
         device_index = getattr(self.backend, "_device_index", None)
@@ -692,7 +883,19 @@ class TransferScheduler:
         )
 
     def _new_event_from(self, owner, factory, *, completion=False):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         event = self._create_event_owned(
             owner=owner,
             factory=factory,
@@ -718,7 +921,19 @@ class TransferScheduler:
         return event
 
     def _record(self, event, stream=None):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         event.record(stream)
 
     @staticmethod
@@ -769,7 +984,11 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "load", "operator_call", "prefetch"),
+        )
         self._require_usable()
         ref, local_slice, reverse_axis = self._source(source_ref)
         staging = self._host_view(
@@ -845,7 +1064,11 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "load", "operator_call"),
+        )
         self._require_usable()
         owner = self._event_owners.get(id(event))
         if owner is not None:
@@ -903,7 +1126,11 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "child_close", "operator_call"),
+        )
         self._require_usable()
         cache_leases = tuple(cache_leases)
         resources = tuple(resources)
@@ -940,7 +1167,11 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "child_close", "operator_call"),
+        )
         self._require_usable()
         if handle is None:
             handle = self.begin_compute(
@@ -992,7 +1223,11 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("close_progress", "schedule_writeback"),
+        )
         self._require_usable()
         staging = self._host_view(slot, source.shape, source.dtype)
         if tuple(source.shape) != tuple(destination_ref.shape):
@@ -1113,7 +1348,24 @@ class TransferScheduler:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            ),
+        )
         self._require_usable()
         errors = []
         for owner in tuple(self._owners.values()):
@@ -1142,7 +1394,11 @@ class TransferScheduler:
         _admission_validator=None,
         _deadline=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("scheduler_close", "scheduler_complete"),
+        )
         _remaining_lifecycle_time(
             _deadline,
             "transfer scheduler lifecycle timed out before completion drain",

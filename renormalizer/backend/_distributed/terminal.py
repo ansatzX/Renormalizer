@@ -53,6 +53,15 @@ class _ResourceAdmission:
 _MANAGED_LIVE_EPOCH = object()
 _MANAGED_DEFERRED_EPOCH = object()
 
+_MANAGED_ASYNC_OPERATIONS = frozenset(
+    {
+        "async_completion",
+        "compute_completion",
+        "d2h_completion",
+        "h2d_completion",
+    }
+)
+
 _MANAGED_SCOPE_OPERATIONS = {
     "runtime": frozenset(
         {
@@ -490,6 +499,7 @@ class _TokenState:
     token: _ResourceAdmission
     status: Literal["active", "released", "converted"] = "active"
     async_capability: object = _MISSING
+    async_operation: object = _MISSING
     async_claimed: bool = False
 
 
@@ -806,18 +816,22 @@ class _TerminalLifecycleGate:
                 "managed resource admission scope is not authorized"
             )
         canonical_operations = _MANAGED_SCOPE_OPERATIONS.get(token.scope, ())
-        operations = (
-            canonical_operations | {"async_completion"}
-            if allowed_operations is None
-            else frozenset(allowed_operations)
-        )
+        if allowed_operations is None:
+            raise TypeError(
+                "managed resource admission requires allowed operations"
+            )
+        operations = frozenset(allowed_operations)
         is_async = token.parent_sequence is not None
         if is_async:
-            if token.operation != "async_completion":
+            if (
+                state.async_operation is _MISSING
+                or token.operation != state.async_operation
+                or token.operation not in _MANAGED_ASYNC_OPERATIONS
+            ):
                 raise RuntimeError(
                     "managed resource admission async operation is not canonical"
                 )
-            if "async_completion" not in operations:
+            if token.operation not in operations:
                 raise RuntimeError(
                     "managed resource admission operation is not authorized"
                 )
@@ -1152,7 +1166,12 @@ class _TerminalLifecycleGate:
                 self._require_managed_resource_admission_locked(
                     state.token,
                     allowed_scopes=("lease", "lease_close"),
-                    allowed_operations=None,
+                    allowed_operations=(
+                        "acquire",
+                        "load",
+                        "operator_call",
+                        "prefetch",
+                    ),
                     epoch=transaction.epoch,
                 )
             else:
@@ -1690,7 +1709,10 @@ class _TerminalLifecycleGate:
             self._condition.notify_all()
 
     def spawn_async(
-        self, parent: _ResourceAdmission, owner_identity: object
+        self,
+        parent: _ResourceAdmission,
+        owner_identity: object,
+        operation=None,
     ) -> _ResourceAdmission:
         with self._condition:
             state = self._token_state(parent)
@@ -1741,14 +1763,24 @@ class _TerminalLifecycleGate:
                     != self._runtime_close_transition.sequence
                 ):
                     raise RuntimeError("stale runtime close admission")
-            return self._new_token(
+            async_operation = _MISSING
+            token_operation = parent.operation
+            if operation is not None:
+                self._require_operation(operation)
+                if operation not in _MANAGED_ASYNC_OPERATIONS:
+                    raise RuntimeError("async operation is not canonical")
+                async_operation = operation
+                token_operation = operation
+            token = self._new_token(
                 parent.scope,
                 parent.epoch,
-                parent.operation,
+                token_operation,
                 parent_sequence=parent.sequence,
                 transition_sequence=parent.transition_sequence,
                 async_capability=owner_identity,
             )
+            self._tokens[token.sequence].async_operation = async_operation
+            return token
 
     def claim_async(
         self,
@@ -1765,6 +1797,11 @@ class _TerminalLifecycleGate:
                 raise RuntimeError("async admission claim capability does not match")
             if state.async_claimed:
                 raise RuntimeError("async admission was already claimed")
+            if (
+                state.async_operation is not _MISSING
+                and operation != state.async_operation
+            ):
+                raise RuntimeError("async operation does not match its spawn family")
             thread_id = threading.get_ident()
             self._require_no_nested_token(thread_id)
             claimed = replace(token, thread_id=thread_id, operation=operation)

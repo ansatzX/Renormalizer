@@ -57,40 +57,98 @@ class StagingSlot:
         self._owner = None
         self._checked_out = False
 
-    def _require_admission(self, token=None, validator=None):
+    def _require_admission(
+        self,
+        token=None,
+        validator=None,
+        *,
+        allowed_operations=(),
+    ):
         return _require_managed_resource_admission(
             self._managed_guard,
             token,
             validator,
             allowed_scopes=("construction", "lease", "lease_close"),
+            allowed_operations=allowed_operations,
             epoch=lambda _token: self._pool._managed_epoch,
         )
 
     @property
     def array(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            )
+        )
         if self._array is None:
             raise RuntimeError("staging slot is closed")
         return self._array
 
     @property
     def pinned(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+            )
+        )
         return self._pinned
 
     @property
     def nbytes(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+            )
+        )
         return self._nbytes
 
     @property
     def capacity_bytes(self):
-        self._require_admission()
-        return self._pool.capacity_bytes
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+            )
+        )
+        return self._pool._capacity_bytes
 
     @property
     def completion_event(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+            )
+        )
         if self._owner is not None:
             return self._owner.completion_event
         return None
@@ -104,7 +162,17 @@ class StagingSlot:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if not self._checked_out:
             raise RuntimeError("staging slot is not checked out")
         if order not in {"C", "F"}:
@@ -130,7 +198,17 @@ class StagingSlot:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if not self._checked_out:
             raise RuntimeError("staging slot is not checked out")
         if self._owner is not None:
@@ -297,19 +375,44 @@ class PinnedBufferPool:
 
     @property
     def capacity_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "lease_construction",
+                "resource_state",
+            ),
+        )
         return self._capacity_bytes
 
     @property
     def allocated_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "lease_construction",
+                "observe_peaks",
+                "resource_state",
+            ),
+        )
         if self._slot._array is None:
             return 0
         return self._allocation_record.capacity_bytes
 
     @property
     def allocation_records(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "lease_construction",
+                "resource_state",
+            ),
+        )
         return self._terminal_allocation_records()
 
     def _terminal_allocation_records(self):
@@ -319,32 +422,73 @@ class PinnedBufferPool:
 
     @property
     def checked_out_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("observe_peaks", "resource_state"),
+        )
         return self._checked_out_bytes
 
     @property
     def pending_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+            ),
+        )
         return self._pending_bytes
 
     @property
     def peak_checked_out_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("emit_profile", "observe_peaks", "resource_state"),
+        )
         return self._peak_checked_out_bytes
 
     @property
     def pageable_fallback_count(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("emit_profile", "lease_construction", "resource_state"),
+        )
         return self._pageable_fallback_count
 
     @property
     def pageable_fallback_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("emit_profile", "lease_construction", "resource_state"),
+        )
         return self._pageable_fallback_bytes
 
     @property
     def poisoned(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+            ),
+        )
         return self._poisoned_error is not None
 
     def _require_usable(self):
@@ -360,7 +504,7 @@ class PinnedBufferPool:
         token,
         validator,
         *,
-        allowed_operations=None,
+        allowed_operations=(),
     ):
         guard = getattr(self, "_managed_guard", None)
         if (
@@ -406,7 +550,17 @@ class PinnedBufferPool:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         self._require_usable()
         if type(nbytes) is not int or nbytes <= 0:
             raise ValueError("checkout nbytes must be a positive integer")
@@ -426,7 +580,17 @@ class PinnedBufferPool:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         self._require_usable()
         self.reap_completed(
             _admission_token=_admission_token,
@@ -448,7 +612,18 @@ class PinnedBufferPool:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if slot is not self._slot or not slot._checked_out:
             raise RuntimeError("staging slot is not owned by this checkout")
         slot._checked_out = False
@@ -484,7 +659,21 @@ class PinnedBufferPool:
         _admission_validator=None,
         _deadline=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "close_progress",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+            ),
+        )
         _remaining_lifecycle_time(
             _deadline,
             "pinned pool lifecycle timed out before reap",
@@ -516,7 +705,11 @@ class PinnedBufferPool:
         _admission_validator=None,
         _deadline=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("lease_construction", "pool_close"),
+        )
         _remaining_lifecycle_time(
             _deadline,
             "pinned pool lifecycle timed out before owner wait",

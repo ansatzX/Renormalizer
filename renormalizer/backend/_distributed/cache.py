@@ -151,15 +151,7 @@ class CacheEntryLease:
         token=None,
         validator=None,
         *,
-        allowed_operations=(
-            "acquire",
-            "child_close",
-            "load",
-            "operator_call",
-            "prefetch",
-            "resource_state",
-            "async_completion",
-        ),
+        allowed_operations=(),
     ):
         guard = getattr(self, "_managed_guard", None)
         if (
@@ -180,19 +172,43 @@ class CacheEntryLease:
 
     @property
     def identity(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "compute_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+            )
+        )
         return self._require_entry().spec.identity
 
     @property
     def state(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "compute_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+            )
+        )
         if self._entry is not None:
             return self._entry.state
         return "failed" if self._failure is not None else "closed"
 
     @property
     def array(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("acquire", "load", "operator_call", "prefetch")
+        )
         entry = self._require_entry()
         if entry.array is None:
             raise RuntimeError("cache entry lease failed") from entry.error
@@ -200,7 +216,9 @@ class CacheEntryLease:
 
     @property
     def transfer_array(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("acquire", "load", "operator_call", "prefetch")
+        )
         entry = self._require_entry()
         if entry.transfer_array is None:
             raise RuntimeError("cache entry lease failed") from entry.error
@@ -208,7 +226,9 @@ class CacheEntryLease:
 
     @property
     def reverse_axis(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("acquire", "load", "operator_call", "prefetch")
+        )
         return self._require_entry().reverse_axis
 
     def install_readiness(
@@ -218,7 +238,11 @@ class CacheEntryLease:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "load", "operator_call", "prefetch"),
+        )
         entry = self._require_entry()
         self._cache._install_readiness(entry, ticket)
 
@@ -229,7 +253,11 @@ class CacheEntryLease:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "load", "operator_call"),
+        )
         entry = self._require_entry()
         self._cache._wait_for_ready(entry, waiter)
 
@@ -240,7 +268,11 @@ class CacheEntryLease:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "load", "operator_call", "prefetch"),
+        )
         entry = self._require_entry()
         self._cache._fail_entry(entry, error)
 
@@ -261,7 +293,11 @@ class CacheEntryLease:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "load", "operator_call", "prefetch"),
+        )
         if self._closed:
             return
         if not isinstance(owner, AsyncResourceOwner):
@@ -288,9 +324,11 @@ class CacheEntryLease:
             allowed_operations=(
                 "acquire",
                 "child_close",
+                "compute_completion",
+                "h2d_completion",
                 "load",
                 "prefetch",
-                "async_completion",
+                "operator_call",
             ),
         )
         if self._closed:
@@ -311,7 +349,9 @@ class CacheEntryLease:
             self._detach()
 
     def __enter__(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("acquire", "load", "operator_call", "prefetch")
+        )
         if self._closed:
             raise RuntimeError("cache entry lease is closed")
         return self
@@ -535,7 +575,7 @@ class DeviceTensorCache:
             self._resource_recorder(
                 resource=self,
                 kind="cache",
-                records=self.allocation_records,
+                records=self._terminal_allocation_records(),
                 _replace_kind=True,
             )
 
@@ -544,52 +584,122 @@ class DeviceTensorCache:
 
     @property
     def capacity_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "cache_lifetime_reconcile",
+                "lease_construction",
+                "provider_close",
+                "resource_state",
+            ),
+        )
         return self._capacity_bytes
 
     @property
     def allocated_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "cache_lifetime_reconcile",
+                "lease_construction",
+                "observe_peaks",
+                "provider_close",
+                "resource_state",
+            ),
+        )
         return self._allocated_bytes
 
     @property
     def allocation_records(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "cache_lifetime_reconcile",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "lease_construction",
+                "provider_close",
+                "resource_state",
+            ),
+        )
         return self._terminal_allocation_records()
 
     @property
     def peak_allocated_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("emit_profile", "observe_peaks", "resource_state"),
+        )
         return self._peak_allocated_bytes
 
     @property
     def reserved_bytes(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("lease_construction", "resource_state"),
+        )
         return 0 if self._reservation is None else self._reservation.required_bytes
 
     @property
     def cache_hits(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("resource_state",),
+        )
         return self._cache_hits
 
     @property
     def cache_misses(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("resource_state",),
+        )
         return self._cache_misses
 
     @property
     def entry_count(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("cache_refcount", "resource_state"),
+        )
         return len(self._entries)
 
     @property
     def pending_release_count(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=("cache_refcount", "resource_state"),
+        )
         return len(self._owner_pending)
 
     @property
     def poisoned(self):
-        self._require_admission(None, None)
+        self._require_admission(
+            None,
+            None,
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "prefetch",
+                "provider_close",
+                "reap",
+                "resource_state",
+            ),
+        )
         return self._poisoned_error is not None
 
     def _require_usable(self):
@@ -606,7 +716,7 @@ class DeviceTensorCache:
         validator,
         *,
         allowed_scopes=("construction", "lease", "lease_close", "runtime_close"),
-        allowed_operations=None,
+        allowed_operations=(),
         epoch_resolver=None,
     ):
         guard = getattr(self, "_managed_guard", None)
@@ -786,7 +896,11 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "load", "operator_call", "prefetch"),
+        )
         self._require_usable()
         _validate_identity(identity)
         reservation = self._reservation
@@ -950,7 +1064,22 @@ class DeviceTensorCache:
         _admission_validator=None,
         _deadline=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "cache_invalidate",
+                "cache_wait",
+                "close_progress",
+                "lease_construction",
+                "load",
+                "operator_call",
+                "prefetch",
+                "provider_close",
+                "reap",
+            ),
+        )
         _remaining_lifecycle_time(
             _deadline,
             "device cache lifecycle timed out before reap",
@@ -987,7 +1116,11 @@ class DeviceTensorCache:
         _admission_validator=None,
         _deadline=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("cache_wait", "provider_close"),
+        )
         _remaining_lifecycle_time(
             _deadline,
             "device cache lifecycle timed out before pending wait",
@@ -1040,7 +1173,11 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "operator_call", "prefetch"),
+        )
         return identity in self._entries
 
     def refcount(
@@ -1050,7 +1187,11 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("cache_refcount", "resource_state"),
+        )
         if isinstance(identity, str):
             return sum(
                 entry.refcount
@@ -1079,7 +1220,11 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("cache_invalidate",),
+        )
         entry = self._entries.get(identity)
         if entry is None:
             return
@@ -1098,7 +1243,11 @@ class DeviceTensorCache:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("cache_invalidate",),
+        )
         identities = [
             identity
             for identity in self._entries

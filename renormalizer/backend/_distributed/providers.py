@@ -692,6 +692,8 @@ class _ActiveOperandLease:
         admission_token,
         shared_call=False,
     ):
+        self._managed_guard = working_set._provider._managed_guard
+        self._managed_epoch = working_set._epoch
         self._working_set = working_set
         self.bindings = bindings
         self._cache_leases = tuple(cache_leases)
@@ -699,6 +701,42 @@ class _ActiveOperandLease:
         self._admission_token = admission_token
         self._shared_call = shared_call
         self._closed = False
+
+    def _require_close_admission(self, admission_token, admission_validator):
+        _require_managed_resource_admission(
+            getattr(self, "_managed_guard", None),
+            admission_token,
+            admission_validator,
+            allowed_scopes=("lease", "lease_close"),
+            allowed_operations=("acquire", "child_close", "operator_call"),
+            epoch=getattr(self, "_managed_epoch", admission_token.epoch),
+        )
+        creating = getattr(self, "_admission_token", None)
+        if getattr(self, "_shared_call", False):
+            if (
+                admission_token is not creating
+                or admission_token.scope != "lease"
+                or admission_token.operation != "operator_call"
+                or admission_token.thread_id != threading.get_ident()
+            ):
+                raise RuntimeError(
+                    "shared child close requires its creating operator admission"
+                )
+            return admission_token
+        if admission_token.scope == "lease":
+            if admission_token.operation == "child_close":
+                return admission_token
+            if (
+                admission_token is creating
+                and admission_token.operation in {"acquire", "operator_call"}
+            ):
+                return admission_token
+            raise RuntimeError(
+                "child close requires its exact creating admission"
+            )
+        elif admission_token.operation != "child_close":
+            raise RuntimeError("child close admission operation is not authorized")
+        return admission_token
 
     def mark_dirty(self, key, local_array):
         if self._closed:
@@ -743,7 +781,7 @@ class _ActiveOperandLease:
             raise
 
     def _close_admitted(self, admission_token, admission_validator):
-        _require_resource_admission(
+        self._require_close_admission(
             admission_token,
             admission_validator,
         )
@@ -854,13 +892,7 @@ class _LeaseStatusWorkspace:
         validator=None,
         *,
         allowed_scopes=("construction", "lease", "lease_close"),
-        allowed_operations=(
-            "lease_construction",
-            "operator_call",
-            "resource_state",
-            "status_close",
-            "async_completion",
-        ),
+        allowed_operations=(),
     ):
         return _require_managed_resource_admission(
             self._managed_guard,
@@ -873,22 +905,36 @@ class _LeaseStatusWorkspace:
 
     @property
     def device_status(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("operator_call", "resource_state"),
+        )
         return self._device_status
 
     @property
     def host_status(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("operator_call", "resource_state"),
+        )
         return self._host_status
 
     @property
     def borrower(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=("operator_call", "resource_state"),
+        )
         return self._borrower
 
     @property
     def allocation_records(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "lease_construction",
+                "resource_state",
+            ),
+        )
         return self._allocation_records
 
     def _terminal_allocation_records(self):
@@ -2678,12 +2724,20 @@ class ActiveWorkingSetProvider:
 
     @property
     def closed(self):
-        _require_managed_resource_admission(self._managed_guard)
+        _require_managed_resource_admission(
+            self._managed_guard,
+            allowed_scopes=("runtime", "lease"),
+            allowed_operations=("resource_state",),
+        )
         return self._closed
 
     @property
     def terminal_poisoned(self):
-        _require_managed_resource_admission(self._managed_guard)
+        _require_managed_resource_admission(
+            self._managed_guard,
+            allowed_scopes=("runtime", "lease"),
+            allowed_operations=("resource_state",),
+        )
         return self._terminal_error is not None
 
     @property
@@ -2797,7 +2851,12 @@ class ActiveWorkingSetProvider:
             raise RuntimeError(
                 "working-set async scheduling requires lease ownership"
             )
-        return _CountedAsyncAdmission(gate, parent, capability)
+        return _CountedAsyncAdmission(
+            gate,
+            parent,
+            capability,
+            operation,
+        )
 
     def acquire(self, request):
         raise RuntimeError("factory provider cannot acquire operand blocks directly")

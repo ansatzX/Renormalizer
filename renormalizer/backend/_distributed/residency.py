@@ -608,7 +608,7 @@ class _HostTensorReservation:
                 "resource_state",
                 "schedule_writeback",
                 "store_reservation_close",
-                "async_completion",
+                "d2h_completion",
             ),
         )
         if self._closed:
@@ -625,7 +625,7 @@ class _HostTensorReservation:
                 "resource_state",
                 "schedule_writeback",
                 "store_reservation_close",
-                "async_completion",
+                "d2h_completion",
             ),
         )
         if self._closed:
@@ -649,7 +649,7 @@ class _HostTensorReservation:
             _admission_token,
             _admission_validator,
             allowed_scopes=("lease", "lease_close"),
-            allowed_operations=("async_completion",),
+            allowed_operations=("d2h_completion",),
         )
         if self._closed:
             raise HostTensorError("host tensor reservation is closed")

@@ -165,11 +165,12 @@ def require_async_owner(value, context):
 class _CountedAsyncAdmission:
     """One pre-counted descendant claimed only by its completion worker."""
 
-    def __init__(self, gate, parent, capability):
+    def __init__(self, gate, parent, capability, operation=None):
         self._gate = gate
         self._parent = parent
         self._capability = capability
-        self._token = gate.spawn_async(parent, capability)
+        self._operation = operation
+        self._token = gate.spawn_async(parent, capability, operation)
         self._state_lock = threading.RLock()
         self._claimed = None
         self._released = False
@@ -187,6 +188,10 @@ class _CountedAsyncAdmission:
                 or claimed.epoch != parent.epoch
                 or claimed.parent_sequence != parent.sequence
                 or claimed.transition_sequence != parent.transition_sequence
+                or (
+                    self._operation is not None
+                    and claimed.operation != self._operation
+                )
             ):
                 raise RuntimeError(
                     "async admission does not match its canonical parent"
@@ -218,11 +223,21 @@ class _CountedAsyncAdmission:
     def close_owned(self):
         return self.token.scope == "lease_close"
 
+    @property
+    def operation(self):
+        return (
+            "async_completion"
+            if self._operation is None
+            else self._operation
+        )
+
     def run(self, operation, callback):
         # Admission state may enter the gate lock; it never enters an owner lock.
         with self._state_lock:
             if self._state != "installed":
                 raise RuntimeError("async admission is no longer claimable")
+            if self._operation is not None and operation != self._operation:
+                raise RuntimeError("async operation does not match its family")
             claimed = self._gate.claim_async(
                 self._token,
                 self._capability,
@@ -385,50 +400,178 @@ class AsyncResourceOwner:
 
     @property
     def arrays(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+            )
+        )
         return tuple(self._arrays)
 
     @property
     def resources(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+            )
+        )
         return tuple(self._resources)
 
     @property
     def allocations(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+            )
+        )
         return tuple(self._allocations)
 
     @property
     def streams(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "prefetch",
+                "resource_state",
+                "schedule_writeback",
+            )
+        )
         return tuple(self._streams)
 
     @property
     def events(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return tuple(self._events)
 
     @property
     def completion_event(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return self._completion_event
 
     @property
     def completed(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "emit_profile",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return self.state == "detached"
 
     @property
     def quarantined(self):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "compute_completion",
+                "d2h_completion",
+                "h2d_completion",
+                "load",
+                "operator_call",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "resource_state",
+                "schedule_writeback",
+                "scheduler_complete",
+            )
+        )
         return self.state == "quarantined"
 
-    def _require_admission(self, token=None, validator=None):
+    def _require_admission(
+        self,
+        token=None,
+        validator=None,
+        *,
+        allowed_operations=(),
+    ):
         return _require_managed_resource_admission(
             self._managed_guard,
             token,
             validator,
             allowed_scopes=("lease", "lease_close"),
+            allowed_operations=allowed_operations,
             epoch=lambda _token: self._managed_epoch,
         )
 
@@ -451,7 +594,11 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "child_close", "operator_call"),
+        )
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture arrays")
         self._arrays = _unique((*self._arrays, *arrays))
@@ -465,7 +612,17 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture allocations")
         self._allocations = merge_allocation_records(self._allocations, arrays)
@@ -478,7 +635,18 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture resources")
         self._resources = _unique((*self._resources, *resources))
@@ -489,7 +657,18 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture streams")
         self._streams = _unique((*self._streams, *streams))
@@ -504,7 +683,18 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer capture events")
         if event is None:
@@ -525,7 +715,18 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if not callable(callback):
             raise TypeError("release callback must be callable")
         if self.state not in {"new", "enqueued"}:
@@ -538,7 +739,18 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if self.state not in {"new", "enqueued"}:
             raise RuntimeError("async owner can no longer arm completion")
         self._completion_armed = True
@@ -643,7 +855,14 @@ class AsyncResourceOwner:
     def _start_counted_completion(self, *, _close_transition=None):
         if self._managed_guard is not None:
             if _close_transition is None:
-                self._require_admission()
+                self._require_admission(
+                    allowed_operations=(
+                        "child_close",
+                        "close_progress",
+                        "reap",
+                        "scheduler_complete",
+                    )
+                )
             else:
                 self._managed_guard.require_close_transition(
                     _close_transition,
@@ -661,7 +880,11 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "load", "operator_call", "prefetch"),
+        )
         with self._async_lock:
             self._async_completion_deferred = False
         self._watch_counted_completion()
@@ -674,7 +897,11 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "child_close", "operator_call"),
+        )
         with self._async_lock:
             if self._async_admission is not None or self._async_worker is not None:
                 raise RuntimeError("async owner already has a counted admission")
@@ -689,7 +916,11 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("acquire", "child_close", "operator_call"),
+        )
         self._watch_counted_completion()
 
     def _run_counted_completion(self, admission):
@@ -730,7 +961,7 @@ class AsyncResourceOwner:
                 return
 
         try:
-            admission.run("async_completion", complete)
+            admission.run(admission.operation, complete)
         except BaseException as error:
             self._remember_error(error)
             if self.state not in {"detached", "quarantined"}:
@@ -805,11 +1036,36 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "child_close",
+                "close_progress",
+                "reap",
+                "scheduler_complete",
+            ),
+        )
         self._start_counted_completion()
 
     def _prepare_counted_completion(self, *, wait, _deadline=None):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            )
+        )
         if self._async_admission is None:
             return None
         if (
@@ -840,7 +1096,23 @@ class AsyncResourceOwner:
         )
 
     def _counted_completion_result(self, *, wait, _deadline=None):
-        self._require_admission()
+        self._require_admission(
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            )
+        )
         worker = self._async_worker
         if worker is None:
             return None
@@ -875,7 +1147,18 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "child_close",
+                "load",
+                "operator_call",
+                "prefetch",
+                "schedule_writeback",
+            ),
+        )
         if self.state != "new":
             raise RuntimeError("async owner is not new")
         self.state = "enqueued"
@@ -1058,7 +1341,25 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            ),
+        )
         return self._force_quarantine_terminal(
             error,
             secondary_errors=secondary_errors,
@@ -1085,7 +1386,25 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            ),
+        )
         self._remember_error(error)
         for secondary_error in secondary_errors:
             self._remember_secondary(secondary_error)
@@ -1121,7 +1440,25 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            ),
+        )
         counted = self._prepare_counted_completion(wait=False)
         if counted is not None:
             return counted
@@ -1148,7 +1485,25 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=(
+                "acquire",
+                "cache_wait",
+                "child_close",
+                "close_progress",
+                "load",
+                "operator_call",
+                "pool_close",
+                "pool_reap",
+                "prefetch",
+                "reap",
+                "schedule_writeback",
+                "scheduler_close",
+                "scheduler_complete",
+            ),
+        )
         counted = self._prepare_counted_completion(
             wait=True,
             _deadline=_deadline,
@@ -1184,7 +1539,11 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("scheduler_close", "scheduler_complete"),
+        )
         counted = self._prepare_counted_completion(
             wait=True,
             _deadline=_deadline,
@@ -1219,7 +1578,11 @@ class AsyncResourceOwner:
         _admission_token=None,
         _admission_validator=None,
     ):
-        self._require_admission(_admission_token, _admission_validator)
+        self._require_admission(
+            _admission_token,
+            _admission_validator,
+            allowed_operations=("scheduler_complete",),
+        )
         if self.state != "detached":
             raise RuntimeError("async owner is not complete")
         result = self.result

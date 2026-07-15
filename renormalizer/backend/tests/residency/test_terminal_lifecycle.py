@@ -17,13 +17,17 @@ from renormalizer.backend._distributed.async_owner import (
     allocation_record,
 )
 from renormalizer.backend._distributed.cache import (
+    CacheEntryLease,
     CacheReservation,
     DeviceTensorCache,
 )
 from renormalizer.backend._distributed.local_operator import DistributedLocalOperator
-from renormalizer.backend._distributed.pinned import PinnedBufferPool
+from renormalizer.backend._distributed.pinned import PinnedBufferPool, StagingSlot
 from renormalizer.backend._distributed import pinned as pinned_module
-from renormalizer.backend._distributed.residency import ResidencyPlanner
+from renormalizer.backend._distributed.residency import (
+    ResidencyPlanner,
+    _HostTensorReservation,
+)
 from renormalizer.backend._distributed.providers import (
     ActiveWorkingSetProvider,
     WorkingSetLease,
@@ -3124,7 +3128,10 @@ def test_runtime_close_starts_preexisting_counted_descendant_before_gate_drain()
     assert len(descendants) == 1
     descendant = descendants[0]
     _assert_token(descendant, scope="lease", epoch=lease._epoch)
-    assert descendant.operation == "child_close"
+    assert descendant.operation == "compute_completion"
+    with gate._condition:
+        parent = gate._tokens[descendant.parent_sequence].token
+    assert parent.operation == "child_close"
     assert owner.kind == "compute"
     assert owner._async_admission.token is descendant
     assert not owner._async_requested.is_set()
@@ -9312,3 +9319,407 @@ def test_fatal_gate_waits_reuse_transition_deadline(monkeypatch, operation):
         assert captured == [transition.deadline]
     finally:
         runtime._closed = True
+
+
+@pytest.mark.parametrize(
+    "family,parent_operation",
+    (
+        ("h2d_completion", "load"),
+        ("d2h_completion", "close_progress"),
+        ("compute_completion", "acquire"),
+    ),
+)
+@pytest.mark.parametrize(
+    "allowed_family",
+    ("h2d_completion", "d2h_completion", "compute_completion"),
+)
+def test_provider_counted_async_semantic_family_matrix(
+    family,
+    parent_operation,
+    allowed_family,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-semantic-async-{}".format(family)
+    )
+    gate = runtime._terminal_gate
+    observed = []
+    admission = None
+    try:
+        with lease._lease_admission(parent_operation):
+            admission = lease._spawn_async_admission(object(), family)
+            sequence = admission.token.sequence
+
+        def inspect(*, _admission_token, _admission_validator):
+            lease.scheduler._require_admission(
+                _admission_token,
+                _admission_validator,
+                allowed_operations=(allowed_family,),
+            )
+            observed.append(_admission_token)
+
+        if family == allowed_family:
+            admission.run(family, inspect)
+            assert len(observed) == 1
+            claimed = observed[0]
+            assert claimed.operation == family
+            assert claimed.sequence == sequence
+        else:
+            with pytest.raises(RuntimeError, match="operation is not authorized"):
+                admission.run(family, inspect)
+            assert observed == []
+        with gate._condition:
+            assert gate._tokens[sequence].status == "released"
+    finally:
+        if admission is not None:
+            admission.cancel()
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "family,parent_operation,commits",
+    (
+        ("h2d_completion", "load", False),
+        ("d2h_completion", "close_progress", True),
+        ("compute_completion", "acquire", False),
+    ),
+)
+def test_only_d2h_counted_async_can_commit_host_reservation(
+    family,
+    parent_operation,
+    commits,
+):
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-semantic-reservation-{}".format(family)
+    )
+    reservation = lease._store_reservation
+    dirty_ref = reservation._dirty_ref
+    value = np.zeros(dirty_ref.shape, dtype=np.dtype(dirty_ref.dtype))
+    before = store.snapshot()
+    admission = None
+    try:
+        with lease._lease_admission(parent_operation):
+            admission = lease._spawn_async_admission(object(), family)
+
+        def commit(*, _admission_token, _admission_validator):
+            return reservation.commit(
+                dirty_ref,
+                value,
+                _admission_token=_admission_token,
+                _admission_validator=_admission_validator,
+            )
+
+        if commits:
+            updated = admission.run(family, commit)
+            assert updated.version == dirty_ref.version + 1
+            assert store.snapshot() != before
+            assert reservation._committed is True
+        else:
+            with pytest.raises(RuntimeError, match="operation is not authorized"):
+                admission.run(family, commit)
+            assert store.snapshot() == before
+            assert reservation._committed is False
+    finally:
+        if admission is not None:
+            admission.cancel()
+        _close_case(runtime, store)
+
+
+def test_direct_child_close_rejects_sibling_before_any_state_mutation():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-direct-child-close-operation"
+    )
+    gate = runtime._terminal_gate
+    child = lease.acquire(_block_request(lease))
+    cache_leases = child._cache_leases
+    transition, elected = gate.begin_lease_close(lease._epoch)
+    assert elected is True
+    sibling = gate.admit_lease_close(transition, "schedule_writeback")
+    validator = runtime._exact_admission_validator(
+        sibling,
+        scope="lease_close",
+        epoch=lease._epoch,
+        operation="schedule_writeback",
+        transition_sequence=transition.sequence,
+    )
+
+    def snapshot():
+        entries = tuple(cache_lease._entry for cache_lease in cache_leases)
+        return (
+            child._working_set,
+            child.bindings,
+            child._cache_leases,
+            child._compute_handle,
+            child._admission_token,
+            child._shared_call,
+            child._closed,
+            child in lease._children,
+            entries,
+            tuple(None if entry is None else entry.refcount for entry in entries),
+        )
+
+    before = snapshot()
+    try:
+        with pytest.raises(RuntimeError, match="operation"):
+            child._close_admitted(sibling, validator)
+        assert snapshot() == before
+    finally:
+        gate.release(sibling)
+        if not child._closed:
+            cleanup = gate.admit_lease_close(transition, "child_close")
+            try:
+                child.close(_admission_token=cleanup)
+            finally:
+                gate.release(cleanup)
+        _repair_test_abandoned_close_entry(gate)
+        runtime._closed = True
+        reservation = lease._store_reservation
+        if reservation is not None and not reservation._closed:
+            reservation._store._release_reservation(reservation)
+            reservation._closed = True
+        if not store.closed:
+            store.close()
+
+
+def test_shared_operator_child_rejects_foreign_thread_close_before_mutation():
+    runtime, _, _, store, _, lease = _open_managed_active_case(
+        store_id="terminal-shared-child-foreign-close"
+    )
+    operator_ready = threading.Event()
+    foreign_done = threading.Event()
+    release_operator = threading.Event()
+    shared = []
+    before = []
+
+    def run_operator():
+        with lease._operator_call(np.ones(4, dtype=np.float64)):
+            child = lease.acquire(_block_request(lease))
+            shared.append(child)
+            before.append(
+                (
+                    child._working_set,
+                    child.bindings,
+                    child._cache_leases,
+                    child._admission_token,
+                    child._shared_call,
+                    child._closed,
+                    child in lease._children,
+                )
+            )
+            operator_ready.set()
+            assert foreign_done.wait(_TIMEOUT_S)
+            assert (
+                child._working_set,
+                child.bindings,
+                child._cache_leases,
+                child._admission_token,
+                child._shared_call,
+                child._closed,
+                child in lease._children,
+            ) == before[0]
+            child.close()
+            assert release_operator.wait(_TIMEOUT_S)
+
+    operator, _, operator_errors, operator_done = _start(run_operator)
+    foreign = None
+    foreign_errors = []
+    foreign_thread_done = threading.Event()
+    try:
+        assert operator_ready.wait(_TIMEOUT_S)
+        foreign, _, foreign_errors, foreign_thread_done = _start(shared[0].close)
+        _join(foreign, foreign_thread_done)
+        foreign_done.set()
+        release_operator.set()
+        _join(operator, operator_done)
+        assert len(foreign_errors) == 1
+        assert isinstance(foreign_errors[0], RuntimeError)
+        assert operator_errors == []
+    finally:
+        foreign_done.set()
+        release_operator.set()
+        if foreign is not None and foreign.is_alive():
+            _join(foreign, foreign_thread_done)
+        if operator.is_alive():
+            _join(operator, operator_done)
+        _close_case(runtime, store)
+
+
+@pytest.mark.parametrize(
+    "helper,legitimate_operation",
+    (
+        ("pool_checkout", "acquire"),
+        ("cache_contains", "prefetch"),
+        ("scheduler_compute", "operator_call"),
+        ("owner_capture", "acquire"),
+    ),
+)
+def test_managed_lower_helper_admission_matrix(
+    helper,
+    legitimate_operation,
+):
+    runtime, _, _, store, provider, lease = _open_managed_active_case(
+        store_id="terminal-fail-closed-lower-{}".format(helper)
+    )
+    gate = runtime._terminal_gate
+    owner = None
+    if helper == "owner_capture":
+        with lease._lease_admission("acquire"):
+            owner = lease.scheduler._register_owner(
+                "compute",
+                defer_counted_admission=True,
+            )
+    sibling = gate.admit_lease(lease._epoch, "mark_dirty")
+    sibling_validator = lease._exact_admission_validator(sibling)
+    marker = object()
+    if helper == "pool_checkout":
+        before = (lease.pool._slot._checked_out, lease.pool._checked_out_bytes)
+
+        def invoke(token, validator):
+            return lease.pool._checkout(
+                1,
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+
+        def snapshot():
+            return (lease.pool._slot._checked_out, lease.pool._checked_out_bytes)
+
+    elif helper == "cache_contains":
+        before = dict(provider._cache._entries)
+
+        def invoke(token, validator):
+            return provider._cache.contains(
+                lease.cache_identities[0],
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+
+        def snapshot():
+            return dict(provider._cache._entries)
+
+    elif helper == "scheduler_compute":
+        before = dict(lease.scheduler._owners)
+
+        def invoke(token, validator):
+            return lease.scheduler.begin_compute(
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+
+        def snapshot():
+            return dict(lease.scheduler._owners)
+
+    else:
+        before = owner._resources
+
+        def invoke(token, validator):
+            return owner.capture_resources(
+                marker,
+                _admission_token=token,
+                _admission_validator=validator,
+            )
+
+        def snapshot():
+            return owner._resources
+
+    try:
+        with pytest.raises((TypeError, RuntimeError), match="operation"):
+            invoke(sibling, sibling_validator)
+        assert snapshot() == before
+        gate.release(sibling)
+        sibling = None
+        with lease._lease_admission(legitimate_operation) as exact:
+            exact_validator = lease._exact_admission_validator(exact)
+            result = invoke(exact, exact_validator)
+            if helper == "pool_checkout":
+                assert snapshot() != before
+                lease.pool._release(
+                    result,
+                    _admission_token=exact,
+                    _admission_validator=exact_validator,
+                )
+            elif helper == "cache_contains":
+                assert type(result) is bool
+            elif helper == "scheduler_compute":
+                assert result.owner is lease.scheduler._owners[id(result.owner)]
+            else:
+                assert marker in snapshot()
+    finally:
+        if sibling is not None:
+            gate.release(sibling)
+        _close_case(runtime, store)
+
+
+def test_every_managed_lower_helper_declares_operations_explicitly():
+    managed_classes = (
+        AsyncCompletionHandle,
+        AsyncResourceOwner,
+        CacheEntryLease,
+        DeviceTensorCache,
+        PinnedBufferPool,
+        StagingSlot,
+        TransferScheduler,
+        TransferTicket,
+        _HostTensorReservation,
+        _LeaseStatusWorkspace,
+    )
+    modules = {
+        inspect.getmodule(managed_class).__file__
+        for managed_class in managed_classes
+    }
+    parsed = {}
+    for path in modules:
+        with open(path, encoding="utf-8") as handle:
+            parsed[path] = ast.parse(handle.read())
+
+    missing = []
+    for managed_class in managed_classes:
+        path = inspect.getmodule(managed_class).__file__
+        class_node = next(
+            node
+            for node in parsed[path].body
+            if isinstance(node, ast.ClassDef) and node.name == managed_class.__name__
+        )
+        for method in class_node.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in ast.walk(method):
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_require_admission"
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "self"
+                ):
+                    continue
+                keywords = {keyword.arg for keyword in call.keywords}
+                if "allowed_operations" not in keywords:
+                    missing.append(
+                        "{}.{}:{}".format(
+                            managed_class.__name__,
+                            method.name,
+                            call.lineno,
+                        )
+                    )
+
+    direct_modules = modules | {
+        providers_module.__file__,
+        terminal_module.__file__,
+    }
+    for path in direct_modules:
+        tree = parsed.get(path)
+        if tree is None:
+            with open(path, encoding="utf-8") as handle:
+                tree = ast.parse(handle.read())
+        for call in ast.walk(tree):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_require_managed_resource_admission"
+            ):
+                continue
+            if "allowed_operations" not in {
+                keyword.arg for keyword in call.keywords
+            }:
+                missing.append("{}:{}".format(path, call.lineno))
+
+    assert missing == []
