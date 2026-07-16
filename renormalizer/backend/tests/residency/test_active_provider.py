@@ -1,9 +1,12 @@
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
+import ast
 import builtins
 import gc
+import hashlib
 import inspect
 import json
+from multiprocessing.connection import wait as wait_for_process_sentinels
 import os
 import threading
 import time
@@ -57,6 +60,148 @@ from renormalizer.backend.distributed_runtime import (
     active_working_set_execution,
 )
 from renormalizer.backend.factory import create_backend
+
+
+TASK_18_4_CASE_IDS = (
+    "local-same-thread-discoverer",
+    "remote-between-calls-pending-inspection",
+    "lease-ordinary-admission-drain",
+    "lease-async-descendant-drain",
+    "lease-live-resource-step",
+    "lease-owner-teardown-step",
+    "lease-precommit",
+    "runtime-freeze-lease-join",
+    "runtime-provider-step",
+    "runtime-collective-monitor-before-stop",
+    "runtime-monitor-after-clean-stop",
+)
+
+
+TASK_18_4_STRESS_MATRIX = tuple(
+    (case_id, iteration)
+    for case_id in TASK_18_4_CASE_IDS
+    for iteration in range(10)
+)
+
+
+TASK_18_4_PHASE_BANDS = {
+    "local-same-thread-discoverer": (),
+    "remote-between-calls-pending-inspection": (),
+    "lease-ordinary-admission-drain": ("begin_lease_close",),
+    "lease-async-descendant-drain": (),
+    "lease-live-resource-step": (
+        "child_close",
+        "schedule_writeback",
+        "dirty_writeback_callback",
+        "observe_peaks",
+        "scheduler_complete",
+        "cache_wait",
+        "pool_reap",
+        "cache_invalidate",
+        "emit_profile",
+    ),
+    "lease-owner-teardown-step": (
+        "status_close",
+        "scheduler_close",
+        "pool_close",
+        "cache_reservation_close",
+        "cache_lifetime_reconcile",
+    ),
+    "lease-precommit": ("store_reservation_close", "lease_close_commit"),
+    "runtime-freeze-lease-join": ("begin_runtime_close",),
+    "runtime-provider-step": ("provider_close",),
+    "runtime-collective-monitor-before-stop": (
+        "collective_monitor_start",
+        "collective_close_ready",
+        "collective_monitor_stop",
+    ),
+    "runtime-monitor-after-clean-stop": (
+        "collective_close",
+        "runtime_close_commit",
+    ),
+}
+
+
+_TASK_18_4_PROTOCOL_PHASES = (
+    "initialized",
+    "actor_entry",
+    "contender_gate",
+    "outcome_selected",
+    "actor_released",
+    "threads_joined",
+    "record_captured",
+)
+
+
+@dataclass(frozen=True)
+class _Task184NodeRecord:
+    node_id: str
+    case_id: str
+    iteration: int
+    rank: int
+    local_rank: int
+    origin_rank: int
+    namespace_keys: tuple
+    primary_source: str
+    primary_type: str | None
+    primary_message: str | None
+    primary_object_id: int | None
+    injected_object_id: int | None
+    primary_origin_rank: int | None
+    primary_channels: tuple
+    abort_entry_count: int
+    raw_abort_count: int
+    abort_started: bool
+    abort_completed: bool
+    abort_error_type: str | None
+    local_ack_write_count: int
+    fatal_values: tuple
+    ack_values: tuple
+    protocol_completed: bool
+    cache_bytes: int
+    pinned_bytes: int
+    quarantined_bytes: int
+    allocation_identities: tuple
+    owner_identities: tuple
+    event_identities: tuple
+    stream_identities: tuple
+    post_publication_accesses: tuple
+    gate_phase: str
+    live_tokens: int
+    runtime_closed: bool
+    collective_closed: bool
+    admitted_operations: int
+    publications: int
+    thread_liveness: tuple
+    backend_identity: int
+    store_identity: int
+    provider_identity: int
+    lease_identity: int
+    reservation_identity: int
+    reservation_retained: bool
+    store_closed: bool
+    visible_devices: str | None
+    clean_close: bool
+
+
+@dataclass(frozen=True)
+class _FatalActiveRetentionSnapshot:
+    store_identity: int
+    reservation_identity: int
+    provider_identity: int
+    lease_identity: int
+    reservation_keys: tuple
+    allocations: tuple
+    owner_identities: tuple
+    event_identities: tuple
+    stream_identities: tuple
+    resource_state: tuple
+
+
+@dataclass(frozen=True)
+class _FatalActiveReleaseEvidence:
+    references: tuple
+    listener: object | None
 
 
 def _has_one_visible_gpu():
@@ -5074,11 +5219,877 @@ def test_real_one_gpu_f_order_h2d_uses_bounded_pinned_staging(monkeypatch):
     assert raw_ref() is None
 
 
+def _snapshot_fatal_active_retention(
+    runtime,
+    store,
+    working_set,
+    *,
+    reservation_retained=True,
+):
+    provider = working_set._provider
+    reservation = working_set._store_reservation
+    quarantine = runtime._terminal_quarantine
+    state = runtime.resource_state()
+    snapshot = _FatalActiveRetentionSnapshot(
+        store_identity=id(store),
+        reservation_identity=id(reservation),
+        provider_identity=id(provider),
+        lease_identity=id(working_set),
+        reservation_keys=tuple(sorted(store._reservations)),
+        allocations=tuple(
+            sorted(
+                (
+                    repr(record.identity),
+                    record.capacity_bytes,
+                    id(record.owner),
+                )
+                for record in quarantine.allocations
+            )
+        ),
+        owner_identities=tuple(sorted(id(owner) for owner in quarantine.owners)),
+        event_identities=tuple(
+            sorted(id(event) for event in quarantine._retained_events())
+        ),
+        stream_identities=tuple(
+            sorted(id(stream) for stream in quarantine._retained_streams())
+        ),
+        resource_state=tuple(sorted(state.items())),
+    )
+    assert bool(snapshot.reservation_keys) is reservation_retained
+    _assert_fatal_active_retention(snapshot, runtime, store, working_set)
+    return snapshot
+
+
+def _assert_fatal_active_retention(snapshot, runtime, store, working_set):
+    provider = working_set._provider
+    reservation = working_set._store_reservation
+    quarantine = runtime._terminal_quarantine
+    assert id(store) == snapshot.store_identity
+    assert id(reservation) == snapshot.reservation_identity
+    assert id(provider) == snapshot.provider_identity
+    assert id(working_set) == snapshot.lease_identity
+    assert runtime._active_provider is provider
+    assert provider._active_lease is working_set
+    assert tuple(sorted(store._reservations)) == snapshot.reservation_keys
+    if snapshot.reservation_keys:
+        assert store._reservations == {id(reservation): reservation}
+    else:
+        assert store._reservations == {}
+    assert tuple(
+        sorted(
+            (
+                repr(record.identity),
+                record.capacity_bytes,
+                id(record.owner),
+            )
+            for record in quarantine.allocations
+        )
+    ) == snapshot.allocations
+    assert tuple(sorted(id(owner) for owner in quarantine.owners)) == (
+        snapshot.owner_identities
+    )
+    assert tuple(
+        sorted(id(event) for event in quarantine._retained_events())
+    ) == snapshot.event_identities
+    assert tuple(
+        sorted(id(stream) for stream in quarantine._retained_streams())
+    ) == snapshot.stream_identities
+    assert tuple(sorted(runtime.resource_state().items())) == snapshot.resource_state
+    assert store.closed is False
+
+
+def _capture_fatal_active_release_evidence(
+    runtime,
+    store,
+    working_set,
+    operator,
+    local_vector,
+):
+    collective = runtime.collective
+    backend = collective._backend
+    provider = working_set._provider
+    scheduler = working_set.scheduler
+    reservation = working_set._store_reservation
+    control = collective._bootstrap_store_proxy
+    store_owner = getattr(backend, "_store", None)
+    listener = getattr(store_owner, "_process", None)
+    values = (
+        ("runtime", runtime),
+        ("working-set", working_set),
+        ("operator", operator),
+        ("scheduler", scheduler),
+        ("reservation", reservation),
+        ("store", store),
+        ("local-vector", local_vector),
+        ("collective", collective),
+        ("control", control),
+        ("backend", backend),
+        *(((("tcp-store", store_owner),) if store_owner is not None else ())),
+        ("provider", provider),
+        *tuple(
+            ("owner-{}".format(index), owner)
+            for index, owner in enumerate(runtime._terminal_quarantine.owners)
+        ),
+    )
+    references = tuple(_task_18_4_weakref(label, value) for label, value in values)
+    unsupported = tuple(
+        (label, type(value).__name__)
+        for (label, value), reference in zip(values, references)
+        if reference is None
+    )
+    assert unsupported == ()
+    return _FatalActiveReleaseEvidence(
+        references=references,
+        listener=listener,
+    )
+
+
+def _assert_fatal_active_graph_released(evidence):
+    for _ in range(3):
+        gc.collect()
+    surviving = tuple(
+        label for label, reference in evidence.references if reference() is not None
+    )
+    assert surviving == ()
+    listener = evidence.listener
+    if listener is not None:
+        assert wait_for_process_sentinels((listener.sentinel,), timeout=10.0) == [
+            listener.sentinel
+        ]
+        listener.join()
+        assert listener.is_alive() is False
+        assert listener.exitcode is not None
+
+
+def test_task_18_4_stress_matrix_is_complete_bounded_and_sleep_free():
+    assert TASK_18_4_CASE_IDS == (
+        "local-same-thread-discoverer",
+        "remote-between-calls-pending-inspection",
+        "lease-ordinary-admission-drain",
+        "lease-async-descendant-drain",
+        "lease-live-resource-step",
+        "lease-owner-teardown-step",
+        "lease-precommit",
+        "runtime-freeze-lease-join",
+        "runtime-provider-step",
+        "runtime-collective-monitor-before-stop",
+        "runtime-monitor-after-clean-stop",
+    )
+    assert len(TASK_18_4_STRESS_MATRIX) == 110
+    assert len(set(TASK_18_4_STRESS_MATRIX)) == 110
+    assert {case_id for case_id, _ in TASK_18_4_STRESS_MATRIX} == set(
+        TASK_18_4_CASE_IDS
+    )
+    assert all(
+        tuple(
+            iteration
+            for matrix_case_id, iteration in TASK_18_4_STRESS_MATRIX
+            if matrix_case_id == case_id
+        )
+        == tuple(range(10))
+        for case_id in TASK_18_4_CASE_IDS
+    )
+
+    source = inspect.getsource(_run_task_18_4_stress_node)
+    tree = ast.parse(source)
+    assert not any(isinstance(node, ast.While) for node in ast.walk(tree))
+    assert "time.sleep(" not in source
+    assert "random" not in source
+    assert "threading.Event" in source
+    assert ".wait_for(" in source
+    assert ".join(" in source
+
+
+def test_task_18_4_stress_ports_are_deterministic_unique_and_bounded():
+    for master_port in (1, 29500, 65535):
+        ports = tuple(
+            _task_18_4_rendezvous_port(master_port, case_id, iteration)
+            for case_id, iteration in TASK_18_4_STRESS_MATRIX
+        )
+        assert ports == tuple(
+            ((master_port - 1 + offset) % 65535) + 1
+            for offset in range(1, len(TASK_18_4_STRESS_MATRIX) + 1)
+        )
+        assert len(set(ports)) == len(TASK_18_4_STRESS_MATRIX)
+        assert master_port not in ports
+        assert all(1 <= port <= 65535 for port in ports)
+
+
+def _task_18_4_rendezvous_port(master_port, case_id, iteration):
+    matrix_offset = TASK_18_4_STRESS_MATRIX.index((case_id, iteration)) + 1
+    return ((master_port - 1 + matrix_offset) % 65535) + 1
+
+
+def _task_18_4_key(node_id, case_id, iteration, phase, rank):
+    digest = hashlib.sha256(
+        "{}|{}|{}|{}|{}".format(
+            node_id,
+            case_id,
+            iteration,
+            phase,
+            rank,
+        ).encode("utf-8")
+    ).hexdigest()
+    return "renormalizer.test.task18.4.{}".format(digest)
+
+
+def _task_18_4_weakref(label, value):
+    try:
+        return label, weakref.ref(value)
+    except TypeError:
+        return None
+
+
+def _run_task_18_4_stress_node(
+    monkeypatch,
+    request,
+    case_id,
+    iteration,
+):
+    node_id = request.node.nodeid
+    origin_rank = iteration % 2
+    store_id = _task_18_4_key(
+        node_id,
+        case_id,
+        iteration,
+        "host-store",
+        origin_rank,
+    )
+    rendezvous_port = _task_18_4_rendezvous_port(
+        int(os.environ["MASTER_PORT"]),
+        case_id,
+        iteration,
+    )
+    runtime, store, working_set, operator, local_vector = (
+        _real_two_rank_active_operator_case(
+            store_id,
+            _rendezvous_port=rendezvous_port,
+        )
+    )
+    rank = runtime.rank
+    collective = runtime.collective
+    store_owner = getattr(collective._backend, "_store", None)
+    listener = getattr(store_owner, "_process", None)
+    assert (listener is not None) is (rank == 0)
+    control = collective._bootstrap_store_proxy
+    gate = runtime._terminal_gate
+    provider = working_set._provider
+    cache = provider._cache
+    reservation = working_set._store_reservation
+    backend = runtime.backend
+    phase_keys = tuple(
+        _task_18_4_key(
+            node_id,
+            case_id,
+            iteration,
+            phase,
+            phase_rank,
+        )
+        for phase in _TASK_18_4_PROTOCOL_PHASES
+        for phase_rank in range(2)
+    )
+    local_phase_keys = {
+        phase: _task_18_4_key(
+            node_id,
+            case_id,
+            iteration,
+            phase,
+            rank,
+        )
+        for phase in _TASK_18_4_PROTOCOL_PHASES
+    }
+    for key in local_phase_keys.values():
+        control[key] = 0
+    control.barrier()
+
+    def phase_barrier(phase):
+        control[local_phase_keys[phase]] = 1
+        control.barrier()
+        assert tuple(
+            int(
+                control[
+                    _task_18_4_key(
+                        node_id,
+                        case_id,
+                        iteration,
+                        phase,
+                        peer,
+                    )
+                ]
+            )
+            for peer in range(2)
+        ) == (1, 1)
+
+    phase_barrier("initialized")
+
+    fatal_entry = []
+    original_handler = runtime._enter_communicator_fatal
+
+    def record_fatal_entry(error):
+        fatal_entry.append(error)
+        return original_handler(error)
+
+    collective._install_fatal_handler(record_fatal_entry)
+    raw_abort_calls = []
+    original_abort = collective._abort_local_communicator
+
+    def record_raw_abort(*args, **kwargs):
+        raw_abort_calls.append(1)
+        return original_abort(*args, **kwargs)
+
+    monkeypatch.setattr(collective, "_abort_local_communicator", record_raw_abort)
+    ack_writes = []
+    fatal_writes = []
+    original_fatal_store_set = collective._fatal_store_set
+
+    def record_terminal_write(key, value, *args, **kwargs):
+        if key == collective._fatal_ack_key(rank) and int(value) == 1:
+            ack_writes.append(1)
+        if key == collective._fatal_key(rank) and int(value) == 1:
+            fatal_writes.append(1)
+        return original_fatal_store_set(key, value, *args, **kwargs)
+
+    monkeypatch.setattr(collective, "_fatal_store_set", record_terminal_write)
+
+    operator(local_vector)
+    phase_barrier("actor_entry")
+    identity_snapshot = (
+        id(store),
+        id(reservation),
+        id(provider),
+        id(working_set),
+    )
+    assert store._reservations[id(reservation)] is reservation
+
+    post_publication_accesses = []
+
+    def guard_resource(resource, attribute, label):
+        original = getattr(resource, attribute)
+
+        def guarded(*args, **kwargs):
+            if gate.phase in (
+                _TerminalPhase.FATAL_PUBLISHED,
+                _TerminalPhase.RUNTIME_CLOSED,
+            ) and gate._fatal_transition is not None:
+                post_publication_accesses.append(label)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(resource, attribute, guarded)
+
+    for guarded_resource, guarded_attribute, guarded_label in (
+        (cache, "wait_for_pending", "cache.wait_for_pending"),
+        (cache, "reap_completed", "cache.reap_completed"),
+        (working_set.scheduler, "complete_all", "scheduler.complete_all"),
+        (working_set.scheduler, "reap_completed", "scheduler.reap_completed"),
+        (working_set.pool, "reap_completed", "pool.reap_completed"),
+        (backend, "_execute_plan_with_scope", "backend.execute"),
+    ):
+        guard_resource(guarded_resource, guarded_attribute, guarded_label)
+
+    phase_entered = threading.Event()
+    phase_release = threading.Event()
+    close_done = threading.Event()
+    fatal_done = threading.Event()
+    inspection_done = threading.Event()
+    close_errors = []
+    fatal_errors = []
+    inspection_errors = []
+    close_thread = None
+    fatal_thread = None
+    inspection_thread = None
+    held_tokens = []
+
+    def block_phase(resource, attribute):
+        original = getattr(resource, attribute)
+
+        def blocked(*args, **kwargs):
+            phase_entered.set()
+            assert phase_release.wait(20.0)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(resource, attribute, blocked)
+
+    if case_id == "lease-live-resource-step":
+        block_phase(working_set.scheduler, "complete_all")
+    elif case_id == "lease-owner-teardown-step":
+        block_phase(working_set._status_workspace, "close")
+    elif case_id == "lease-precommit":
+        block_phase(working_set, "_close_store_reservation")
+    elif case_id == "runtime-provider-step":
+        block_phase(provider, "_close_for_runtime")
+    elif case_id == "runtime-collective-monitor-before-stop":
+        block_phase(collective, "_request_fatal_monitor_stop")
+
+    if case_id in (
+        "lease-ordinary-admission-drain",
+        "runtime-freeze-lease-join",
+    ):
+        held_tokens.append(gate.admit_lease(working_set._epoch, "operator_call"))
+    elif case_id == "lease-async-descendant-drain":
+        parent = gate.admit_lease(working_set._epoch, "operator_call")
+        capability = object()
+        descendant = gate.spawn_async(parent, capability, "compute_completion")
+        held_tokens.extend((descendant, parent))
+
+    def run_close():
+        try:
+            if case_id.startswith("runtime-"):
+                runtime.close()
+            else:
+                working_set.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    def run_fatal(injected):
+        try:
+            record_fatal_entry(injected)
+        except BaseException as error:
+            fatal_errors.append(error)
+        finally:
+            fatal_done.set()
+
+    fatal_case = case_id != "runtime-monitor-after-clean-stop"
+    injected = (
+        RuntimeError(
+            "task18.4 {} iteration {} origin {}".format(
+                case_id,
+                iteration,
+                origin_rank,
+            )
+        )
+        if fatal_case
+        else None
+    )
+
+    if case_id not in (
+        "local-same-thread-discoverer",
+        "remote-between-calls-pending-inspection",
+        "runtime-monitor-after-clean-stop",
+    ):
+        close_thread = threading.Thread(target=run_close, daemon=True)
+        close_thread.start()
+        if case_id in (
+            "lease-ordinary-admission-drain",
+            "lease-async-descendant-drain",
+        ):
+            with gate._condition:
+                assert gate._condition.wait_for(
+                    lambda: gate._leases[working_set._epoch].phase == "closing",
+                    timeout=20.0,
+                )
+            phase_entered.set()
+        elif case_id == "runtime-freeze-lease-join":
+            with gate._condition:
+                assert gate._condition.wait_for(
+                    lambda: gate._phase is _TerminalPhase.RUNTIME_CLOSING,
+                    timeout=20.0,
+                )
+            phase_entered.set()
+        assert phase_entered.wait(20.0)
+    elif case_id == "runtime-monitor-after-clean-stop":
+        phase_entered.set()
+
+    phase_barrier("contender_gate")
+    resource_snapshot = working_set._resource_record.snapshot()
+    expected_allocations = {
+        record.identity: record for record in resource_snapshot.allocations
+    }
+    expected_cache = {
+        record.identity: record for record in resource_snapshot.cache_allocations
+    }
+    expected_pinned = {
+        record.identity: record for record in resource_snapshot.pinned_allocations
+    }
+    expected_events = {id(event) for event in resource_snapshot.events}
+    expected_streams = {id(stream) for stream in resource_snapshot.streams}
+    expected_owner_ids = {
+        id(owner) for owner in working_set.scheduler._owners.values()
+    }
+    reservation_snapshot = (
+        *identity_snapshot,
+        tuple(sorted(store._reservations)),
+    )
+    if not fatal_case:
+        phase_barrier("outcome_selected")
+        phase_release.set()
+        phase_barrier("actor_released")
+        phase_barrier("threads_joined")
+        phase_barrier("record_captured")
+        runtime.close()
+
+    if case_id == "local-same-thread-discoverer":
+        if rank == origin_rank:
+            token = gate.admit_lease(working_set._epoch, "operator_call")
+            held_tokens.append(token)
+            assert record_fatal_entry(injected) is injected
+        else:
+            with gate._condition:
+                assert gate._condition.wait_for(
+                    lambda: gate._phase is _TerminalPhase.FATAL_PUBLISHED,
+                    timeout=20.0,
+                )
+    elif fatal_case:
+        if rank == origin_rank:
+            fatal_thread = threading.Thread(
+                target=lambda: run_fatal(injected),
+                daemon=True,
+            )
+            fatal_thread.start()
+        with gate._condition:
+            assert gate._condition.wait_for(
+                lambda: gate._phase
+                in (_TerminalPhase.FATAL_PENDING, _TerminalPhase.FATAL_PUBLISHED),
+                timeout=20.0,
+            )
+
+        if case_id == "remote-between-calls-pending-inspection":
+            def inspect_pending():
+                try:
+                    runtime.resource_state()
+                except BaseException as error:
+                    inspection_errors.append(error)
+                finally:
+                    inspection_done.set()
+
+            inspection_thread = threading.Thread(
+                target=inspect_pending,
+                daemon=True,
+            )
+            inspection_thread.start()
+
+    if fatal_case:
+        phase_barrier("outcome_selected")
+    phase_release.set()
+    for token in held_tokens:
+        try:
+            gate.release(token)
+        except RuntimeError as error:
+            assert "converted" in str(error) or "released" in str(error)
+    if fatal_case:
+        phase_barrier("actor_released")
+
+    for thread, done in (
+        (fatal_thread, fatal_done),
+        (inspection_thread, inspection_done),
+        (close_thread, close_done),
+    ):
+        if thread is None:
+            continue
+        assert done.wait(30.0)
+        thread.join(30.0)
+        assert not thread.is_alive()
+
+    if fatal_case:
+        with gate._condition:
+            published = gate._condition.wait_for(
+                lambda: gate._phase is _TerminalPhase.FATAL_PUBLISHED
+                or (
+                    gate._phase is _TerminalPhase.RUNTIME_CLOSED
+                    and gate._fatal_transition is not None
+                ),
+                timeout=20.0,
+            )
+            token_diagnostics = tuple(
+                (state.token.scope, state.token.operation, state.status)
+                for state in gate._tokens.values()
+                if state.status != "released"
+            )
+        assert published, (
+            gate.phase,
+            tuple(type(error).__name__ for error in close_errors),
+            tuple(type(error).__name__ for error in fatal_errors),
+            token_diagnostics,
+            collective._fatal_publications,
+            collective._fatal_publication_failure,
+        )
+        terminal = runtime._terminal_error
+        assert terminal is not None
+        if rank == origin_rank:
+            assert terminal is injected
+        else:
+            assert collective._fatal_origin_rank == origin_rank
+        if not runtime._closed:
+            with pytest.raises(BaseException) as close_info:
+                runtime.close()
+            assert close_info.value is terminal
+    else:
+        terminal = None
+        assert close_errors == []
+        assert runtime._terminal_error is None
+        assert runtime._closed is True
+
+    if fatal_case:
+        phase_barrier("threads_joined")
+
+    fatal_values = (
+        tuple(int(control[collective._fatal_key(peer)]) for peer in range(2))
+        if fatal_case
+        else (0, 0)
+    )
+    ack_values = (
+        tuple(int(control[collective._fatal_ack_key(peer)]) for peer in range(2))
+        if fatal_case
+        else (0, 0)
+    )
+    channels = []
+    for channel, candidate in (
+        ("gate", None if gate._fatal_transition is None else gate._fatal_transition.primary),
+        ("runtime", runtime._terminal_error),
+        ("collective", collective._fatal_error),
+        ("provider", provider._terminal_error),
+        ("lease", working_set._poisoned_error),
+        ("backend", getattr(backend, "_execution_terminal_error", None)),
+        ("quarantine", runtime._terminal_quarantine.first_error),
+    ):
+        if isinstance(candidate, BaseException):
+            channels.append((channel, id(candidate)))
+
+    if fatal_case:
+        assert fatal_entry == [terminal]
+        assert raw_abort_calls == [1]
+        assert ack_writes == [1]
+        assert fatal_writes == [1]
+        assert fatal_values == (1, 1)
+        assert ack_values == (1, 1)
+        assert collective._fatal_protocol_completed is True
+        assert channels
+        assert {identity for _, identity in channels} == {id(terminal)}
+        assert post_publication_accesses == []
+        retained_allocations = {
+            record.identity: record
+            for record in runtime._terminal_quarantine.allocations
+        }
+        assert set(retained_allocations) == set(expected_allocations)
+        assert all(
+            retained_allocations[identity].owner
+            is expected_allocations[identity].owner
+            and retained_allocations[identity].capacity_bytes
+            == expected_allocations[identity].capacity_bytes
+            for identity in expected_allocations
+        )
+        assert (id(store), id(reservation), id(provider), id(working_set)) == (
+            reservation_snapshot[0],
+            reservation_snapshot[1],
+            reservation_snapshot[2],
+            reservation_snapshot[3],
+        )
+        assert tuple(sorted(store._reservations)) == reservation_snapshot[4]
+        if reservation_snapshot[4]:
+            assert store._reservations[id(reservation)] is reservation
+        else:
+            assert store._reservations == {}
+    else:
+        assert fatal_entry == []
+        assert raw_abort_calls == []
+        assert ack_writes == []
+        assert fatal_writes == []
+        assert fatal_values == (0, 0)
+        assert ack_values == (0, 0)
+        assert channels == []
+        assert post_publication_accesses == []
+        assert store._reservations == {}
+        store.close()
+
+    resource_state = runtime.resource_state()
+    if fatal_case:
+        phase_barrier("record_captured")
+    monitor = collective._fatal_monitor_thread
+    abort_thread = getattr(collective, "_fatal_abort_thread", None)
+    scheduler_threads = tuple(
+        owner._async_worker
+        for owner in runtime._terminal_quarantine.owners
+        if owner._async_worker is not None
+    )
+    thread_liveness = tuple(
+        (label, thread is not None and thread.is_alive())
+        for label, thread in (
+            ("monitor", monitor),
+            ("abort", abort_thread),
+            ("fatal-test", fatal_thread),
+            ("inspection-test", inspection_thread),
+            ("close-test", close_thread),
+            *tuple(
+                ("async-{}".format(index), thread)
+                for index, thread in enumerate(scheduler_threads)
+            ),
+        )
+    )
+    with gate._condition:
+        live_tokens = sum(
+            state.status == "active" for state in gate._tokens.values()
+        )
+    retained_records = tuple(
+        sorted(
+            (
+                repr(record.identity),
+                record.capacity_bytes,
+                id(record.owner),
+            )
+            for record in runtime._terminal_quarantine.allocations
+        )
+    )
+    record = _Task184NodeRecord(
+        node_id=node_id,
+        case_id=case_id,
+        iteration=iteration,
+        rank=rank,
+        local_rank=runtime.local_rank,
+        origin_rank=origin_rank,
+        namespace_keys=phase_keys,
+        primary_source=(
+            "clean"
+            if terminal is None
+            else "local" if rank == origin_rank else "remote"
+        ),
+        primary_type=None if terminal is None else type(terminal).__name__,
+        primary_message=None if terminal is None else str(terminal),
+        primary_object_id=None if terminal is None else id(terminal),
+        injected_object_id=(
+            id(injected) if rank == origin_rank and injected is not None else None
+        ),
+        primary_origin_rank=(
+            None if terminal is None else collective._fatal_origin_rank
+        ),
+        primary_channels=tuple(channels),
+        abort_entry_count=len(fatal_entry),
+        raw_abort_count=len(raw_abort_calls),
+        abort_started=collective._fatal_abort_started,
+        abort_completed=collective._fatal_abort_completed,
+        abort_error_type=(
+            None
+            if collective._fatal_abort_error is None
+            else type(collective._fatal_abort_error).__name__
+        ),
+        local_ack_write_count=len(ack_writes),
+        fatal_values=fatal_values,
+        ack_values=ack_values,
+        protocol_completed=collective._fatal_protocol_completed,
+        cache_bytes=resource_state["cache_bytes"],
+        pinned_bytes=resource_state["pinned_bytes"],
+        quarantined_bytes=resource_state.get("quarantined_bytes", 0),
+        allocation_identities=retained_records,
+        owner_identities=tuple(
+            sorted(id(owner) for owner in runtime._terminal_quarantine.owners)
+        ),
+        event_identities=tuple(
+            sorted(id(event) for event in runtime._terminal_quarantine._retained_events())
+        ),
+        stream_identities=tuple(
+            sorted(id(stream) for stream in runtime._terminal_quarantine._retained_streams())
+        ),
+        post_publication_accesses=tuple(post_publication_accesses),
+        gate_phase=gate.phase.value,
+        live_tokens=live_tokens,
+        runtime_closed=runtime._closed,
+        collective_closed=collective._closed,
+        admitted_operations=collective._admitted_operations,
+        publications=collective._fatal_publications,
+        thread_liveness=thread_liveness,
+        backend_identity=id(backend),
+        store_identity=id(store),
+        provider_identity=id(provider),
+        lease_identity=id(working_set),
+        reservation_identity=id(reservation),
+        reservation_retained=id(reservation) in store._reservations,
+        store_closed=store.closed,
+        visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        clean_close=not fatal_case,
+    )
+
+    assert record.live_tokens == 0
+    assert not any(alive for _, alive in record.thread_liveness)
+    assert record.admitted_operations == 0
+    assert record.publications == 0
+    if fatal_case:
+        assert record.primary_origin_rank == origin_rank
+        assert record.reservation_retained is bool(reservation_snapshot[4])
+        assert record.store_closed is False
+        assert record.runtime_closed is True
+        assert record.collective_closed is False
+        assert record.cache_bytes == sum(
+            retained.capacity_bytes for retained in expected_cache.values()
+        )
+        assert record.pinned_bytes == sum(
+            retained.capacity_bytes for retained in expected_pinned.values()
+        )
+        assert set(record.event_identities) == expected_events
+        assert set(record.stream_identities) == expected_streams
+        assert expected_owner_ids.issubset(set(record.owner_identities))
+    else:
+        assert record.primary_object_id is None
+        assert record.reservation_retained is False
+        assert record.store_closed is True
+        assert record.runtime_closed is True
+        assert record.collective_closed is True
+
+    weakrefs = tuple(
+        retained
+        for retained in (
+            _task_18_4_weakref("runtime", runtime),
+            _task_18_4_weakref("collective", collective),
+            _task_18_4_weakref("provider", provider),
+            _task_18_4_weakref("lease", working_set),
+            _task_18_4_weakref("reservation", reservation),
+            _task_18_4_weakref("store", store),
+            _task_18_4_weakref("backend", backend),
+            *tuple(
+                _task_18_4_weakref(
+                    "allocation-{}".format(index), allocation.owner
+                )
+                for index, allocation in enumerate(expected_allocations.values())
+            ),
+        )
+        if retained is not None
+    )
+    return record, weakrefs, listener
+
+
 @pytest.mark.skipif(
     os.environ.get("WORLD_SIZE") != "2",
     reason="requires the exact two-rank torchrun command",
 )
-def test_real_two_rank_h2d_failed_drain_aborts_without_post_terminal_access(
+@pytest.mark.parametrize(
+    ("case_id", "iteration"),
+    TASK_18_4_STRESS_MATRIX,
+    ids=(
+        "{}-{:02d}".format(case_id, iteration)
+        for case_id, iteration in TASK_18_4_STRESS_MATRIX
+    ),
+)
+def test_real_two_rank_task_18_4_terminal_lifecycle_stress(
+    monkeypatch,
+    request,
+    case_id,
+    iteration,
+):
+    with monkeypatch.context() as node_monkeypatch:
+        record, weakrefs, listener = _run_task_18_4_stress_node(
+            node_monkeypatch,
+            request,
+            case_id,
+            iteration,
+        )
+    gc.collect()
+    surviving_refs = tuple(
+        label for label, retained in weakrefs if retained() is not None
+    )
+    assert surviving_refs == (), (record, surviving_refs)
+    if listener is not None:
+        assert wait_for_process_sentinels((listener.sentinel,), timeout=10.0) == [
+            listener.sentinel
+        ]
+        listener.join()
+        assert listener.is_alive() is False
+        assert listener.exitcode is not None
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+def _run_real_two_rank_h2d_failed_drain_aborts_without_post_terminal_access(
     monkeypatch,
 ):
     cupy = pytest.importorskip("cupy")
@@ -5137,6 +6148,13 @@ def test_real_two_rank_h2d_failed_drain_aborts_without_post_terminal_access(
     except BaseException as error:
         caught = error
     assert caught is not None
+    with runtime._terminal_gate._condition:
+        assert runtime._terminal_gate._condition.wait_for(
+            lambda: runtime._terminal_gate.phase
+            in (_TerminalPhase.FATAL_PUBLISHED, _TerminalPhase.RUNTIME_CLOSED),
+            timeout=10.0,
+        )
+    assert runtime.collective._fatal_abort_event.wait(10.0)
     assert runtime.terminal_poisoned is True
     assert runtime.collective._fatal_abort_started is True
     assert runtime.collective._fatal_abort_completed is True, (
@@ -5150,7 +6168,10 @@ def test_real_two_rank_h2d_failed_drain_aborts_without_post_terminal_access(
     )
     assert runtime.collective._fatal_abort_error is None
     assert forbidden == []
+    terminal = runtime._terminal_error
+    assert terminal is not None
     if rank == 0:
+        assert terminal is enqueue_error
         assert caught is enqueue_error
         assert len(status_calls) == 2
         owners = runtime._terminal_quarantine.owners
@@ -5164,27 +6185,51 @@ def test_real_two_rank_h2d_failed_drain_aborts_without_post_terminal_access(
         operator(local_vector)
     assert len(status_calls) == before_retry
 
-    terminal = runtime._terminal_error
+    retention = _snapshot_fatal_active_retention(runtime, store, working_set)
     try:
         runtime.close()
     except BaseException as error:
         assert error is terminal
-    store.close()
+    _assert_fatal_active_retention(retention, runtime, store, working_set)
     assert runtime._closed is True
+    evidence = _capture_fatal_active_release_evidence(
+        runtime,
+        store,
+        working_set,
+        operator,
+        local_vector,
+    )
+    return evidence
 
 
 @pytest.mark.skipif(
     os.environ.get("WORLD_SIZE") != "2",
     reason="requires the exact two-rank torchrun command",
 )
-def test_real_two_rank_failed_compute_drain_runtime_fatal_reserves_before_close(
+def test_real_two_rank_h2d_failed_drain_aborts_without_post_terminal_access(
+    monkeypatch,
+):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = (
+            _run_real_two_rank_h2d_failed_drain_aborts_without_post_terminal_access(
+                node_monkeypatch
+            )
+        )
+    _assert_fatal_active_graph_released(evidence)
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+def _run_real_two_rank_failed_compute_drain_runtime_fatal_reserves_before_close(
     monkeypatch,
 ):
     (
         runtime,
         store,
         working_set,
-        _,
+        operator,
         local_vector,
     ) = _real_two_rank_active_operator_case("real-two-rank-compute-drain-close")
     rank = runtime.rank
@@ -5192,37 +6237,17 @@ def test_real_two_rank_failed_compute_drain_runtime_fatal_reserves_before_close(
     control = collective._bootstrap_store_proxy
     backend = collective._backend
     scheduler = working_set.scheduler
-    paused_key = "renormalizer.test.review19.failed_drain.paused"
-    closing_prefix = "renormalizer.test.review19.failed_drain.closing."
-    if rank == 0:
-        control[paused_key] = 0
-        for peer in range(2):
-            control["{}{}".format(closing_prefix, peer)] = 0
+    gate = runtime._terminal_gate
     control.barrier()
 
-    callbacks = []
-    original_handler = runtime._enter_communicator_fatal
-
-    def record_callback(error):
-        callbacks.append(error)
-        return original_handler(error)
-
-    collective._install_fatal_handler(record_callback)
     abort_calls = []
     original_abort = collective._abort_local_communicator
 
-    def record_abort():
+    def record_abort(**kwargs):
         abort_calls.append(1)
-        return original_abort()
+        return original_abort(**kwargs)
 
     monkeypatch.setattr(collective, "_abort_local_communicator", record_abort)
-    hard_exits = []
-
-    def hard_exit():
-        hard_exits.append(1)
-        raise AssertionError("unexpected communicator hard exit")
-
-    monkeypatch.setattr(collective, "_fatal_hard_exit", hard_exit)
     stop_snapshots = []
     original_stop = backend.stop
 
@@ -5250,128 +6275,107 @@ def test_real_two_rank_failed_compute_drain_runtime_fatal_reserves_before_close(
     primary = RuntimeError("injected real close-race compute failure")
     drain_error = RuntimeError("injected real close-race compute drain failure")
     failed_owner = None
-    if rank == 0:
-        failed_owner = scheduler.begin_compute(arrays=(local_vector,)).owner
-        failed_owner._drainer = lambda: (_ for _ in ()).throw(drain_error)
-
-    handoff_entered = threading.Event()
-    release_handoff = threading.Event()
-    if rank == 0:
-        original_publish = collective._publish_communicator_fatal
-
-        def pause_runtime_handoff(error, **kwargs):
-            handoff_entered.set()
-            assert release_handoff.wait(10.0)
-            return original_publish(error, **kwargs)
-
-        monkeypatch.setattr(
-            collective, "_publish_communicator_fatal", pause_runtime_handoff
-        )
-
+    deferred_owners = []
     operation_errors = []
     close_errors = []
-
-    def run_operation():
-        try:
-            failed_owner.fail(primary)
-        except BaseException as error:
-            operation_errors.append(error)
-
-    def close_runtime():
-        try:
-            runtime.close()
-        except BaseException as error:
-            close_errors.append(error)
-
-    operation = (
-        threading.Thread(target=run_operation, daemon=True) if rank == 0 else None
-    )
-    closer = threading.Thread(target=close_runtime, daemon=True)
-    state_at_visibility = None
-    close_joined_reservation = None
-    try:
-        if rank == 0:
-            operation.start()
-            assert handoff_entered.wait(10.0)
-            state_at_visibility = (
-                collective._fatal_publications,
-                collective._fatal_abort_started,
-                int(control[collective._fatal_key(0)]),
-            )
-            control[paused_key] = 1
-        else:
-            deadline = time.monotonic() + 10.0
-            while int(control[paused_key]) != 1:
-                assert time.monotonic() < deadline
-                time.sleep(0.001)
-
-        closer.start()
-        deadline = time.monotonic() + 10.0
-        while not collective._closing:
-            assert time.monotonic() < deadline
-            time.sleep(0.001)
-        control["{}{}".format(closing_prefix, rank)] = 1
-        deadline = time.monotonic() + 10.0
-        while not all(
-            int(control["{}{}".format(closing_prefix, peer)]) == 1 for peer in range(2)
-        ):
-            assert time.monotonic() < deadline
-            time.sleep(0.001)
-        closer.join(0.05)
-        close_joined_reservation = closer.is_alive()
-
-        release_handoff.set()
-        if operation is not None:
-            operation.join(20.0)
-        closer.join(20.0)
-    finally:
-        release_handoff.set()
-        if operation is not None and operation.ident is not None:
-            operation.join(20.0)
-        if closer.ident is not None:
-            closer.join(20.0)
-        if not runtime._closed:
-            try:
-                runtime.close()
-            except BaseException:
-                pass
-        store.close()
-
     if rank == 0:
-        assert state_at_visibility == (1, True, 1)
-    else:
-        assert state_at_visibility is None
-    assert close_joined_reservation is True
-    assert operation is None or not operation.is_alive()
-    assert not closer.is_alive()
+        original_accept_quarantine = scheduler._quarantine
+
+        def defer_quarantine(owner):
+            deferred_owners.append(owner)
+
+        with working_set._lease_admission("operator_call") as admission_token:
+            validator = working_set._exact_admission_validator(admission_token)
+            failed_owner = scheduler.begin_compute(
+                arrays=(local_vector,),
+                _admission_token=admission_token,
+                _admission_validator=validator,
+            ).owner
+            failed_owner._drainer = lambda: (_ for _ in ()).throw(drain_error)
+            monkeypatch.setattr(scheduler, "_quarantine", defer_quarantine)
+            try:
+                failed_owner.fail(
+                    primary,
+                    _admission_token=admission_token,
+                    _admission_validator=validator,
+                )
+            except BaseException as error:
+                operation_errors.append(error)
+        with gate._condition:
+            assert gate._tokens[admission_token.sequence].status == "released"
+        assert deferred_owners == [failed_owner]
+        monkeypatch.setattr(
+            scheduler,
+            "_quarantine",
+            original_accept_quarantine,
+        )
+        original_accept_quarantine(failed_owner)
+    with runtime._terminal_gate._condition:
+        assert runtime._terminal_gate._condition.wait_for(
+            lambda: runtime._terminal_gate.phase
+            in (_TerminalPhase.FATAL_PUBLISHED, _TerminalPhase.RUNTIME_CLOSED),
+            timeout=10.0,
+        )
+    assert collective._fatal_abort_event.wait(10.0)
     terminal = runtime._terminal_error
     assert terminal is not None
+    try:
+        runtime.close()
+    except BaseException as error:
+        close_errors.append(error)
     assert close_errors == [terminal]
     if rank == 0:
         assert terminal is primary
         assert operation_errors == [primary]
-        assert callbacks == []
         assert failed_owner in runtime._terminal_quarantine.owners
         assert failed_owner.error is primary
         assert failed_owner.secondary_errors == (drain_error,)
     else:
         assert operation_errors == []
-        assert len(callbacks) == 1
-        assert callbacks[0].origin_rank == 0
+        assert terminal.origin_rank == 0
     assert abort_calls == [1]
-    assert hard_exits == []
     assert collective._admitted_operations == 0
     assert collective._fatal_publications == 0
     assert collective._fatal_abort_started is True
     assert collective._fatal_abort_completed is True
-    assert collective._closed is True
-    assert stop_snapshots
-    assert stop_snapshots[0]["fatal"] == (1, 1)
-    assert stop_snapshots[0]["ack"] == (1, 1)
-    assert stop_snapshots[0]["admitted"] == 0
-    assert stop_snapshots[0]["publications"] == 0
-    if rank == 0:
-        assert stop_snapshots[0]["close_consumed"] == (1, 1)
+    assert runtime._closed is True
+    assert collective._closed is False
+    assert stop_snapshots == []
+    assert tuple(
+        int(control[collective._fatal_key(peer)]) for peer in range(2)
+    ) == (1, 1)
+    assert tuple(
+        int(control[collective._fatal_ack_key(peer)]) for peer in range(2)
+    ) == (1, 1)
+    assert tuple(
+        int(control[collective._close_consumed_key(peer)]) for peer in range(2)
+    ) == (0, 0)
+    retention = _snapshot_fatal_active_retention(runtime, store, working_set)
+    _assert_fatal_active_retention(retention, runtime, store, working_set)
+    evidence = _capture_fatal_active_release_evidence(
+        runtime,
+        store,
+        working_set,
+        operator,
+        local_vector,
+    )
+    return evidence
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+def test_real_two_rank_failed_compute_drain_runtime_fatal_reserves_before_close(
+    monkeypatch,
+):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = (
+            _run_real_two_rank_failed_compute_drain_runtime_fatal_reserves_before_close(
+                node_monkeypatch
+            )
+        )
+    _assert_fatal_active_graph_released(evidence)
 
 
 @pytest.mark.skipif(
@@ -5380,7 +6384,8 @@ def test_real_two_rank_failed_compute_drain_runtime_fatal_reserves_before_close(
 )
 @pytest.mark.parametrize("failure_operation", ("query", "wait"))
 @pytest.mark.parametrize("drain_fails", (False, True))
-def test_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
+def _run_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
+    monkeypatch,
     failure_operation,
     drain_fails,
 ):
@@ -5395,8 +6400,10 @@ def test_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
         "real-two-rank-prior-{}-{}".format(failure_operation, drain_fails)
     )
     operator(local_vector)
-    prior_owner = working_set._status_workspace.borrower
-    assert prior_owner is not None
+    with working_set._lease_admission("resource_state"):
+        prior_owner = working_set._status_workspace.borrower
+        assert prior_owner is not None
+        prior_completion_event = prior_owner.completion_event
     primary = RuntimeError("injected real prior {} failure".format(failure_operation))
     drain_error = RuntimeError("injected real prior owner drain failure")
 
@@ -5414,10 +6421,12 @@ def test_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
             self.synchronize_calls += 1
             if failure_operation == "wait" and self.synchronize_calls == 1:
                 raise primary
+            if drain_fails:
+                raise drain_error
             self.event.synchronize()
 
     if runtime.rank == 0:
-        wrapped_event = EventWrapper(prior_owner.completion_event)
+        wrapped_event = EventWrapper(prior_completion_event)
         prior_owner._completion_event = wrapped_event
         prior_owner._events = [wrapped_event]
         if drain_fails:
@@ -5430,14 +6439,16 @@ def test_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
         status_calls.append(len(status_calls))
         return original_status(call, local_error)
 
-    operator._allreduce_active_status = record_status
+    monkeypatch.setattr(operator, "_allreduce_active_status", record_status)
     caught = None
     try:
         operator(local_vector)
     except BaseException as error:
         caught = error
     assert caught is not None
+    evidence = None
     if drain_fails:
+        assert runtime.collective._fatal_abort_event.wait(10.0)
         assert runtime.terminal_poisoned is True
         assert runtime.collective._fatal_abort_started is True
         assert runtime.collective._fatal_abort_completed is True
@@ -5448,10 +6459,19 @@ def test_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
             assert prior_owner.error is primary
             assert prior_owner.secondary_errors == (drain_error,)
         terminal = runtime._terminal_error
+        retention = _snapshot_fatal_active_retention(runtime, store, working_set)
         try:
             runtime.close()
         except BaseException as error:
             assert error is terminal
+        _assert_fatal_active_retention(retention, runtime, store, working_set)
+        evidence = _capture_fatal_active_release_evidence(
+            runtime,
+            store,
+            working_set,
+            operator,
+            local_vector,
+        )
     else:
         assert status_calls == [0]
         if runtime.rank == 0:
@@ -5464,7 +6484,29 @@ def test_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
         result = operator(local_vector)
         assert result.shape == local_vector.shape
         runtime.close()
-    store.close()
+        store.close()
+    return evidence
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+@pytest.mark.parametrize("failure_operation", ("query", "wait"))
+@pytest.mark.parametrize("drain_fails", (False, True))
+def test_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
+    monkeypatch,
+    failure_operation,
+    drain_fails,
+):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = _run_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
+            node_monkeypatch,
+            failure_operation,
+            drain_fails,
+        )
+    if evidence is not None:
+        _assert_fatal_active_graph_released(evidence)
 
 
 @pytest.mark.skipif(
@@ -5474,7 +6516,7 @@ def test_real_two_rank_prior_owner_failure_reaches_p0_or_aborts(
 @pytest.mark.parametrize(
     "explicit_reap", (False, True), ids=("borrower-live", "after-explicit-reap")
 )
-def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
+def _run_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
     monkeypatch, explicit_reap
 ):
     (
@@ -5487,26 +6529,32 @@ def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
     operator(local_vector)
     collective = runtime.collective
     control = collective._bootstrap_store_proxy
-    owner = working_set._status_workspace.borrower
-    assert owner is not None
+    with working_set._lease_admission("resource_state"):
+        owner = working_set._status_workspace.borrower
+        status_pair = (
+            working_set._status_workspace.device_status,
+            working_set._status_workspace.host_status,
+        )
+        assert owner is not None
+        assert all(
+            any(retained is status for retained in owner.arrays)
+            for status in status_pair
+        )
+        completion = owner.completion_event
+        status_records = tuple(allocation_record(status) for status in status_pair)
+        scheduler = working_set.scheduler
+        cache = working_set._provider._cache
+        pool = working_set.pool
     assert working_set._active_operator_owner is None
-    status_pair = (
-        working_set._status_workspace.device_status,
-        working_set._status_workspace.host_status,
-    )
-    assert all(
-        any(retained is status for retained in owner.arrays) for status in status_pair
-    )
-    status_records = tuple(allocation_record(status) for status in status_pair)
     assert len({record.identity for record in status_records}) == 2
     assert all(record.capacity_bytes == 4 for record in status_records)
     if explicit_reap:
         working_set.reap_completed()
         assert owner.state == "detached"
-        assert working_set._status_workspace.borrower is None
+        with working_set._lease_admission("resource_state"):
+            assert working_set._status_workspace.borrower is None
 
     forbidden = []
-    completion = owner.completion_event
 
     class GuardedEvent:
         def query(self):
@@ -5519,7 +6567,6 @@ def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
                 forbidden.append("event.synchronize")
             completion.synchronize()
 
-    scheduler = working_set.scheduler
     if completion is not None:
         guarded_event = GuardedEvent()
         owner._completion_event = guarded_event
@@ -5534,8 +6581,6 @@ def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
         if event_owner is not None:
             scheduler._event_owners[id(guarded_event)] = event_owner
 
-    cache = working_set._provider.cache
-    pool = working_set.pool
     guarded_resources = (
         ("cache", cache, ("close", "wait_for_pending", "reap_completed")),
         ("scheduler", scheduler, ("close", "complete_all", "reap_completed")),
@@ -5558,20 +6603,37 @@ def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
 
             monkeypatch.setattr(resource, name, guarded_operation)
 
-    records = {}
-    for record in (
-        *(status_records if explicit_reap else owner.allocations),
-        *cache.allocation_records,
-        *pool.allocation_records,
-    ):
-        retained = records.get(record.identity)
-        if retained is None or record.capacity_bytes > retained.capacity_bytes:
-            records[record.identity] = record
-    cache_records = {record.identity: record for record in cache.allocation_records}
-    pool_records = {record.identity: record for record in pool.allocation_records}
-    expected_arrays = tuple(owner.arrays)
-    expected_streams = {id(stream) for stream in scheduler.retained_streams}
-    expected_events = {id(event) for event in scheduler.retained_events}
+    with working_set._lease_admission("resource_state"):
+        records = {}
+        for record in (
+            *(status_records if explicit_reap else owner.allocations),
+            *cache.allocation_records,
+            *pool.allocation_records,
+        ):
+            retained = records.get(record.identity)
+            if retained is None or record.capacity_bytes > retained.capacity_bytes:
+                records[record.identity] = record
+        cache_records = {
+            record.identity: record for record in cache.allocation_records
+        }
+        pool_records = {
+            record.identity: record for record in pool.allocation_records
+        }
+        expected_arrays = tuple(owner.arrays)
+        expected_streams = {
+            id(stream)
+            for stream in (
+                *scheduler.retained_streams,
+                *working_set._resource_record.streams,
+            )
+        }
+        expected_events = {
+            id(event)
+            for event in (
+                *scheduler.retained_events,
+                *working_set._resource_record.events,
+            )
+        }
 
     ready_prefix = "renormalizer.test.review14.between_call.ready."
     if runtime.rank == 0:
@@ -5598,18 +6660,18 @@ def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
     if explicit_reap:
         assert owner.state == "detached"
         assert owner not in runtime._terminal_quarantine.owners
-        assert working_set._status_workspace.borrower is None
+        assert working_set._status_workspace._borrower is None
     else:
         assert owner.state == "quarantined"
         assert owner in runtime._terminal_quarantine.owners
-        assert tuple(owner.arrays) == expected_arrays
+        assert tuple(owner._arrays) == expected_arrays
         assert all(
-            any(retained is status for retained in owner.arrays)
+            any(retained is status for retained in owner._arrays)
             for status in status_pair
         )
     if not explicit_reap:
-        assert cache.poisoned is True
-        assert scheduler.poisoned is True
+        assert cache._poisoned_error is not None
+        assert scheduler._poisoned_error is not None
     assert collective._fatal_abort_started is True
     assert collective._fatal_abort_event.wait(10.0)
     assert collective._fatal_abort_completed is True
@@ -5651,7 +6713,36 @@ def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
     assert state["quarantined_bytes"] == sum(
         record.capacity_bytes for record in records.values()
     )
-    store.close()
+    retention = _snapshot_fatal_active_retention(runtime, store, working_set)
+    _assert_fatal_active_retention(retention, runtime, store, working_set)
+    evidence = _capture_fatal_active_release_evidence(
+        runtime,
+        store,
+        working_set,
+        operator,
+        local_vector,
+    )
+    return evidence
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+@pytest.mark.parametrize(
+    "explicit_reap", (False, True), ids=("borrower-live", "after-explicit-reap")
+)
+def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
+    monkeypatch, explicit_reap
+):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = (
+            _run_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
+                node_monkeypatch,
+                explicit_reap,
+            )
+        )
+    _assert_fatal_active_graph_released(evidence)
 
 
 @pytest.mark.skipif(
@@ -5659,7 +6750,7 @@ def test_real_two_rank_peer_fatal_between_calls_quarantines_without_cuda(
     reason="requires the exact two-rank torchrun command",
 )
 @pytest.mark.parametrize("origin_rank", (0, 1))
-def test_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e(
+def _run_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e(
     monkeypatch, origin_rank
 ):
     cupy = pytest.importorskip("cupy")
@@ -5713,14 +6804,20 @@ def test_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e
         operator(local_vector)
     assert (len(status_calls), len(backend_broadcast_calls)) == before_retry
 
-    pool_records = working_set.pool.allocation_records
-    cache_records = working_set._provider.cache.allocation_records
+    resource_snapshot = working_set._resource_record.snapshot()
+    pool_records = resource_snapshot.pinned_allocations
+    cache_records = resource_snapshot.cache_allocations
     owners = runtime._terminal_quarantine.owners
+    owner_snapshots = tuple(owner._terminal_resource_snapshot() for owner in owners)
     expected_records = {}
     for record in (
         *pool_records,
         *cache_records,
-        *(record for owner in owners for record in owner.allocations),
+        *(
+            record
+            for snapshot in owner_snapshots
+            for record in snapshot["allocations"]
+        ),
     ):
         retained = expected_records.get(record.identity)
         if retained is None or record.capacity_bytes > retained.capacity_bytes:
@@ -5729,7 +6826,8 @@ def test_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e
         id(stream)
         for stream in (
             working_set.scheduler._stream,
-            *(stream for owner in owners for stream in owner.streams),
+            *resource_snapshot.streams,
+            *(stream for snapshot in owner_snapshots for stream in snapshot["streams"]),
         )
         if stream is not None
     }
@@ -5737,7 +6835,8 @@ def test_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e
         id(event)
         for event in (
             *working_set.scheduler._events,
-            *(event for owner in owners for event in owner.events),
+            *resource_snapshot.events,
+            *(event for snapshot in owner_snapshots for event in snapshot["events"]),
         )
     }
     expected_cache_bytes = sum(
@@ -5749,6 +6848,7 @@ def test_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e
         for record in {record.identity: record for record in pool_records}.values()
     )
     terminal = runtime._terminal_error
+    retention = _snapshot_fatal_active_retention(runtime, store, working_set)
     try:
         runtime.close()
     except BaseException as error:
@@ -5766,7 +6866,33 @@ def test_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e
     assert {
         record.identity for record in runtime._terminal_quarantine.allocations
     } == set(expected_records)
-    store.close()
+    _assert_fatal_active_retention(retention, runtime, store, working_set)
+    evidence = _capture_fatal_active_release_evidence(
+        runtime,
+        store,
+        working_set,
+        operator,
+        local_vector,
+    )
+    return evidence
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+@pytest.mark.parametrize("origin_rank", (0, 1))
+def test_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e(
+    monkeypatch, origin_rank
+):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = (
+            _run_real_two_rank_broadcast_enqueue_then_raise_aborts_before_execution_or_e(
+                node_monkeypatch,
+                origin_rank,
+            )
+        )
+    _assert_fatal_active_graph_released(evidence)
 
 
 @pytest.mark.skipif(
@@ -5847,7 +6973,7 @@ def test_real_two_rank_asymmetric_private_store_loss_rejects_all_ranks(
         runtime.close()
 
 
-def _real_two_rank_active_operator_case(store_id):
+def _real_two_rank_active_operator_case(store_id, *, _rendezvous_port=None):
     cupy = pytest.importorskip("cupy")
     from renormalizer import set_backend
     from renormalizer.backend.distributed_runtime import (
@@ -5858,6 +6984,7 @@ def _real_two_rank_active_operator_case(store_id):
         expected_world_size=2,
         execution_policy="execution_ir",
         fallback_policy="error",
+        port=_rendezvous_port,
     )
     set_backend(
         "cupy",
@@ -5932,13 +7059,13 @@ def test_real_two_rank_staggered_healthy_close_stops_rank_zero_store_last():
     os.environ.get("WORLD_SIZE") != "2",
     reason="requires the exact two-rank torchrun command",
 )
-def test_real_two_rank_close_ready_joins_unpolled_nonzero_fatal(monkeypatch):
+def _run_real_two_rank_close_ready_joins_unpolled_nonzero_fatal(monkeypatch):
     (
         runtime,
         store,
-        _,
-        _,
-        _,
+        working_set,
+        operator,
+        local_vector,
     ) = _real_two_rank_active_operator_case("real-two-rank-close-fatal-race")
     collective = runtime.collective
     control = collective._bootstrap_store_proxy
@@ -6020,13 +7147,9 @@ def test_real_two_rank_close_ready_joins_unpolled_nonzero_fatal(monkeypatch):
     closer = threading.Thread(target=close_runtime, daemon=True)
     closer.start()
     if runtime.rank == 0:
-        deadline = time.monotonic() + 10.0
-        while int(control[collective._fatal_ack_key(0)]) != 1:
-            assert time.monotonic() < deadline
-            time.sleep(0.001)
-        assert collective._fatal_abort_started is True
-        assert collective._fatal_abort_completed is True
+        assert collective._fatal_abort_event.is_set() is False
         release_monitor.set()
+        assert collective._fatal_abort_event.wait(10.0)
     else:
         publisher.join(10.0)
         assert not publisher.is_alive()
@@ -6039,24 +7162,54 @@ def test_real_two_rank_close_ready_joins_unpolled_nonzero_fatal(monkeypatch):
     assert close_errors == [terminal]
     assert collective._fatal_abort_started is True
     assert collective._fatal_abort_completed is True
-    assert collective._closed is True
-    assert stop_snapshots
-    if runtime.rank == 0:
-        assert stop_snapshots == [(1, 1)]
-    store.close()
+    assert runtime._closed is True
+    assert collective._closed is False
+    assert stop_snapshots == []
+    assert tuple(
+        int(control[collective._fatal_key(peer)]) for peer in range(2)
+    ) == (1, 1)
+    assert tuple(
+        int(control[collective._fatal_ack_key(peer)]) for peer in range(2)
+    ) == (1, 1)
+    retention = _snapshot_fatal_active_retention(
+        runtime,
+        store,
+        working_set,
+        reservation_retained=runtime.rank == 1,
+    )
+    _assert_fatal_active_retention(retention, runtime, store, working_set)
+    return _capture_fatal_active_release_evidence(
+        runtime,
+        store,
+        working_set,
+        operator,
+        local_vector,
+    )
 
 
 @pytest.mark.skipif(
     os.environ.get("WORLD_SIZE") != "2",
     reason="requires the exact two-rank torchrun command",
 )
-def test_real_two_rank_close_intent_waits_for_admitted_operation_fatal(monkeypatch):
+def test_real_two_rank_close_ready_joins_unpolled_nonzero_fatal(monkeypatch):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = _run_real_two_rank_close_ready_joins_unpolled_nonzero_fatal(
+            node_monkeypatch
+        )
+    _assert_fatal_active_graph_released(evidence)
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+def _run_real_two_rank_close_intent_waits_for_admitted_operation_fatal(monkeypatch):
     (
         runtime,
         store,
-        _,
-        _,
-        _,
+        working_set,
+        operator,
+        local_vector,
     ) = _real_two_rank_active_operator_case("real-two-rank-admitted-close-fatal")
     collective = runtime.collective
     control = collective._bootstrap_store_proxy
@@ -6145,25 +7298,55 @@ def test_real_two_rank_close_intent_waits_for_admitted_operation_fatal(monkeypat
     assert close_errors == [terminal]
     assert collective._fatal_abort_started is True
     assert collective._fatal_abort_completed is True
-    assert collective._closed is True
-    assert stop_snapshots
-    if runtime.rank == 0:
-        assert stop_snapshots == [(1, 1)]
-    store.close()
+    assert runtime._closed is True
+    assert collective._closed is False
+    assert stop_snapshots == []
+    assert tuple(
+        int(control[collective._fatal_key(peer)]) for peer in range(2)
+    ) == (1, 1)
+    assert tuple(
+        int(control[collective._fatal_ack_key(peer)]) for peer in range(2)
+    ) == (1, 1)
+    retention = _snapshot_fatal_active_retention(
+        runtime,
+        store,
+        working_set,
+        reservation_retained=False,
+    )
+    _assert_fatal_active_retention(retention, runtime, store, working_set)
+    return _capture_fatal_active_release_evidence(
+        runtime,
+        store,
+        working_set,
+        operator,
+        local_vector,
+    )
 
 
 @pytest.mark.skipif(
     os.environ.get("WORLD_SIZE") != "2",
     reason="requires the exact two-rank torchrun command",
 )
-def test_real_two_rank_close_joins_monitor_fatal_for_admitted_peer(monkeypatch):
+def test_real_two_rank_close_intent_waits_for_admitted_operation_fatal(monkeypatch):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = _run_real_two_rank_close_intent_waits_for_admitted_operation_fatal(
+            node_monkeypatch
+        )
+    _assert_fatal_active_graph_released(evidence)
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+def _run_real_two_rank_close_joins_monitor_fatal_for_admitted_peer(monkeypatch):
     cupy = pytest.importorskip("cupy")
     (
         runtime,
         store,
-        _,
-        _,
-        _,
+        working_set,
+        operator,
+        local_vector,
     ) = _real_two_rank_active_operator_case("real-two-rank-both-admitted-close-fatal")
     collective = runtime.collective
     control = collective._bootstrap_store_proxy
@@ -6189,19 +7372,11 @@ def test_real_two_rank_close_joins_monitor_fatal_for_admitted_peer(monkeypatch):
     abort_calls = []
     original_abort = collective._abort_local_communicator
 
-    def record_abort():
+    def record_abort(**kwargs):
         abort_calls.append(1)
-        return original_abort()
+        return original_abort(**kwargs)
 
     monkeypatch.setattr(collective, "_abort_local_communicator", record_abort)
-
-    hard_exits = []
-
-    def hard_exit():
-        hard_exits.append(1)
-        raise AssertionError("unexpected communicator hard exit")
-
-    monkeypatch.setattr(collective, "_fatal_hard_exit", hard_exit)
 
     stop_snapshots = []
     actual_threads = []
@@ -6334,51 +7509,59 @@ def test_real_two_rank_close_joins_monitor_fatal_for_admitted_peer(monkeypatch):
     assert len(callbacks) == 1
     assert close_errors == [terminal]
     assert abort_calls == [1]
-    assert hard_exits == []
     assert collective._admitted_operations == 0
     assert collective._fatal_publications == 0
     assert collective._fatal_abort_started is True
     assert collective._fatal_abort_completed is True
-    assert collective._closed is True
+    assert runtime._closed is True
+    assert collective._closed is False
     assert len(actual_threads) == 1
     assert all(not thread.is_alive() for thread in actual_threads)
-    assert stop_snapshots
-    assert stop_snapshots[0]["fatal"] == (1, 1)
-    assert stop_snapshots[0]["ack"] == (1, 1)
-    assert stop_snapshots[0]["admitted"] == 0
-    assert stop_snapshots[0]["publications"] == 0
-    assert stop_snapshots[0]["actual_alive"] == 0
-    if runtime.rank == 0:
-        assert stop_snapshots == [
-            {
-                "close_consumed": (1, 1),
-                "fatal": (1, 1),
-                "ack": (1, 1),
-                "admitted": 0,
-                "publications": 0,
-                "actual_alive": 0,
-            }
-        ]
-    store.close()
+    assert stop_snapshots == []
+    assert tuple(
+        int(control[collective._fatal_key(peer)]) for peer in range(2)
+    ) == (1, 1)
+    assert tuple(
+        int(control[collective._fatal_ack_key(peer)]) for peer in range(2)
+    ) == (1, 1)
+    retention = _snapshot_fatal_active_retention(
+        runtime,
+        store,
+        working_set,
+        reservation_retained=False,
+    )
+    _assert_fatal_active_retention(retention, runtime, store, working_set)
+    return _capture_fatal_active_release_evidence(
+        runtime,
+        store,
+        working_set,
+        operator,
+        local_vector,
+    )
 
 
 @pytest.mark.skipif(
     os.environ.get("WORLD_SIZE") != "2",
     reason="requires the exact two-rank torchrun command",
 )
-@pytest.mark.parametrize(
-    "fatal", (os.environ.get("RENORMALIZER_TEST_REVIEW17_FATAL") == "1",)
-)
-def test_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
+def test_real_two_rank_close_joins_monitor_fatal_for_admitted_peer(monkeypatch):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = _run_real_two_rank_close_joins_monitor_fatal_for_admitted_peer(
+            node_monkeypatch
+        )
+    _assert_fatal_active_graph_released(evidence)
+
+
+def _run_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
     monkeypatch, fatal
 ):
     cupy = pytest.importorskip("cupy")
     (
         runtime,
         store,
-        _,
-        _,
-        _,
+        working_set,
+        operator,
+        local_vector,
     ) = _real_two_rank_active_operator_case(
         "real-two-rank-active-b-close-{}".format("fatal" if fatal else "healthy")
     )
@@ -6414,26 +7597,21 @@ def test_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
     collective._install_fatal_handler(record_callback)
 
     abort_calls = []
+    ack_writes = []
     original_abort = collective._abort_local_communicator
 
-    def record_abort():
+    def record_abort(**kwargs):
         abort_calls.append(1)
-        return original_abort()
+        return original_abort(**kwargs)
 
     monkeypatch.setattr(collective, "_abort_local_communicator", record_abort)
-
-    hard_exits = []
-
-    def hard_exit():
-        hard_exits.append(1)
-        raise AssertionError("unexpected communicator hard exit")
-
-    monkeypatch.setattr(collective, "_fatal_hard_exit", hard_exit)
 
     original_set = collective._fatal_store_set
     release_agreement = threading.Event()
 
-    def pause_active_record(key, value):
+    def pause_active_record(key, value, **kwargs):
+        if key == collective._fatal_ack_key(runtime.rank) and int(value) == 1:
+            ack_writes.append(1)
         if key == collective._active_b_key(runtime.rank):
             sequence, _ = collective._decode_active_b(value)
             if int(sequence) == 1:
@@ -6446,7 +7624,7 @@ def test_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
                     assert time.monotonic() < deadline
                     time.sleep(0.001)
                 assert release_agreement.wait(10.0)
-        return original_set(key, value)
+        return original_set(key, value, **kwargs)
 
     monkeypatch.setattr(collective, "_fatal_store_set", pause_active_record)
 
@@ -6515,7 +7693,20 @@ def test_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
             time.sleep(0.001)
 
         closer.start()
-        while not collective._closing:
+        gate = runtime._terminal_gate
+        while not (
+            collective._closing
+            or (
+                fatal
+                and gate._fatal_transition is not None
+                and gate.phase
+                in (
+                    _TerminalPhase.FATAL_PENDING,
+                    _TerminalPhase.FATAL_PUBLISHED,
+                    _TerminalPhase.RUNTIME_CLOSED,
+                )
+            )
+        ):
             assert time.monotonic() < deadline
             time.sleep(0.001)
         control["{}{}".format(closing_prefix, runtime.rank)] = 1
@@ -6543,22 +7734,71 @@ def test_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
     assert not operation.is_alive()
     assert not closer.is_alive()
     if fatal:
+        terminal = runtime._terminal_error
+        assert terminal is not None
         assert len(operation_errors) == 1
         if runtime.rank == 1:
+            assert terminal is primary
             assert operation_errors == [primary]
             assert callbacks == [primary]
         else:
-            assert callbacks[0].origin_rank == 1
-        assert len(callbacks) == 1
-        assert len(close_errors) == 1
-        assert close_errors[0] is runtime._terminal_error
+            assert terminal.origin_rank == 1
+            assert str(operation_errors[0]) == "collective fatal publication is pending"
+            assert callbacks == [terminal]
+        assert collective._fatal_origin_rank == 1
+        assert close_errors == [terminal]
         assert abort_calls == [1]
+        assert ack_writes == [1]
+        channels = tuple(
+            channel
+            for channel in (
+                gate._fatal_transition.primary,
+                runtime._terminal_error,
+                collective._fatal_error,
+                working_set._provider._terminal_error,
+                working_set._poisoned_error,
+                getattr(backend, "_execution_terminal_error", None),
+                runtime._terminal_quarantine.first_error,
+            )
+            if isinstance(channel, BaseException)
+        )
+        assert channels
+        assert all(channel is terminal for channel in channels)
+        assert collective._fatal_abort_started is True
+        assert collective._fatal_abort_completed is True
+        assert collective._fatal_protocol_completed is True
+        assert runtime._closed is True
+        assert collective._closed is False
+        assert stop_snapshots == []
+        assert tuple(
+            int(control[collective._fatal_key(peer)]) for peer in range(2)
+        ) == (1, 1)
+        assert tuple(
+            int(control[collective._fatal_ack_key(peer)]) for peer in range(2)
+        ) == (1, 1)
+        assert tuple(
+            int(control[collective._close_consumed_key(peer)]) for peer in range(2)
+        ) == (0, 0)
+        retention = _snapshot_fatal_active_retention(
+            runtime,
+            store,
+            working_set,
+            reservation_retained=runtime.rank == 1,
+        )
+        _assert_fatal_active_retention(retention, runtime, store, working_set)
+        return _capture_fatal_active_release_evidence(
+            runtime,
+            store,
+            working_set,
+            operator,
+            local_vector,
+        )
     else:
         assert operation_errors == []
         assert callbacks == []
         assert close_errors == []
         assert abort_calls == []
-    assert hard_exits == []
+        assert ack_writes == []
     assert collective._admitted_operations == 0
     assert collective._fatal_publications == 0
     assert collective._closed is True
@@ -6574,6 +7814,28 @@ def test_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
             }
         ]
     store.close()
+    return None
+
+
+@pytest.mark.skipif(
+    os.environ.get("WORLD_SIZE") != "2",
+    reason="requires the exact two-rank torchrun command",
+)
+@pytest.mark.parametrize(
+    "fatal", (os.environ.get("RENORMALIZER_TEST_REVIEW17_FATAL") == "1",)
+)
+def test_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
+    monkeypatch, fatal
+):
+    with monkeypatch.context() as node_monkeypatch:
+        evidence = (
+            _run_real_two_rank_close_waits_for_complete_active_broadcast_agreement(
+                node_monkeypatch,
+                fatal,
+            )
+        )
+    if evidence is not None:
+        _assert_fatal_active_graph_released(evidence)
 
 
 @pytest.mark.skipif(
@@ -6684,7 +7946,11 @@ def test_real_two_rank_outer_lease_reuses_static_shards_and_cleans_up():
         assert metrics.h2d_count == expected_h2d
         assert metrics.full_replica is False
         assert store.ref("output").version == center.version + 1
-        state = config.provider.resource_state()
+        state_token = runtime._terminal_gate.admit_runtime("resource_state")
+        try:
+            state = config.provider.resource_state()
+        finally:
+            runtime._release_admission(state_token)
         assert state["active_leases"] == 0
         assert state["reserved_cache_bytes"] == 0
         assert state["checked_out_pinned_bytes"] == 0

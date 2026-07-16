@@ -53,6 +53,8 @@ from renormalizer.backend._distributed.transfer import (
 from renormalizer.backend._execution.model import ExecutionBindings
 from renormalizer.backend.distributed_runtime import CupyDistributedRuntime
 from renormalizer.backend.tests.residency.test_active_provider import (
+    TASK_18_4_CASE_IDS,
+    TASK_18_4_PHASE_BANDS,
     _LoopbackCollective,
     _ManualEvent,
     _active_case,
@@ -660,6 +662,29 @@ def test_admission_sentinel_matrix_covers_every_approved_boundary():
         "begin_runtime_close",
         "runtime_close_commit",
     )
+
+
+def test_task_18_4_phase_bands_partition_all_close_boundaries():
+    close_boundaries = set(TRANSITION_BOUNDARIES)
+    close_boundaries.update(LEASE_CLOSE_MATRIX_ROWS)
+    close_boundaries.update(
+        {
+            "provider_close",
+            "collective_monitor_start",
+            "collective_close_ready",
+            "collective_monitor_stop",
+            "collective_close",
+        }
+    )
+    covered = tuple(
+        boundary
+        for boundaries in TASK_18_4_PHASE_BANDS.values()
+        for boundary in boundaries
+    )
+
+    assert tuple(TASK_18_4_PHASE_BANDS) == TASK_18_4_CASE_IDS
+    assert len(covered) == len(set(covered))
+    assert set(covered) == close_boundaries
 
 
 def _matrix_admission_token(runtime, row):
