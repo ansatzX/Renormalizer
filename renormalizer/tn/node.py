@@ -1,6 +1,7 @@
 from typing import List, Dict, Union, Sequence
 
-from renormalizer.mps.backend import np, backend
+from renormalizer.mps.backend import np
+from renormalizer.backend.context import internal_backend as backend
 from renormalizer.mps.matrix import asnumpy
 from renormalizer.model.basis import BasisSet, BasisDummy
 
@@ -169,11 +170,12 @@ class TreeNodeTensor(TreeNode):
 
     @tensor.setter
     def tensor(self, tensor):
+        tensor = asnumpy(tensor)
         if np.iscomplexobj(tensor):
             dtype = backend.complex_dtype
         else:
             dtype = backend.real_dtype
-        self._tensor = np.asarray(asnumpy(tensor), dtype=dtype)
+        self._tensor = np.asarray(tensor, dtype=dtype)
 
     # alias
     array = tensor

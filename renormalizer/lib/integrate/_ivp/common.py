@@ -1,10 +1,11 @@
 from __future__ import division, print_function, absolute_import
+from math import prod
 from itertools import groupby
 from warnings import warn
 
 from scipy.sparse import find, coo_matrix
 
-from renormalizer.mps.backend import xp
+from renormalizer.backend.context import internal_backend as xp
 
 
 EPS = xp.finfo(float).eps
@@ -66,7 +67,7 @@ def norm(x):
     """Compute RMS norm."""
     # this step looks like a bottleneck in some benchmarks.
     # This is because GPU and CPU have to sync in this function
-    return float(xp.linalg.norm(x)) / x.size ** 0.5
+    return float(xp.linalg.norm(x)) / prod(x.shape) ** 0.5
 
 
 def select_initial_step(fun, t0, y0, f0, direction, order, rtol, atol):
@@ -103,7 +104,7 @@ def select_initial_step(fun, t0, y0, f0, direction, order, rtol, atol):
     .. [1] E. Hairer, S. P. Norsett G. Wanner, "Solving Ordinary Differential
            Equations I: Nonstiff Problems", Sec. II.4.
     """
-    if y0.size == 0:
+    if prod(y0.shape) == 0:
         return xp.inf
 
     scale = atol + xp.abs(y0) * rtol

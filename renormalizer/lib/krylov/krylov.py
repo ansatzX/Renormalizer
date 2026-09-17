@@ -6,7 +6,7 @@ import logging
 from scipy.linalg import eigh_tridiagonal
 import numpy as np
 
-from renormalizer.mps.backend import xp
+from renormalizer.backend.context import internal_backend as xp
 
 
 logger = logging.getLogger(__name__)
@@ -48,14 +48,14 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
     beta  = np.zeros(block_size - 1)
 
     V = xp.empty((block_size, len(vstart)), dtype=vstart.dtype)
-    V[0] = vstart
+    V = xp.at_set(V, 0, vstart)
     res = None
 
 
     for j in range(len(vstart)):
 
         w = Afunc(V[j])
-        alpha[j] = xp.vdot(w, V[j]).real
+        alpha[j] = float(xp.vdot(w, V[j]).real)
 
         if j == len(vstart)-1:
             #logger.debug("the krylov subspace is equal to the full space")
@@ -63,13 +63,13 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
 
         if len(V) == j+1:
             V, old_V = xp.empty((len(V) + block_size, len(vstart)), dtype=vstart.dtype), V
-            V[:len(old_V)] = old_V
+            V = xp.at_set(V, slice(None, len(old_V)), old_V)
             del old_V
             alpha = np.concatenate([alpha, np.zeros(block_size)])
             beta = np.concatenate([beta, np.zeros(block_size)])
 
         w -= alpha[j]*V[j] + (beta[j-1]*V[j-1] if j > 0 else 0)
-        beta[j] = xp.linalg.norm(w)
+        beta[j] = float(xp.linalg.norm(w))
         if beta[j] < 100*len(vstart)*np.finfo(float).eps:
             # logger.warning(f'beta[{j}] ~= 0 encountered during Lanczos iteration.')
             return _expm_krylov(alpha[:j+1], beta[:j], V[:j+1, :].T, nrmv, dt), j+1
@@ -80,6 +80,6 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
                 return new_res, j+1
             else:
                 res = new_res
-        V[j + 1] = w / beta[j]
+        V = xp.at_set(V, j + 1, w / beta[j])
 
 

@@ -4,7 +4,8 @@
 from functools import reduce
 from collections import deque
 
-from renormalizer.mps.backend import np, backend, xp
+from renormalizer.mps.backend import np
+from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
 from renormalizer.mps.matrix import (Matrix, multi_tensor_contract, asxp,
     asnumpy, tensordot)
 

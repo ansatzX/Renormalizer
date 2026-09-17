@@ -3,7 +3,7 @@ import numpy as np
 import scipy
 import logging
 
-from renormalizer.mps.backend import backend, xp
+from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
 from renormalizer.mps.lib import Environ, cvec2cmat
 from renormalizer.mps import Mpo, Mps
 from renormalizer.mps.svd_qn import get_qn_mask

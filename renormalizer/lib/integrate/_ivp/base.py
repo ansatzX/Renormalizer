@@ -1,6 +1,7 @@
+from math import prod
 import numpy as np
 
-from renormalizer.mps.backend import xp
+from renormalizer.backend.context import internal_backend as xp
 
 
 def check_arguments(fun, y0, support_complex):
@@ -146,7 +147,7 @@ class OdeSolver(object):
         self.fun_vectorized = fun_vectorized
 
         self.direction = np.sign(t_bound - t0) if t_bound != t0 else 1
-        self.n = self.y.size
+        self.n = prod(self.y.shape)
         self.status = "running"
 
         self.nfev = 0
@@ -232,6 +233,7 @@ class DenseOutput(object):
     """
 
     def __init__(self, t_old, t):
+        self._backend = xp.current
         self.t_old = t_old
         self.t = t
         self.t_min = min(t, t_old)
@@ -254,7 +256,9 @@ class DenseOutput(object):
         t = np.asarray(t)
         if t.ndim > 1:
             raise ValueError("`t` must be float or 1-d array.")
-        return self._call_impl(t)
+        from renormalizer.backend.context import capture_backend
+        with capture_backend(self._backend):
+            return self._call_impl(t)
 
     def _call_impl(self, t):
         raise NotImplementedError
@@ -275,6 +279,4 @@ class ConstantDenseOutput(DenseOutput):
         if t.ndim == 0:
             return self.value
         else:
-            ret = np.empty((self.value.shape[0], t.shape[0]))
-            ret[:] = self.value[:, None]
-            return ret
+            return xp.ones((self.value.shape[0], t.shape[0]), dtype=self.value.dtype) * self.value[:, None]

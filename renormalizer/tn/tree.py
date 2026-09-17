@@ -1,3 +1,4 @@
+from renormalizer.backend.execution import bind_backend
 from typing import List, Dict, Tuple, Union, Callable, Any
 import logging
 
@@ -5,7 +6,8 @@ import scipy
 
 from renormalizer import Op, Mps, Model, OpSum
 from renormalizer.model.basis import BasisSet, BasisDummy
-from renormalizer.mps.backend import np, backend, xp
+from renormalizer.mps.backend import np
+from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
 from renormalizer.mps.matrix import asnumpy, asxp_oe_args, tensordot
 from renormalizer.mps.svd_qn import add_outer, svd_qn, blockrecover, get_qn_mask
 from renormalizer.mps.lib import select_basis
@@ -410,6 +412,7 @@ class TTNS(TTNBase):
         -------
         The new TTNS
         """
+        tensors = asnumpy(tensors)
         ttns = template.metacopy()
         cursor = 0
         for node, tnode in zip(ttns.node_list, template.node_list):
@@ -1382,6 +1385,7 @@ class TTNS(TTNBase):
 
         return normalize(self, kind)
 
+    @bind_backend
     def evolve(self, ttno: TTNO, tau: Union[complex, float], normalize: bool = True):
         imag_time = np.iscomplex(tau)
         # trick to avoid complex algebra
@@ -1511,7 +1515,7 @@ class TTNS(TTNBase):
         ichild = parent.children.index(node)
         del shape[ichild]
         shape = [-1] + shape
-        parent.tensor = np.moveaxis(m_parent.reshape(shape), 0, ichild)
+        parent.tensor = np.moveaxis(asnumpy(m_parent).reshape(shape), 0, ichild)
 
     @property
     def norm(self):

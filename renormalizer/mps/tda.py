@@ -7,7 +7,8 @@ import numpy as np
 import scipy
 
 from renormalizer.mps.matrix import tensordot, multi_tensor_contract, asnumpy, asxp
-from renormalizer.mps.backend import backend, xp, primme, IMPORT_PRIMME_EXCEPTION
+from renormalizer.mps.backend import primme, IMPORT_PRIMME_EXCEPTION
+from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
 from renormalizer.mps import Mps
 from renormalizer.mps.lib import Environ, compressed_sum
 from renormalizer.mps.oe_contract_wrap import oe_contract

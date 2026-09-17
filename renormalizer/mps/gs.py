@@ -1,3 +1,4 @@
+from renormalizer.backend.execution import bind_backend
 # -*- coding: utf-8 -*-
 """
 
@@ -18,7 +19,8 @@ import scipy
 from renormalizer.lib import davidson
 from renormalizer.model.h_qc import qc_model, int_to_h, generate_ladder_operator, simplify_op
 from renormalizer.model import Model, Op
-from renormalizer.mps.backend import backend, xp, primme, IMPORT_PRIMME_EXCEPTION
+from renormalizer.mps.backend import primme, IMPORT_PRIMME_EXCEPTION
+from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
 from renormalizer.mps.matrix import multi_tensor_contract, tensordot, asnumpy, asxp
 from renormalizer.mps.hop_expr import  hop_expr
 from renormalizer.mps.svd_qn import get_qn_mask
@@ -51,6 +53,7 @@ def construct_mps_mpo(model, mmax, nexciton, offset=Quantity(0)):
     return mps, mpo
 
 
+@bind_backend
 def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> Tuple[List, Mps]:
     r"""DMRG ground state algorithm and state-averaged excited states algorithm
 
@@ -559,8 +562,8 @@ def eigh_iterative(
             raise IMPORT_PRIMME_EXCEPTION
         h_dim = np.sum(qn_mask)
         precond = lambda x: scipy.sparse.diags(1 / (hdiag + 1e-4)) @ x
-        A = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=hop, matmat=hop)
-        M = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=precond, matmat=hop)
+        A = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=hop, matmat=hop, dtype=np.result_type(hdiag, np.asarray(cguess)))
+        M = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=precond, matmat=hop, dtype=np.result_type(hdiag, np.asarray(cguess)))
         e, c = primme.eigsh(
             A,
             k=min(nroots, h_dim),

@@ -10,7 +10,7 @@ from renormalizer.backend.numpy_backend import NumpyBackend
 logger = logging.getLogger(__name__)
 
 
-SUPPORTED_BACKENDS = ("numpy", "cupy", "jax")
+SUPPORTED_BACKENDS = ("numpy", "cupy", "jax", "torch")
 
 
 def normalize_backend_name(name):
@@ -23,6 +23,8 @@ def normalize_backend_name(name):
         return "cupy"
     if normalized in {"jax", "jnp"}:
         return "jax"
+    if normalized in {"torch", "pytorch"}:
+        return "torch"
     raise ValueError(
         f"Unknown backend '{name}'. Supported backends: {', '.join(SUPPORTED_BACKENDS)}"
     )
@@ -50,7 +52,7 @@ def probe_legacy_cupy(device_id=None):
     return True, cp, effective_id
 
 
-def create_backend(name=None, *, explicit=True):
+def create_backend(name=None, *, explicit=True, device=None):
     if name is None and not explicit:
         enabled, _, device_id = probe_legacy_cupy(os.environ.get("RENO_GPU"))
         if enabled:
@@ -65,10 +67,13 @@ def create_backend(name=None, *, explicit=True):
         return NumpyBackend()
     if normalized == "cupy":
         from renormalizer.backend.cupy_backend import CupyBackend
-        return CupyBackend()
+        return CupyBackend(device=device)
     if normalized == "jax":
         from renormalizer.backend.jax_backend import JaxBackend
-        return JaxBackend()
+        return JaxBackend(device=device)
+    if normalized == "torch":
+        from renormalizer.backend.torch_backend import TorchBackend
+        return TorchBackend(device=device or "cpu")
     raise ValueError(
         f"Unknown backend '{name}'. Supported backends: {', '.join(SUPPORTED_BACKENDS)}"
     )

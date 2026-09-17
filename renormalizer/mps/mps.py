@@ -1,3 +1,4 @@
+from renormalizer.backend.execution import bind_backend
 # -*- encoding: utf-8 -*-
 
 import logging
@@ -14,7 +15,8 @@ from renormalizer.lib import solve_ivp, expm_krylov
 from renormalizer.model import Model, Op, OpSum, basis as ba
 from renormalizer.mps import svd_qn
 from renormalizer.mps.svd_qn import add_outer, get_qn_mask
-from renormalizer.mps.backend import backend, np, xp
+from renormalizer.mps.backend import np
+from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
 from renormalizer.mps.lib import (
     Environ,
     select_basis,
@@ -654,6 +656,7 @@ class Mps(MatrixProduct):
         return expand_bond_dimension(self, hint_mpo, coef, include_ex)
 
 
+    @bind_backend
     def evolve(self, mpo, evolve_dt, normalize=True) -> "Mps":
 
         method = {

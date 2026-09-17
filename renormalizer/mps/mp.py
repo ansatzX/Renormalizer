@@ -7,7 +7,8 @@ import shutil
 from typing import List, Union
 
 from renormalizer.model import Model, HolsteinModel
-from renormalizer.mps.backend import np, xp
+from renormalizer.mps.backend import np
+from renormalizer.backend.context import internal_backend as xp
 from renormalizer.mps import svd_qn
 from renormalizer.mps.svd_qn import add_outer, get_qn_mask
 from renormalizer.mps.matrix import (

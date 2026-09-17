@@ -6,7 +6,8 @@ import scipy
 from scipy import stats
 
 from renormalizer.mps.lib import compressed_sum
-from renormalizer.mps.backend import np, xp
+from renormalizer.mps.backend import np
+from renormalizer.backend.context import internal_backend as xp
 from renormalizer.mps.matrix import asxp
 from renormalizer.mps.oe_contract_wrap import oe_contract
 from renormalizer.lib import solve_ivp, expm_krylov
@@ -42,7 +43,7 @@ def time_derivative_vmf(ttns: TTNS, ttno: TTNO):
             deriv = oe_contract("bf, bg, fh -> gh", deriv, xp.eye(proj.shape[0]) - proj, asxp(ovlp_inv.T))
         qnmask = ttns.get_qnmask(node).reshape(deriv.shape)
         deriv_list.append(deriv[qnmask].ravel())
-    return np.concatenate(deriv_list)
+    return xp.concatenate(deriv_list)
 
 
 def regularized_inversion(m, eps):

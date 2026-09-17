@@ -15,7 +15,8 @@ from renormalizer.mps.matrix import (
     moveaxis
 )
 from renormalizer.cv.spectra_cv import SpectraCv
-from renormalizer.mps.backend import np, xp
+from renormalizer.mps.backend import np
+from renormalizer.backend.context import internal_backend as xp
 from renormalizer.mps.matrix import asxp, asnumpy
 from renormalizer.mps import (
     Mpo, svd_qn, MpDm, ThermalProp, load_thermal_state)

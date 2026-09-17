@@ -319,3 +319,242 @@ class StrictOperations:
             raise ValueError('scalar requires a zero-dimensional array')
         self.sync()
         return x.item()
+
+
+@dataclass(frozen=True)
+class DeviceOperations(StrictOperations):
+    """Strict native-device operations; NumPy is used only for host metadata.
+
+    Input/output finiteness checks synchronize a device boolean. They never
+    evaluate the requested numerical operation on the CPU. Cross-device or
+    foreign-array operands must pass through explicit conversion boundaries.
+    """
+    @property
+    def adapter(self):
+        return self.context.adapter
+
+    def capability(self, operation, dtype):
+        record = super().capability(operation, dtype)
+        import importlib.metadata
+        package = {'jax':'jax', 'torch':'torch', 'cupy':'cupy-cuda12x'}[self.adapter.name]
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            version = getattr(self.adapter.array_namespace, '__version__', 'unknown')
+        record.update(backend=self.adapter.name, version=version, device=self.context.device,
+                      layout='explicit host conversion may materialize; reshape may copy')
+        return record
+
+    def _call(self, name, *args, **kwargs):
+        return self.adapter.strict_call(name, *args, **kwargs)
+
+    def _owned(self, x, *, numeric=True):
+        if not self.adapter.owns(x):
+            raise OwnershipError('array ownership/device mismatch; use explicit conversion')
+        dtype = self.adapter.dtype_of(x)
+        domain = NUMERIC_DTYPES if numeric else NUMERIC_DTYPES + AUXILIARY_DTYPES
+        if dtype not in domain:
+            raise CapabilityError(f'unsupported input dtype {dtype}')
+        if numeric and not bool(self._call('all', self._call('isfinite', x))):
+            raise ValueError('numerical input must be finite')
+        return x
+
+    def _result(self, result, dtype=None):
+        if not self.adapter.owns(result):
+            raise OwnershipError('operation returned an array on the wrong device')
+        if dtype is not None:
+            check_actual_dtype(self.adapter.dtype_of(result), dtype)
+        if not bool(self._call('all', self._call('isfinite', result))):
+            raise ValueError('numerical output must be finite')
+        return result
+
+    def _operand(self, x):
+        if isinstance(x, np.generic):
+            return self._owned(self.array(x, dtype=x.dtype))
+        if isinstance(x, numbers.Number) and not isinstance(x, np.ndarray):
+            return self._owned(self.array(x))
+        return self._owned(x)
+
+    def _promote(self, *args):
+        arrays = [self._operand(x) for x in args]
+        dtype = self.adapter.dtype_of(arrays[0])
+        for x in arrays[1:]:
+            dtype = PROMOTION[dtype, self.adapter.dtype_of(x)]
+        return [self._call('astype', x, dtype, copy=False) for x in arrays], dtype
+
+    def array(self, data, dtype=None, *, copy=None):
+        if isinstance(data, self.adapter.device_array_types):
+            input_dtype = self.adapter.dtype_of(data)
+        else:
+            if not isinstance(data, (np.ndarray, np.generic, list, tuple, numbers.Number)):
+                raise OwnershipError('array requires explicit host data or same-backend array')
+            def validate(value):
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        validate(item)
+                elif not isinstance(value, (np.ndarray, np.generic, numbers.Number)):
+                    raise CapabilityError('unsupported input dtype')
+            validate(data)
+            input_dtype = np.asarray(data).dtype
+        if input_dtype.kind not in 'biufc':
+            raise CapabilityError(f'unsupported input dtype {input_dtype}')
+        dtype = self._dtype(dtype, complex_input=input_dtype.kind == 'c')
+        out = self.adapter.array(data, dtype=dtype, copy=copy)
+        if not self.adapter.owns(out):
+            raise OwnershipError('conversion returned wrong device')
+        check_actual_dtype(self.adapter.dtype_of(out), dtype)
+        return out
+
+    def from_numpy(self, x, *, copy=None):
+        if not isinstance(x, np.ndarray):
+            raise OwnershipError('from_numpy requires a NumPy array')
+        return self.array(x, dtype=x.dtype, copy=copy)
+
+    def to_numpy(self, x, *, copy=None):
+        if copy is not None and copy is not True and copy is not False:
+            raise ValueError('copy must be True, False, or None')
+        self._owned(x, numeric=False)
+        out = self.adapter.to_numpy(x, copy=copy)
+        check_actual_dtype(out.dtype, self.adapter.dtype_of(x))
+        return out
+
+    def zeros(self, shape, dtype=None):
+        dtype = self._dtype(dtype)
+        return self._result(self._call('zeros', shape, dtype=dtype), dtype)
+
+    def ones(self, shape, dtype=None):
+        dtype = self._dtype(dtype)
+        return self._result(self._call('ones', shape, dtype=dtype), dtype)
+
+    def eye(self, n, m=None, dtype=None):
+        dtype = self._dtype(dtype)
+        return self._result(self._call('eye', n, M=m, dtype=dtype), dtype)
+
+    def reshape(self, x, shape):
+        return self._call('reshape', self._owned(x, numeric=False), shape)
+
+    def transpose(self, x, axes=None):
+        return self._call('transpose', self._owned(x, numeric=False), axes)
+
+    def conj(self, x):
+        return self._result(self._call('conj', self._owned(x)), self.adapter.dtype_of(x))
+
+    def astype(self, x, dtype, *, copy=True):
+        self._owned(x, numeric=False)
+        dtype = self._dtype(dtype)
+        return self._result(self._call('astype', x, dtype, copy=copy), dtype)
+
+    def _binary(self, operation, a, b):
+        (a,b),dtype = self._promote(a,b)
+        return self._result(self._call(operation,a,b),dtype)
+
+    def add(self,a,b):
+        return self._binary('add',a,b)
+
+    def subtract(self,a,b):
+        return self._binary('subtract',a,b)
+
+    def multiply(self,a,b):
+        return self._binary('multiply',a,b)
+
+    def divide(self,a,b):
+        return self._binary('divide',a,b)
+
+    def sum(self,x,axis=None,keepdims=False,dtype=None):
+        self._owned(x)
+        dtype = self.adapter.dtype_of(x) if dtype is None else self._dtype(dtype)
+        if dtype not in NUMERIC_DTYPES:
+            raise CapabilityError('sum requires floating or complex dtype')
+        return self._result(self._call('sum',x,axis=axis,keepdims=keepdims,dtype=dtype),dtype)
+
+    def max(self,x,axis=None,keepdims=False):
+        self._owned(x)
+        return self._result(self._call('max',x,axis=axis,keepdims=keepdims),self.adapter.dtype_of(x))
+
+    def min(self,x,axis=None,keepdims=False):
+        self._owned(x)
+        return self._result(self._call('min',x,axis=axis,keepdims=keepdims),self.adapter.dtype_of(x))
+
+    def real(self,x):
+        return self._result(self._call('real',self._owned(x)))
+
+    def imag(self,x):
+        return self._result(self._call('imag',self._owned(x)))
+
+    def matmul(self,a,b):
+        self._owned(a)
+        self._owned(b)
+        return self._binary('matmul',a,b)
+
+    def einsum(self,subscripts,*operands):
+        if not isinstance(subscripts,str) or '->' not in subscripts:
+            raise ValueError('einsum requires explicit output subscripts')
+        if not operands:
+            raise ValueError('einsum requires operands')
+        for operand in operands:
+            self._owned(operand)
+        arrays,dtype=self._promote(*operands)
+        return self._result(self._call('einsum',subscripts,*arrays),dtype)
+
+    def qr(self,a,mode='reduced'):
+        if mode != 'reduced':
+            raise CapabilityError('only reduced QR is supported')
+        self._matrix(a)
+        return tuple(self._result(x,self.adapter.dtype_of(a)) for x in self._call('linalg.qr',a,mode=mode))
+
+    def svd(self,a,full_matrices=False):
+        if full_matrices is not False:
+            raise CapabilityError('only reduced SVD is supported')
+        self._matrix(a)
+        u,s,vh=self._call('linalg.svd',a,full_matrices=False)
+        dtype=self.adapter.dtype_of(a)
+        return self._result(u,dtype),self._result(s,np.empty((),dtype=dtype).real.dtype),self._result(vh,dtype)
+
+    def eigh(self,a,UPLO='L'):
+        if UPLO not in ('L','U'):
+            raise ValueError('UPLO must be L or U')
+        self._matrix(a,square=True)
+        w,v=self._call('linalg.eigh',a,UPLO=UPLO)
+        dtype=self.adapter.dtype_of(a)
+        return self._result(w,np.empty((),dtype=dtype).real.dtype),self._result(v,dtype)
+
+    def solve(self,a,b):
+        self._owned(a)
+        self._owned(b)
+        check_solve_shapes(a,b)
+        (a,b),dtype=self._promote(a,b)
+        return self._result(self._call('linalg.solve',a,b),dtype)
+
+    def norm(self,x,ord=None,axis=None,keepdims=False):
+        self._owned(x)
+        valid = ((axis is None and (ord is None or (x.ndim==1 and ord==2) or (x.ndim==2 and ord=='fro')))
+                 or (isinstance(axis,(int,np.integer)) and ord in (None,2))
+                 or (isinstance(axis,tuple) and len(axis)==2 and ord in (None,'fro')))
+        if not valid:
+            raise CapabilityError('norm supports vector 2-norm and Frobenius norm only')
+        if x.ndim==0 and axis is None:
+            return self._result(self._call('abs',x))
+        return self._result(self._call('linalg.norm',x,ord=ord,axis=axis,keepdims=keepdims))
+
+    def _update(self,name,x,idx,value):
+        self._owned(x)
+        if isinstance(idx,np.ndarray):
+            if x.ndim!=1 or idx.ndim!=1 or idx.dtype.kind not in 'iu':
+                raise CapabilityError('advanced index must be one-dimensional integer indices on a vector')
+            if np.any(idx >= x.shape[0]) or (idx.dtype.kind=='i' and np.any(idx < -x.shape[0])):
+                raise IndexError('index out of bounds')
+            idx=idx.astype(np.intp,copy=False)%max(x.shape[0],1)
+            if name=='set' and len(np.unique(idx))!=len(idx):
+                raise CapabilityError('duplicate assignment indices')
+        else:
+            parts=idx if isinstance(idx,tuple) else (idx,)
+            if not all(isinstance(part,(int,np.integer,slice)) and not isinstance(part,(bool,np.bool_)) for part in parts):
+                raise CapabilityError('unsupported index pattern')
+            if len(parts) > x.ndim:
+                raise IndexError('too many indices')
+            for axis, part in enumerate(parts):
+                if isinstance(part, (int, np.integer)) and not -x.shape[axis] <= part < x.shape[axis]:
+                    raise IndexError('index out of bounds')
+            x[idx]
+        (x,value),dtype=self._promote(x,value)
+        return self._result(self.adapter.strict_update(name,x,idx,value),dtype)

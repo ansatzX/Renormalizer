@@ -6,7 +6,7 @@ from scipy.optimize import OptimizeResult
 from .common import EPS, OdeSolution
 from .base import OdeSolver
 
-from renormalizer.mps.backend import xp
+from renormalizer.backend.context import internal_backend as xp
 
 METHODS = {"RK23": RK23, "RK45": RK45}
 

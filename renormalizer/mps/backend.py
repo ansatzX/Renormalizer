@@ -48,7 +48,7 @@ class Backend(AbstractBackend):
 def backend_snapshot():
     """Current configuration; exported scalar constants are import snapshots."""
     selected = get_backend()
-    array_types = selected.ndarray
+    array_types = getattr(selected, "array_types", selected.ndarray)
     if not isinstance(array_types, tuple):
         array_types = (array_types,)
     return {
