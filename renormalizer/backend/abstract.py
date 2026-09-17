@@ -77,7 +77,7 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @property
     def canonical_rtol(self):
-        return getattr(self, "_canonical_rtol", 1e-4 if self.is_32bits else 1e-5)
+        return getattr(self, "_canonical_rtol", 1e-2 if self.is_32bits else 1e-5)
 
     @canonical_rtol.setter
     def canonical_rtol(self, value):

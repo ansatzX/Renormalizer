@@ -40,6 +40,7 @@ class CupyBackend(AbstractBackend):
                 "CuPy is not installed. Install cupy or select another backend."
             )
         super().__init__()
+        self._device = _cupy.cuda.Device()
         self.array_namespace = _cupy
         self.ndarray = (np.ndarray, _cupy.ndarray)
         self.memory_errors = (MemoryError, _cupy.cuda.memory.OutOfMemoryError)
@@ -82,4 +83,4 @@ class CupyBackend(AbstractBackend):
         )
 
     def sync(self):
-        _cupy.cuda.Device(0).synchronize()
+        self._device.synchronize()

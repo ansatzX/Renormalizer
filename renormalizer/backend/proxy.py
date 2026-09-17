@@ -1,15 +1,24 @@
 # -*- coding: utf-8 -*-
 
+from threading import RLock
+
 from renormalizer.backend.factory import create_backend
 
 
 class BackendManager:
     def __init__(self, initial_backend=None):
+        self._selection_lock = RLock()
         self.current = create_backend(initial_backend, explicit=False)
 
-    def set_backend(self, name, *, explicit=True):
-        self.current = create_backend(name, explicit=explicit)
-        return self.current
+    def set_backend(self, name, *, explicit=True, initialize=None):
+        # Publish only a fully initialized candidate. Previously returned real
+        # instances and cached public proxy references keep their own semantics.
+        with self._selection_lock:
+            candidate = create_backend(name, explicit=explicit)
+            if initialize is not None:
+                initialize(candidate)
+            self.current = candidate
+            return candidate
 
     def get_backend(self):
         return self.current

@@ -17,17 +17,17 @@ maintainers = [{ name = "Weitang Li", email = "liwt31@gmail.com" }]
 
 license = "Apache-2.0" 
 readme = "README.md"
-requires-python = ">=3.6,<=3.10"
+requires-python = ">=3.10,<3.14"
 
 dependencies = [
-    "numpy>=1.24",
-    "scipy==1.10.*",
+    "numpy>=1.26,<3",
+    "scipy>=1.13,<2",
     "h5py>=3.1",
     "opt_einsum>=3.4",
     "sympy>=1.11",
     "print-tree2",
     "PyYAML",
-    "qutip==4.6.*",
+    "qutip>=5,<6",
 ]
 
 [project.optional-dependencies]
@@ -42,7 +42,8 @@ docs = [
     "nbsphinx",
     "sphinxcontrib-googleanalytics",
 ]
-cupy = ["cupy>=13"]
+cupy = ["cupy-cuda12x>=13,<14"]
+torch = ["torch>=2,<3"]
 jax = ["jax>=0.5,<1", "jaxlib>=0.5,<1"]
 
 [project.urls]

@@ -25,9 +25,20 @@ xp = backend
 
 
 def set_backend(name):
-    selected = _manager.set_backend(name, explicit=True)
-    selected.random.seed(2019)
-    return selected
+    # Legacy selection resets its RNG. Restore host RNGs if candidate setup
+    # fails; do not expose a half-initialized backend via the public proxy.
+    with _manager._selection_lock:
+        numpy_state = np.random.get_state()
+        python_state = random.getstate()
+        try:
+            return _manager.set_backend(
+                name, explicit=True,
+                initialize=lambda candidate: candidate.random.seed(2019),
+            )
+        except BaseException:
+            np.random.set_state(numpy_state)
+            random.setstate(python_state)
+            raise
 
 
 def get_backend():
