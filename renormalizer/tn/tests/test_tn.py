@@ -3,6 +3,7 @@ import pytest
 from renormalizer import BasisHalfSpin, Model, Mpo, Mps, Op
 from renormalizer import optimize_mps
 from renormalizer.mps.backend import np
+from renormalizer.model.basis import BasisDummy, BasisSHO
 from renormalizer.model.model import heisenberg_ops
 from renormalizer.tn.node import TreeNodeBasis
 from renormalizer.tn.tree import TTNO, TTNS, TTNEnviron, from_mps
@@ -34,6 +35,34 @@ nspin = 7
 basis_list = [BasisHalfSpin(i) for i in range(nspin)]
 basis_binary = BasisTree.binary(basis_list)
 basis_multi_basis = multi_basis_tree(basis_list)
+
+
+def test_zero_qn_basis_expands_to_multidimensional_qn_in_node():
+    electron = BasisHalfSpin("e", sigmaqn=np.array([[0, 0], [1, 0]]))
+    phonon = BasisSHO("v", 1.0, 4)
+    node = TreeNodeBasis([electron, phonon])
+    assert node.qn_size == 2
+    np.testing.assert_array_equal(phonon.sigmaqn, np.zeros((4, 2), dtype=int))
+
+
+def test_zero_qn_nodes_expand_to_multidimensional_qn_in_tree():
+    electron = TreeNodeBasis(BasisHalfSpin("e", sigmaqn=np.array([[0, 0], [1, 0]])))
+    phonon = TreeNodeBasis(BasisSHO("v", 1.0, 4))
+    root = TreeNodeBasis(BasisDummy("root"))
+    root.add_child([electron, phonon])
+    basis = BasisTree(root)
+    assert basis.qn_size == 2
+    assert root.qn_size == 2
+    assert phonon.qn_size == 2
+    np.testing.assert_array_equal(root.basis_sets[0].sigmaqn, np.zeros((1, 2), dtype=int))
+    np.testing.assert_array_equal(phonon.basis_sets[0].sigmaqn, np.zeros((4, 2), dtype=int))
+
+
+def test_nonzero_qn_dimension_mismatch_still_raises():
+    electron_1d = BasisHalfSpin("e1", sigmaqn=np.array([[0], [1]]))
+    electron_2d = BasisHalfSpin("e2", sigmaqn=np.array([[0, 0], [1, 0]]))
+    with pytest.raises(ValueError, match="Inconsistent quantum number size"):
+        TreeNodeBasis([electron_1d, electron_2d])
 
 
 def holstein_scheme3() -> BasisTree:
@@ -156,6 +185,29 @@ def test_add(basis_tree):
     assert np.iscomplexobj(s2)
     s3 = ttns3.todense()
     np.testing.assert_allclose(s1 + s2, s3)
+
+
+@pytest.mark.parametrize("basis_tree", [basis_binary, basis_multi_basis])
+def test_overlap(basis_tree):
+    ttns1 = TTNS.random(basis_tree, qntot=0, m_max=4).scale(1 + 0.2j)
+    ttns2 = TTNS.random(basis_tree, qntot=0, m_max=2).scale(0.7 - 0.3j)
+    overlap = ttns1.overlap(ttns2)
+    dense_overlap = ttns2.todense().ravel().conj() @ ttns1.todense().ravel()
+    np.testing.assert_allclose(overlap, dense_overlap)
+
+
+@pytest.mark.parametrize("basis_tree", [basis_binary, basis_multi_basis])
+def test_transition_expectation(basis_tree):
+    ttns1 = TTNS.random(basis_tree, qntot=0, m_max=4).scale(1 + 0.2j)
+    ttns2 = TTNS.random(basis_tree, qntot=0, m_max=2).scale(0.7 - 0.3j)
+    ttno = TTNO(basis_tree, heisenberg_ops(nspin))
+    transition = ttns1.expectation(ttno, bra=ttns2)
+    dense_transition = (
+        ttns2.todense().ravel().conj()
+        @ ttno.todense().reshape(2 ** nspin, 2 ** nspin)
+        @ ttns1.todense().ravel()
+    )
+    np.testing.assert_allclose(transition, dense_transition)
 
 
 @pytest.mark.parametrize("basis_tree", [basis_binary, basis_multi_basis])

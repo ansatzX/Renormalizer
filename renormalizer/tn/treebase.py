@@ -6,7 +6,14 @@ from print_tree import print_tree
 
 from renormalizer import Op
 from renormalizer.model.basis import BasisSet, BasisDummy
-from renormalizer.tn.node import NodeUnion, TreeNodeBasis, copy_connection, build_connection_adj_mat, TreeNodeText
+from renormalizer.tn.node import (
+    NodeUnion,
+    TreeNodeBasis,
+    copy_connection,
+    build_connection_adj_mat,
+    TreeNodeText,
+    _expand_zero_qn_basis,
+)
 
 
 class Tree:
@@ -318,9 +325,12 @@ class BasisTree(Tree):
         for node in self.node_list:
             assert isinstance(node, TreeNodeBasis)
         qn_size_list = [n.qn_size for n in self.node_list]
-        if len(set(qn_size_list)) != 1:
-            raise ValueError(f"Inconsistent quantum number size: {set(qn_size_list)}")
-        self.qn_size: int = qn_size_list[0]
+        qn_size = max(qn_size_list)
+        for node in self.node_list:
+            for basis in node.basis_sets:
+                _expand_zero_qn_basis(basis, qn_size)
+            node.qn_size = qn_size
+        self.qn_size: int = qn_size
 
         # map basis to node index
         self.basis2idx: Dict[BasisSet, int] = {}

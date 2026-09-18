@@ -882,7 +882,9 @@ class TTNS(TTNBase):
         .. math::
             \langle \psi | \hat{O} | \psi \rangle
 
-        where :math:`|\psi\rangle` is the current TTNS (ket). The `bra` vector is currently not supported.
+        where :math:`|\psi\rangle` is the current TTNS (ket). If ``bra`` is
+        provided, compute the transition amplitude
+        :math:`\langle \mathrm{bra} | \hat{O} | \psi \rangle`.
 
         Parameters
         ----------
@@ -890,7 +892,8 @@ class TTNS(TTNBase):
             The operator to compute the expectation value of. If an `Op` or `OpSum` is provided,
             it is automatically converted to a TTNO using the basis tree of the current TTNS.
         bra : :class:`~renormalizer.tn.TTNS`, optional
-            The bra vector (currently not implemented). Defaults to None.
+            The bra vector. Defaults to None, in which case ``self`` is used as
+            both bra and ket.
 
         Returns
         -------
@@ -915,32 +918,75 @@ class TTNS(TTNBase):
         if isinstance(ttno, (Op, OpSum)):
             ttno = TTNO(self.basis, ttno)
 
-        assert bra is None  # not implemented yet
+        # Sharing the ket as bra needs only one temporary root attachment.
+        if bra is self:
+            bra = None
         basis_node = TreeNodeBasis([BasisDummy("expectation dummy")])
         basis_node_ttns = basis_node
+        if bra is not None:
+            assert self.basis is bra.basis
+            basis_node_bra = basis_node.copy()
         basis_node_ttno = basis_node.copy()
         basis_node_ttns.add_child(self.basis.root.copy())
+        if bra is not None:
+            basis_node_bra.add_child(bra.basis.root.copy())
         basis_node_ttno.add_child(ttno.basis.root.copy())
         basis_tree_ttns = BasisTree(basis_node_ttns)
+        if bra is not None:
+            basis_tree_bra = BasisTree(basis_node_bra)
         basis_tree_ttno = BasisTree(basis_node_ttno)
-        snode = TreeNodeTensor(np.ones((1, 1, 1)), qn=np.zeros((1, basis_tree_ttns.qn_size)))
-        snode.add_child(self.root)
-        onode = TreeNodeTensor(np.ones((1, 1, 1, 1)), qn=np.zeros((1, basis_tree_ttno.qn_size)))
-        onode.add_child(ttno.root)
+        nodes = [self.root, ttno.root]
+        if bra is not None:
+            nodes.append(bra.root)
+        original_parents = [(node, node.parent) for node in nodes]
+        try:
+            snode = TreeNodeTensor(np.ones((1, 1, 1)), qn=np.zeros((1, basis_tree_ttns.qn_size)))
+            snode.add_child(self.root)
+            if bra is not None:
+                bnode = TreeNodeTensor(np.ones((1, 1, 1)), qn=np.zeros((1, basis_tree_bra.qn_size)))
+                bnode.add_child(bra.root)
+            onode = TreeNodeTensor(np.ones((1, 1, 1, 1)), qn=np.zeros((1, basis_tree_ttno.qn_size)))
+            onode.add_child(ttno.root)
 
-        ttns_extended = TTNS(basis_tree_ttns, root=snode)
-        ttno_extended = TTNO(basis_tree_ttno, [], root=onode)
-        environ = TTNEnviron(ttns_extended, ttno_extended, build_environ=False)
-        environ.build_children_environ(ttns_extended, ttno_extended)
-        val = environ.root.environ_children[0].ravel()[0]
-
-        for node in [self.basis.root, self.root, ttno.root]:
-            node.parent = None
+            ttns_extended = TTNS(basis_tree_ttns, root=snode)
+            if bra is not None:
+                bra_extended = TTNS(basis_tree_bra, root=bnode)
+            else:
+                bra_extended = None
+            ttno_extended = TTNO(basis_tree_ttno, [], root=onode)
+            environ = TTNEnviron(ttns_extended, ttno_extended, build_environ=False, bra=bra_extended)
+            environ.build_children_environ(ttns_extended, ttno_extended, bra=bra_extended)
+            val = environ.root.environ_children[0].ravel()[0]
+        finally:
+            # A construction or contraction failure must not poison the input
+            # trees. Basis roots above are copies and need no restoration.
+            for node, parent in original_parents:
+                node.parent = parent
 
         if np.isclose(float(val.imag), 0):
             return float(val.real)
         else:
             return complex(val)
+
+    def overlap(self, bra: "TTNS") -> Union[float, complex]:
+        r"""
+        Compute the overlap between two TTNS objects.
+
+        .. math::
+            \langle \mathrm{bra} | \mathrm{self} \rangle
+
+        Parameters
+        ----------
+        bra : :class:`~renormalizer.tn.TTNS`
+            The bra state.
+
+        Returns
+        -------
+        float or complex
+            The overlap. Returns a float if the imaginary part is negligible;
+            otherwise returns complex.
+        """
+        return self.expectation(TTNO.identity(self.basis), bra=bra)
 
     def calc_1site_rdm(self, idx: Union[int, List]=None) -> Dict[int, np.ndarray]:
         r""" Calculate 1-site reduced density matrix
@@ -1582,8 +1628,21 @@ class TTNEnviron(Tree):
     """
     A tree whose tree node is ``TreeNodeEnviron``.
     """
-    def __init__(self, ttns: TTNS, ttno: TTNO, build_environ=True):
+    @staticmethod
+    def _assert_compatible_basis(basis1: BasisTree, basis2: BasisTree):
+        assert basis1.size == basis2.size
+        assert basis1.qn_size == basis2.qn_size
+        assert np.array_equal(basis1.adj_matrix, basis2.adj_matrix)
+        for node1, node2 in zip(basis1.node_list, basis2.node_list):
+            assert node1.dofs == node2.dofs
+            assert node1.pbond_dims == node2.pbond_dims
+
+    def __init__(self, ttns: TTNS, ttno: TTNO, build_environ=True, bra: TTNS = None):
+        if bra is None:
+            bra = ttns
+        self._assert_compatible_basis(bra.basis, ttns.basis)
         self.basis_ttns = ttns.basis
+        self.basis_bra = bra.basis
         self.basis_ttno = ttno.basis
         enodes: List[TreeNodeEnviron] = [TreeNodeEnviron() for _ in range(ttns.size)]
         copy_connection(ttns.node_list, enodes)
@@ -1592,25 +1651,30 @@ class TTNEnviron(Tree):
         self.root.environ_parent = np.array([1], dtype=backend.real_dtype).reshape([1, 1, 1])
         # tensor node to basis node. todo: remove duplication?
         self.tn2dofs_ttns = {tn: bn.dofs for tn, bn in zip(self.node_list, self.basis_ttns.node_list)}
+        self.tn2dofs_bra = {tn: bn.dofs for tn, bn in zip(self.node_list, self.basis_bra.node_list)}
         self.tn2dofs_ttno = {tn: bn.dofs for tn, bn in zip(self.node_list, self.basis_ttno.node_list)}
         if build_environ:
-            self.build_children_environ(ttns, ttno)
-            self.build_parent_environ(ttns, ttno)
+            self.build_children_environ(ttns, ttno, bra=bra)
+            self.build_parent_environ(ttns, ttno, bra=bra)
 
-    def build_children_environ(self, ttns, ttno):
+    def build_children_environ(self, ttns, ttno, bra=None):
+        if bra is None:
+            bra = ttns
         # first run, children environment to the parent.
         # set enode.environ_children
         snodes: List[TreeNodeTensor] = ttns.postorder_list()
         for snode in snodes:
-            self.build_children_environ_node(snode, ttns, ttno)
+            self.build_children_environ_node(snode, ttns, ttno, bra=bra)
 
-    def build_parent_environ(self, ttns, ttno):
+    def build_parent_environ(self, ttns, ttno, bra=None):
+        if bra is None:
+            bra = ttns
         # second run, parent environment to children
         # set enode.environ_parent
         snodes: List[TreeNodeTensor] = ttns.node_list
         for snode in snodes:
             for ichild in range(len(snode.children)):
-                self.build_parent_environ_node(snode, ichild, ttns, ttno)
+                self.build_parent_environ_node(snode, ichild, ttns, ttno, bra=bra)
 
     def update_1bond(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO):
         # update environ for the bond between snode and snode.parent
@@ -1632,19 +1696,22 @@ class TTNEnviron(Tree):
         for ichild in range(len(snode.children)):
             self.build_parent_environ_node(snode, ichild, ttns, ttno)
 
-    def build_children_environ_node(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO):
+    def build_children_environ_node(self, snode: TreeNodeTensor, ttns: TTNS, ttno: TTNO, bra: TTNS = None):
+        if bra is None:
+            bra = ttns
         # build the environment from snode to its parent and store the environment in its parent
         if snode.parent is None:
             return
         enode = self.node_list[ttns.node_idx[snode]]
         onode = ttno.node_list[ttns.node_idx[snode]]
+        bnode = bra.node_list[ttns.node_idx[snode]]
         args = []
         for i, child_tensor in enumerate(enode.environ_children):
-            indices = self.get_child_indices(enode, i, ttns, ttno)
+            indices = self.get_child_indices(enode, i, ttns, ttno, bra=bra)
             args.extend([child_tensor, indices])
 
-        args.append(snode.tensor.conj())
-        args.append(ttns.get_node_indices(snode, conj=True))
+        args.append(bnode.tensor.conj())
+        args.append(bra.get_node_indices(bnode, conj=True))
 
         args.append(onode.tensor)
         args.append(ttno.get_node_indices(onode))
@@ -1653,7 +1720,7 @@ class TTNEnviron(Tree):
         args.append(ttns.get_node_indices(snode, ttno=ttno))
 
         # indices for the resulting tensor
-        indices = self.get_parent_indices(enode, ttns, ttno)
+        indices = self.get_parent_indices(enode, ttns, ttno, bra=bra)
         args.append(indices)
         res = oe_contract(*asxp_oe_args(args))
         if len(enode.parent.environ_children) != len(enode.parent.children):
@@ -1664,24 +1731,27 @@ class TTNEnviron(Tree):
             ichild = snode.parent.children.index(snode)
             enode.parent.environ_children[ichild] = asnumpy(res)
 
-    def build_parent_environ_node(self, snode: TreeNodeTensor, ichild: int, ttns: TTNS, ttno: TTNO):
+    def build_parent_environ_node(self, snode: TreeNodeTensor, ichild: int, ttns: TTNS, ttno: TTNO, bra: TTNS = None):
+        if bra is None:
+            bra = ttns
         # build the environment from snode to the ith child of snode and store the environment in the child
         enode = self.node_list[ttns.node_idx[snode]]
         onode = ttno.node_list[ttns.node_idx[snode]]
+        bnode = bra.node_list[ttns.node_idx[snode]]
         args = []
         # children tensor
         for j, child_tensor in enumerate(enode.environ_children):
             if j == ichild:
                 continue
-            indices = self.get_child_indices(enode, j, ttns, ttno)
+            indices = self.get_child_indices(enode, j, ttns, ttno, bra=bra)
             args.extend([child_tensor, indices])
 
         # parent tensor
-        indices = self.get_parent_indices(enode, ttns, ttno)
+        indices = self.get_parent_indices(enode, ttns, ttno, bra=bra)
         args.extend([enode.environ_parent, indices])
 
-        args.append(snode.tensor.conj())
-        args.append(ttns.get_node_indices(snode, conj=True))
+        args.append(bnode.tensor.conj())
+        args.append(bra.get_node_indices(bnode, conj=True))
 
         args.append(onode.tensor)
         args.append(ttno.get_node_indices(onode))
@@ -1690,34 +1760,43 @@ class TTNEnviron(Tree):
         args.append(ttns.get_node_indices(snode, ttno=ttno))
 
         # indices for the resulting tensor
-        indices = self.get_child_indices(enode, ichild, ttns, ttno)
+        indices = self.get_child_indices(enode, ichild, ttns, ttno, bra=bra)
 
         args.append(indices)
         res = oe_contract(*asxp_oe_args(args))
         enode.children[ichild].environ_parent = asnumpy(res)
 
-    def get_child_indices(self, enode, i, ttns, ttno):
+    def get_child_indices(self, enode, i, ttns, ttno, bra=None):
+        if bra is None:
+            bra = ttns
+        dofs_bra = self.tn2dofs_bra[enode]
+        dofs_child_bra = self.tn2dofs_bra[enode.children[i]]
         dofs_ttns = self.tn2dofs_ttns[enode]
         dofs_child_ttns = self.tn2dofs_ttns[enode.children[i]]
         dofs_ttno = self.tn2dofs_ttno[enode]
         dofs_child_ttno = self.tn2dofs_ttno[enode.children[i]]
         indices = [
-            (str(id(ttns)) + "_conj", str(dofs_ttns), str(dofs_child_ttns)),
+            (str(id(bra)) + "_conj", str(dofs_bra), str(dofs_child_bra)),
             (str(id(ttno)), str(dofs_ttno), str(dofs_child_ttno)),
             (str(id(ttns)), str(dofs_ttns), str(dofs_child_ttns)),
         ]
         return indices
 
-    def get_parent_indices(self, enode, ttns, ttno):
+    def get_parent_indices(self, enode, ttns, ttno, bra=None):
+        if bra is None:
+            bra = ttns
+        dofs_bra = self.tn2dofs_bra[enode]
         dofs_ttns = self.tn2dofs_ttns[enode]
         dofs_ttno = self.tn2dofs_ttno[enode]
         if enode.parent is not None:
+            dofs_parent_bra = self.tn2dofs_bra[enode.parent]
             dofs_parent_ttns = self.tn2dofs_ttns[enode.parent]
             dofs_parent_ttno = self.tn2dofs_ttno[enode.parent]
         else:
+            dofs_parent_bra = "root"
             dofs_parent_ttns = dofs_parent_ttno = "root"
         indices = [
-            (str(id(ttns)) + "_conj", str(dofs_parent_ttns), str(dofs_ttns)),
+            (str(id(bra)) + "_conj", str(dofs_parent_bra), str(dofs_bra)),
             (str(id(ttno)), str(dofs_parent_ttno), str(dofs_ttno)),
             (str(id(ttns)), str(dofs_parent_ttns), str(dofs_ttns)),
         ]

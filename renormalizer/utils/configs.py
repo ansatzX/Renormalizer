@@ -286,6 +286,11 @@ class OptimizeConfig:
         #       primme (if installed)
         self.algo = "davidson"
         self.nroots = 1
+        # Experimental: use QN-block sparse environment contractions for
+        # ordinary single-MPO MPS ground-state optimization.
+        self.use_block_env = False
+        self.block_env_threshold = 1e-14
+        self.block_env_min_bond_dim = 64
         # the ground state energy convergence tolerance
         self.e_rtol = 1e-6
         self.e_atol = 1e-8

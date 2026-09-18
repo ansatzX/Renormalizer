@@ -483,14 +483,16 @@ class Mps(MatrixProduct):
     def _expectation_conj(self):
         return self.conj()
 
-    def expectation(self, mpo: Union[Mpo, Op, OpSum], self_conj: "Mps"=None) -> Union[float, complex]:
+    def expectation(
+            self, mpo: Union[Mpo, Op, OpSum], self_conj: "Mps"=None, *, bra: "Mps"=None
+    ) -> Union[float, complex]:
         r"""
         Calculate the expectation value of the operator ``mpo`` with respect to the MPS.
 
         For the expectation value :math:`\langle \psi | \hat O | \psi \rangle`, ``self`` is :math:`|\psi\rangle`
         and ``mpo`` is :math:`\hat O`.
         For the transition amplitude :math:`\langle \phi | \hat O | \psi \rangle`,
-        ``self_conj`` should be set to :math:`|\phi\rangle`.
+        ``bra`` should be set to :math:`|\phi\rangle`.
 
         Parameters
         ----------
@@ -500,7 +502,10 @@ class Mps(MatrixProduct):
             - Op: Single symbolic operator
             - OpSum: Sum of symbolic operators
         self_conj : :class:`~renormalizer.mps.Mps`, optional
-            The MPS for the bra vector. If not provided, uses the conjugate of ``self``.
+            Legacy preconjugated MPS. Unlike ``bra``, its tensors are used as
+            supplied. If neither is provided, uses the conjugate of ``self``.
+        bra : :class:`~renormalizer.mps.Mps`, optional
+            The MPS for the bra vector. ``bra`` and ``self_conj`` cannot both be provided.
 
         Returns
         -------
@@ -519,9 +524,16 @@ class Mps(MatrixProduct):
         0.0
 
         >>> mps2 = Mps.hartree_product_state(model, condition={0: [0,1]})
-        >>> mps.expectation(mpo, self_conj=mps2)
+        >>> mps.expectation(mpo, bra=mps2)
         1.0
         """
+        if bra is not None:
+            if self_conj is not None:
+                raise ValueError("Provide only one of `bra` or legacy `self_conj`.")
+            # The public bra is a ket representing phi; contractions consume
+            # its conjugate. Keep legacy self_conj preconjugated to avoid
+            # changing callers that already prepared conjugate tensors.
+            self_conj = bra._expectation_conj()
         # Convert Op/OpSum to MPO if needed
         if isinstance(mpo, (Op, OpSum)):
             mpo = Mpo(self.model, mpo)
@@ -539,7 +551,18 @@ class Mps(MatrixProduct):
         # This is time and memory consuming
         # return self_conj.dot(mpo.apply(self)).real
 
-    def expectations(self, mpos: Union[List[Union[Mpo, Op, OpSum]]], self_conj:"Mps"=None, opt:bool=True) -> np.ndarray:
+    def expectations(
+            self, mpos: Union[List[Union[Mpo, Op, OpSum]]], self_conj:"Mps"=None, opt:bool=True, *,
+            bra: "Mps"=None
+    ) -> np.ndarray:
+        if bra is not None:
+            if self_conj is not None:
+                raise ValueError("Provide only one of `bra` or legacy `self_conj`.")
+            # The public bra is a ket representing phi; contractions consume
+            # its conjugate. Keep legacy self_conj preconjugated to avoid
+            # changing callers that already prepared conjugate tensors.
+            self_conj = bra._expectation_conj()
+
         new_mpos = []
         for mpo in mpos:
             # Convert Op/OpSum to MPO if needed
@@ -550,7 +573,7 @@ class Mps(MatrixProduct):
 
         if not opt:
             # the naive way, slow and time consuming. Yet predictable and reliable
-            return np.array([self.expectation(mpo, self_conj) for mpo in mpos])
+            return np.array([self.expectation(mpo, self_conj=self_conj) for mpo in mpos])
 
         # optimized way, cache for intermediates
         # hash is used as indices of the matrices.

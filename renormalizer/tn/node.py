@@ -57,6 +57,17 @@ class TreeNode:
 DUMMY_IDX = 0
 
 
+def _expand_zero_qn_basis(basis: BasisSet, qn_size: int):
+    if basis.sigmaqn.shape[1] == qn_size:
+        return
+    if not np.all(basis.sigmaqn == 0):
+        raise ValueError(
+            f"Inconsistent quantum number size for nonzero basis {basis}: "
+            f"{basis.sigmaqn.shape[1]} != {qn_size}"
+        )
+    basis.sigmaqn = np.zeros((basis.nbas, qn_size), dtype=basis.sigmaqn.dtype)
+
+
 class TreeNodeBasis(TreeNode):
     # tree node whose data is basis sets
     def __init__(self, basis_sets: Union[BasisSet, List[BasisSet]]=None, bond_dim: int=None):
@@ -101,9 +112,10 @@ class TreeNodeBasis(TreeNode):
         self.basis_sets: List[BasisSet] = basis_sets
         self.n_sets = len(basis_sets)
         qn_size_list = [b.sigmaqn.shape[1] for b in self.basis_sets]
-        if len(set(qn_size_list)) != 1:
-            raise ValueError(f"Inconsistent quantum number size: {set(qn_size_list)}")
-        self.qn_size: int = qn_size_list[0]
+        qn_size = max(qn_size_list)
+        for basis in self.basis_sets:
+            _expand_zero_qn_basis(basis, qn_size)
+        self.qn_size: int = qn_size
         self.dofs = [b.dofs for b in basis_sets]
         self.pbond_dims = [len(b.sigmaqn) for b in self.basis_sets]
 

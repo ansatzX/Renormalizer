@@ -43,6 +43,39 @@ def test_expectations(mpos):
     assert np.allclose(e1, e2)
 
 
+def test_expectation_bra_alias():
+    random = Mps.random(parameter.holstein_model, 1, 20)
+    bra = Mps.random(parameter.holstein_model, 1, 20)
+    mpo = Mpo.onsite(parameter.holstein_model, r"a^\dagger a", dof_set={0})
+
+    e_bra = random.expectation(mpo, bra=bra)
+    e_self_conj = random.expectation(mpo, self_conj=bra)
+    assert e_bra == pytest.approx(e_self_conj)
+
+    with pytest.raises(ValueError):
+        random.expectation(mpo, self_conj=bra, bra=bra)
+
+
+def test_expectations_bra_alias():
+    random = Mps.random(parameter.holstein_model, 1, 20)
+    bra = Mps.random(parameter.holstein_model, 1, 20)
+    mpos = [
+        Mpo.onsite(parameter.holstein_model, r"a^\dagger a", dof_set={0}),
+        Mpo.onsite(parameter.holstein_model, r"a^\dagger a", dof_set={1}),
+    ]
+
+    e_bra = random.expectations(mpos, bra=bra)
+    e_self_conj = random.expectations(mpos, self_conj=bra)
+    assert np.allclose(e_bra, e_self_conj)
+
+    e_bra_no_opt = random.expectations(mpos, bra=bra, opt=False)
+    e_self_conj_no_opt = random.expectations(mpos, self_conj=bra, opt=False)
+    assert np.allclose(e_bra_no_opt, e_self_conj_no_opt)
+
+    with pytest.raises(ValueError):
+        random.expectations(mpos, self_conj=bra, bra=bra)
+
+
 def check_reduced_density_matrix(basis):
     model = Model(basis, [])
     mps = Mps.random(model, 1, 20)

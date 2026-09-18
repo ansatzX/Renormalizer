@@ -6,4 +6,4 @@ from renormalizer.model.mol import Mol
 from renormalizer.model.op import Op, OpSum
 from renormalizer.model.model import Model, load_from_dict, HolsteinModel, SpinBosonModel, TI1DModel
 from renormalizer.model.basis import BasisSHO, BasisHopsBoson, BasisSineDVR, BasisMultiElectron, \
-    BasisMultiElectronVac, BasisSimpleElectron, BasisHalfSpin, BasisDummy
+    BasisMultiElectronVac, BasisSimpleElectron, BasisHalfSpin, BasisSpatialOrbital, BasisDummy

@@ -8,10 +8,25 @@ from renormalizer.mps.backend import np
 from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
 from renormalizer.mps.matrix import (Matrix, multi_tensor_contract, asxp,
     asnumpy, tensordot)
+from renormalizer.mps.block_env import (
+    BlockEnvData,
+    BlockEnvCache,
+    contract_one_site_block,
+    supports_block_env,
+)
 
 
 class Environ:
-    def __init__(self, mps, mpo, domain=None, mps_conj=None):
+    def __init__(
+        self,
+        mps,
+        mpo,
+        domain=None,
+        mps_conj=None,
+        use_block_env=False,
+        block_env_threshold=1e-14,
+        block_env_min_bond_dim=64,
+    ):
         # todo: real disk and other backend
         # todo: contract_one_site_multi_mpo could generalize contract_one_site,
         # we could unify them in the future.
@@ -19,6 +34,10 @@ class Environ:
         # idx indicates the exact position of L or R, like
         # L(idx-1) - mpo(idx) - R(idx+1)
         self._virtual_disk = {}
+        self.use_block_env = use_block_env and type(mpo) is not list
+        self.block_env_threshold = block_env_threshold
+        self.block_env_min_bond_dim = block_env_min_bond_dim
+        self._block_env_cache = BlockEnvCache(mpo, block_env_threshold) if self.use_block_env else None
         if type(mpo) is list:
             ndim = len(mpo) + 2
         else:
@@ -51,7 +70,7 @@ class Environ:
                 tensor = contract_one_site_multi_mpo(tensor, mps[idx], [mp[idx] for mp in mpo], domain, ms_conj=mps_conj[idx])
             else:
                 # one single mpo
-                tensor = contract_one_site(tensor, mps[idx], mpo[idx], domain, ms_conj=mps_conj[idx])
+                tensor = self.contract_one_site(tensor, mps, mpo, idx, domain, ms_conj=mps_conj[idx])
             self.write(domain, idx, tensor)
 
     def write_l_sentinel(self, mps):
@@ -61,7 +80,7 @@ class Environ:
         self.write("R", len(mps), self.sentinel)
 
     def GetLR(
-        self, domain, siteidx, mps, mpo, itensor=None, method="Scratch", mps_conj=None):
+        self, domain, siteidx, mps, mpo, itensor=None, method="Scratch", mps_conj=None, raw=False):
         """
         get the L/R Hamiltonian matrix at a random site(siteidx): 3d tensor
         S-     -S     mpsconj
@@ -93,30 +112,81 @@ class Environ:
                             [mp[imps] for mp in mpo], domain,
                             ms_conj=mps_conj[imps])
                 else:
-                    itensor = contract_one_site(itensor, mps[imps], mpo[imps],
-                        domain, ms_conj=mps_conj[imps])
+                    itensor = self.contract_one_site(
+                        itensor, mps, mpo, imps, domain, ms_conj=mps_conj[imps]
+                    )
         elif method == "Enviro":
-            itensor = self.read(domain, siteidx)
+            if raw:
+                itensor = self.read_raw(domain, siteidx)
+            else:
+                itensor = self.read(domain, siteidx)
         elif method == "System":
             if itensor is None:
                 offset = -1 if domain == "L" else 1
-                itensor = self.read(domain, siteidx + offset)
+                itensor = self.read_raw(domain, siteidx + offset)
             if type(mpo) is list:
                 itensor = contract_one_site_multi_mpo(itensor, mps[siteidx],
                         [mp[siteidx] for mp in mpo],
                         domain, mps_conj[siteidx])
             else:
-                itensor = contract_one_site(itensor, mps[siteidx], mpo[siteidx],
-                        domain, mps_conj[siteidx])
+                itensor = self.contract_one_site(
+                    itensor, mps, mpo, siteidx, domain, mps_conj[siteidx]
+                )
             self.write(domain, siteidx, itensor)
 
+        if raw:
+            return itensor
+        if isinstance(itensor, BlockEnvData):
+            return asxp(itensor.to_dense())
         return itensor
 
+    def contract_one_site(self, tensor, mps, mpo, siteidx, domain, ms_conj=None):
+        mt = mps[siteidx]
+        mo = mpo[siteidx]
+        if (
+            self.use_block_env
+            and supports_block_env(mt, mo)
+            and (
+                isinstance(tensor, BlockEnvData)
+                or max(mt.shape[0], mt.shape[-1]) >= self.block_env_min_bond_dim
+            )
+        ):
+            return contract_one_site_block(
+                tensor,
+                mt,
+                mo,
+                domain,
+                mps.qn[siteidx],
+                mps.qn[siteidx + 1],
+                mpo.qn[siteidx],
+                mpo.qn[siteidx + 1],
+                cache=self._block_env_cache,
+                siteidx=siteidx,
+                threshold=self.block_env_threshold,
+                ms_conj=ms_conj,
+            )
+        if isinstance(tensor, BlockEnvData):
+            tensor = tensor.to_dense()
+        return contract_one_site(tensor, mt, mo, domain, ms_conj=ms_conj)
+
+    def reset_block_env_cache(self, mpo):
+        if self.use_block_env:
+            self._block_env_cache = BlockEnvCache(mpo, self.block_env_threshold)
+
     def write(self, domain, siteidx, tensor):
+        if isinstance(tensor, BlockEnvData):
+            self._virtual_disk[(domain, siteidx)] = tensor
+            return
         self._virtual_disk[(domain, siteidx)] = asnumpy(tensor)
 
     def read(self, domain: str, siteidx: int):
-        return asxp(self._virtual_disk[(domain, siteidx)])
+        tensor = self._virtual_disk[(domain, siteidx)]
+        if isinstance(tensor, BlockEnvData):
+            return asxp(tensor.to_dense())
+        return asxp(tensor)
+
+    def read_raw(self, domain: str, siteidx: int):
+        return self._virtual_disk[(domain, siteidx)]
 
 
 def contract_one_site_multi_mpo(environ, ms, mos, domain, ms_conj=None):

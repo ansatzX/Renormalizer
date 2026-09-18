@@ -1111,6 +1111,70 @@ class BasisHalfSpin(BasisSet):
         return self.__class__(new_dof, self.sigmaqn)
 
 
+class BasisSpatialOrbital(BasisSet):
+    r"""
+    Four-state local basis for one spatial orbital.
+
+    The local states are ordered as ``|0>``, ``|alpha>``, ``|beta>``,
+    and ``|alpha beta>``.  The two DoF labels are the adjacent alpha and beta
+    spin-orbital labels used by :func:`renormalizer.model.h_qc.qc_model`.
+    """
+
+    is_electron = True
+    multi_dof = True
+
+    def __init__(self, dof, sigmaqn: List = None):
+        if len(dof) != 2:
+            raise ValueError("BasisSpatialOrbital expects two spin-orbital DoF labels")
+        if sigmaqn is None:
+            sigmaqn = [[0, 0], [1, 0], [0, 1], [1, 1]]
+        super().__init__(tuple(dof), 4, sigmaqn)
+
+    def op_mat(self, op: Union[Op, str]):
+        if not isinstance(op, Op):
+            op = Op(op, self.dof[0])
+        mat = np.eye(4)
+        for symbol, dof in zip(op.split_symbol, op.dofs):
+            mat = mat @ self._single_op_mat(symbol, dof)
+        return mat * op.factor
+
+    def _single_op_mat(self, symbol, dof):
+        if symbol == "I":
+            return np.eye(4)
+        if dof not in self.dof:
+            raise ValueError(f"DoF {dof!r} is not in basis {self.dof!r}")
+
+        spin = self.dof.index(dof)
+        mat = np.zeros((4, 4))
+        for ket, (nalpha, nbeta) in enumerate([(0, 0), (1, 0), (0, 1), (1, 1)]):
+            occ = nalpha if spin == 0 else nbeta
+            if symbol in ["sigma_z", "Z", "z"]:
+                mat[ket, ket] = 1.0 if occ == 0 else -1.0
+            elif symbol in ["sigma_+", "+"]:
+                if occ == 1:
+                    bra = self._state_index(0, nbeta) if spin == 0 else self._state_index(nalpha, 0)
+                    mat[bra, ket] = 1.0
+            elif symbol in ["sigma_-", "-"]:
+                if occ == 0:
+                    bra = self._state_index(1, nbeta) if spin == 0 else self._state_index(nalpha, 1)
+                    mat[bra, ket] = 1.0
+            else:
+                raise ValueError(f"op_symbol:{symbol} is not supported")
+        return mat
+
+    @staticmethod
+    def _state_index(nalpha, nbeta):
+        return {
+            (0, 0): 0,
+            (1, 0): 1,
+            (0, 1): 2,
+            (1, 1): 3,
+        }[(nalpha, nbeta)]
+
+    def copy(self, new_dof):
+        return self.__class__(new_dof, self.sigmaqn)
+
+
 class BasisDummy(BasisSet):
     def __init__(self, dof, nbas=1, sigmaqn:List=None):
         if sigmaqn is None:

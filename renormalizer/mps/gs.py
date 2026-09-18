@@ -26,6 +26,7 @@ from renormalizer.mps.hop_expr import  hop_expr
 from renormalizer.mps.svd_qn import get_qn_mask
 from renormalizer.mps import Mpo, Mps, StackedMpo
 from renormalizer.mps.lib import Environ, cvec2cmat
+from renormalizer.mps.block_env import BlockEnvData, block_hdiag_two_site, block_hop_expr_two_site
 from renormalizer.mps.oe_contract_wrap import oe_contract
 from renormalizer.utils import Quantity, CompressConfig, CompressCriteria
 
@@ -104,6 +105,10 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
         env = "L"
 
     compress_config_bk = mps.compress_config
+    if mps.optimize_config.use_block_env:
+        for compress_config, _ in mps.optimize_config.procedure:
+            if isinstance(compress_config, CompressConfig) and compress_config.ofs is not None:
+                raise NotImplementedError("use_block_env with OFS is not tested yet")
 
     # construct the environment matrix
     if omega is not None:
@@ -116,7 +121,14 @@ def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> 
         if isinstance(mpo, StackedMpo):
             environ = [Environ(mps, item, env) for item in mpo.mpos]
         else:
-            environ = Environ(mps, mpo, env)
+            environ = Environ(
+                mps,
+                mpo,
+                env,
+                use_block_env=mps.optimize_config.use_block_env,
+                block_env_threshold=mps.optimize_config.block_env_threshold,
+                block_env_min_bond_dim=mps.optimize_config.block_env_min_bond_dim,
+            )
 
     macro_iteration_result = []
     # Idx of the active site with lowest energy for each sweep
@@ -221,23 +233,32 @@ def single_sweep(
             assert False
         logger.debug(f"optimize site: {cidx}")
 
+        # get the quantum number pattern
+        qnbigl, qnbigr, qnmat = mps._get_big_qn(cidx)
+        qn_mask = get_qn_mask(qnmat, mps.qntot)
+        cshape = qn_mask.shape
+        use_direct_eigh = np.prod(cshape) < 1000 or mps.optimize_config.algo == "direct"
+
         if omega is None:
             operator = mpo
         else:
             assert isinstance(mpo, Mpo)
             operator = [mpo, mpo]
 
+        use_raw_block_env = (
+            mps.optimize_config.use_block_env
+            and not isinstance(mpo, StackedMpo)
+            and omega is None
+            and method == "2site"
+            and not use_direct_eigh
+        )
+
         if isinstance(mpo, StackedMpo):
             ltensor = [environ_item.GetLR("L", lidx, mps, operator_item, itensor=None, method=lmethod) for environ_item, operator_item in zip(environ, operator.mpos)]
             rtensor = [environ_item.GetLR("R", ridx, mps, operator_item, itensor=None, method=rmethod) for environ_item, operator_item in zip(environ, operator.mpos)]
         else:
-            ltensor = environ.GetLR("L", lidx, mps, operator, itensor=None, method=lmethod)
-            rtensor = environ.GetLR("R", ridx, mps, operator, itensor=None, method=rmethod)
-
-        # get the quantum number pattern
-        qnbigl, qnbigr, qnmat = mps._get_big_qn(cidx)
-        qn_mask = get_qn_mask(qnmat, mps.qntot)
-        cshape = qn_mask.shape
+            ltensor = environ.GetLR("L", lidx, mps, operator, itensor=None, method=lmethod, raw=use_raw_block_env)
+            rtensor = environ.GetLR("R", ridx, mps, operator, itensor=None, method=rmethod, raw=use_raw_block_env)
 
         # center mo
         if isinstance(mpo, StackedMpo):
@@ -245,7 +266,6 @@ def single_sweep(
         else:
             cmo = [asxp(mpo[idx]) for idx in cidx]
 
-        use_direct_eigh = np.prod(cshape) < 1000 or mps.optimize_config.algo == "direct"
         if use_direct_eigh:
             e, c = eigh_direct(mps, qn_mask, ltensor, rtensor, cmo, omega)
         else:
@@ -277,7 +297,21 @@ def single_sweep(
             cguess.extend(
                 [np.random.rand(guess_dim) - 0.5 for i in range(len(cguess), nroots)]
             )
-            e, c = eigh_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega, cguess)
+            block_hop_qns = None
+            if use_raw_block_env and isinstance(ltensor, BlockEnvData) and isinstance(rtensor, BlockEnvData):
+                block_env_cache = getattr(environ, "_block_env_cache", None)
+                block_hop_qns = (
+                    mps.qn[cidx[0]],
+                    mps.qn[cidx[1]],
+                    mps.qn[cidx[1] + 1],
+                    operator.qn[cidx[0]],
+                    operator.qn[cidx[1]],
+                    operator.qn[cidx[1] + 1],
+                    mps.optimize_config.block_env_threshold,
+                    None if block_env_cache is None else block_env_cache.symbolic_nonzero_keys(cidx[0]),
+                    None if block_env_cache is None else block_env_cache.symbolic_nonzero_keys(cidx[1]),
+                )
+            e, c = eigh_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega, cguess, block_hop_qns=block_hop_qns)
 
         # if multi roots, both davidson and primme return np.ndarray
         if nroots > 1:
@@ -316,6 +350,10 @@ def get_ham_direct(
     omega: float,
 ):
     logger.debug("use direct eigensolver")
+    if isinstance(ltensor, BlockEnvData):
+        ltensor = asxp(ltensor.to_dense())
+    if isinstance(rtensor, BlockEnvData):
+        rtensor = asxp(rtensor.to_dense())
 
     # direct algorithm
     if omega is None:
@@ -417,13 +455,41 @@ def get_ham_iterative(
     rtensor: Union[xp.ndarray, List[xp.ndarray]],
     cmo: List[xp.ndarray],
     omega: float,
+    block_hop_qns=None,
 ):
     # iterative algorithm
     method = mps.optimize_config.method
     inverse = mps.optimize_config.inverse
+    raw_ltensor = ltensor
+    raw_rtensor = rtensor
+    use_block_hop = (
+        omega is None
+        and method == "2site"
+        and block_hop_qns is not None
+        and isinstance(raw_ltensor, BlockEnvData)
+        and isinstance(raw_rtensor, BlockEnvData)
+    )
 
     # diagonal elements of H for preconditioning
-    if omega is None:
+    if use_block_hop:
+        hdiag = block_hdiag_two_site(
+            raw_ltensor,
+            raw_rtensor,
+            cmo[0],
+            cmo[1],
+            qn_mask.shape,
+            block_hop_qns[3],
+            block_hop_qns[4],
+            block_hop_qns[5],
+            block_hop_qns[6],
+        )
+    else:
+        if isinstance(ltensor, BlockEnvData):
+            ltensor = asxp(ltensor.to_dense())
+        if isinstance(rtensor, BlockEnvData):
+            rtensor = asxp(rtensor.to_dense())
+
+    if not use_block_hop and omega is None:
         tmp_ltensor = xp.einsum("aba -> ba", ltensor)
         tmp_cmo0 = xp.einsum("abbc -> abc", cmo[0])
         tmp_rtensor = xp.einsum("aba -> ba", rtensor)
@@ -446,7 +512,7 @@ def get_ham_iterative(
             hdiag = multi_tensor_contract(
                 path, tmp_ltensor, tmp_cmo0, tmp_cmo1, tmp_rtensor
             )
-    else:
+    elif omega is not None:
         if method == "1site":
             #   S-a d h-S
             #   O-b-O-f-O
@@ -476,7 +542,18 @@ def get_ham_iterative(
 
     # contraction expression
     cshape = qn_mask.shape
-    expr = hop_expr(ltensor, rtensor, cmo, cshape, omega is not None)
+    if use_block_hop:
+        expr = block_hop_expr_two_site(
+            raw_ltensor,
+            raw_rtensor,
+            cmo[0],
+            cmo[1],
+            cshape,
+            qn_mask,
+            *block_hop_qns,
+        )
+    else:
+        expr = hop_expr(ltensor, rtensor, cmo, cshape, omega is not None)
     return hdiag, expr
 
 
@@ -494,6 +571,7 @@ def eigh_iterative(
     cmo: List[xp.ndarray],
     omega: float,
     cguess: List[np.ndarray],
+    block_hop_qns=None,
 ):
     # iterative algorithm
     inverse = mps.optimize_config.inverse
@@ -504,7 +582,7 @@ def eigh_iterative(
         hdiag = sum([hdiag_item for hdiag_item, expr_item in ham])
         expr = func_sum([expr_item for hdiag_item, expr_item in ham])
     else:
-        hdiag, expr = get_ham_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega)
+        hdiag, expr = get_ham_iterative(mps, qn_mask, ltensor, rtensor, cmo, omega, block_hop_qns=block_hop_qns)
 
     count = 0
 
@@ -519,11 +597,14 @@ def eigh_iterative(
                 clist.append(x[:, icol])
         res = []
         for c in clist:
-            # convert c to initial structure according to qn pattern
-            cstruct = asxp(cvec2cmat(c, qn_mask))
-            cout = expr(cstruct) * inverse
-            # convert structure c to 1d according to qn
-            res.append(asnumpy(cout)[qn_mask])
+            if hasattr(expr, "apply_packed"):
+                res.append(asnumpy(expr.apply_packed(c)) * inverse)
+            else:
+                # convert c to initial structure according to qn pattern
+                cstruct = asxp(cvec2cmat(c, qn_mask))
+                cout = expr(cstruct) * inverse
+                # convert structure c to 1d according to qn
+                res.append(asnumpy(cout)[qn_mask])
 
         if len(res) == 1:
             return res[0]

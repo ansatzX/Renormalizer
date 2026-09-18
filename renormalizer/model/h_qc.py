@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 
-from functools import partial
 import itertools
 import logging
 
 import numpy as np
 
 from renormalizer.model.op import Op
-from renormalizer.model.basis import BasisHalfSpin
+from renormalizer.model.basis import BasisHalfSpin, BasisSpatialOrbital
 
 logger = logging.getLogger(__name__)
 
@@ -124,11 +123,79 @@ def simplify_op(old_op: Op, norbs: int, conserve_qn:bool=True):
     return Op.product(new_ops)
 
 
-def qc_model(h1e, h2e, stacked=False, conserve_qn=True):
+def _site_qn_dict(site_idx: int, conserve_qn: bool):
+    if conserve_qn:
+        if site_idx % 2 == 1:
+            return {"+": [0, -1], "-": [0, 1], "Z": [0, 0]}
+        else:
+            return {"+": [-1, 0], "-": [1, 0], "Z": [0, 0]}
+    else:
+        return {"+": 0, "-": 0, "Z": 0}
+
+
+def _jw_term_to_op(ladder_ops, conserve_qn: bool = True):
+    """
+    Construct the simplified spin operator for a product of fermionic ladder
+    operators without first materialising the full Jordan-Wigner string.
+
+    ``ladder_ops`` is a list of ``(orbital_index, symbol)`` pairs, where
+    ``symbol`` is ``"-"`` for creation and ``"+"`` for annihilation, matching
+    :func:`generate_ladder_operator`.
+    """
+    grouped = {}
+    for iorb, symbol in ladder_ops:
+        for iz in range(iorb):
+            grouped.setdefault(iz, []).append("Z")
+        grouped.setdefault(iorb, []).append(symbol)
+
+    new_symbols = []
+    new_dofs = []
+    new_qn = []
+    factor = 1
+
+    for site_idx in sorted(grouped):
+        symbols = grouped[site_idx]
+
+        n_sigma_z = symbols.count("Z")
+        n_non_sigma_z = 0
+        n_permute = 0
+        for simple_symbol in symbols:
+            if simple_symbol != "Z":
+                n_non_sigma_z += 1
+            else:
+                n_permute += n_non_sigma_z
+        factor *= (-1) ** n_permute
+
+        site_symbols = [s for s in symbols if s != "Z"]
+        if n_sigma_z % 2 == 1:
+            site_symbols.insert(0, "Z")
+        if not site_symbols:
+            continue
+
+        qn_dict = _site_qn_dict(site_idx, conserve_qn)
+        new_symbols.extend(site_symbols)
+        new_dofs.extend([site_idx] * len(site_symbols))
+        new_qn.extend(qn_dict[s] for s in site_symbols)
+
+    return Op(" ".join(new_symbols), new_dofs, factor, new_qn)
+
+
+def _one_electron_op(p: int, q: int, conserve_qn: bool = True):
+    return _jw_term_to_op([(p, "-"), (q, "+")], conserve_qn)
+
+
+def _two_electron_op(p: int, q: int, r: int, s: int, conserve_qn: bool = True):
+    return _jw_term_to_op([(p, "-"), (q, "-"), (r, "+"), (s, "+")], conserve_qn)
+
+
+def qc_model(h1e, h2e, stacked=False, conserve_qn=True, spatial_orbital=False):
     """
     Ab initio electronic Hamiltonian in spin-orbitals
     h1e: sh above
     h2e: aseri above
+    spatial_orbital: if True, use one four-state local basis for each
+        adjacent alpha/beta spin-orbital pair. The Hamiltonian terms are
+        still represented by spin-orbital DoF labels.
     return model: "e_0", "e_1"... is according to the orbital index in sh and
     aseri
     """
@@ -149,19 +216,17 @@ def qc_model(h1e, h2e, stacked=False, conserve_qn=True):
     assert np.all(np.array(h2e.shape) == norbs)
 
     ham_terms = []
-    process_op = partial(simplify_op, norbs=norbs, conserve_qn=conserve_qn)
     pairs1 = np.argwhere(h1e!=0)
     pairs2 = np.argwhere(h2e!=0)
-    a_ops, a_dag_ops = generate_ladder_operator(norbs)
     if stacked is False:
         # 1-e terms
         for p, q in pairs1:
-            op = process_op(a_dag_ops[p] * a_ops[q])
+            op = _one_electron_op(p, q, conserve_qn)
             ham_terms.append(op * h1e[p, q])
 
         # 2-e terms.
         for p, q, r, s in pairs2:
-            op = process_op(Op.product([a_dag_ops[p], a_dag_ops[q], a_ops[r], a_ops[s]]))
+            op = _two_electron_op(p, q, r, s, conserve_qn)
             ham_terms.append(op * h2e[p, q, r, s])
     else:
         p_1e = np.unique(pairs1[:, 0])
@@ -173,24 +238,34 @@ def qc_model(h1e, h2e, stacked=False, conserve_qn=True):
             qrs_values = pairs2[pairs2[:, 0] == p][:, 1:]
             if q_values.size > 0:
                 for q in q_values:
-                    op = process_op(a_dag_ops[p] * a_ops[q])
+                    op = _one_electron_op(p, q, conserve_qn)
                     local_ham_terms.append(op * h1e[p, q])
             if qrs_values.size > 0:
                 for q, r, s in qrs_values:
-                    op = process_op(Op.product([a_dag_ops[p], a_dag_ops[q], a_ops[r], a_ops[s]]))
+                    op = _two_electron_op(p, q, r, s, conserve_qn)
                     local_ham_terms.append(op * h2e[p, q, r, s])
             ham_terms.append(local_ham_terms)
 
-    basis = []
-    for iorb in range(norbs):
+    if spatial_orbital:
+        if norbs % 2 != 0:
+            raise ValueError("spatial_orbital=True requires an even number of spin orbitals")
         if conserve_qn:
-            if iorb % 2 == 0:
-                sigmaqn = np.array([[0, 0], [1, 0]])
-            else:
-                sigmaqn = np.array([[0, 0], [0, 1]])
+            basis = [BasisSpatialOrbital((2 * iorb, 2 * iorb + 1)) for iorb in range(norbs // 2)]
         else:
-            sigmaqn = [0, 0]
-        b = BasisHalfSpin(iorb, sigmaqn=sigmaqn)
-        basis.append(b)
+            basis = [
+                BasisSpatialOrbital((2 * iorb, 2 * iorb + 1), sigmaqn=[0, 0, 0, 0])
+                for iorb in range(norbs // 2)
+            ]
+    else:
+        basis = []
+        for iorb in range(norbs):
+            if conserve_qn:
+                if iorb % 2 == 0:
+                    sigmaqn = np.array([[0, 0], [1, 0]])
+                else:
+                    sigmaqn = np.array([[0, 0], [0, 1]])
+            else:
+                sigmaqn = [0, 0]
+            b = BasisHalfSpin(iorb, sigmaqn=sigmaqn)
+            basis.append(b)
     return basis, ham_terms
-
