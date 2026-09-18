@@ -133,9 +133,11 @@ class OdeSolver(object):
             fun_single = self._fun
 
             def fun_vectorized(t, y):
-                f = xp.empty_like(y)
+                # This temporary belongs only to this wrapper. Retaining each
+                # write supports JAX without copying mutable backend storage.
+                f = xp.empty(y.shape, dtype=y.dtype)
                 for i, yi in enumerate(y.T):
-                    f[:, i] = self._fun(t, yi)
+                    f = xp.write_owned(f, (slice(None), i), self._fun(t, yi))
                 return f
 
         def fun(t, y):
@@ -147,6 +149,8 @@ class OdeSolver(object):
         self.fun_vectorized = fun_vectorized
 
         self.direction = np.sign(t_bound - t0) if t_bound != t0 else 1
+        # Tensor.size is a method in Torch; shape is host metadata everywhere.
+        # Multiplying dimensions neither reads nor transfers state values.
         self.n = prod(self.y.shape)
         self.status = "running"
 
@@ -233,6 +237,8 @@ class DenseOutput(object):
     """
 
     def __init__(self, t_old, t):
+        # Interpolants may outlive the solve's capture scope. Retain their
+        # creating adapter so later global selection cannot move evaluation.
         self._backend = xp.current
         self.t_old = t_old
         self.t = t
@@ -279,4 +285,7 @@ class ConstantDenseOutput(DenseOutput):
         if t.ndim == 0:
             return self.value
         else:
-            return xp.ones((self.value.shape[0], t.shape[0]), dtype=self.value.dtype) * self.value[:, None]
+            # Broadcast on the creating backend, then materialize an independent
+            # output without arithmetic (which can alter complex infinities).
+            view = xp.broadcast_to(self.value[:, None], (self.value.shape[0], t.shape[0]))
+            return xp.array(view, dtype=self.value.dtype, copy=True)

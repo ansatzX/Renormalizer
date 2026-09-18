@@ -183,6 +183,12 @@ class TorchBackend(AbstractBackend):
     def transpose(self,x,axes=None):
         return self.strict_call('transpose',x,axes)
 
+    def identity(self, n, dtype=None):
+        # NumPy-style solver identity must stay on this captured device; Torch
+        # has eye rather than identity and its global default dtype can differ.
+        return self._torch.eye(n, dtype=self._dtype(self.real_dtype if dtype is None else dtype),
+                               device=self._device)
+
     def tensordot(self,a,b,axes=2):
         a,b=self.asarray(a),self.asarray(b)
         dtype=self._torch.promote_types(a.dtype,b.dtype)
@@ -225,7 +231,9 @@ class TorchBackend(AbstractBackend):
         if name in ('float32','float64','complex64','complex128','int32','int64','bool_'):
             return getattr(np,name)
         if name in ('zeros','ones','empty','full','eye','arange','sum','max','min','all','any',
-                    'reshape','moveaxis','conj','real','imag','abs','sqrt','exp','log','sin','cos',
+                    # Dense output broadcasts natively, then explicitly copies
+                    # before any private workspace write to expanded storage.
+                    'reshape','moveaxis','broadcast_to','conj','real','imag','abs','sqrt','exp','log','sin','cos',
                     'isfinite','matmul','einsum','diag','diagonal','stack','hstack','vstack',
                     'allclose','isclose','where','sign','argsort','sort','clip'):
             return lambda *args,**kwargs:self.strict_call(name,*args,**kwargs)

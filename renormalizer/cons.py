@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import os
+from pathlib import Path
 import random
 import subprocess
 
@@ -12,10 +14,29 @@ logger = logging.getLogger(__name__)
 
 
 def get_git_commit_hash():
+    # Identify this source checkout, not the application that happens to import
+    # it. Installed packages without their own Git metadata have no source hash.
+    root = Path(__file__).resolve().parents[1]
+    if not (root / '.git').exists():
+        return "Unknown"
+    # Inherited Git routing/configuration can redirect even `git -C`; remove it
+    # only in the child environment, preserving the importing process's state.
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith('GIT_')}
     try:
-        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.PIPE)
+        actual_root = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            stderr=subprocess.PIPE, env=environment, timeout=5).decode("utf-8").strip()
+        # Do not borrow provenance from an enclosing unrelated checkout.
+        if Path(actual_root).resolve() != root:
+            return "Unknown"
+        commit_hash = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            stderr=subprocess.PIPE, env=environment, timeout=5)
         return commit_hash.strip().decode("utf-8")
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    # Provenance is diagnostic: absent/inaccessible Git or broken metadata
+    # must not break imports. Interrupts and other BaseExceptions still escape.
+    except (subprocess.SubprocessError, OSError, UnicodeError):
         return "Unknown"
 
 

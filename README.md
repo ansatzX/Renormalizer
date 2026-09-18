@@ -12,6 +12,14 @@ Renormalizer is a Python based tensor network package with a special focus on el
 pip install renormalizer
 ```
 
+The multi-backend extras on this branch have not yet been released to PyPI.
+To use them now, install this checkout with `python -m pip install '.[torch]'`
+(or `.[jax]`, `.[jax-cuda12]`, `.[cupy]`); the plain `pip install renormalizer`
+command above installs the existing published release. After the new release,
+use the corresponding `renormalizer[...]` extra. Torch CPU-only/specific CUDA
+build selection and optional reproducible locks are explained in the
+[branch installation guide](doc/source/install.md).
+
 For users who are not familiar with python, 
 please check out the step-by-step [installation guide](https://shuaigroup.github.io/Renormalizer/install.html).
 

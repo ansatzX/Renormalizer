@@ -80,3 +80,25 @@ def test_eigh_relative_residual_uses_effective_matrix_norm():
     result = checks().check_eigh(a, w, v, atol=1e-5, rtol=1e-5)
     expected = np.linalg.norm(a@v-v*w)/np.linalg.norm(a)
     assert result['residual']['relative_frobenius'] == pytest.approx(expected, rel=1e-14, abs=0)
+
+
+@pytest.mark.parametrize('dtype',['int64','uint64','float16','float32','float64','complex64','complex128'])
+def test_shared_arithmetic_preserves_legacy_numeric_domain(dtype):
+    value=np.array([1,2],dtype=dtype)
+    checks().check_error(value,value,atol=np.float32(0),rtol=np.float64(0))
+
+
+def test_shared_arithmetic_does_not_round_int64_through_float64():
+    actual=np.array([2**60+1],dtype='int64')
+    reference=np.array([2**60],dtype='int64')
+    with pytest.raises(AssertionError):
+        checks().check_error(actual,reference,atol=0,rtol=0)
+    assert checks().check_error(actual,reference,atol=1,rtol=0)['maximum_error']==1
+
+
+def test_test_helper_keeps_extended_tolerance_bounds():
+    if np.finfo(np.longdouble).max <= np.finfo(float).max:
+        pytest.skip('platform has no extended exponent range')
+    # Original helper accepts finite longdouble bounds beyond binary64.
+    large=np.longdouble('1e400')
+    checks().check_error(np.ones(1),np.zeros(1),atol=large,rtol=0)

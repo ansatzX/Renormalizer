@@ -35,3 +35,14 @@ def test_stable_norm_and_invalid_tolerance():
     assert score_array(a, a, tolerances=TOL)['status'] == 'pass'
     with pytest.raises(ValueError):
         score_array(a, a, tolerances={**TOL,'atol_F': float('inf')})
+
+
+@pytest.mark.parametrize('dtype',['int64','float16'])
+def test_shared_arithmetic_does_not_expand_candidate_domain(dtype):
+    value=np.ones(1,dtype=dtype)
+    assert score_array(value,value,tolerances=TOL)['reason']=='unsupported_dtype'
+
+
+def test_candidate_tolerances_remain_frozen_builtin_numbers():
+    with pytest.raises(ValueError):
+        score_array(np.ones(1),np.ones(1),tolerances={**TOL,'atol_F':np.float64(1e-12)})

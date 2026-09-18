@@ -35,6 +35,27 @@ def _maximum(array):
     return result
 
 
+def error_metrics(candidate, reference, *, atol_F, rtol_F, atol_max, rtol_max):
+    """Pure CPU arithmetic after the caller validates its input domain.
+
+    Preserve integer bits by widening directly to longdouble, never through
+    float64. Bounds retain the caller's scalar arithmetic: the candidate
+    scorer requires finite binary64 bounds, whereas legacy test helpers also
+    permit finite extended-precision tolerance scalars. Policy stays outside
+    this helper so sharing arithmetic does not narrow either public contract.
+    """
+    precision = np.clongdouble if candidate.dtype.kind == 'c' else np.longdouble
+    a, b = candidate.astype(precision), reference.astype(precision)
+    delta = a - b
+    error, scale = _norm(delta), _norm(b)
+    maximum, max_scale = _maximum(delta), _maximum(b)
+    return {'absolute_frobenius': error, 'reference_frobenius': scale,
+            'maximum_error': maximum, 'reference_maximum': max_scale,
+            'frobenius_bound': atol_F + rtol_F * scale,
+            'maximum_bound': atol_max + rtol_max * max_scale,
+            'verification_precision': np.dtype(precision).name}
+
+
 def score_array(candidate, reference, *, tolerances):
     """Use float64/complex128 output domain and widened acceptance arithmetic.
 
@@ -57,13 +78,10 @@ def score_array(candidate, reference, *, tolerances):
         return fail('nonfinite')
     try:
         with np.errstate(over='raise', invalid='raise', divide='raise'):
-            precision = np.clongdouble if candidate.dtype.kind == 'c' else np.longdouble
-            a, b = candidate.astype(precision), reference.astype(precision)
-            delta = a - b
-            error, scale = _norm(delta), _norm(b)
-            maximum, max_scale = _maximum(delta), _maximum(b)
-            bound = tolerances['atol_F'] + tolerances['rtol_F'] * scale
-            max_bound = tolerances['atol_max'] + tolerances['rtol_max'] * max_scale
+            metrics = error_metrics(candidate, reference, **tolerances)
+            error, scale = metrics['absolute_frobenius'], metrics['reference_frobenius']
+            maximum = metrics['maximum_error']
+            bound, max_bound = metrics['frobenius_bound'], metrics['maximum_bound']
             if not math.isfinite(bound) or not math.isfinite(max_bound):
                 raise FloatingPointError('verification bound overflow')
     except (FloatingPointError, OverflowError):
@@ -73,7 +91,6 @@ def score_array(candidate, reference, *, tolerances):
         relative = 'infinity'
     return {'status': 'pass' if error <= bound and maximum <= max_bound else 'fail',
             'reason': 'accepted' if error <= bound and maximum <= max_bound else 'numerical_error',
-            'metrics': {'absolute_frobenius': error, 'reference_frobenius': scale,
-                        'relative_frobenius': relative, 'maximum_error': maximum,
-                        'frobenius_bound': bound, 'maximum_bound': max_bound,
-                        'verification_precision': np.dtype(precision).name}}
+            'metrics': {key: value for key, value in
+                        dict(metrics, relative_frobenius=relative).items()
+                        if key != 'reference_maximum'}}

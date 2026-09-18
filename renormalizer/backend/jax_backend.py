@@ -176,6 +176,11 @@ class JaxBackend(AbstractBackend):
     def at_set(self, x, idx, value):
         return self.track(x.at[idx].set(value))
 
+    def write_owned(self, x, idx, value):
+        # JAX arrays remain immutable even for private solver workspaces;
+        # callers retain this result, and sync must track the new array.
+        return self.at_set(x, idx, value)
+
     def at_add(self, x, idx, value):
         return self.track(x.at[idx].add(value))
 

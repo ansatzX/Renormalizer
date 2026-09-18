@@ -108,6 +108,18 @@ class AbstractBackend(SingleProcessDistributedMixin):
         y[idx] = value
         return y
 
+    def write_owned(self, x, idx, value):
+        """Internal write into caller-owned scratch storage; retain the result.
+
+        Unlike public at_set, this may mutate x. Callers must own the workspace
+        and must not pass user inputs or storage aliased by another live value.
+        Immutable adapters override this method and return updated storage.
+        """
+        # Krylov/RK workspaces are already private: copying their full backing
+        # array for every row update would introduce quadratic memory traffic.
+        x[idx] = value
+        return x
+
     def at_add(self, x, idx, value):
         y = self.array(x, copy=True)
         y[idx] += value

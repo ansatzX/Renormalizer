@@ -31,20 +31,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# One developer environment includes tests, formatting and documentation.
+# Keep backend runtimes optional: building docs must not require a GPU wheel.
 dev = [
     "pytest>=6.2",
     "black>=23.0,<24.0",
     "flake8>=6.0,<7.0",
-]
-docs = [
     "recommonmark",
     "furo",
     "nbsphinx",
     "sphinxcontrib-googleanalytics",
 ]
 cupy = ["cupy-cuda12x>=13,<14"]
+# Standard PyPI metadata describes the dependency, not an accelerator index.
+# A compatible preinstalled Torch CPU/CUDA build satisfies this extra; see the
+# installation guide for optional CPU-only or specific CUDA build selection.
 torch = ["torch>=2,<3"]
 jax = ["jax>=0.5,<1", "jaxlib>=0.5,<1"]
+# JAX's CUDA extra installs its plugin/runtime dependencies. NVIDIA drivers
+# remain a host prerequisite; doc/source/install.md verifies actual execution.
+jax-cuda12 = ["jax[cuda12]>=0.5,<1"]
 
 [project.urls]
 homepage = "https://github.com/shuaigroup/Renormalizer"
@@ -53,3 +59,9 @@ documentation = "https://shuaigroup.github.io/Renormalizer/"
 [build-system]
 requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Publish the numerical library, not the generic top-level development tools
+# package. Keep its Python subpackages; accelerator wheels remain dependencies.
+include = ["renormalizer*"]
+namespaces = false

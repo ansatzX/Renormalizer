@@ -64,21 +64,26 @@ def rk_step(fun, t, y, f, h, A, B, C, E, K):
         Derivative ``fun(t + h, y_new)``.
     error : ndarray, shape (n,)
         Error estimate of a less accurate method.
+    K : ndarray, shape (n_stages + 1, n)
+        Updated exclusively owned stage workspace. Retain this return value:
+        immutable backends return a new array; mutable backends reuse storage.
 
     References
     ----------
     .. [1] E. Hairer, S. P. Norsett G. Wanner, "Solving Ordinary Differential
            Equations I: Nonstiff Problems", Sec. II.4.
     """
-    K = xp.at_set(K, 0, f)
+    # K is exclusively owned by this solver. Mutable adapters reuse it;
+    # immutable adapters return a replacement retained through dense output.
+    K = xp.write_owned(K, 0, f)
     for s, (a, c) in enumerate(zip(A, C)):
         dy = xp.dot(K[: s + 1].T, a) * h
-        K = xp.at_set(K, s + 1, fun(t + float(c) * h, y + dy))
+        K = xp.write_owned(K, s + 1, fun(t + c * h, y + dy))
 
     y_new = y + h * xp.dot(K[:-1].T, B)
     f_new = fun(t + h, y_new)
 
-    K = xp.at_set(K, -1, f_new)
+    K = xp.write_owned(K, -1, f_new)
     error = xp.dot(K.T, E) * h
 
     return y_new, f_new, error, K
@@ -112,8 +117,11 @@ class RungeKutta(OdeSolver):
         super(RungeKutta, self).__init__(
             fun, t0, y0, t_bound, vectorized, support_complex=True
         )
+        # State combinations use native coefficients; C only advances host
+        # time and stays on the host to avoid a scalar download per stage.
+        self.C = np.array(self.C, dtype=np.float64, copy=True)
         self.A = [xp.asarray(a, dtype=backend.real_dtype) for a in self.A]
-        for name in ('B', 'C', 'E', 'P'):
+        for name in ('B', 'E', 'P'):
             setattr(self, name, xp.asarray(getattr(self, name), dtype=backend.real_dtype))
         self.y_old = None
         self.max_step = validate_max_step(max_step)
@@ -142,6 +150,8 @@ class RungeKutta(OdeSolver):
         rtol = self.rtol
         atol = self.atol
 
+        # Time/step control is host scalar arithmetic, independent of where
+        # the solution vector lives; nextafter must not dispatch a GPU tensor.
         min_step = 10 * np.abs(np.nextafter(t, self.direction * np.inf) - t)
 
         if self.h_abs > max_step:
@@ -198,10 +208,14 @@ class RungeKutta(OdeSolver):
         return True, None
 
     def _dense_output_impl(self):
+        # Tensor.dot has different rank rules across libraries. The adapter
+        # performs native matrix multiplication and real/complex promotion.
         Q = xp.dot(self.K.T, self.P)
         return RkDenseOutput(self.t_old, self.t, self.y_old, Q)
 
 
+# Host templates avoid binding a device or truncating precision at import.
+# Each solver places the state-combination coefficients on its own backend.
 dtype = np.float64
 
 
@@ -442,6 +456,8 @@ class RkDenseOutput(DenseOutput):
         self.y_old = y_old
 
     def _call_impl(self, t):
+        # Query times arrive as host metadata. Build polynomial weights here,
+        # then explicitly upload them; the large Q and solution remain native.
         x = (t - self.t_old) / self.h
         if t.ndim == 0:
             p = np.tile(x, self.order + 1)

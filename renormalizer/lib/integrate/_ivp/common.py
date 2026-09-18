@@ -15,7 +15,8 @@ def validate_first_step(first_step, t0, t_bound):
     """Assert that first_step is valid and return it."""
     if first_step <= 0:
         raise ValueError("`first_step` must be positive.")
-    if first_step > xp.abs(t_bound - t0):
+    # Time bounds are host scalars, even when the state lives on a device.
+    if first_step > abs(t_bound - t0):
         raise ValueError("`first_step` exceeds bounds.")
     return first_step
 
@@ -67,6 +68,8 @@ def norm(x):
     """Compute RMS norm."""
     # this step looks like a bottleneck in some benchmarks.
     # This is because GPU and CPU have to sync in this function
+    # Shape is portable host metadata (Torch.size is a method); only the
+    # reduced norm crosses to the host for the adaptive step decision.
     return float(xp.linalg.norm(x)) / prod(x.shape) ** 0.5
 
 

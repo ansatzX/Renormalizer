@@ -22,7 +22,22 @@ def _expm_krylov(alpha, beta, V, v_norm, dt):
         h = np.diag(alpha) + np.diag(beta, k=-1) + np.diag(beta, k=1)
         w_hess, u_hess = np.linalg.eigh(h)
 
-    return V @ xp.asarray(u_hess @ (v_norm * np.exp(dt*w_hess) * u_hess[0]))
+    # The small projected eigensolve deliberately runs on the host in double
+    # precision. Cast its coefficients to the basis precision at the explicit
+    # upload boundary, promoting a real basis when complex time requires it.
+    coefficients = u_hess @ (v_norm * np.exp(dt*w_hess) * u_hess[0])
+    basis_dtype = np.dtype(str(V.dtype).removeprefix("torch."))
+    result_dtype = np.result_type(basis_dtype, np.complex64) if np.iscomplexobj(coefficients) else basis_dtype
+    if basis_dtype.kind != 'c' and np.iscomplexobj(coefficients):
+        # A complex time step needs a complex result, not a complex copy of
+        # the entire real basis on each convergence check. Two same-dtype
+        # real matvecs trade an extra GEMV for avoiding that basis allocation;
+        # only the resulting vectors are combined into complex storage.
+        real = xp.dot(V, xp.asarray(coefficients.real, dtype=basis_dtype))
+        imag = xp.dot(V, xp.asarray(coefficients.imag, dtype=basis_dtype))
+        return xp.asarray(real + 1j * imag, dtype=result_dtype)
+    native_coefficients = xp.asarray(coefficients, dtype=result_dtype)
+    return xp.dot(V, native_coefficients)
 
 
 def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
@@ -47,14 +62,19 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
     alpha = np.zeros(block_size)
     beta  = np.zeros(block_size - 1)
 
+    # V is private solver workspace: mutable adapters write in place; JAX
+    # returns a replacement, which every write below must retain.
     V = xp.empty((block_size, len(vstart)), dtype=vstart.dtype)
-    V = xp.at_set(V, 0, vstart)
+    V = xp.write_owned(V, 0, vstart)
     res = None
 
 
     for j in range(len(vstart)):
 
         w = Afunc(V[j])
+        # Lanczos coefficients feed the small CPU tridiagonal eigensolver;
+        # make the synchronizing scalar transfer explicit, not an implicit
+        # CUDA-tensor conversion during NumPy assignment.
         alpha[j] = float(xp.vdot(w, V[j]).real)
 
         if j == len(vstart)-1:
@@ -63,12 +83,15 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
 
         if len(V) == j+1:
             V, old_V = xp.empty((len(V) + block_size, len(vstart)), dtype=vstart.dtype), V
-            V = xp.at_set(V, slice(None, len(old_V)), old_V)
+            V = xp.write_owned(V, slice(None, len(old_V)), old_V)
             del old_V
             alpha = np.concatenate([alpha, np.zeros(block_size)])
             beta = np.concatenate([beta, np.zeros(block_size)])
 
-        w -= alpha[j]*V[j] + (beta[j-1]*V[j-1] if j > 0 else 0)
+        # NumPy float64 scalars carry a strong dtype into JAX arithmetic.
+        # Python scalars keep these host coefficients weakly typed so the
+        # native recurrence retains the chosen basis precision.
+        w -= float(alpha[j])*V[j] + (float(beta[j-1])*V[j-1] if j > 0 else 0)
         beta[j] = float(xp.linalg.norm(w))
         if beta[j] < 100*len(vstart)*np.finfo(float).eps:
             # logger.warning(f'beta[{j}] ~= 0 encountered during Lanczos iteration.')
@@ -80,6 +103,6 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
                 return new_res, j+1
             else:
                 res = new_res
-        V = xp.at_set(V, j + 1, w / beta[j])
+        V = xp.write_owned(V, j + 1, w / float(beta[j]))
 
 

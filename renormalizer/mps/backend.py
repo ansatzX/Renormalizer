@@ -8,6 +8,9 @@ import numpy as np
 from renormalizer.cons import backend, get_backend, runtime_backend, set_backend, xp
 from renormalizer.backend.abstract import AbstractBackend
 from renormalizer.backend.factory import probe_legacy_cupy
+# Preserve the historical facade import as the exact utility object, not a
+# wrapper; callers may have imported this formatter from mps.backend directly.
+from renormalizer.utils.utils import sizeof_fmt
 
 try:
     import primme
@@ -81,4 +84,5 @@ __all__ = [
     "primme",
     "IMPORT_PRIMME_EXCEPTION",
     "get_git_commit_hash",
+    "sizeof_fmt",
 ]

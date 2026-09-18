@@ -1,0 +1,4 @@
+# Linux x86_64, CPython 3.11 reference build; other platforms must resolve separately.
+# The official wheel URL fixes the CPU/CUDA build without searching a second
+# index for unrelated dependencies; its digest is published by the Torch index.
+torch @ https://download.pytorch.org/whl/cu124/torch-2.5.1%2Bcu124-cp311-cp311-linux_x86_64.whl#sha256=6b2966ede9affe2fd69e0765691ca723ec870e0c34c7761f4d5b8e318383fdaf
