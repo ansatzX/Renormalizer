@@ -188,6 +188,9 @@ class TreeNodeTensor(TreeNode):
         else:
             dtype = backend.real_dtype
         self._tensor = np.asarray(tensor, dtype=dtype)
+        # Persistent host tensors support in-place updates after native conversion.
+        if not self._tensor.flags.writeable:
+            self._tensor = self._tensor.copy()
 
     # alias
     array = tensor

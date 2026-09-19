@@ -485,9 +485,12 @@ def get_ham_iterative(
         )
     else:
         if isinstance(ltensor, BlockEnvData):
-            ltensor = asxp(ltensor.to_dense())
+            ltensor = ltensor.to_dense()
         if isinstance(rtensor, BlockEnvData):
-            rtensor = asxp(rtensor.to_dense())
+            rtensor = rtensor.to_dense()
+        # Sparse dispatch may decline and leave raw host environments.
+        ltensor = asxp(ltensor)
+        rtensor = asxp(rtensor)
 
     if not use_block_hop and omega is None:
         tmp_ltensor = xp.einsum("aba -> ba", ltensor)

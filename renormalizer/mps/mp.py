@@ -621,7 +621,7 @@ class MatrixProduct:
                 hop = hop_expr(ltensor, rtensor, cmo, cms.shape)
                 cout = hop(cms)
                 # clean up the elements which do not meet the qn requirements
-                cout[~qn_mask] = 0
+                cout = xp.write_owned(cout, asxp(~qn_mask), 0)
                 mps._update_mps(cout, cidx, qnbigl, qnbigr, percent)
                 if mps.compress_config.ofs is not None:
                     # need to swap the original MPS. Tedious to implement and probably not useful.

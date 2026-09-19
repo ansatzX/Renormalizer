@@ -175,7 +175,7 @@ class Mps(MatrixProduct):
         # set elements with wrong qn to zero
         qnmat = add_outer(mps.qn[-2], model.basis[-1].sigmaqn)
         qnmask = get_qn_mask(qnmat, qntot)
-        last_mt[~qnmask] = 0
+        last_mt = xp.write_owned(last_mt, asxp(~qnmask), 0)
         # normalize the mt so that the whole mps is normalized
         last_mt /= xp.linalg.norm(last_mt.flatten())
         mps.append(last_mt)
@@ -544,8 +544,8 @@ class Mps(MatrixProduct):
         r = environ.read("R", 1)
         path = self._expectation_path()
         val = multi_tensor_contract(path, l, self[0], mpo[0], self_conj[0], r)
-        if np.isclose(float(val.imag), 0):
-            return float(val.real)
+        if np.isclose(float(xp.imag(val)), 0):
+            return float(xp.real(val))
         else:
             return complex(val)
         # This is time and memory consuming
@@ -604,7 +604,7 @@ class Mps(MatrixProduct):
             r_environ, r_idx = _get_freq_environ(r_environ_dict, mpo, "R", len(mpo)-l_idx-1)
             for i in range(l_idx+1, r_idx):
                 l_environ = contract_one_site(l_environ, self[i], mpo[i], "L", self_conj[i])
-            results.append(complex(l_environ.flatten() @ r_environ.flatten()))  # cast to python type
+            results.append(complex(xp.dot(asxp(l_environ).flatten(), asxp(r_environ).flatten())))  # cast to python type
 
         results = np.array(results)
         if np.allclose(results.imag, 0):
@@ -1033,8 +1033,8 @@ class Mps(MatrixProduct):
                             coef, ovlp_inv1=S_L_inv_list[imps+1],
                             ovlp_inv0=S_L_inv_list[imps], ovlp0=S_L_list[imps])
 
-                    hop_y[position[imps]:position[imps+1]] = func(0,
-                            mps[imps].array.ravel()).reshape(mps[imps].shape)[qn_mask_list[imps]]
+                    hop_y = xp.write_owned(hop_y, slice(position[imps], position[imps+1]),
+                            func(0, asxp(mps[imps].array.ravel())).reshape(mps[imps].shape)[asxp(qn_mask_list[imps])])
 
                     continue
 
@@ -1056,7 +1056,7 @@ class Mps(MatrixProduct):
                     regular_s = _mu_regularize(s, epsilon=self.evolve_config.reg_epsilon)
 
                     u = asxp(u)
-                    us = u.dot(xp.diag(s))
+                    us = xp.dot(u, xp.diag(asxp(s)))
 
                     rtensor = xp.tensordot(rtensor, us, axes=(-1, -1))
 
@@ -1064,7 +1064,7 @@ class Mps(MatrixProduct):
                     environ_mps.qn[imps + 1] = qnrset
                     environ_mps.qnidx = imps
 
-                    S_inv = u.conj().dot(xp.diag(1.0 / regular_s)).T
+                    S_inv = xp.dot(u.conj(), xp.diag(asxp(1.0 / regular_s))).T
 
                 elif self.evolve_config.method == EvolveMethod.tdvp_vmf:
                     rtensor = environ.GetLR(
@@ -1084,7 +1084,7 @@ class Mps(MatrixProduct):
 
                     u = asxp(u)
                     # S_inv is (#.conj, #)
-                    S_inv = u.dot(xp.diag(1.0 / w)).dot(u.T.conj()).T
+                    S_inv = xp.dot(xp.dot(u, xp.diag(asxp(1.0 / w))), u.T.conj()).T
 
                 hop = hop_expr(ltensor, rtensor, [asxp(mpo[imps])], shape)
 
@@ -1092,8 +1092,8 @@ class Mps(MatrixProduct):
                         coef, ovlp_inv1=S_L_inv_list[imps+1],
                         ovlp_inv0=S_L_inv_list[imps], ovlp0=S_L_list[imps])
 
-                hop_y[position[imps]:position[imps+1]] = func(0,
-                        asxp(mps[imps].array.ravel())).reshape(mps[imps].shape)[qn_mask_list[imps]]
+                hop_y = xp.write_owned(hop_y, slice(position[imps], position[imps+1]),
+                        func(0, asxp(mps[imps].array.ravel())).reshape(mps[imps].shape)[asxp(qn_mask_list[imps])])
 
             return hop_y
 
@@ -1529,13 +1529,13 @@ class Mps(MatrixProduct):
                 if self.evolve_config.ivp_solver == "krylov":
                     mps_t, j = expm_krylov(
                         lambda y: hop(y.reshape(ms1.shape)).ravel(),
-                        1j * evolve_dt / 2, ms1.ravel()
+                        1j * evolve_dt / 2, asxp(ms1).ravel()
                     )
                 else:
                     sol = solve_ivp(
                         lambda t, y: hop(y.reshape(ms1.shape)).ravel() / -coef,
                         (0, evolve_dt/2),
-                        ms1.ravel(),
+                        asxp(ms1).ravel(),
                         method=self.evolve_config.ivp_solver,
                         rtol=self.evolve_config.ivp_rtol,
                         atol=self.evolve_config.ivp_atol,
@@ -1632,7 +1632,8 @@ class Mps(MatrixProduct):
             else:
                 tensor = tensordot(tensor, ms, ([0,-1,-2],[0,-1,-2]))
             assert xp.allclose(tensor, tensor.T.conj())
-            rdm[ims] = asnumpy(tensor)
+            # Contractions above leave the bra index first; expose |psi><psi|.
+            rdm[ims] = asnumpy(tensor.T)
 
         return rdm
     
@@ -1663,7 +1664,7 @@ class Mps(MatrixProduct):
                 tensor = tensordot(tensor, ms, ([0],[0]))
             elif ms.ndim == 4:
                 tensor = tensordot(tensor, ms, ([0,2],[0,2]))
-            L_component.append(tensor.transpose((0,2,1,3)))
+            L_component.append(xp.transpose(tensor, (0,2,1,3)))
             
             rtensor = environ_R.GetLR("R", ims+1, self, identity,
                     itensor=None, method="Enviro")
@@ -1673,7 +1674,7 @@ class Mps(MatrixProduct):
                 tensor = tensordot(tensor, ms, ([-1],[-1]))
             elif ms.ndim == 4:
                 tensor = tensordot(tensor, ms, ([2,-1],[2,-1]))
-            R_component.append(tensor.transpose((0,2,1,3)))
+            R_component.append(xp.transpose(tensor, (0,2,1,3)))
         
         # merge two 1-site environment together
         for ims in range(self.site_num):
@@ -1688,8 +1689,9 @@ class Mps(MatrixProduct):
                         tensor = tensordot(tensor, self[kms], ([2,3,4],[0,1,2]))
                 
                 rtensor = R_component[jms]
-                res = tensordot(tensor, rtensor,
-                        ([2,3],[0,1])).transpose(0,2,1,3)
+                # Group ket indices first, then bra indices, matching |psi><psi|.
+                res = xp.transpose(tensordot(tensor, rtensor,
+                        ([2,3],[0,1])), (1,3,0,2))
                 rdm[(ims, jms)] = asnumpy(res.reshape(res.shape[0]*res.shape[1],-1))
         return rdm
     

@@ -107,6 +107,8 @@ class TorchBackend(AbstractBackend):
         if name=='astype':
             return args[0].to(dtype=self._dtype(args[1]),copy=kwargs.get('copy',True))
         if name in ('zeros','ones','empty','full','arange'):
+            if name == 'full' and isinstance(args[0], (int, np.integer)):
+                args = ((int(args[0]),), *args[1:])
             if kwargs.get('dtype') is not None:
                 kwargs['dtype']=self._dtype(kwargs['dtype'])
             elif name != 'arange':
@@ -189,17 +191,74 @@ class TorchBackend(AbstractBackend):
         return self._torch.eye(n, dtype=self._dtype(self.real_dtype if dtype is None else dtype),
                                device=self._device)
 
+    def argmax(self,x,axis=None):
+        return self._torch.argmax(self.asarray(x),dim=axis)
+
+    def repeat(self,x,repeats,axis=None):
+        if isinstance(repeats,np.ndarray):
+            repeats=self.asarray(repeats)
+        return self._torch.repeat_interleave(self.asarray(x),repeats,dim=axis)
+
+    def nonzero(self,x):
+        return self._torch.nonzero(self.asarray(x),as_tuple=True)
+
+    def equal(self,a,b):
+        return self._torch.eq(self.asarray(a),self.asarray(b))
+
+    def unique(self,x):
+        return self._torch.unique(self.asarray(x),sorted=True)
+
+    def absolute(self,x):
+        return self._torch.abs(self.asarray(x))
+
     def tensordot(self,a,b,axes=2):
         a,b=self.asarray(a),self.asarray(b)
         dtype=self._torch.promote_types(a.dtype,b.dtype)
-        if isinstance(axes,tuple):
+        if isinstance(axes,np.integer):
+            axes=int(axes)
+        if isinstance(axes,(tuple,list)):
             axes=tuple([int(v)] if isinstance(v,(int,np.integer)) else list(v) for v in axes)
         return self._torch.tensordot(a.to(dtype),b.to(dtype),dims=axes)
 
     def dot(self,a,b):
         a,b=self.asarray(a),self.asarray(b)
         dtype=self._torch.promote_types(a.dtype,b.dtype)
-        return self._torch.matmul(a.to(dtype),b.to(dtype))
+        a,b=a.to(dtype),b.to(dtype)
+        if a.ndim == 0 or b.ndim == 0:
+            return a*b
+        return self._torch.tensordot(a,b,dims=([-1],[-1 if b.ndim == 1 else -2]))
+
+    def finfo(self,dtype):
+        # Precision constants are host metadata, not state arrays.
+        return np.finfo(self._reverse_dtypes.get(dtype,dtype))
+
+    def empty_like(self,x,dtype=None):
+        return self._torch.empty_like(x,dtype=x.dtype if dtype is None else self._dtype(dtype),device=self._device)
+
+    def allclose(self,a,b,rtol=1e-5,atol=1e-8,equal_nan=False):
+        a,b=self.asarray(a),self.asarray(b)
+        dtype=self._torch.promote_types(a.dtype,b.dtype)
+        return self._torch.allclose(a.to(dtype),b.to(dtype),rtol=rtol,atol=atol,equal_nan=equal_nan)
+
+    def iscomplex(self,x):
+        x=self.asarray(x)
+        return x.imag != 0 if x.is_complex() else self._torch.zeros_like(x,dtype=self._torch.bool)
+
+    def diff(self,x,n=1,axis=-1):
+        return self._torch.diff(self.asarray(x),n=n,dim=axis)
+
+    def searchsorted(self,a,v,side='left',sorter=None):
+        if side not in ('left','right'):
+            raise ValueError("side must be 'left' or 'right'")
+        return self._torch.searchsorted(self.asarray(a),self.asarray(v),right=side=='right',sorter=sorter)
+
+    def sort(self,a,axis=-1,kind=None,order=None):
+        if order is not None or kind not in (None,'stable'):
+            raise NotImplementedError('Torch sort supports default or stable ordering without fields')
+        a=self.asarray(a)
+        if axis is None:
+            a,axis=a.reshape(-1),-1
+        return self._torch.sort(a,dim=axis,stable=kind=='stable').values
 
     def vdot(self,a,b):
         a,b=self.asarray(a),self.asarray(b)

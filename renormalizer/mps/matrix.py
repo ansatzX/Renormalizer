@@ -25,6 +25,9 @@ class Matrix:
             else:
                 dtype = backend.real_dtype
         self.array: np.ndarray = np.asarray(array, dtype=dtype)
+        # Persistent host tensors support in-place updates after native conversion.
+        if not self.array.flags.writeable:
+            self.array = self.array.copy()
         self.original_shape = self.array.shape
         self.sigmaqn = None
         pass  # backend.running removed

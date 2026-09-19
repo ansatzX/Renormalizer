@@ -113,7 +113,7 @@ class TDA(object):
                 
                 vt = xp.einsum("i, ij -> ij", asxp(s), asxp(vt))
                 if ims == site_num-1:
-                    assert vt.size == 1 and xp.allclose(vt, 1)
+                    assert np.prod(vt.shape) == 1 and xp.allclose(vt, 1)
                 else:
                     mps[ims+1] = asnumpy(tensordot(vt, mps[ims+1], ([-1],[0])))
                 
@@ -475,7 +475,7 @@ class TDA(object):
                 for mps_tangent in mps_tangent_list:
                     sentinel = xp.ones((1,1))
                     for ims, ms in enumerate(mps_tangent):
-                        sentinel = sentinel.dot(asxp(ms[:,config[ims],:]))
+                        sentinel = xp.dot(sentinel, asxp(ms[:,config[ims],:]))
                     ci_coeff_list.append(float(sentinel[0,0]))
                 ci_coeff = np.sum(ci_coeff_list)
                 coeff_square_sum += ci_coeff**2

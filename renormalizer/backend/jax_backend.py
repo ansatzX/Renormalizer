@@ -102,6 +102,16 @@ class JaxBackend(AbstractBackend):
                 self._pending[key] = weakref.ref(value, lambda ref, key=key: self._pending.pop(key, None))
         return result
 
+    def tensordot(self, a, b, axes=2):
+        # Basis contractions supply range objects; JAX versions require
+        # concrete axis pairs. Scalar axes are contraction counts, not pairs.
+        if isinstance(axes, (int, np.integer)):
+            axes = int(axes)
+        else:
+            axes = tuple(int(axis) if isinstance(axis, (int, np.integer))
+                         else tuple(axis) for axis in axes)
+        return self.strict_call('tensordot', a, b, axes=axes)
+
     def strict_call(self, name, *args, **kwargs):
         if name == 'linalg.eigh':
             kwargs['symmetrize_input'] = False
@@ -253,6 +263,9 @@ class _JaxRandomProxy:
     def rand(self, *dims):
         key = self._backend._consume_key()
         return self._backend.track(jr.uniform(key, shape=dims if dims else (), dtype=self._backend.real_dtype))
+
+    def random(self, size=None):
+        return self.uniform(size=size)
 
 
 class _JaxLinalg:

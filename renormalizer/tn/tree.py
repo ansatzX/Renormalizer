@@ -865,8 +865,8 @@ class TTNS(TTNBase):
         args.extend(ttno.to_contract_args("up", "down"))
         val = oe_contract(*asxp_oe_args(args), optimize="greedy").ravel()[0]
 
-        if np.isclose(float(val.imag), 0):
-            return float(val.real)
+        if np.isclose(float(xp.imag(val)), 0):
+            return float(xp.real(val))
         else:
             return complex(val)
 
@@ -1073,7 +1073,7 @@ class TTNS(TTNBase):
             The 1-site entanglement entropy. The key is the index of the site in ``self.node_list``.
         """
         rdm = self.calc_1site_rdm(idx)
-        entropy = {key: calc_vn_entropy_dm(dm) for key, dm in rdm.items()}
+        entropy = {key: calc_vn_entropy_dm(asnumpy(dm)) for key, dm in rdm.items()}
         return entropy
 
     def calc_1dof_rdm(self, dof: Union[Any, List[Any]]=None) -> Dict[Any, np.ndarray]:
@@ -1119,7 +1119,7 @@ class TTNS(TTNBase):
 
     def calc_1dof_entropy(self, dof: Union[Any, List[Any]]=None) -> Dict[Any, float]:
         rdm = self.calc_1dof_rdm(dof)
-        return {key: calc_vn_entropy_dm(dm) for key, dm in rdm.items()}
+        return {key: calc_vn_entropy_dm(asnumpy(dm)) for key, dm in rdm.items()}
 
     def calc_2site_rdm(self, idxs: Union[Tuple[int, int], List[Tuple[int, int]]]=None) -> Dict[Tuple[int, int], np.ndarray]:
         r""" Calculate 2-site reduced density matrix
@@ -1225,7 +1225,7 @@ class TTNS(TTNBase):
             assert isinstance(idxs, list)
 
         rdm = self.calc_2site_rdm(idxs)
-        entropy = {key: calc_vn_entropy_dm(dm) for key, dm in rdm.items()}
+        entropy = {key: calc_vn_entropy_dm(asnumpy(dm)) for key, dm in rdm.items()}
         return entropy
 
     def calc_2dof_rdm(self, dofs: Union[Tuple[Any, Any], List[Tuple[Any, Any]]]) -> Dict[Tuple[Any, Any], np.ndarray]:
@@ -1290,7 +1290,7 @@ class TTNS(TTNBase):
         if rdm is None:
             rdm = self.calc_2dof_rdm(dofs)
         
-        entropy = {key: calc_vn_entropy_dm(dm) for key, dm in rdm.items()}
+        entropy = {key: calc_vn_entropy_dm(asnumpy(dm)) for key, dm in rdm.items()}
         return entropy
 
     def calc_2dof_mutual_info(self, dofs: Union[Tuple[Any, Any], List[Tuple[Any, Any]]], rdm_2dof: Dict[Any, np.ndarray]=None) -> Dict[Tuple[Any, Any], float]:
