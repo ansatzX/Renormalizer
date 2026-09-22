@@ -82,7 +82,7 @@ def to_backend(array):
     context, ledger = _context.get(), _ledger.get()
     if context is not None and isinstance(array, np.ndarray):
         from .host_solver import from_host
-        return from_host(array, context=context, ledger=[] if ledger is None else ledger.transfers,
+        return from_host(array, context=context, ledger=None if ledger is None else ledger.transfers,
                          reason='algorithm operand', operation_id=0 if ledger is None else len(ledger.operations))
     result = selected.from_numpy(array) if isinstance(array,np.ndarray) else selected.asarray(array)
     _record_transfer(array,result,'algorithm operand')
@@ -93,7 +93,7 @@ def to_host(array):
     context, ledger = _context.get(), _ledger.get()
     if context is not None and not isinstance(array, np.ndarray):
         from .host_solver import to_host as download
-        return download(array, context=context, ledger=[] if ledger is None else ledger.transfers,
+        return download(array, context=context, ledger=None if ledger is None else ledger.transfers,
                         reason='host storage or solver boundary', operation_id=0 if ledger is None else len(ledger.operations))
     result = current_backend().numpy(array)
     _record_transfer(array,result,'host storage or solver boundary')
@@ -149,7 +149,11 @@ def contract_expression(*args, **kwargs):
     selected = current_backend()
     converted = tuple(to_backend(a) if hasattr(a, 'dtype') and hasattr(a, 'shape') else a for a in args)
     expr = oe.contract_expression(*converted, **kwargs)
+    # Retain only the latest precision specialization, never operand contents.
+    # Tuple comparison avoids content hashes and an unbounded expression cache.
+    specialization = None
     def call(*operands, **options):
+        nonlocal specialization
         if current_backend() is not selected:
             raise CapabilityError('contraction expression belongs to another backend instance')
         options['backend'] = selected.opt_einsum_name
@@ -157,7 +161,13 @@ def contract_expression(*args, **kwargs):
         active_expr = expr
         if selected.name == 'torch':
             promoted = _promote_operands(converted + native, selected)
-            active_expr = oe.contract_expression(*promoted[:len(converted)], **kwargs)
+            signature = tuple(a.dtype if hasattr(a,'dtype') else None for a in promoted)
+            cached = specialization
+            if cached is None or cached[0] != signature:
+                active_expr = oe.contract_expression(*promoted[:len(converted)], **kwargs)
+                specialization = (signature, active_expr)
+            else:
+                active_expr = cached[1]
             native = promoted[len(converted):]
         result = active_expr(*native, **options)
         _witness(result)

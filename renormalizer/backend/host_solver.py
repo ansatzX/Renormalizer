@@ -28,6 +28,8 @@ def _identifier(operation_id):
 
 
 def _record(ledger, *, source, target, shape, dtype, reason, operation_id):
+    if ledger is None:
+        return
     source_host = str(source).split(':')[0].lower() == 'cpu'
     target_host = str(target).split(':')[0].lower() == 'cpu'
     if source_host and target_host:
@@ -48,16 +50,18 @@ def to_host(array, *, context, ledger, reason, operation_id=None):
 
     All four public helpers take the same keyword-only context/ledger/reason;
     operation_id is optional, and callers can share it across related boundaries.
-    ledger must provide append(dict). Conversion failures are never retried.
+    ledger must provide append(dict), or be None to disable recording.
+    Conversion failures are never retried.
     """
     _authorize(context)
-    operation_id = _identifier(operation_id)
+    operation_id = _identifier(operation_id) if ledger is not None else operation_id
     dtype = _dtype(array)
     host = context.ops.to_numpy(array)
     if not isinstance(host, np.ndarray):
         raise TypeError('to_numpy must return a NumPy array')
-    _record(ledger, source=context.device, target='cpu', shape=array.shape,
-            dtype=dtype, reason=reason, operation_id=operation_id)
+    if ledger is not None:
+        _record(ledger, source=context.device, target='cpu', shape=array.shape,
+                dtype=dtype, reason=reason, operation_id=operation_id)
     check_actual_dtype(host.dtype, dtype)
     if host.shape != tuple(array.shape):
         raise ValueError('host conversion changed array shape')
@@ -69,10 +73,11 @@ def from_host(array, *, context, ledger, reason, operation_id=None):
     _authorize(context)
     if not isinstance(array, np.ndarray) or array.dtype.kind not in 'biufc':
         raise CapabilityError('host solver arrays must have numeric dtypes')
-    operation_id = _identifier(operation_id)
+    operation_id = _identifier(operation_id) if ledger is not None else operation_id
     result = context.ops.from_numpy(array)
-    _record(ledger, source='cpu', target=context.device, shape=array.shape,
-            dtype=array.dtype, reason=reason, operation_id=operation_id)
+    if ledger is not None:
+        _record(ledger, source='cpu', target=context.device, shape=array.shape,
+                dtype=array.dtype, reason=reason, operation_id=operation_id)
     check_actual_dtype(_dtype(result), array.dtype)
     if tuple(result.shape) != array.shape:
         raise ValueError('device conversion changed array shape')
@@ -105,7 +110,7 @@ def call_host_solver(solver, arrays, *, context, ledger, reason, operation_id=No
     metadata should be extracted by that closure if it must remain on host.
     """
     _authorize(context)
-    operation_id = _identifier(operation_id)
+    operation_id = _identifier(operation_id) if ledger is not None else operation_id
     host_arrays = [to_host(array, context=context, ledger=ledger, reason=reason,
                            operation_id=operation_id) for array in arrays]
     result = solver(*host_arrays)
@@ -122,7 +127,7 @@ def wrap_host_callback(callback, *, context, ledger, reason, operation_id=None):
     return one backend array. Matrix inputs support block iterative solvers.
     """
     _authorize(context)
-    operation_id = _identifier(operation_id)
+    operation_id = _identifier(operation_id) if ledger is not None else operation_id
 
     def host_callback(array):
         device_array = from_host(array, context=context, ledger=ledger, reason=reason,

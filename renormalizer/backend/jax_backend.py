@@ -242,9 +242,13 @@ class _JaxRandomProxy:
             return self._backend.track(fn(key, shape=size, **kwargs))
         return self._backend.track(fn(key, **kwargs))
 
+    @staticmethod
+    def _shape(size):
+        return (int(size),) if isinstance(size, (int, np.integer)) else size
+
     def uniform(self, low=0.0, high=1.0, size=None, dtype=None):
         dtype = self._backend.real_dtype if dtype is None else dtype
-        size = (size,) if isinstance(size, int) else size
+        size = self._shape(size)
         key = self._backend._consume_key()
         if size is not None:
             x = jr.uniform(key, shape=size, minval=low, maxval=high, dtype=dtype)
@@ -254,7 +258,7 @@ class _JaxRandomProxy:
 
     def normal(self, loc=0.0, scale=1.0, size=None, dtype=None):
         dtype = self._backend.real_dtype if dtype is None else dtype
-        size = (size,) if isinstance(size, int) else size
+        size = self._shape(size)
         key = self._backend._consume_key()
         if size is not None:
             x = jr.normal(key, shape=size, dtype=dtype) * scale + loc
@@ -265,7 +269,7 @@ class _JaxRandomProxy:
     def randint(self, low, high=None, size=None, dtype=int):
         if high is None:
             low, high = 0, low
-        size = (size,) if isinstance(size, int) else size
+        size = self._shape(size)
         key = self._backend._consume_key()
         if size is not None:
             x = jr.randint(key, shape=size, minval=low, maxval=high, dtype=dtype)

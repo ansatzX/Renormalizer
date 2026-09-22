@@ -555,6 +555,9 @@ class DeviceOperations(StrictOperations):
             for axis, part in enumerate(parts):
                 if isinstance(part, (int, np.integer)) and not -x.shape[axis] <= part < x.shape[axis]:
                     raise IndexError('index out of bounds')
-            x[idx]
+                if isinstance(part,slice):
+                    # Validate basic slicing as metadata. Torch cannot directly
+                    # index negative steps; its adapter normalizes those updates.
+                    part.indices(x.shape[axis])
         (x,value),dtype=self._promote(x,value)
         return self._result(self.adapter.strict_update(name,x,idx,value),dtype)

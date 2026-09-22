@@ -102,6 +102,24 @@ class TorchBackend(AbstractBackend):
             return x
         return self.to_numpy(x)
 
+    @staticmethod
+    def _arguments(args, kwargs, names, defaults):
+        """Bind the supported NumPy signature without discarding arguments."""
+        if len(args) > len(names):
+            raise TypeError('too many positional arguments')
+        values = dict(defaults)
+        for name, value in zip(names, args):
+            if name in kwargs:
+                raise TypeError(f'multiple values for {name}')
+            values[name] = value
+        for name, value in kwargs.items():
+            if name not in names:
+                raise TypeError(f'unsupported argument {name}')
+            values[name] = value
+        if names[0] not in values:
+            raise TypeError(f'missing required argument {names[0]}')
+        return values
+
     def strict_call(self,name,*args,**kwargs):
         t=self._torch
         if name=='astype':
@@ -115,9 +133,18 @@ class TorchBackend(AbstractBackend):
                 kwargs['dtype']=self._dtype(self.real_dtype)
             return getattr(t,name)(*args,device=self._device,**kwargs)
         if name=='eye':
-            n=args[0]
-            m=kwargs.pop('M',None)
-            return t.eye(n,n if m is None else m,dtype=self._dtype(kwargs.get('dtype',self.real_dtype)),device=self._device)
+            values=self._arguments(args,kwargs,('N','M','k','dtype','order'),
+                dict(M=None,k=0,dtype=self.real_dtype,order='C'))
+            if values['order'] != 'C':
+                raise NotImplementedError('Torch eye supports C order only')
+            n,m=values['N'],values['M']
+            m=n if m is None else m
+            dtype=self._dtype(self.real_dtype if values['dtype'] is None else values['dtype'])
+            if values['k'] == 0:
+                return t.eye(n,m,dtype=dtype,device=self._device)
+            result=t.zeros((n,m),dtype=dtype,device=self._device)
+            result.diagonal(offset=values['k']).fill_(1)
+            return result
         if name=='transpose':
             x,axes=args
             return x.permute(tuple(reversed(range(x.ndim))) if axes is None else tuple(axes))
@@ -128,15 +155,32 @@ class TorchBackend(AbstractBackend):
         if name=='imag' and not args[0].is_complex():
             return t.zeros_like(args[0])
         if name in ('sum','max','min','all','any'):
-            axis=kwargs.pop('axis',None)
-            keepdims=kwargs.pop('keepdims',False)
+            names=('a','axis','dtype','out','keepdims') if name=='sum' else ('a','axis','out','keepdims')
+            values=self._arguments(args,kwargs,names,dict(axis=None,out=None,keepdims=False))
+            x=self.asarray(values['a'])
+            axis=values['axis']
+            if isinstance(axis,np.integer):
+                axis=int(axis)
+            elif isinstance(axis,tuple):
+                axis=tuple(int(a) if isinstance(a,np.integer) else a for a in axis)
+            keepdims=values['keepdims']
+            def finish(result):
+                out=values['out']
+                if out is not None:
+                    out.copy_(result)
+                    return out
+                return result
+            if isinstance(axis,tuple) and not axis:
+                if name=='sum':
+                    dtype=values.get('dtype')
+                    dtype=self._dtype(dtype) if dtype is not None else (x.dtype if x.is_floating_point() or x.is_complex() else t.int64)
+                    return finish(x.to(dtype=dtype).clone())
+                return finish(x.bool() if name in ('all','any') else x.clone())
             if name=='sum':
-                if kwargs.get('dtype') is not None:
-                    kwargs['dtype']=self._dtype(kwargs['dtype'])
-                return t.sum(args[0],dim=axis,keepdim=keepdims,**kwargs)
+                dtype=values.get('dtype')
+                return finish(t.sum(x,dim=axis,keepdim=keepdims,dtype=None if dtype is None else self._dtype(dtype)))
             if name in ('max','min'):
                 reduce=t.amax if name=='max' else t.amin
-                x=args[0]
                 if x.is_complex():
                     real=reduce(x.real,dim=axis,keepdim=True)
                     infinity=-float('inf') if name=='max' else float('inf')
@@ -149,9 +193,9 @@ class TorchBackend(AbstractBackend):
                             axes=(axis,) if isinstance(axis,int) else axis
                             for index in sorted((a%x.ndim for a in axes),reverse=True):
                                 out=out.squeeze(index)
-                    return out
-                return reduce(x,dim=axis,keepdim=keepdims)
-            return getattr(t,name)(args[0],dim=axis,keepdim=keepdims)
+                    return finish(out)
+                return finish(reduce(x,dim=axis,keepdim=keepdims))
+            return finish(getattr(t,name)(x,dim=axis,keepdim=keepdims))
         if name=='linalg.norm':
             kwargs['dim']=kwargs.pop('axis',None)
             kwargs['keepdim']=kwargs.pop('keepdims',False)
@@ -161,6 +205,19 @@ class TorchBackend(AbstractBackend):
 
     def strict_update(self,name,x,idx,value):
         y=x.clone()
+        flipped=[]
+        if not isinstance(idx,np.ndarray):
+            parts=list(idx if isinstance(idx,tuple) else (idx,))
+            for axis,part in enumerate(parts):
+                if isinstance(part,slice) and part.step is not None and part.step < 0:
+                    start,stop,step=part.indices(x.shape[axis])
+                    count=len(range(start,stop,step))
+                    first=x.shape[axis]-1-start
+                    parts[axis]=slice(first,first+count*(-step),-step) if count else slice(0,0)
+                    flipped.append(axis)
+            if flipped:
+                y=self._torch.flip(y,flipped)
+                idx=tuple(parts)
         if isinstance(idx,np.ndarray):
             values=self._torch.broadcast_to(value,idx.shape)
             for position,index in enumerate(idx):
@@ -180,7 +237,7 @@ class TorchBackend(AbstractBackend):
             y[idx]-=value
         else:
             y[idx]*=value
-        return y
+        return self._torch.flip(y,flipped) if flipped else y
 
     def transpose(self,x,axes=None):
         return self.strict_call('transpose',x,axes)
