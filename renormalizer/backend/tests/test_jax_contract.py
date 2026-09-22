@@ -11,6 +11,73 @@ import pytest
 pytestmark=pytest.mark.skipif(importlib.util.find_spec('jax') is None,reason='JAX environment required')
 
 
+@pytest.mark.parametrize('x64', ['0', '1'])
+@pytest.mark.parametrize('fp32', [False, True])
+def test_public_selection_precision_is_transactional(x64, fp32):
+    # Each process initializes JAX under the requested policy. Changing its
+    # global setting in a running test would not test the public startup path.
+    code = '''
+import json, os, random
+import jax
+import numpy as np
+import renormalizer as reno
+from renormalizer.backend.context import make_context
+from renormalizer.backend.contracts import PrecisionError
+
+previous = reno.set_backend('numpy')
+proxy = reno.backend
+np.random.seed(734)
+random.seed(829)
+numpy_state = np.random.get_state()
+python_state = random.getstate()
+before_x64 = bool(jax.config.x64_enabled)
+fp32 = 'RENO_FP32' in os.environ
+should_reject = not before_x64 and not fp32
+try:
+    selected = reno.set_backend('jax')
+except PrecisionError as error:
+    assert should_reject, str(error)
+    assert 'JAX_ENABLE_X64=1' in str(error)
+    assert reno.get_backend() is previous and proxy.current is previous
+    after = np.random.get_state()
+    assert after[0] == numpy_state[0]
+    np.testing.assert_array_equal(after[1], numpy_state[1])
+    assert after[2:] == numpy_state[2:]
+    assert random.getstate() == python_state
+else:
+    assert not should_reject, 'global JAX selection silently accepted false float64'
+    assert reno.get_backend() is selected and proxy.current is selected
+    real = np.float32 if fp32 else np.float64
+    complex_dtype = np.complex64 if fp32 else np.complex128
+    assert selected.real_dtype == real and selected.complex_dtype == complex_dtype
+    value = np.array([1.25 if fp32 else 1 + 2**-40], dtype=real)
+    actual = selected.asarray(value)
+    assert actual.dtype == np.dtype(real)
+    np.testing.assert_array_equal(selected.numpy(actual), value)
+    value = value.astype(complex_dtype) * (1 + 1j)
+    actual = selected.asarray(value)
+    assert actual.dtype == np.dtype(complex_dtype)
+    np.testing.assert_array_equal(selected.numpy(actual), value)
+
+# Explicit float32 contexts remain legal even if legacy defaults request f64.
+ctx = make_context('jax', device='cpu', real_dtype='float32')
+assert ctx.ops.ones((1,)).dtype == np.float32
+assert bool(jax.config.x64_enabled) is before_x64
+print(json.dumps({'rejected': should_reject, 'x64': before_x64, 'fp32': fp32}))
+'''
+    env = os.environ.copy()
+    env.update(JAX_ENABLE_X64=x64, JAX_PLATFORMS='cpu', CUDA_VISIBLE_DEVICES='',
+               XLA_PYTHON_CLIENT_PREALLOCATE='false')
+    env.pop('RENO_FP32', None)
+    if fp32:
+        env['RENO_FP32'] = ''  # Legacy option is presence-based.
+    result = subprocess.run([sys.executable, '-c', code], env=env, text=True,
+                            capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        'rejected': x64 == '0' and not fp32, 'x64': x64 == '1', 'fp32': fp32}
+
+
 def test_x64_requirement_does_not_mutate_process_configuration():
     code='''
 import jax,json

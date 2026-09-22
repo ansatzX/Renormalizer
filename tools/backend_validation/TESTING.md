@@ -31,6 +31,11 @@ CUDA_VISIBLE_DEVICES=0 python -m pytest \
 
 Use `cupy` or `jax` with `cuda:0` for the other device jobs; JAX float64 requires `JAX_ENABLE_X64=1` before initialization. `RENO_TEST_BACKEND` and `RENO_TEST_DEVICE` are equivalent fixture defaults; CLI options take precedence. An explicitly selected missing or unusable runtime is a failing job, not a skipped success. These options select the new fixtures; they do **not** magically parameterize every historical test or change the application's global backend API. Legacy global-selection checks need a separate process and explicit `set_backend` before collection and execution.
 
+Public `set_backend('jax')` also rejects a float64 request when JAX x64 is
+disabled, preserving the previously selected backend and host RNG states. It
+does not enable x64 implicitly. Explicit float32 contexts and the legacy
+presence-based `RENO_FP32` selection remain available without x64.
+
 Default `python -m pytest` discovers source tests/doctests and the validation tool tests. Build outputs, environments, docs and examples are excluded. The optional JAX adapter is omitted from doctest import only when JAX is absent; an installed but broken runtime is not hidden.
 
 ## Evidence and boundaries
