@@ -52,7 +52,7 @@ def probe_legacy_cupy(device_id=None):
     return True, cp, effective_id
 
 
-def create_backend(name=None, *, explicit=True, device=None):
+def create_backend(name=None, *, explicit=True, device=None, real_dtype=None):
     if name is None and not explicit:
         enabled, _, device_id = probe_legacy_cupy(os.environ.get("RENO_GPU"))
         if enabled:
@@ -70,7 +70,7 @@ def create_backend(name=None, *, explicit=True, device=None):
         return CupyBackend(device=device)
     if normalized == "jax":
         from renormalizer.backend.jax_backend import JaxBackend
-        return JaxBackend(device=device)
+        return JaxBackend(device=device, real_dtype=real_dtype)
     if normalized == "torch":
         from renormalizer.backend.torch_backend import TorchBackend
         return TorchBackend(device=device or "cpu")

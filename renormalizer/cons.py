@@ -46,18 +46,6 @@ xp = backend
 
 
 def set_backend(name):
-    def initialize(candidate):
-        # Match explicit-context precision checks before seeding/publishing a
-        # legacy candidate. Checking here keeps float32 contexts constructible
-        # even when their adapter initially has the legacy float64 default.
-        if candidate.name == 'jax' and not candidate.is_32bits:
-            import jax
-            from renormalizer.backend.contracts import PrecisionError
-            if not jax.config.x64_enabled:
-                raise PrecisionError(
-                    'float64 requires JAX_ENABLE_X64=1 before initialization')
-        candidate.random.seed(2019)
-
     # Legacy selection resets its RNG. Restore host RNGs if candidate setup
     # fails; do not expose a half-initialized backend via the public proxy.
     with _manager._selection_lock:
@@ -66,7 +54,7 @@ def set_backend(name):
         try:
             return _manager.set_backend(
                 name, explicit=True,
-                initialize=initialize,
+                initialize=lambda candidate: candidate.random.seed(2019),
             )
         except BaseException:
             np.random.set_state(numpy_state)

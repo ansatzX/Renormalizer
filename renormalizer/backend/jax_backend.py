@@ -52,7 +52,14 @@ class JaxBackend(AbstractBackend):
     supports_jit = True
     supports_functional_update = True
 
-    def __init__(self, device=None):
+    def __init__(self, device=None, *, real_dtype=None):
+        # Reno's scientific default is double precision. Configure JAX before
+        # creating our arrays, without requiring a new user environment knob.
+        # An explicit float32 context wins over the legacy environment default.
+        dtype = np.dtype(real_dtype if real_dtype is not None else
+                         ('float32' if os.environ.get('RENO_FP32') is not None else 'float64'))
+        if dtype not in (np.dtype('float32'), np.dtype('float64')):
+            raise ValueError('real_dtype must be float32 or float64')
         if device is None:
             self._device = jax.devices()[0]
         elif device == 'cpu':
@@ -65,14 +72,24 @@ class JaxBackend(AbstractBackend):
                 raise ValueError(f'JAX device {device} unavailable') from error
         else:
             raise ValueError(f'unsupported JAX device {device}')
+        if dtype == np.dtype('float64'):
+            jax.config.update('jax_enable_x64', True)
+            if not jax.config.x64_enabled:
+                from renormalizer.backend.contracts import PrecisionError
+                raise PrecisionError('JAX could not enable required double precision')
         self._pending = {}
         super().__init__()
-        if os.environ.get("RENO_FP32") is not None:
+        if dtype == np.dtype('float32'):
             self.use_32bits()
 
         self.linalg = _JaxLinalg(self)
         self._rng_key = jax.device_put(jr.PRNGKey(2019), self._device)
         self.transforms = JaxTransforms()
+        from renormalizer.backend.contracts import check_actual_dtype
+        # Do not publish a backend whose reported precision differs from its
+        # actual allocations, including the legacy global-selection route.
+        for requested in self.dtypes:
+            check_actual_dtype(self.zeros((0,), dtype=requested).dtype, requested)
 
     def __getattr__(self, name):
         attribute = getattr(jnp, name)

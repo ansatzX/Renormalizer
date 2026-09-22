@@ -130,13 +130,16 @@ requests fail instead of accepting a CPU fallback. Run from the source checkout;
 .venvs/run/bin/python -m tools.backend_validation.environment torch --device cpu
 CUDA_VISIBLE_DEVICES=0 .venvs/run/bin/python -m tools.backend_validation.environment torch --device cuda:0
 CUDA_VISIBLE_DEVICES=0 .venvs/run/bin/python -m tools.backend_validation.environment cupy --device cuda:0
-JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu .venvs/run/bin/python -m tools.backend_validation.environment jax --device cpu
-CUDA_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 XLA_PYTHON_CLIENT_PREALLOCATE=false .venvs/run/bin/python -m tools.backend_validation.environment jax --device cuda:0
+.venvs/run/bin/python -m tools.backend_validation.environment jax --device cpu
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false .venvs/run/bin/python -m tools.backend_validation.environment jax --device cuda:0
 ```
 
 Run only the command matching the environment. `cuda:0` is relative to visible
-devices, not necessarily machine GPU0. JAX x64 must be enabled **before** import;
-preallocation is disabled on shared GPUs. CuPy and Torch should likewise use an
+devices, not necessarily machine GPU0. Reno enables JAX double precision when
+its JAX backend is selected; no precision environment variable is required.
+This enables process-wide JAX x64 support for subsequent operations, without
+changing existing arrays. Preallocation is disabled on shared GPUs in the
+example above. CuPy and Torch should likewise use an
 explicitly selected device. This tiny smoke establishes installation/runtime
 functionality, not every algorithm, performance, or memory-capacity guarantee.
 
@@ -146,8 +149,8 @@ For physical regression in an environment also containing pytest:
 RENO_TEST_BACKEND=torch RENO_TEST_DEVICE=cuda:0 CUDA_VISIBLE_DEVICES=0 .venvs/run/bin/python -m pytest renormalizer/mps/tests/test_multibackend_spin.py renormalizer/tn/tests/test_multibackend_spin.py -q
 ```
 
-Use `numpy`/`jax`/`cupy` and the corresponding device for the other builds; retain
-JAX's x64 setting. NumPy1 and NumPy2 need separate environments. These small spin
+Use `numpy`/`jax`/`cupy` and the corresponding device for the other builds.
+NumPy1 and NumPy2 need separate environments. These small spin
 problems do not certify all models, CV paths or optional precision settings.
 
 Optional `primme` remains available for static DMRG; see its installation guide

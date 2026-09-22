@@ -11,9 +11,9 @@ import pytest
 pytestmark=pytest.mark.skipif(importlib.util.find_spec('jax') is None,reason='JAX environment required')
 
 
-@pytest.mark.parametrize('x64', ['0', '1'])
+@pytest.mark.parametrize('x64', [None, '0', '1'])
 @pytest.mark.parametrize('fp32', [False, True])
-def test_public_selection_precision_is_transactional(x64, fp32):
+def test_public_selection_defaults_to_double_precision(x64, fp32):
     # Each process initializes JAX under the requested policy. Changing its
     # global setting in a running test would not test the public startup path.
     code = '''
@@ -22,7 +22,6 @@ import jax
 import numpy as np
 import renormalizer as reno
 from renormalizer.backend.context import make_context
-from renormalizer.backend.contracts import PrecisionError
 
 previous = reno.set_backend('numpy')
 proxy = reno.backend
@@ -32,42 +31,37 @@ numpy_state = np.random.get_state()
 python_state = random.getstate()
 before_x64 = bool(jax.config.x64_enabled)
 fp32 = 'RENO_FP32' in os.environ
-should_reject = not before_x64 and not fp32
-try:
-    selected = reno.set_backend('jax')
-except PrecisionError as error:
-    assert should_reject, str(error)
-    assert 'JAX_ENABLE_X64=1' in str(error)
-    assert reno.get_backend() is previous and proxy.current is previous
-    after = np.random.get_state()
-    assert after[0] == numpy_state[0]
-    np.testing.assert_array_equal(after[1], numpy_state[1])
-    assert after[2:] == numpy_state[2:]
-    assert random.getstate() == python_state
-else:
-    assert not should_reject, 'global JAX selection silently accepted false float64'
-    assert reno.get_backend() is selected and proxy.current is selected
-    real = np.float32 if fp32 else np.float64
-    complex_dtype = np.complex64 if fp32 else np.complex128
-    assert selected.real_dtype == real and selected.complex_dtype == complex_dtype
-    value = np.array([1.25 if fp32 else 1 + 2**-40], dtype=real)
-    actual = selected.asarray(value)
-    assert actual.dtype == np.dtype(real)
-    np.testing.assert_array_equal(selected.numpy(actual), value)
-    value = value.astype(complex_dtype) * (1 + 1j)
-    actual = selected.asarray(value)
-    assert actual.dtype == np.dtype(complex_dtype)
-    np.testing.assert_array_equal(selected.numpy(actual), value)
+selected = reno.set_backend('jax')
+assert reno.get_backend() is selected and proxy.current is selected
+real = np.float32 if fp32 else np.float64
+complex_dtype = np.complex64 if fp32 else np.complex128
+assert selected.real_dtype == real and selected.complex_dtype == complex_dtype
+value = np.array([1.25 if fp32 else 1 + 2**-40], dtype=real)
+actual = selected.asarray(value)
+assert actual.dtype == np.dtype(real)
+np.testing.assert_array_equal(selected.numpy(actual), value)
+value = value.astype(complex_dtype) * (1 + 1j)
+actual = selected.asarray(value)
+assert actual.dtype == np.dtype(complex_dtype)
+np.testing.assert_array_equal(selected.numpy(actual), value)
+after = np.random.get_state()
+assert after[0] == numpy_state[0]
+np.testing.assert_array_equal(after[1], numpy_state[1])
+assert after[2:] == numpy_state[2:]
+assert random.getstate() == python_state
 
 # Explicit float32 contexts remain legal even if legacy defaults request f64.
 ctx = make_context('jax', device='cpu', real_dtype='float32')
 assert ctx.ops.ones((1,)).dtype == np.float32
-assert bool(jax.config.x64_enabled) is before_x64
-print(json.dumps({'rejected': should_reject, 'x64': before_x64, 'fp32': fp32}))
+assert bool(jax.config.x64_enabled) == (before_x64 or not fp32)
+print(json.dumps({'x64': bool(jax.config.x64_enabled), 'fp32': fp32}))
 '''
     env = os.environ.copy()
-    env.update(JAX_ENABLE_X64=x64, JAX_PLATFORMS='cpu', CUDA_VISIBLE_DEVICES='',
+    env.update(JAX_PLATFORMS='cpu', CUDA_VISIBLE_DEVICES='',
                XLA_PYTHON_CLIENT_PREALLOCATE='false')
+    env.pop('JAX_ENABLE_X64', None)
+    if x64 is not None:
+        env['JAX_ENABLE_X64'] = x64
     env.pop('RENO_FP32', None)
     if fp32:
         env['RENO_FP32'] = ''  # Legacy option is presence-based.
@@ -75,30 +69,65 @@ print(json.dumps({'rejected': should_reject, 'x64': before_x64, 'fp32': fp32}))
                             capture_output=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout.strip().splitlines()[-1]) == {
-        'rejected': x64 == '0' and not fp32, 'x64': x64 == '1', 'fp32': fp32}
+        'x64': x64 == '1' or not fp32, 'fp32': fp32}
 
 
-def test_x64_requirement_does_not_mutate_process_configuration():
+def test_default_context_enables_double_but_explicit_float32_does_not():
     code='''
-import jax,json
+import jax,json,numpy as np
 from renormalizer.backend.context import make_context
 before=bool(jax.config.x64_enabled)
-make_context('jax',device='cpu',real_dtype='float32')
-try:
-    make_context('jax',device='cpu',real_dtype='float64')
-except ValueError as error:
-    message=str(error)
-else:
-    raise AssertionError('float64 silently accepted without x64')
-print(json.dumps([before,bool(jax.config.x64_enabled),message]))
+ctx32=make_context('jax',device='cpu',real_dtype='float32')
+assert ctx32.ops.ones((1,)).dtype == np.float32
+assert not jax.config.x64_enabled
+existing = ctx32.ops.ones((1,))
+ctx=make_context('jax',device='cpu')
+assert ctx.ops.ones((1,)).dtype == np.float64
+assert ctx.ops.array([1j]).dtype == np.complex128
+assert existing.dtype == np.float32
+assert ctx32.ops.ones((1,)).dtype == np.float32
+print(json.dumps([before,bool(jax.config.x64_enabled)]))
 '''
     env=os.environ.copy()
     env['JAX_ENABLE_X64']='0'
+    env['JAX_PLATFORMS']='cpu'
+    env['CUDA_VISIBLE_DEVICES']=''
+    env.pop('RENO_FP32', None)
     env['XLA_PYTHON_CLIENT_PREALLOCATE']='false'
     result=subprocess.run([sys.executable,'-c',code],env=env,text=True,capture_output=True,timeout=60,check=True)
-    before,after,message=json.loads(result.stdout.strip().splitlines()[-1])
-    assert before is False and after is False
-    assert 'JAX_ENABLE_X64=1' in message
+    before,after=json.loads(result.stdout.strip().splitlines()[-1])
+    assert before is False and after is True
+
+
+def test_failed_x64_configuration_does_not_publish_backend():
+    code = '''
+import jax, numpy as np, random
+import renormalizer as reno
+from renormalizer.backend.contracts import PrecisionError
+previous = reno.set_backend('numpy')
+numpy_state = np.random.get_state()
+python_state = random.getstate()
+# A configuration operation that did not take effect must fail closed.
+jax.config.update = lambda *args: None
+try:
+    reno.set_backend('jax')
+except PrecisionError:
+    pass
+else:
+    raise AssertionError('unavailable double precision was accepted')
+assert reno.get_backend() is previous and reno.backend.current is previous
+after = np.random.get_state()
+assert after[0] == numpy_state[0] and after[2:] == numpy_state[2:]
+np.testing.assert_array_equal(after[1], numpy_state[1])
+assert random.getstate() == python_state
+assert not jax.config.x64_enabled
+'''
+    env = os.environ.copy()
+    env.update(JAX_ENABLE_X64='0', JAX_PLATFORMS='cpu', CUDA_VISIBLE_DEVICES='')
+    env.pop('RENO_FP32', None)
+    result = subprocess.run([sys.executable, '-c', code], env=env, text=True,
+                            capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_instance_rng_precision_and_sync_does_not_retain_arrays():

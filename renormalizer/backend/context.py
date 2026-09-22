@@ -70,6 +70,8 @@ def make_context(name='numpy', *, device='cpu', real_dtype='float64', host_polic
 
     Device selection and requested precision are verified before publishing the
     context. Optional libraries are imported only when explicitly selected.
+    Selecting JAX float64 enables JAX's process-wide x64 support; existing
+    arrays retain their dtype. Explicit float32 never disables x64 support.
     """
     from renormalizer.backend.contracts import CapabilityError, PrecisionError
     if host_policy not in ('forbid', 'explicit'):
@@ -82,11 +84,9 @@ def make_context(name='numpy', *, device='cpu', real_dtype='float64', host_polic
         if device != 'cpu':
             raise ValueError('NumPy context device must be cpu')
         adapter = create_backend(normalized, explicit=True)
+    elif normalized == 'jax':
+        adapter = create_backend(normalized, explicit=True, device=device, real_dtype=dtype)
     else:
-        if normalized == 'jax' and dtype == np.dtype('float64'):
-            import jax
-            if not jax.config.x64_enabled:
-                raise PrecisionError('float64 requires JAX_ENABLE_X64=1 before initialization')
         adapter = create_backend(normalized, explicit=True, device=device)
     complex_dtype = np.dtype('complex64' if dtype == np.dtype('float32') else 'complex128')
     # Explicit policy wins over the old presence-based RENO_FP32 default.
