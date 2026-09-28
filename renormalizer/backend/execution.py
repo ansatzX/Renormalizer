@@ -110,21 +110,29 @@ def _witness(result):
             device=_device(result),dtype=str(result.dtype),adapter_id=id(adapter),shape=tuple(result.shape)))
 
 
-def _promote_operands(values, adapter):
-    if adapter.name != 'torch':
-        return tuple(values)
+def _contraction_dtype(values, adapter):
     from .contracts import PROMOTION
     arrays = [a for a in values if hasattr(a, 'shape') and hasattr(a, 'dtype')]
     if not arrays:
-        return tuple(values)
-    dtype = np.dtype(str(arrays[0].dtype).removeprefix('torch.'))
+        return None
+    dtype = adapter.dtype_of(arrays[0])
     for a in arrays[1:]:
-        other = np.dtype(str(a.dtype).removeprefix('torch.'))
-        dtype = PROMOTION.get((dtype, other), np.result_type(dtype, other))
+        other = adapter.dtype_of(a)
+        promoted = PROMOTION.get((dtype, other))
+        dtype = np.result_type(dtype, other) if promoted is None else promoted
+    return dtype
+
+
+def _promote_operands(values, adapter, dtype=None):
+    if adapter.name != 'torch':
+        return tuple(values)
+    dtype = _contraction_dtype(values, adapter) if dtype is None else dtype
+    if dtype is None:
+        return tuple(values)
     result = []
     for a in values:
         if hasattr(a, 'shape') and hasattr(a, 'dtype'):
-            b = adapter.asarray(a, dtype=dtype)
+            b = a if adapter.dtype_of(a) == dtype else adapter.asarray(a, dtype=dtype)
             _record_transfer(a, b, 'explicit contraction dtype promotion')
             result.append(b)
         else:
@@ -138,7 +146,12 @@ def contract(*args, **kwargs):
     args = tuple(to_backend(a) if hasattr(a,'shape') and hasattr(a,'dtype') else a for a in args)
     args = _promote_operands(args, selected)
     kwargs['backend'] = selected.opt_einsum_name
-    result = oe.contract(*args,**kwargs)
+    context = _context.get()
+    if context is None or context.operators.policy == 'builtin':
+        result = oe.contract(*args, **kwargs)
+    else:
+        from .operators import dispatch
+        result = dispatch(context, 'contract', oe.contract, args, kwargs)
     _witness(result)
     return result
 
@@ -148,9 +161,10 @@ def contract_expression(*args, **kwargs):
     # process-default device conversion. Expressions belong to one instance.
     selected = current_backend()
     converted = tuple(to_backend(a) if hasattr(a, 'dtype') and hasattr(a, 'shape') else a for a in args)
+    context = _context.get()
     expr = oe.contract_expression(*converted, **kwargs)
-    # Retain only the latest precision specialization, never operand contents.
-    # Tuple comparison avoids content hashes and an unbounded expression cache.
+    # Retain only the latest precision specialization and its constants, never
+    # runtime operand contents. Metadata comparisons need no content hashes.
     specialization = None
     def call(*operands, **options):
         nonlocal specialization
@@ -160,16 +174,27 @@ def contract_expression(*args, **kwargs):
         native = tuple(to_backend(a) for a in operands)
         active_expr = expr
         if selected.name == 'torch':
-            promoted = _promote_operands(converted + native, selected)
-            signature = tuple(a.dtype if hasattr(a,'dtype') else None for a in promoted)
+            dtype = _contraction_dtype(converted + native, selected)
             cached = specialization
-            if cached is None or cached[0] != signature:
-                active_expr = oe.contract_expression(*promoted[:len(converted)], **kwargs)
-                specialization = (signature, active_expr)
+            if cached is None or cached[0] != dtype:
+                constants = _promote_operands(converted, selected, dtype)
+                if any(a is not b for a, b in zip(constants, converted)):
+                    active_expr = oe.contract_expression(*constants, **kwargs)
+                specialization = (dtype, active_expr)
             else:
                 active_expr = cached[1]
-            native = promoted[len(converted):]
-        result = active_expr(*native, **options)
+            native = _promote_operands(native, selected, dtype)
+        if context is not None and context.operators.policy != 'builtin' and _context.get() is not context:
+            raise CapabilityError('contraction expression belongs to another numerical context')
+        if context is None or context.operators.policy == 'builtin':
+            result = active_expr(*native, **options)
+        else:
+            from .operators import dispatch
+            def evaluate(*values, expression, **opts):
+                return expression(*values, **opts)
+            result = dispatch(context, 'contract_expression', evaluate, native,
+                              dict(options, expression=active_expr),
+                              metadata_values=converted + native)
         _witness(result)
         return result
     return call

@@ -63,6 +63,9 @@ class TorchBackend(AbstractBackend):
     def array(self,data,dtype=None,*,copy=True):
         if copy is not None and type(copy) is not bool:
             raise TypeError('copy must be None, True, or False')
+        if (copy is None and self.owns(data)
+                and (dtype is None or data.dtype == self._dtype(dtype))):
+            return data
         if dtype is None:
             dtype = self.dtype_of(data) if isinstance(data,self._torch.Tensor) else np.asarray(data).dtype
         dtype = self._dtype(dtype)

@@ -116,7 +116,8 @@ class JaxBackend(AbstractBackend):
         for value in jax.tree.leaves(result):
             if isinstance(value, jax.Array):
                 key = id(value)
-                self._pending[key] = weakref.ref(value, lambda ref, key=key: self._pending.pop(key, None))
+                if key not in self._pending:
+                    self._pending[key] = weakref.ref(value, lambda ref, key=key: self._pending.pop(key, None))
         return result
 
     def tensordot(self, a, b, axes=2):
@@ -168,6 +169,11 @@ class JaxBackend(AbstractBackend):
     def array(self, data, dtype=None, *, copy=True):
         if copy is not None and type(copy) is not bool:
             raise TypeError('copy must be None, True, or False')
+        # Tracers have no concrete device. An explicit dtype also removes JAX's
+        # weak scalar typing, even when its storage dtype already matches.
+        if (copy is None and not isinstance(data, jax.core.Tracer) and self.owns(data)
+                and (dtype is None or (np.dtype(dtype) == data.dtype and not data.weak_type))):
+            return self.track(data)
         if copy is False:
             if not self.owns(data) or (dtype is not None and np.dtype(dtype) != data.dtype):
                 raise ValueError('copy=False cannot transfer or convert a JAX array')

@@ -20,7 +20,8 @@ def _authorize(context):
 
 def _dtype(array):
     # Torch exposes torch.dtype rather than a NumPy dtype object.
-    return np.dtype(str(array.dtype).removeprefix('torch.'))
+    dtype = array.dtype
+    return dtype if isinstance(dtype, np.dtype) else np.dtype(str(dtype).removeprefix('torch.'))
 
 
 def _identifier(operation_id):

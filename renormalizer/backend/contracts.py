@@ -49,6 +49,35 @@ def check_solve_shapes(a, b):
         raise ValueError('solve RHS must have shape (n,) or (n,k)')
 
 
+def _numpy_einsum(subscripts, *operands):
+    """Use native GEMM for ordinary two-matrix contractions, without planning.
+
+    Diagonals, ellipses, broadcasting and other contractions keep NumPy's full
+    einsum semantics. This changes no contraction order for multi-input calls.
+    """
+    if len(operands) == 2 and all(x.ndim == 2 for x in operands):
+        parts = subscripts.replace(' ', '').split('->')
+        if len(parts) == 2:
+            inputs, output = parts
+            labels = inputs.split(',')
+            if (len(labels) == 2 and len(output) == 2
+                    and all(len(s) == 2 and s.isascii() and s.isalpha() for s in labels)
+                    and labels[0][0] != labels[0][1] and labels[1][0] != labels[1][1]):
+                left, right = labels
+                shared = set(left) & set(right)
+                if len(shared) == 1:
+                    contracted = next(iter(shared))
+                    free = left.replace(contracted, '') + right.replace(contracted, '')
+                    if output in (free, free[::-1]):
+                        a, b = operands
+                        a = a if left[1] == contracted else a.T
+                        b = b if right[0] == contracted else b.T
+                        if a.shape[1] == b.shape[0]:
+                            result = np.matmul(a, b)
+                            return result if output == free else result.T
+    return np.einsum(subscripts, *operands)
+
+
 @dataclass(frozen=True)
 class StrictOperations:
     context: object
@@ -59,6 +88,12 @@ class StrictOperations:
         'sum', 'max', 'min', 'real', 'imag', 'matmul', 'einsum', 'qr', 'svd',
         'eigh', 'solve', 'norm', 'at_set', 'at_add', 'at_sub', 'at_mul', 'scalar', 'sync',
     ))
+
+    def _compute(self, operation, builtin, *args, **kwargs):
+        if self.context.operators.policy == 'builtin':
+            return builtin(*args, **kwargs)
+        from .operators import dispatch
+        return dispatch(self.context, operation, builtin, args, kwargs)
 
     def capability(self, operation, dtype):
         """Implementation domain only; runtime evidence is recorded separately."""
@@ -108,11 +143,14 @@ class StrictOperations:
         raise OwnershipError('operation requires an array or scalar; use an explicit conversion')
 
     def _promote(self, *args):
-        arrays = [self._operand(x) for x in args]
+        return self._promote_arrays([self._operand(x) for x in args])
+
+    def _promote_arrays(self, arrays):
+        """Promote inputs already checked in this call, without rescanning them."""
         dtype = arrays[0].dtype
         for x in arrays[1:]:
             dtype = PROMOTION[dtype, x.dtype]
-        return [x.astype(dtype, copy=False) for x in arrays], dtype
+        return [x if x.dtype == dtype else x.astype(dtype, copy=False) for x in arrays], dtype
 
     def array(self, data, dtype=None, *, copy=None):
         if not isinstance(data, (np.ndarray, np.generic, list, tuple, numbers.Number)):
@@ -206,20 +244,18 @@ class StrictOperations:
         return self._result(np.imag(self._owned(x)))
 
     def matmul(self, a, b):
-        self._owned(a)
-        self._owned(b)
-        return self._binary(np.matmul, a, b)
+        (a, b), dtype = self._promote_arrays([self._owned(a), self._owned(b)])
+        with np.errstate(over='raise', invalid='raise', divide='raise'):
+            return self._result(self._compute('matmul', np.matmul, a, b), dtype)
 
     def einsum(self, subscripts, *operands):
         if not isinstance(subscripts, str) or '->' not in subscripts:
             raise ValueError('einsum requires explicit output subscripts')
         if not operands:
             raise ValueError('einsum requires operands')
-        for operand in operands:
-            self._owned(operand)
-        arrays, dtype = self._promote(*operands)
+        arrays, dtype = self._promote_arrays([self._owned(x) for x in operands])
         with np.errstate(over='raise', invalid='raise'):
-            return self._result(np.einsum(subscripts, *arrays), dtype)
+            return self._result(self._compute('einsum', _numpy_einsum, subscripts, *arrays), dtype)
 
     def _matrix(self, a, *, square=False):
         self._owned(a)
@@ -231,13 +267,13 @@ class StrictOperations:
         if mode != 'reduced':
             raise CapabilityError('only reduced QR is supported')
         self._matrix(a)
-        return tuple(self._result(x, a.dtype) for x in np.linalg.qr(a, mode='reduced'))
+        return tuple(self._result(x, a.dtype) for x in self._compute('qr', np.linalg.qr, a, mode='reduced'))
 
     def svd(self, a, full_matrices=False):
         if full_matrices is not False:
             raise CapabilityError('only reduced SVD is supported')
         self._matrix(a)
-        u, s, vh = np.linalg.svd(a, full_matrices=False)
+        u, s, vh = self._compute('svd', np.linalg.svd, a, full_matrices=False)
         real_dtype = np.empty((), dtype=a.dtype).real.dtype
         return self._result(u, a.dtype), self._result(s, real_dtype), self._result(vh, a.dtype)
 
@@ -245,7 +281,7 @@ class StrictOperations:
         if UPLO not in ('L', 'U'):
             raise ValueError('UPLO must be L or U')
         self._matrix(a, square=True)
-        w, v = np.linalg.eigh(a, UPLO=UPLO)
+        w, v = self._compute('eigh', np.linalg.eigh, a, UPLO=UPLO)
         real_dtype = np.empty((), dtype=a.dtype).real.dtype
         return self._result(w, real_dtype), self._result(v, a.dtype)
 
@@ -253,8 +289,8 @@ class StrictOperations:
         self._owned(a)
         self._owned(b)
         check_solve_shapes(a, b)
-        (a, b), dtype = self._promote(a, b)
-        return self._result(np.linalg.solve(a, b), dtype)
+        (a, b), dtype = self._promote_arrays([a, b])
+        return self._result(self._compute('solve', np.linalg.solve, a, b), dtype)
 
     def norm(self, x, ord=None, axis=None, keepdims=False):
         self._owned(x)
@@ -289,7 +325,7 @@ class StrictOperations:
             if not all(isinstance(part, (int, np.integer, slice)) and not isinstance(part, (bool, np.bool_)) for part in parts):
                 raise CapabilityError('unsupported index pattern')
             x[idx]  # Validate basic indexing before allocating an output.
-        (x, value), dtype = self._promote(x, value)
+        (x, value), dtype = self._promote_arrays([x, self._operand(value)])
         y = x.copy()
         with np.errstate(over='raise', invalid='raise', divide='raise'):
             if name == 'set':
@@ -375,12 +411,14 @@ class DeviceOperations(StrictOperations):
             return self._owned(self.array(x))
         return self._owned(x)
 
-    def _promote(self, *args):
-        arrays = [self._operand(x) for x in args]
+    def _promote_arrays(self, arrays):
         dtype = self.adapter.dtype_of(arrays[0])
         for x in arrays[1:]:
             dtype = PROMOTION[dtype, self.adapter.dtype_of(x)]
-        return [self._call('astype', x, dtype, copy=False) for x in arrays], dtype
+        return [x if (self.adapter.dtype_of(x) == dtype
+                      and (self.adapter.name != 'jax' or not x.weak_type))
+                else self._call('astype', x, dtype, copy=False)
+                for x in arrays], dtype
 
     def array(self, data, dtype=None, *, copy=None):
         if isinstance(data, self.adapter.device_array_types):
@@ -482,31 +520,28 @@ class DeviceOperations(StrictOperations):
         return self._result(self._call('imag',self._owned(x)))
 
     def matmul(self,a,b):
-        self._owned(a)
-        self._owned(b)
-        return self._binary('matmul',a,b)
+        (a,b),dtype = self._promote_arrays([self._owned(a), self._owned(b)])
+        return self._result(self._compute('matmul', lambda a,b: self._call('matmul',a,b), a,b),dtype)
 
     def einsum(self,subscripts,*operands):
         if not isinstance(subscripts,str) or '->' not in subscripts:
             raise ValueError('einsum requires explicit output subscripts')
         if not operands:
             raise ValueError('einsum requires operands')
-        for operand in operands:
-            self._owned(operand)
-        arrays,dtype=self._promote(*operands)
-        return self._result(self._call('einsum',subscripts,*arrays),dtype)
+        arrays,dtype=self._promote_arrays([self._owned(x) for x in operands])
+        return self._result(self._compute('einsum', lambda *a: self._call('einsum',*a), subscripts,*arrays),dtype)
 
     def qr(self,a,mode='reduced'):
         if mode != 'reduced':
             raise CapabilityError('only reduced QR is supported')
         self._matrix(a)
-        return tuple(self._result(x,self.adapter.dtype_of(a)) for x in self._call('linalg.qr',a,mode=mode))
+        return tuple(self._result(x,self.adapter.dtype_of(a)) for x in self._compute('qr', lambda *a,**k: self._call('linalg.qr',*a,**k), a,mode=mode))
 
     def svd(self,a,full_matrices=False):
         if full_matrices is not False:
             raise CapabilityError('only reduced SVD is supported')
         self._matrix(a)
-        u,s,vh=self._call('linalg.svd',a,full_matrices=False)
+        u,s,vh=self._compute('svd', lambda *a,**k: self._call('linalg.svd',*a,**k), a,full_matrices=False)
         dtype=self.adapter.dtype_of(a)
         return self._result(u,dtype),self._result(s,np.empty((),dtype=dtype).real.dtype),self._result(vh,dtype)
 
@@ -514,7 +549,7 @@ class DeviceOperations(StrictOperations):
         if UPLO not in ('L','U'):
             raise ValueError('UPLO must be L or U')
         self._matrix(a,square=True)
-        w,v=self._call('linalg.eigh',a,UPLO=UPLO)
+        w,v=self._compute('eigh', lambda *a,**k: self._call('linalg.eigh',*a,**k), a,UPLO=UPLO)
         dtype=self.adapter.dtype_of(a)
         return self._result(w,np.empty((),dtype=dtype).real.dtype),self._result(v,dtype)
 
@@ -522,8 +557,8 @@ class DeviceOperations(StrictOperations):
         self._owned(a)
         self._owned(b)
         check_solve_shapes(a,b)
-        (a,b),dtype=self._promote(a,b)
-        return self._result(self._call('linalg.solve',a,b),dtype)
+        (a,b),dtype=self._promote_arrays([a,b])
+        return self._result(self._compute('solve', lambda *a,**k: self._call('linalg.solve',*a,**k), a,b),dtype)
 
     def norm(self,x,ord=None,axis=None,keepdims=False):
         self._owned(x)
@@ -559,5 +594,5 @@ class DeviceOperations(StrictOperations):
                     # Validate basic slicing as metadata. Torch cannot directly
                     # index negative steps; its adapter normalizes those updates.
                     part.indices(x.shape[axis])
-        (x,value),dtype=self._promote(x,value)
+        (x,value),dtype=self._promote_arrays([x,self._operand(value)])
         return self._result(self.adapter.strict_update(name,x,idx,value),dtype)

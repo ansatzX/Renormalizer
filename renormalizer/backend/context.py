@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from renormalizer.backend.factory import create_backend, normalize_backend_name
+from renormalizer.backend.contracts import StrictOperations, DeviceOperations
 from renormalizer.backend.proxy import BackendProxy
 from renormalizer.cons import runtime_backend
 
@@ -58,14 +59,22 @@ class NumericalContext:
     real_dtype: np.dtype
     complex_dtype: np.dtype
     host_policy: str
+    operators: object = None
+
+    def __post_init__(self):
+        if self.operators is None:
+            from .operators import OperatorSelection
+            object.__setattr__(self, "operators", OperatorSelection())
 
     @property
     def ops(self):
-        from renormalizer.backend.contracts import StrictOperations, DeviceOperations
+        # Resolve classes once at import, but do not retain an ops -> context ->
+        # ops cycle: context/native owners must release without cyclic GC.
         return StrictOperations(self) if self.adapter.name == "numpy" else DeviceOperations(self)
 
 
-def make_context(name='numpy', *, device='cpu', real_dtype='float64', host_policy='forbid'):
+def make_context(name='numpy', *, device='cpu', real_dtype='float64', host_policy='forbid',
+                 operator_policy='builtin', operator_providers=()):
     """Create a private instance without selecting it or seeding global RNGs.
 
     Device selection and requested precision are verified before publishing the
@@ -74,6 +83,8 @@ def make_context(name='numpy', *, device='cpu', real_dtype='float64', host_polic
     arrays retain their dtype. Explicit float32 never disables x64 support.
     """
     from renormalizer.backend.contracts import CapabilityError, PrecisionError
+    from .operators import select_operators
+    operators = select_operators(operator_policy, operator_providers)
     if host_policy not in ('forbid', 'explicit'):
         raise ValueError("host_policy must be 'forbid' or 'explicit'")
     dtype = np.dtype(real_dtype)
@@ -98,4 +109,4 @@ def make_context(name='numpy', *, device='cpu', real_dtype='float64', host_polic
     if actual != dtype:
         raise PrecisionError(f'requested {dtype}, received {actual}')
     adapter.first_mp = True
-    return NumericalContext(adapter, device, dtype, complex_dtype, host_policy)
+    return NumericalContext(adapter, device, dtype, complex_dtype, host_policy, operators)
