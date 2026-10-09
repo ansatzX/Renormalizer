@@ -178,3 +178,38 @@ def test_sync_waits_for_live_legacy_linalg_result(monkeypatch):
     monkeypatch.setattr(type(q),'block_until_ready',wait)
     ctx.ops.sync()
     assert id(q) in waited and id(r) in waited
+
+
+def test_host_upload_does_not_alias_host_storage():
+    # Host Matrix storage is mutable; an uploaded array must keep its values.
+    from renormalizer.backend.context import make_context
+    ctx=make_context('jax',device='cpu',real_dtype='float64')
+    for copy in (None, True):
+        host=np.arange(6.).reshape(2,3)
+        uploaded=ctx.adapter.array(host, copy=copy)
+        host[0,0]=42.
+        assert uploaded.dtype==np.float64 and ctx.adapter.owns(uploaded)
+        np.testing.assert_array_equal(np.asarray(uploaded), np.arange(6.).reshape(2,3))
+
+
+def test_write_owned_rows_match_functional_update_and_sync_skips_donated():
+    from renormalizer.backend.context import make_context
+    ctx=make_context('jax',device='cpu',real_dtype='float64')
+    adapter=ctx.adapter
+    expected=np.zeros((4,3), dtype=complex)
+    workspace=adapter.zeros((4,3), dtype=np.complex128)
+    for row in (0, np.int64(2), -1):
+        value=np.full(3, 1.5+row*1j)
+        expected[row]=value
+        workspace=adapter.write_owned(workspace, row, value)
+    np.testing.assert_array_equal(np.asarray(workspace), expected)
+    # Slices keep the functional path.
+    workspace=adapter.write_owned(workspace, slice(1, 2), np.ones((1,3)))
+    expected[1:2]=1
+    np.testing.assert_array_equal(np.asarray(workspace), expected)
+    # A still-referenced donated buffer must not break sync.
+    donated=workspace
+    workspace=adapter.write_owned(donated, 3, np.zeros(3))
+    adapter.sync()
+    expected[3]=0
+    np.testing.assert_array_equal(np.asarray(workspace), expected)

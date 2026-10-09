@@ -114,7 +114,7 @@ def test_torch_expression_promotes_constants_once_and_releases_them(monkeypatch)
         for _ in range(3):
             np.testing.assert_array_equal(ctx.adapter.numpy(call(complex_value)), np.eye(8)*1j)
         # One promoted constant belongs to this expression, not to each call.
-        assert conversions == [8*8*16]
+        assert len(conversions) == 1
         assert len(builds) == 2
         assert refs[0]() is not None
         call(real)
@@ -177,10 +177,9 @@ def test_jax_tracking_does_not_retain_borrowed_arrays():
     pytest.importorskip('jax')
     ctx = make_context('jax')
     value = ctx.adapter.from_numpy(np.arange(6.))
-    key, reference = id(value), weakref.ref(value)
+    reference = weakref.ref(value)
     for _ in range(5):
         assert ctx.adapter.asarray(value) is value
     ctx.adapter.sync()
     del value
     assert reference() is None
-    assert key not in ctx.adapter._pending

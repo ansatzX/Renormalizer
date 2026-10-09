@@ -1038,7 +1038,7 @@ class MatrixProduct:
         new._mp = [None] * len(self)
         new.dtype = self.dtype
         # With OFS, `model` is a mutable object
-        new.model = self.model.copy()
+        new.model = self.model.shallow_copy()
         # need to deep copy compress_config because threshold might change dynamically
         new.compress_config = self.compress_config.copy()
         new.qn = [qn.copy() for qn in self.qn]

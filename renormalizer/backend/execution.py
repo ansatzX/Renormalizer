@@ -6,12 +6,14 @@ workspace. Existing Matrix/tree storage and scientific solvers remain on host.
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import wraps
+from functools import lru_cache, wraps
 from math import prod
 import numpy as np
 import opt_einsum as oe
 from .context import capture_backend, current_backend
-from .contracts import CapabilityError
+from .contracts import CapabilityError, NUMERIC_DTYPES, AUXILIARY_DTYPES
+
+_HOST_DTYPES = frozenset(NUMERIC_DTYPES + AUXILIARY_DTYPES)
 
 _context = ContextVar('renormalizer_numerical_context', default=None)
 _ledger = ContextVar('renormalizer_execution_ledger', default=None)
@@ -80,6 +82,13 @@ def _record_transfer(source, result, reason):
 def to_backend(array):
     selected = current_backend()
     context, ledger = _context.get(), _ledger.get()
+    # NumPy hot path: uploading a host ndarray to the NumPy adapter is the
+    # identity, and without a ledger there is nothing to record. DMRG/TDVP issue
+    # tens of thousands of small contractions, so skip the conversion chain.
+    # Context uploads keep from_host's dtype domain; others take the slow path.
+    if ledger is None and type(array) is np.ndarray and selected.name == 'numpy' and (
+            context is None or array.dtype in _HOST_DTYPES):
+        return array
     if context is not None and isinstance(array, np.ndarray):
         from .host_solver import from_host
         return from_host(array, context=context, ledger=None if ledger is None else ledger.transfers,
@@ -90,6 +99,10 @@ def to_backend(array):
 
 
 def to_host(array):
+    # Every adapter's numpy() returns host ndarrays unchanged, and an unchanged
+    # array is never recorded as a transfer.
+    if type(array) is np.ndarray:
+        return array
     context, ledger = _context.get(), _ledger.get()
     if context is not None and not isinstance(array, np.ndarray):
         from .host_solver import to_host as download
@@ -156,12 +169,28 @@ def contract(*args, **kwargs):
     return result
 
 
+@lru_cache(maxsize=4096)
+def _cached_path(subscripts, shapes, options):
+    path, _ = oe.contract_path(subscripts, *shapes, shapes=True, **dict(options))
+    return path
+
+
 def contract_expression(*args, **kwargs):
     # Constants must be placed by the captured adapter, not opt_einsum's
     # process-default device conversion. Expressions belong to one instance.
     selected = current_backend()
     converted = tuple(to_backend(a) if hasattr(a, 'dtype') and hasattr(a, 'shape') else a for a in args)
     context = _context.get()
+    if isinstance(kwargs.get('optimize', 'auto'), str) and converted and isinstance(converted[0], str):
+        # Sweeps rebuild the same expression at every site; a named path search
+        # depends only on subscripts, shapes and options, so reuse its result.
+        shapes = tuple(tuple(map(int, a.shape)) if hasattr(a, 'shape') else tuple(map(int, a))
+                       for a in converted[1:])
+        options = tuple(sorted((k, v) for k, v in kwargs.items() if k != 'constants'))
+        try:
+            kwargs['optimize'] = _cached_path(converted[0], shapes, options)
+        except TypeError:  # unhashable option: search the path as before
+            pass
     expr = oe.contract_expression(*converted, **kwargs)
     # Retain only the latest precision specialization and its constants, never
     # runtime operand contents. Metadata comparisons need no content hashes.

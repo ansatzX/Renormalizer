@@ -26,7 +26,7 @@ def _expm_krylov(alpha, beta, V, v_norm, dt):
     # precision. Cast its coefficients to the basis precision at the explicit
     # upload boundary, promoting a real basis when complex time requires it.
     coefficients = u_hess @ (v_norm * np.exp(dt*w_hess) * u_hess[0])
-    basis_dtype = np.dtype(str(V.dtype).removeprefix("torch."))
+    basis_dtype = V.dtype if isinstance(V.dtype, np.dtype) else np.dtype(str(V.dtype).removeprefix("torch."))
     result_dtype = np.result_type(basis_dtype, np.complex64) if np.iscomplexobj(coefficients) else basis_dtype
     if basis_dtype.kind != 'c' and np.iscomplexobj(coefficients):
         # A complex time step needs a complex result, not a complex copy of

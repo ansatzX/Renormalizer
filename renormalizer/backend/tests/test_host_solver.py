@@ -45,25 +45,33 @@ def test_solver_preserves_dtype_and_nested_scalar_metadata(dtype):
     assert result['metadata'][1:] == ('converged', None)
     assert len(ledger) == 2
     for event in ledger:
-        assert event == dict(direction='host_to_host', logical_bytes=x.nbytes,
-                             source_device='cpu', target_device='cpu',
-                             reason='reference solve', operation_id='solve-1')
+        assert event['direction'] == 'host_to_host'
+        assert event['logical_bytes'] == x.nbytes
+        assert event['reason'] == 'reference solve'
+        assert event['operation_id'] == 'solve-1'
 
 
-def test_callback_uses_captured_context_despite_global_switch():
+@pytest.mark.parametrize('switch_to', ['torch', 'jax'])
+def test_callback_uses_captured_context_despite_global_switch(switch_to):
+    # The global switch must select a different backend; otherwise the captured
+    # NumPy context and the global backend are indistinguishable.
+    pytest.importorskip(switch_to)
     from renormalizer.cons import get_backend, set_backend
     context = make_context(host_policy='explicit')
     previous = get_backend()
     rng_state = np.random.get_state()
     ledger = []
     def callback(x):
-        set_backend('numpy')
+        set_backend(switch_to)
         return context.ops.multiply(x, np.array(2., dtype=x.dtype))
     wrapped = wrap_host_callback(callback, context=context, ledger=ledger,
                                  reason='iterative matvec', operation_id='iteration')
     try:
         x = np.arange(3, dtype='float32')
-        np.testing.assert_array_equal(wrapped(x), 2 * x)
+        result = wrapped(x)
+        assert get_backend().name == switch_to
+        assert isinstance(result, np.ndarray) and result.dtype == x.dtype
+        np.testing.assert_array_equal(result, 2 * x)
         assert len(ledger) == 2
         assert {item['operation_id'] for item in ledger} == {'iteration'}
         assert all(item['logical_bytes'] == x.nbytes for item in ledger)

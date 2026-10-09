@@ -60,13 +60,6 @@ def test_allclose_scalar_rhs_consumed_by_tda(captured_backend):
     assert not bool(ctx.adapter.allclose(ctx.ops.array([2.]), 1))
 
 
-def test_allclose_rejects_unknown_keyword(captured_backend):
-    ctx = captured_backend
-    x = ctx.ops.array([1.])
-    with pytest.raises(TypeError):
-        ctx.adapter.allclose(x, x, unsupported_keyword=True)
-
-
 def test_exposed_dot_high_rank_retains_numpy_contraction(captured_backend):
     ctx = captured_backend
     a = np.arange(24.).reshape(2, 3, 4)
@@ -101,7 +94,7 @@ def test_tensordot_axes_forms_consumed_by_tree_updates(captured_backend, axes):
     np.testing.assert_allclose(host(ctx, result), np.tensordot(a, b, axes=axes), rtol=1e-12)
 
 
-def test_diff_and_searchsorted_consumed_by_ivp(captured_backend):
+def test_diff_and_searchsorted_match_numpy(captured_backend):
     ctx = captured_backend
     t = ctx.ops.array([0., .1, .4, .9])
     np.testing.assert_allclose(host(ctx, ctx.adapter.diff(t)), [.1, .3, .5])

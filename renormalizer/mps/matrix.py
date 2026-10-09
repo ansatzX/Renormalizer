@@ -7,6 +7,7 @@ from typing import List, Union
 
 from renormalizer.mps.backend import np
 from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
+from renormalizer.backend.execution import to_backend, to_host
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +307,6 @@ def asnumpy(array):
         return array.array
     if isinstance(array, list):
         return np.array(array)
-    from renormalizer.backend.execution import to_host
     return to_host(array)
 
 
@@ -315,10 +315,6 @@ def asxp(array):
         return None
     if isinstance(array, Matrix):
         array = array.array
-    if isinstance(array, np.ndarray):
-        from renormalizer.backend.execution import to_backend
-        return to_backend(array)
-    from renormalizer.backend.execution import to_backend
     return to_backend(array)
 
 

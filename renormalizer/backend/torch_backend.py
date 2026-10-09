@@ -4,6 +4,8 @@ Narrow migration reference: ef971a3 torch_backend.py's dtype/device and RNG
 mapping. No BackendConfig, distributed, execution-IR or resident dependencies.
 """
 import os
+import sys
+
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
@@ -14,6 +16,15 @@ class TorchBackend(AbstractBackend):
     opt_einsum_name = 'torch'
 
     def __init__(self, device='cpu'):
+        if 'torch' not in sys.modules:
+            # Reno alternates Torch kernels with NumPy/SciPy BLAS calls
+            # (Davidson, SVD, eigh). Under the OpenMP default, Torch's OpenMP
+            # and MKL workers spin after each parallel region and starve the
+            # OpenBLAS threads on the same cores: a pinned 2-thread ground state
+            # took 57 s instead of 17 s. The policy is read once when Torch's
+            # OpenMP runtime loads, so it is only defaulted before that and
+            # never overrides a policy the user chose.
+            os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
         try:
             import torch
         except (ImportError, OSError) as error:

@@ -15,6 +15,10 @@ from renormalizer.backend.abstract import AbstractBackend
 
 logger = logging.getLogger(__name__)
 
+# The row index is traced, so one compilation per workspace shape serves every
+# row; argument 0 is donated so the update happens in place.
+_donated_row_set = jax.jit(lambda x, idx, value: x.at[idx].set(value), donate_argnums=0)
+
 
 class JaxTransforms:
     """Autodiff transform namespace backed by JAX."""
@@ -169,6 +173,15 @@ class JaxBackend(AbstractBackend):
     def array(self, data, dtype=None, *, copy=True):
         if copy is not None and type(copy) is not bool:
             raise TypeError('copy must be None, True, or False')
+        # Host storage (Matrix, environments) is uploaded at every contraction.
+        # device_put places the exact host dtype on the captured device in a new
+        # buffer, satisfying copy=None and copy=True at a fraction of the
+        # jnp.array dispatch cost. Dtypes JAX would canonicalize (64-bit without
+        # x64) keep the jnp.array path and its conversion semantics.
+        if (copy is not False and type(data) is np.ndarray and data.dtype.kind in 'biufc'
+                and (dtype is None or np.dtype(dtype) == data.dtype)
+                and jax.dtypes.canonicalize_dtype(data.dtype) == data.dtype):
+            return self.track(jax.device_put(data, self._device))
         # Tracers have no concrete device. An explicit dtype also removes JAX's
         # weak scalar typing, even when its storage dtype already matches.
         if (copy is None and not isinstance(data, jax.core.Tracer) and self.owns(data)
@@ -203,7 +216,8 @@ class JaxBackend(AbstractBackend):
     def sync(self):
         for reference in list(self._pending.values()):
             value = reference()
-            if value is not None:
+            # write_owned donates workspaces; a donated buffer has no result.
+            if value is not None and not value.is_deleted():
                 value.block_until_ready()
 
     def at_set(self, x, idx, value):
@@ -212,6 +226,16 @@ class JaxBackend(AbstractBackend):
     def write_owned(self, x, idx, value):
         # JAX arrays remain immutable even for private solver workspaces;
         # callers retain this result, and sync must track the new array.
+        # Eager at[].set copies the whole workspace on every write (one copy
+        # of the Krylov basis per Lanczos step). The same update jitted with
+        # x donated reuses its buffer in place; x is caller-owned scratch that
+        # the caller replaces with the result, so invalidating it is within
+        # the contract. Integer rows only: static slice bounds would compile
+        # once per distinct slice.
+        if (isinstance(idx, (int, np.integer)) and not isinstance(idx, bool)
+                and isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer)):
+            with jax.default_device(self._device):
+                return self.track(_donated_row_set(x, idx, value))
         return self.at_set(x, idx, value)
 
     def at_add(self, x, idx, value):

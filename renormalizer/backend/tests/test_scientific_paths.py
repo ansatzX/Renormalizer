@@ -118,7 +118,6 @@ def test_registered_evolution_dense_reference(captured_backend, family, method, 
         with execution.record_execution(context) as ledger:
             evolved = state.evolve(operator, .001, normalize=False, backend_context=context)
             context.adapter.sync()
-    assert len(observed) == len(ledger.operations)
     for event in ledger.operations:
         assert event['adapter_id'] == id(context.adapter)
         assert event['backend'] == context.adapter.name

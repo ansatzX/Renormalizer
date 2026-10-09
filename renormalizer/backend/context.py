@@ -42,7 +42,9 @@ class InternalBackendProxy:
         return current_backend()
 
     def __getattr__(self, name):
-        return getattr(self.current, name)
+        # Inlined current_backend(): every ``xp.<op>`` in the solvers lands here.
+        selected = _active.get()
+        return getattr(runtime_backend() if selected is None else selected, name)
 
     def __setattr__(self, name, value):
         setattr(self.current, name, value)

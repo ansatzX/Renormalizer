@@ -13,17 +13,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: 3.8
+          # pyproject.toml requires Python >=3.10
+          python-version: "3.11"
           cache: "pip"
       - name: install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir -e ".[dev]"
       - name: run tests
         run: |
           pip install pytest-xdist pytest-cov
           export RENO_NUM_THREADS=1
-          pytest -n 4 --durations=0 --cov=renormalizer renormalizer
+          pytest -n 4 --durations=0 --cov=renormalizer renormalizer tools/backend_validation/tests
       - name: run optional tests
         run: |
           pip install primme==3.2.* pyscf==2.4.0
@@ -44,3 +45,40 @@ jobs:
         uses: codecov/codecov-action@v4
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  backend:
+    # Optional array backends on CPU. Without this job every jax/torch test is
+    # skipped, so their adapters would have no automated coverage.
+    runs-on: ubuntu-latest
+    name: backend (${{ matrix.backend }})
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [torch, jax]
+    env:
+      RENO_TEST_BACKEND: ${{ matrix.backend }}
+      RENO_TEST_DEVICE: cpu
+      RENO_NUM_THREADS: 1
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # The CPU wheel index keeps the torch job from downloading CUDA wheels.
+          extra=""
+          if [ "${{ matrix.backend }}" = torch ]; then
+            extra="--extra-index-url https://download.pytorch.org/whl/cpu"
+          fi
+          pip install --no-cache-dir -e ".[dev,${{ matrix.backend }}]" $extra
+      - name: run backend tests
+        run: |
+          pytest --durations=20 \
+            renormalizer/backend/tests \
+            renormalizer/mps/tests/test_multibackend_spin.py \
+            renormalizer/tn/tests/test_multibackend_spin.py \
+            renormalizer/property/tests/test_transition_and_mobility.py

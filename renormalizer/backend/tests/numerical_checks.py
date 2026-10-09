@@ -31,10 +31,6 @@ def _maximum(x):
 def check_error(actual, reference, *, atol=1e-12, rtol=1e-10,
                 atol_max=None, rtol_max=None):
     """Check shape/dtype, then both Frobenius and maximum absolute error."""
-    # Share only trusted CPU arithmetic. Candidate scoring has a narrower
-    # four-dtype/JSON-tolerance policy; retain this helper's original numeric
-    # dtype and NumPy-scalar tolerance domain instead of delegating its policy.
-    from tools.backend_validation.scoring import error_metrics
     actual, reference = np.asarray(actual), np.asarray(reference)
     assert actual.shape == reference.shape, 'shape mismatch'
     assert actual.dtype == reference.dtype, 'dtype mismatch'
@@ -45,13 +41,14 @@ def check_error(actual, reference, *, atol=1e-12, rtol=1e-10,
     rtol_max = rtol if rtol_max is None else rtol_max
     assert np.isfinite([atol_max, rtol_max]).all() and atol_max >= 0 and rtol_max >= 0
     try:
-        metrics = error_metrics(actual, reference, atol_F=atol, rtol_F=rtol,
-                                atol_max=atol_max, rtol_max=rtol_max)
+        # Widen before subtracting so the comparison itself adds no rounding.
+        precision = np.clongdouble if actual.dtype.kind == 'c' else np.longdouble
+        delta = actual.astype(precision) - reference.astype(precision)
+        error, scale = _norm(delta), _norm(reference.astype(precision))
+        max_error, max_scale = _maximum(delta), _maximum(reference.astype(precision))
+        bound, max_bound = atol + rtol * scale, atol_max + rtol_max * max_scale
     except (FloatingPointError, OverflowError) as exc:
         raise AssertionError('validation arithmetic overflow') from exc
-    error, scale = metrics['absolute_frobenius'], metrics['reference_frobenius']
-    bound, max_bound = metrics['frobenius_bound'], metrics['maximum_bound']
-    max_error, max_scale = metrics['maximum_error'], metrics['reference_maximum']
     assert np.isfinite([bound, max_bound, max_error, max_scale]).all(), 'validation arithmetic overflow'
     assert error <= bound, f'Frobenius error {error} > {bound}'
     assert max_error <= max_bound, f'maximum error {max_error} > {max_bound}'

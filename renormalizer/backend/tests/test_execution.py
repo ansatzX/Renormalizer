@@ -1,4 +1,5 @@
 import numpy as np
+import opt_einsum as oe
 import pytest
 from renormalizer.backend.context import make_context
 from renormalizer.backend.execution import bind_backend, record_execution, contract
@@ -48,11 +49,13 @@ def test_expression_constants_captured_and_cross_instance_refused(monkeypatch):
     ctx = make_context(host_policy='explicit')
     constant = np.eye(2)
     converted = []
-    original = ctx.adapter.from_numpy
-    def traced(value):
-        converted.append(value)
-        return original(value)
-    monkeypatch.setattr(ctx.adapter, 'from_numpy', traced)
+    original = oe.contract_expression
+    def traced(*args, **kwargs):
+        converted.extend(args)
+        return original(*args, **kwargs)
+    # NumPy placement is the identity, so the captured constant itself must
+    # reach opt_einsum, without a copy or a process-default conversion.
+    monkeypatch.setattr(oe, 'contract_expression', traced)
     with capture_backend(ctx.adapter):
         expr = contract_expression('ij,jk->ik',constant,(2,2),constants=[0])
         np.testing.assert_array_equal(expr(np.eye(2)),constant)

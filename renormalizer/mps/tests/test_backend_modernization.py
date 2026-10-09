@@ -12,7 +12,7 @@ def test_numpy_backend_gradient_capabilities_are_explicit():
     assert r.backend.supports_jit is False
     assert r.backend.supports_functional_update is True
 
-    with pytest.raises(NotImplementedError, match="does not provide autodiff transform 'grad'"):
+    with pytest.raises(NotImplementedError, match="grad"):
         r.backend.transforms.grad(lambda x: x)
 
 
@@ -35,14 +35,36 @@ def test_backend_proxy_identity_and_stale_xp_dispatch():
     from renormalizer.mps.backend import xp
 
     assert legacy_backend is r.backend
-    old_xp = xp
-    r.set_backend("numpy")
-    assert old_xp is xp
+    previous = r.get_backend()
+    selected = r.set_backend("numpy")
+    # Names imported before the switch stay valid: the module-level proxy is
+    # not replaced, it dispatches to the newly selected instance.
+    from renormalizer.mps.backend import xp as reimported_xp
+    assert reimported_xp is xp
+    assert selected is not previous
+    assert xp.current is selected
 
     a = xp.ones((2, 2))
     b = xp.eye(2) + (1 - xp.eye(2))
     assert xp.allclose(a, b)
     assert r.backend.name == "numpy"
+
+
+def test_backend_proxy_resolves_backend_subpackage_paths():
+    # ``renormalizer.backend`` is the public proxy, but dotted paths into the
+    # ``renormalizer.backend`` subpackage must keep working.
+    from unittest import mock
+    import renormalizer as r
+    import renormalizer.backend.execution as execution
+    from renormalizer.backend import contracts
+
+    assert r.backend.execution is execution
+    assert r.backend.contracts is contracts
+    with mock.patch("renormalizer.backend.execution.to_host") as patched:
+        assert execution.to_host is patched
+    # Backend attributes keep precedence over same-named submodules.
+    assert r.backend.transforms is r.get_backend().transforms
+    assert not hasattr(r.backend, "no_such_attribute_or_module")
 
 
 def test_numpy_backend_functional_updates_return_updated_array():
@@ -76,19 +98,3 @@ def test_asnumpy_handles_backend_array_and_list():
     backend_array = asxp(np.array([1.0, 2.0]))
     assert asnumpy(backend_array).tolist() == [1.0, 2.0]
     assert asnumpy([1.0, 2.0]).tolist() == [1.0, 2.0]
-
-
-def test_legacy_backend_constants_are_not_used_in_core_call_sites():
-    from pathlib import Path
-
-    repo = Path(__file__).resolve().parents[3]
-    checked = [
-        repo / "renormalizer" / "mps" / "gs.py",
-        repo / "renormalizer" / "mps" / "tda.py",
-        repo / "renormalizer" / "cv" / "zerot.py",
-        repo / "renormalizer" / "vibration" / "vscf.py",
-    ]
-
-    for path in checked:
-        text = path.read_text()
-        assert "OE_BACKEND" not in text

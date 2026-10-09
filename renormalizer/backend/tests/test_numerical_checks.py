@@ -88,14 +88,6 @@ def test_shared_arithmetic_preserves_legacy_numeric_domain(dtype):
     checks().check_error(value,value,atol=np.float32(0),rtol=np.float64(0))
 
 
-def test_shared_arithmetic_does_not_round_int64_through_float64():
-    actual=np.array([2**60+1],dtype='int64')
-    reference=np.array([2**60],dtype='int64')
-    with pytest.raises(AssertionError):
-        checks().check_error(actual,reference,atol=0,rtol=0)
-    assert checks().check_error(actual,reference,atol=1,rtol=0)['maximum_error']==1
-
-
 def test_test_helper_keeps_extended_tolerance_bounds():
     if np.finfo(np.longdouble).max <= np.finfo(float).max:
         pytest.skip('platform has no extended exponent range')

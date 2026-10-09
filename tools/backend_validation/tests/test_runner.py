@@ -76,15 +76,10 @@ def test_untrusted_source_never_runs(tmp_path):
     assert not sentinel.exists()
 
 
-def test_symlink_result_and_oversized_output(tmp_path):
-    source='''from pathlib import Path
-import os
-def candidate(a,b):
- os.symlink('../inputs/a.npy','output/result.npy')
- os._exit(0)
-'''
-    manifest,candidate,policy=setup_run(tmp_path,source)
-    assert run_candidate(manifest,candidate,policy)['status']=='fail'
+def test_oversized_output_is_rejected(tmp_path):
+    # Symlinked outputs are rejected by protocol.read_file; see
+    # test_protocol.py::test_symlink_header_and_budget_rejection.
+    manifest,candidate,_=setup_run(tmp_path,'def candidate(a,b): return a @ b\n')
     candidate.write_text('import numpy as np\ndef candidate(a,b): return np.ones((100,100))\n')
     review=review_source(candidate); manifest['candidate_hash']=review.source_hash
     manifest['resource_policy']['max_file_bytes']=1024
@@ -117,6 +112,7 @@ def candidate(a,b):
     assert run_candidate(manifest,candidate,policy)['status']=='pass'
 
 
+@pytest.mark.skipif(not Path('/proc/self/stat').exists(), reason='process state is read from Linux /proc')
 def test_owned_child_is_terminated_after_leader_exits(tmp_path):
     pidfile=tmp_path/'owned-child-pid'
     source=f'''import subprocess,sys

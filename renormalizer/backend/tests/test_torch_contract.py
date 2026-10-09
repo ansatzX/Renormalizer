@@ -65,3 +65,23 @@ def test_legacy_elementwise_extrema_promote_inputs():
     assert ctx.adapter.dtype_of(maximum)==np.float64
     np.testing.assert_array_equal(ctx.ops.to_numpy(maximum),[3,4])
     np.testing.assert_array_equal(ctx.ops.to_numpy(minimum),[1,2])
+
+
+@pytest.mark.parametrize('preset', [None, 'ACTIVE'])
+def test_openmp_wait_policy_defaults_to_passive_before_torch_loads(preset):
+    # Spinning Torch/MKL OpenMP workers starve interleaved OpenBLAS threads;
+    # the default only applies before Torch loads and never overrides a choice.
+    import os, subprocess, sys
+    code = '''
+import os, sys
+assert 'torch' not in sys.modules
+from renormalizer.backend.torch_backend import TorchBackend
+TorchBackend()
+print(os.environ.get('OMP_WAIT_POLICY'))
+'''
+    env = {k: v for k, v in os.environ.items() if k != 'OMP_WAIT_POLICY'}
+    if preset is not None:
+        env['OMP_WAIT_POLICY'] = preset
+    result = subprocess.run([sys.executable, '-c', code], env=env, text=True,
+                            capture_output=True, timeout=120, check=True)
+    assert result.stdout.strip().splitlines()[-1] == (preset or 'PASSIVE')

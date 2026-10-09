@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import importlib
 from threading import RLock
 
 from renormalizer.backend.factory import create_backend
@@ -33,7 +34,22 @@ class BackendProxy:
         return self._manager.current
 
     def __getattr__(self, name):
-        return getattr(self.current, name)
+        try:
+            return getattr(self.current, name)
+        except AttributeError:
+            if name.startswith("__"):
+                raise
+        # ``renormalizer.backend`` is both this public proxy and the backend
+        # subpackage, so dotted module paths (``import renormalizer.backend.x as
+        # y``, ``mock.patch("renormalizer.backend.x.f")``) arrive here. Backend
+        # attributes take precedence; otherwise resolve the submodule.
+        module_name = f"renormalizer.backend.{name}"
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as error:
+            if error.name != module_name:
+                raise  # the submodule exists but one of its imports is missing
+            raise AttributeError(f"backend has no attribute or submodule {name!r}") from None
 
     def __setattr__(self, name, value):
         if name == "_manager":

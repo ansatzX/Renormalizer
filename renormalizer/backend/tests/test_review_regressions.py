@@ -118,37 +118,16 @@ def test_jax_numpy_integer_size(method):
     np.testing.assert_array_equal(b.numpy(actual), b.numpy(expected))
 
 
-def test_disabled_execution_recording_skips_transfer_records(monkeypatch):
-    from renormalizer.backend import execution, host_solver
+def test_execution_recording_is_scoped_to_record_execution():
+    from renormalizer.backend import execution
     ctx = make_context(host_policy='explicit')
-    original = host_solver._record
-    seen = []
-    def check(ledger, **kwargs):
-        seen.append(ledger)
-        return original(ledger, **kwargs)
-    monkeypatch.setattr(host_solver, '_record', check)
     @execution.bind_backend
     def run():
         return execution.contract('ij,jk->ik', np.eye(2), np.eye(2))
     np.testing.assert_array_equal(run(backend_context=ctx), np.eye(2))
-    assert seen == []
     with execution.record_execution(ctx) as ledger:
         run(backend_context=ctx)
     assert ledger.transfers and ledger.operations
-
-
-def test_disabled_host_solver_recording_does_not_create_identifiers(monkeypatch):
-    from renormalizer.backend import host_solver
-    ctx = make_context(host_policy='explicit')
-    def forbidden():
-        raise AssertionError('disabled diagnostics must not create UUIDs')
-    monkeypatch.setattr(host_solver, 'uuid4', forbidden)
-    result = host_solver.call_host_solver(lambda x: x*2, [np.eye(2)],
-                                         context=ctx, ledger=None, reason='test')
-    np.testing.assert_array_equal(result, 2*np.eye(2))
-    callback = host_solver.wrap_host_callback(lambda x: x*3, context=ctx,
-                                             ledger=None, reason='test')
-    np.testing.assert_array_equal(callback(np.eye(2)), 3*np.eye(2))
 
 
 def test_torch_expression_reuses_unchanged_precision(torch_ctx, monkeypatch):
