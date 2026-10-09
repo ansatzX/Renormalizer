@@ -54,8 +54,10 @@ class CupyBackend(AbstractBackend):
         self.device_array_types = (_cupy.ndarray,)
         self.memory_errors = (MemoryError, _cupy.cuda.memory.OutOfMemoryError)
 
-        self.linalg = _cupy.linalg
-        self.random = _cupy.random
+        # Like __getattr__ below, run these namespaces on this adapter's device
+        # rather than on whichever device is current.
+        self.linalg = _DeviceScoped(_cupy.linalg, self._device)
+        self.random = _DeviceScoped(_cupy.random, self._device)
 
         if os.environ.get("RENO_FP32") is not None:
             self.use_32bits()
@@ -71,6 +73,9 @@ class CupyBackend(AbstractBackend):
 
     def current_device(self):
         return f'cuda:{self._device.id}'
+
+    def device_scope(self):
+        return self._device
 
     def is_array(self, x):
         return isinstance(x, self.array_types)
@@ -168,6 +173,24 @@ class CupyBackend(AbstractBackend):
 
     def sync(self):
         self._device.synchronize()
+
+
+class _DeviceScoped:
+    """A CuPy namespace whose functions run on a fixed device."""
+
+    def __init__(self, namespace, device):
+        self._namespace = namespace
+        self._device = device
+
+    def __getattr__(self, name):
+        attribute = getattr(self._namespace, name)
+        if not callable(attribute) or isinstance(attribute, type):
+            return attribute
+        device = self._device
+        def invoke(*args, **kwargs):
+            with device:
+                return attribute(*args, **kwargs)
+        return invoke
 
 
 class _CupyRandom:

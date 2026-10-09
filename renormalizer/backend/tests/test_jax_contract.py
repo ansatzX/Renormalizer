@@ -181,15 +181,19 @@ def test_sync_waits_for_live_legacy_linalg_result(monkeypatch):
 
 
 def test_host_upload_does_not_alias_host_storage():
-    # Host Matrix storage is mutable; an uploaded array must keep its values.
+    # Host Matrix storage is mutable; an uploaded array must keep its values even
+    # when the host array is updated immediately, before an asynchronous transfer
+    # could complete. Repeated with a large buffer so a race shows up reliably.
     from renormalizer.backend.context import make_context
     ctx=make_context('jax',device='cpu',real_dtype='float64')
+    expected=np.arange(512*512.).reshape(512,512)
     for copy in (None, True):
-        host=np.arange(6.).reshape(2,3)
-        uploaded=ctx.adapter.array(host, copy=copy)
-        host[0,0]=42.
-        assert uploaded.dtype==np.float64 and ctx.adapter.owns(uploaded)
-        np.testing.assert_array_equal(np.asarray(uploaded), np.arange(6.).reshape(2,3))
+        for _ in range(50):
+            host=expected.copy()
+            uploaded=ctx.adapter.array(host, copy=copy)
+            host[...]=-1.
+            assert uploaded.dtype==np.float64 and ctx.adapter.owns(uploaded)
+            np.testing.assert_array_equal(np.asarray(uploaded), expected)
 
 
 def test_write_owned_rows_match_functional_update_and_sync_skips_donated():

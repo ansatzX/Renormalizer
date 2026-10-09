@@ -13,7 +13,8 @@ def log_error(e, args, kwargs):
     logger.exception(e)
     logger.fatal("The arguments are:")
     for i, arg in enumerate(args):
-        if isinstance(arg, xp.ndarray):
+        # Host and device operands both appear here (log shapes, not contents).
+        if hasattr(arg, "shape") and hasattr(arg, "dtype"):
             logger.fatal(f"{i} Array type: {type(arg)}, shape:{arg.shape}")
         else:
             logger.fatal(f"{i} Non-array argument: {arg}")

@@ -75,7 +75,7 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
         # Lanczos coefficients feed the small CPU tridiagonal eigensolver;
         # make the synchronizing scalar transfer explicit, not an implicit
         # CUDA-tensor conversion during NumPy assignment.
-        alpha[j] = float(xp.vdot(w, V[j]).real)
+        alpha[j] = float(xp.lanczos_alpha(V, j, w))
 
         if j == len(vstart)-1:
             #logger.debug("the krylov subspace is equal to the full space")
@@ -91,8 +91,11 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
         # NumPy float64 scalars carry a strong dtype into JAX arithmetic.
         # Python scalars keep these host coefficients weakly typed so the
         # native recurrence retains the chosen basis precision.
-        w -= float(alpha[j])*V[j] + (float(beta[j-1])*V[j-1] if j > 0 else 0)
-        beta[j] = float(xp.linalg.norm(w))
+        # The vector part of each Lanczos step goes through the adapter, which
+        # may evaluate it as one computation; the arithmetic is unchanged.
+        w, norm_w = xp.lanczos_orthogonalize(V, j, w, float(alpha[j]),
+                                             float(beta[j-1]) if j > 0 else 0.0)
+        beta[j] = float(norm_w)
         if beta[j] < 100*len(vstart)*np.finfo(float).eps:
             # logger.warning(f'beta[{j}] ~= 0 encountered during Lanczos iteration.')
             return _expm_krylov(alpha[:j+1], beta[:j], V[:j+1, :].T, nrmv, dt), j+1
@@ -103,6 +106,6 @@ def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):
                 return new_res, j+1
             else:
                 res = new_res
-        V = xp.write_owned(V, j + 1, w / float(beta[j]))
+        V = xp.lanczos_append(V, j + 1, w, float(beta[j]))
 
 

@@ -38,6 +38,10 @@ class Environ:
         self.block_env_threshold = block_env_threshold
         self.block_env_min_bond_dim = block_env_min_bond_dim
         self._block_env_cache = BlockEnvCache(mpo, block_env_threshold) if self.use_block_env else None
+        # Dense environments are stored on the host unless the backend asks for
+        # native storage, which spares an upload on every read. The block-sparse
+        # path works on host arrays and keeps host storage.
+        self._native_storage = xp.native_workspace_storage and not self.use_block_env
         if type(mpo) is list:
             ndim = len(mpo) + 2
         else:
@@ -177,7 +181,7 @@ class Environ:
         if isinstance(tensor, BlockEnvData):
             self._virtual_disk[(domain, siteidx)] = tensor
             return
-        self._virtual_disk[(domain, siteidx)] = asnumpy(tensor)
+        self._virtual_disk[(domain, siteidx)] = asxp(tensor) if self._native_storage else asnumpy(tensor)
 
     def read(self, domain: str, siteidx: int):
         tensor = self._virtual_disk[(domain, siteidx)]

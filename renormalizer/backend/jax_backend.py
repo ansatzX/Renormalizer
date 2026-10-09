@@ -2,6 +2,7 @@
 
 """JAX backend — delegates array operations to jax.numpy, exposes autodiff transforms."""
 
+import functools
 import logging
 import os
 import weakref
@@ -18,6 +19,36 @@ logger = logging.getLogger(__name__)
 # The row index is traced, so one compilation per workspace shape serves every
 # row; argument 0 is donated so the update happens in place.
 _donated_row_set = jax.jit(lambda x, idx, value: x.at[idx].set(value), donate_argnums=0)
+
+
+_jit_tensordot = jax.jit(jnp.tensordot, static_argnames=('axes',))
+
+
+# Lanczos recurrence (see AbstractBackend.lanczos_*): the same statements as the
+# eager defaults, each group compiled into one computation. j is traced, so one
+# compilation per workspace shape serves every iteration. Python-float
+# coefficients stay weakly typed and keep the basis precision.
+@jax.jit
+def _jit_lanczos_alpha(V, j, w):
+    return jnp.vdot(w, V[j]).real
+
+
+@jax.jit
+def _jit_lanczos_orthogonalize(V, j, w, alpha_j, beta_prev):
+    # The beta term is absent at j == 0; where() keeps V[-1] out of the result.
+    w = w - (alpha_j*V[j] + jnp.where(j > 0, beta_prev*V[j - 1], 0))
+    return w, jnp.linalg.norm(w)
+
+
+_jit_lanczos_append = jax.jit(lambda V, j, w, beta_j: V.at[j].set(w / beta_j), donate_argnums=0)
+
+
+@functools.lru_cache(maxsize=1024)
+def _fused_einsum(subscripts, path):
+    # One XLA computation per contraction instead of one dispatch per pairwise
+    # step. Every operand, constants included, is an argument, so jit compiles
+    # once per operand shape and reuses it for every site and time step.
+    return jax.jit(functools.partial(jnp.einsum, subscripts, optimize=[tuple(step) for step in path]))
 
 
 class JaxTransforms:
@@ -55,6 +86,9 @@ class JaxBackend(AbstractBackend):
     supports_autodiff = True
     supports_jit = True
     supports_functional_update = True
+    # Every host upload is a copy (see array()); environments re-read each step
+    # are cheaper kept native.
+    native_workspace_storage = True
 
     def __init__(self, device=None, *, real_dtype=None):
         # Reno's scientific default is double precision. Configure JAX before
@@ -85,6 +119,14 @@ class JaxBackend(AbstractBackend):
         super().__init__()
         if dtype == np.dtype('float32'):
             self.use_32bits()
+        cache_dir = os.environ.get('RENO_JAX_CACHE_DIR')
+        if cache_dir:
+            # Opt-in persistent XLA cache: every new shape in a sweep compiles,
+            # which dominates short runs. Process-wide JAX setting; entries are
+            # keyed by computation, shapes and backend, so reuse is safe.
+            jax.config.update('jax_compilation_cache_dir', cache_dir)
+            jax.config.update('jax_persistent_cache_min_compile_time_secs', 0)
+            jax.config.update('jax_persistent_cache_min_entry_size_bytes', 0)
 
         self.linalg = _JaxLinalg(self)
         self._rng_key = jax.device_put(jr.PRNGKey(2019), self._device)
@@ -116,6 +158,37 @@ class JaxBackend(AbstractBackend):
     def dtype_of(self, x):
         return np.dtype(x.dtype)
 
+    def _lanczos_operands(self, *values):
+        return all(isinstance(v, jax.Array) and not isinstance(v, jax.core.Tracer) for v in values)
+
+    def lanczos_alpha(self, V, j, w):
+        if not self._lanczos_operands(V, w):
+            return super().lanczos_alpha(V, j, w)
+        with jax.default_device(self._device):
+            return _jit_lanczos_alpha(V, j, w)
+
+    def lanczos_orthogonalize(self, V, j, w, alpha_j, beta_prev):
+        if not self._lanczos_operands(V, w):
+            return super().lanczos_orthogonalize(V, j, w, alpha_j, beta_prev)
+        with jax.default_device(self._device):
+            w, norm = _jit_lanczos_orthogonalize(V, j, w, alpha_j, beta_prev)
+        return self.track(w), norm
+
+    def lanczos_append(self, V, j, w, beta_j):
+        # V is the caller's private workspace (write_owned contract), so it is donated.
+        if not self._lanczos_operands(V, w):
+            return super().lanczos_append(V, j, w, beta_j)
+        with jax.default_device(self._device):
+            return self.track(_jit_lanczos_append(V, j, w, beta_j))
+
+    def fused_einsum(self, subscripts, path):
+        """Return a callable evaluating one einsum along `path` as a single jitted computation."""
+        fused = _fused_einsum(subscripts, tuple(tuple(step) for step in path))
+        def call(*operands):
+            with jax.default_device(self._device):
+                return self.track(fused(*operands))
+        return call
+
     def track(self, result):
         for value in jax.tree.leaves(result):
             if isinstance(value, jax.Array):
@@ -131,7 +204,14 @@ class JaxBackend(AbstractBackend):
             axes = int(axes)
         else:
             axes = tuple(int(axis) if isinstance(axis, (int, np.integer))
-                         else tuple(axis) for axis in axes)
+                         else tuple(int(i) for i in axis) for axis in axes)
+        # Environment updates contract pairwise through here many times per
+        # sweep. The jitted form is one dispatch instead of several (transpose,
+        # reshape, dot); axes are static, so it compiles once per shape/axes.
+        if (isinstance(a, (jax.Array, np.ndarray)) and isinstance(b, (jax.Array, np.ndarray))
+                and not isinstance(a, jax.core.Tracer) and not isinstance(b, jax.core.Tracer)):
+            with jax.default_device(self._device):
+                return self.track(_jit_tensordot(a, b, axes=axes))
         return self.strict_call('tensordot', a, b, axes=axes)
 
     def strict_call(self, name, *args, **kwargs):
@@ -174,14 +254,16 @@ class JaxBackend(AbstractBackend):
         if copy is not None and type(copy) is not bool:
             raise TypeError('copy must be None, True, or False')
         # Host storage (Matrix, environments) is uploaded at every contraction.
-        # device_put places the exact host dtype on the captured device in a new
-        # buffer, satisfying copy=None and copy=True at a fraction of the
-        # jnp.array dispatch cost. Dtypes JAX would canonicalize (64-bit without
+        # device_put places the exact host dtype on the captured device at a
+        # fraction of the jnp.array dispatch cost. It transfers asynchronously
+        # and may read the host buffer after returning, so it receives a private
+        # host copy: later in-place updates of the caller's array must not leak
+        # into the uploaded value. Dtypes JAX would canonicalize (64-bit without
         # x64) keep the jnp.array path and its conversion semantics.
         if (copy is not False and type(data) is np.ndarray and data.dtype.kind in 'biufc'
                 and (dtype is None or np.dtype(dtype) == data.dtype)
                 and jax.dtypes.canonicalize_dtype(data.dtype) == data.dtype):
-            return self.track(jax.device_put(data, self._device))
+            return self.track(jax.device_put(np.array(data, copy=True), self._device))
         # Tracers have no concrete device. An explicit dtype also removes JAX's
         # weak scalar typing, even when its storage dtype already matches.
         if (copy is None and not isinstance(data, jax.core.Tracer) and self.owns(data)

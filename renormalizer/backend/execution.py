@@ -44,7 +44,10 @@ def bind_backend(function):
         selected = context.adapter if context is not None else current_backend()
         token = _context.set(context)
         try:
-            with capture_backend(selected):
+            # The device scope matters for CuPy, which launches every kernel on
+            # the process-wide current device: an explicitly selected device
+            # must govern the whole algorithm, not only adapter calls.
+            with capture_backend(selected), selected.device_scope():
                 return function(*args, **kwargs)
         finally:
             _context.reset(token)
@@ -160,7 +163,15 @@ def contract(*args, **kwargs):
     args = _promote_operands(args, selected)
     kwargs['backend'] = selected.opt_einsum_name
     context = _context.get()
-    if context is None or context.operators.policy == 'builtin':
+    if (selected.name == 'jax' and hasattr(selected, 'fused_einsum')
+            and args and isinstance(args[0], str) and all(hasattr(a, 'shape') for a in args[1:])
+            and set(kwargs) <= {'backend', 'optimize'} and isinstance(kwargs.get('optimize', 'auto'), str)
+            and (context is None or context.operators.policy == 'builtin')):
+        # Same single-computation evaluation as _fused_expression, path cached by shape.
+        shapes = tuple(tuple(map(int, a.shape)) for a in args[1:])
+        path = _cached_path(args[0], shapes, (('optimize', kwargs.get('optimize', 'auto')),))
+        result = selected.fused_einsum(args[0], path)(*args[1:])
+    elif context is None or context.operators.policy == 'builtin':
         result = oe.contract(*args, **kwargs)
     else:
         from .operators import dispatch
@@ -173,6 +184,27 @@ def contract(*args, **kwargs):
 def _cached_path(subscripts, shapes, options):
     path, _ = oe.contract_path(subscripts, *shapes, shapes=True, **dict(options))
     return path
+
+
+def _fused_expression(selected, converted, kwargs):
+    # Eager JAX pays one dispatch per pairwise step of the expression, every
+    # Krylov iteration. The adapter evaluates the same path as one jitted
+    # computation; constants are passed as arguments rather than baked in, so
+    # one compilation per shape serves every site and time step.
+    subscripts, specs = converted[0], converted[1:]
+    constants = {i: specs[i] for i in kwargs.get('constants', ())}
+    fused = selected.fused_einsum(subscripts, kwargs['optimize'])
+    def call(*operands, **options):
+        if current_backend() is not selected:
+            raise CapabilityError('contraction expression belongs to another backend instance')
+        options.pop('backend', None)
+        if options:
+            raise TypeError(f'unsupported contraction options: {sorted(options)}')
+        runtime = iter(to_backend(a) for a in operands)
+        result = fused(*(constants[i] if i in constants else next(runtime) for i in range(len(specs))))
+        _witness(result)
+        return result
+    return call
 
 
 def contract_expression(*args, **kwargs):
@@ -191,6 +223,11 @@ def contract_expression(*args, **kwargs):
             kwargs['optimize'] = _cached_path(converted[0], shapes, options)
         except TypeError:  # unhashable option: search the path as before
             pass
+    if (selected.name == 'jax' and hasattr(selected, 'fused_einsum')
+            and isinstance(converted[0], str) and isinstance(kwargs.get('optimize'), list)
+            and set(kwargs) <= {'constants', 'optimize'}
+            and (context is None or context.operators.policy == 'builtin')):
+        return _fused_expression(selected, converted, kwargs)
     expr = oe.contract_expression(*converted, **kwargs)
     # Retain only the latest precision specialization and its constants, never
     # runtime operand contents. Metadata comparisons need no content hashes.

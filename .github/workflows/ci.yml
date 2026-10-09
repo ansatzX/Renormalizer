@@ -4,6 +4,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     name: test
+    env:
+      # RENO_NUM_THREADS does not reach the OpenBLAS bundled with NumPy/SciPy
+      # wheels. Four xdist workers each starting one BLAS thread per core
+      # oversubscribe the runner: the suite stalled for 50+ minutes instead of
+      # finishing in a few. Job-level so every step (tests, examples) gets it.
+      RENO_NUM_THREADS: 1
+      OPENBLAS_NUM_THREADS: 1
     steps:
       - name: install openblas
         run: |
@@ -23,7 +30,6 @@ jobs:
       - name: run tests
         run: |
           pip install pytest-xdist pytest-cov
-          export RENO_NUM_THREADS=1
           pytest -n 4 --durations=0 --cov=renormalizer renormalizer tools/backend_validation/tests
       - name: run optional tests
         run: |
@@ -59,6 +65,7 @@ jobs:
       RENO_TEST_BACKEND: ${{ matrix.backend }}
       RENO_TEST_DEVICE: cpu
       RENO_NUM_THREADS: 1
+      OPENBLAS_NUM_THREADS: 1
     steps:
       - uses: actions/checkout@v2
       - name: Set up Python

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import numpy as _np
@@ -19,6 +20,10 @@ class AbstractBackend(SingleProcessDistributedMixin):
     supports_autodiff = False
     supports_jit = False
     supports_functional_update = True
+    # Whether workspaces an algorithm keeps across steps (e.g. MPS environments)
+    # should stay as native arrays rather than host storage. Host storage costs
+    # nothing for NumPy; adapters that copy on every upload opt in.
+    native_workspace_storage = False
 
     def __init__(self):
         self.first_mp = False
@@ -94,6 +99,14 @@ class AbstractBackend(SingleProcessDistributedMixin):
     def is_array(self, x: Any) -> bool:
         return isinstance(x, self.ndarray)
 
+    def device_scope(self):
+        """Context making this adapter's device current for array operations.
+
+        Adapters whose libraries launch work on a process-wide current device
+        (CuPy) return that device; others need nothing.
+        """
+        return contextlib.nullcontext()
+
     def sync(self):
         return None
 
@@ -119,6 +132,25 @@ class AbstractBackend(SingleProcessDistributedMixin):
         # array for every row update would introduce quadratic memory traffic.
         x[idx] = value
         return x
+
+    # Lanczos recurrence on the private Krylov workspace V (lib/krylov). The
+    # defaults are the exact statements of the recurrence, so eager adapters keep
+    # identical arithmetic; adapters with per-call dispatch cost (JAX) override
+    # them to evaluate each group as one computation. The host-side Lanczos
+    # coefficients, tridiagonal eigensolve and convergence decisions stay in
+    # krylov.py.
+    def lanczos_alpha(self, V, j, w):
+        """alpha_j = Re <w, V[j]>, still a backend scalar."""
+        return self.vdot(w, V[j]).real
+
+    def lanczos_orthogonalize(self, V, j, w, alpha_j, beta_prev):
+        """w -= alpha_j V[j] + beta_prev V[j-1] (no beta term at j == 0); returns (w, ||w||)."""
+        w -= alpha_j*V[j] + (beta_prev*V[j-1] if j > 0 else 0)
+        return w, self.linalg.norm(w)
+
+    def lanczos_append(self, V, j, w, beta_j):
+        """Store the next Krylov vector V[j] = w / beta_j; retain the returned workspace."""
+        return self.write_owned(V, j, w / beta_j)
 
     def at_add(self, x, idx, value):
         y = self.array(x, copy=True)
