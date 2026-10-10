@@ -8,7 +8,8 @@ import pytest
 
 from renormalizer.backend.context import make_context
 from renormalizer.backend.contracts import CapabilityError, OwnershipError
-from renormalizer.backend.execution import bind_backend, contract, contract_expression, record_execution
+from renormalizer.backend.execution import bind_backend, contract, contract_expression
+from renormalizer.backend.testing import record_execution
 from renormalizer.backend.operators import (Kernel, OperatorProvider, discover_operator_providers,
                                            make_request)
 
@@ -255,3 +256,25 @@ def test_torch_cpu_override_preserves_native_arrays_and_autograd_request():
     result.sum().backward()
     assert calls[0].transformations == ('autograd',)
     torch.testing.assert_close(a.grad, torch.full((2, 2), 2., dtype=torch.float64))
+
+
+def test_resolution_and_result_checks_once_per_signature(monkeypatch):
+    from renormalizer.backend import operators
+    asked, returned = [], []
+    def supports(request, *a, **k):
+        asked.append(request.operation)
+        return None
+    def execute(request, *args, **kwargs):
+        returned.append(1)
+        return np.eye(2) if len(returned) == 1 else np.eye(2, dtype='float32')
+    ctx = context(provider('contract', execute, supports))
+    @bind_backend
+    def run():
+        return contract('ij,jk->ik', np.eye(2), np.eye(2))
+    for _ in range(3):
+        run(backend_context=ctx)
+    assert asked == ['contract']  # supports asked once for one signature
+    # Only the first result per signature is checked unless strict.
+    monkeypatch.setattr(operators, '_STRICT_PROVIDERS', True)
+    with pytest.raises(ValueError, match='requested'):
+        run(backend_context=ctx)

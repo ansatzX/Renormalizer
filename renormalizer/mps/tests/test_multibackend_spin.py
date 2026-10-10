@@ -21,7 +21,7 @@ def test_dmrg_dense_ground_space(n, field, tmp_path, record_property):
     state.optimize_config.procedure = [[4, 0]] * 4
     save_reference(tmp_path, dense, state.todense().reshape(-1), record_property)
     ctx = selected_context()
-    from renormalizer.backend.execution import record_execution
+    from renormalizer.backend.testing import record_execution
     with record_execution(ctx) as ledger:
         _, result = optimize_mps(state, operator, backend_context=ctx)
     assert_witness(ledger, ctx, record_property)
@@ -43,7 +43,7 @@ def test_tdvp_ps_dense_reference(bond, dt, tmp_path, record_property):
     psi0 = state.todense().reshape(-1).astype(np.complex128)
     save_reference(tmp_path, dense, psi0, record_property)
     ctx = selected_context()
-    from renormalizer.backend.execution import record_execution
+    from renormalizer.backend.testing import record_execution
     with record_execution(ctx) as ledger:
         for _ in range(round(FINAL_TIME/dt)):
             state = state.evolve(operator, dt, normalize=False, backend_context=ctx)

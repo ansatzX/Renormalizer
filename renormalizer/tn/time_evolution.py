@@ -44,6 +44,7 @@ def time_derivative_vmf(ttns: TTNS, ttno: TTNO):
             deriv = oe_contract("bf, bg, fh -> gh", deriv, xp.eye(proj.shape[0]) - proj, asxp(ovlp_inv.T))
         qnmask = ttns.get_qnmask(node).reshape(deriv.shape)
         deriv_list.append(deriv[qnmask].ravel())
+    # multibackend: the derivatives may be native arrays; concatenate with the bound backend.
     return xp.concatenate(deriv_list)
 
 

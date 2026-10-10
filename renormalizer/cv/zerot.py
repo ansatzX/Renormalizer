@@ -261,6 +261,7 @@ class SpectraZtCV(SpectraCv):
                 # ax1 = oe_contract("abcd, befh, cfgi, hjkn, iklo, mnop, dglp -> aejm",
                 #        first_L, a_oper_isite2, a_oper_isite2, a_oper_isite1,
                 #        a_oper_isite1, first_R, xstruct)
+                # multibackend: replaces the USE_GPU switch between cupy and numpy.
                 oe_backend = xp.opt_einsum_name
                 ax1 = expr(xstruct, backend=oe_backend)   
                 #print(oe_contract_path("abcd, befh, cfgi, hjkn, iklo, mnop, dglp -> aejm",

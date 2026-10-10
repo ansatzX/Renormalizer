@@ -39,6 +39,7 @@ def oe_contract(*args, **kwargs):
     update_kwargs(args, kwargs)
     try:
         return oe.contract(*args, **kwargs)
+    # multibackend: memory error types come from the bound backend (was MEMORY_ERRORS).
     except xp.memory_errors as e:
         logger.fatal("Out of memory error calling oe.contract")
         log_error(e, args, kwargs)

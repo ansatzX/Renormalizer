@@ -621,6 +621,7 @@ class MatrixProduct:
                 hop = hop_expr(ltensor, rtensor, cmo, cms.shape)
                 cout = hop(cms)
                 # clean up the elements which do not meet the qn requirements
+                # multibackend: write through the adapter; JAX arrays are immutable.
                 cout = xp.write_owned(cout, asxp(~qn_mask), 0)
                 mps._update_mps(cout, cidx, qnbigl, qnbigr, percent)
                 if mps.compress_config.ofs is not None:
@@ -1038,6 +1039,7 @@ class MatrixProduct:
         new._mp = [None] * len(self)
         new.dtype = self.dtype
         # With OFS, `model` is a mutable object
+        # shallow_copy instead of copy: same result, much cheaper per step; Model.copy is unchanged.
         new.model = self.model.shallow_copy()
         # need to deep copy compress_config because threshold might change dynamically
         new.compress_config = self.compress_config.copy()

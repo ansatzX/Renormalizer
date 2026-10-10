@@ -1,6 +1,7 @@
 """Explicit CPU solver boundaries with a logical transfer ledger.
 
-The context's strict operations own dtype/device validation and synchronization.
+Conversions go through the context's adapter and check ownership, the dtype
+domain, and that dtype and shape survive the transfer.
 Records count logical array bytes crossing each boundary, not physical transfers,
 allocator peaks, or extra copies inside third-party solvers. NumPy boundaries are
 host_to_host, including zero-copy views. Scalar solver metadata remains on host.
@@ -10,7 +11,10 @@ from uuid import uuid4
 
 import numpy as np
 
-from renormalizer.backend.contracts import CapabilityError, check_actual_dtype
+from renormalizer.backend.contracts import (CapabilityError, OwnershipError, NUMERIC_DTYPES,
+                                            AUXILIARY_DTYPES, check_actual_dtype)
+
+_DTYPES = NUMERIC_DTYPES + AUXILIARY_DTYPES
 
 
 def _authorize(context):
@@ -22,6 +26,13 @@ def _dtype(array):
     # Torch exposes torch.dtype rather than a NumPy dtype object.
     dtype = array.dtype
     return dtype if isinstance(dtype, np.dtype) else np.dtype(str(dtype).removeprefix('torch.'))
+
+
+def _check_owned(context, array):
+    adapter = context.adapter
+    owned = isinstance(array, np.ndarray) if adapter.name == 'numpy' else adapter.owns(array)
+    if not owned:
+        raise OwnershipError('array ownership/device mismatch; use explicit conversion')
 
 
 def _identifier(operation_id):
@@ -56,8 +67,11 @@ def to_host(array, *, context, ledger, reason, operation_id=None):
     """
     _authorize(context)
     operation_id = _identifier(operation_id) if ledger is not None else operation_id
+    _check_owned(context, array)
     dtype = _dtype(array)
-    host = context.ops.to_numpy(array)
+    if dtype not in _DTYPES:
+        raise CapabilityError(f'unsupported input dtype {dtype}')
+    host = context.adapter.to_numpy(array)
     if not isinstance(host, np.ndarray):
         raise TypeError('to_numpy must return a NumPy array')
     if ledger is not None:
@@ -74,8 +88,12 @@ def from_host(array, *, context, ledger, reason, operation_id=None):
     _authorize(context)
     if not isinstance(array, np.ndarray) or array.dtype.kind not in 'biufc':
         raise CapabilityError('host solver arrays must have numeric dtypes')
+    if array.dtype not in _DTYPES:
+        raise CapabilityError(f'unsupported dtype {array.dtype}')
     operation_id = _identifier(operation_id) if ledger is not None else operation_id
-    result = context.ops.from_numpy(array)
+    result = context.adapter.array(array, dtype=array.dtype, copy=None)
+    if context.adapter.name != 'numpy' and not context.adapter.owns(result):
+        raise OwnershipError('conversion returned wrong device')
     if ledger is not None:
         _record(ledger, source='cpu', target=context.device, shape=array.shape,
                 dtype=array.dtype, reason=reason, operation_id=operation_id)

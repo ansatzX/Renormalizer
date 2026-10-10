@@ -420,6 +420,7 @@ class HolsteinModel(Model):
         return model
 
     def shallow_copy(self):
+        # Same as Model.shallow_copy, keeping the HolsteinModel class.
         if type(self).copy is not HolsteinModel.copy:
             return self.copy()
         return self._shallow_copy_as(HolsteinModel)

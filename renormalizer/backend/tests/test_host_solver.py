@@ -12,10 +12,10 @@ from renormalizer.backend.host_solver import (
 
 
 def test_forbidden_policy_precedes_conversion_and_callback_creation():
-    class NeverOps:
+    class NeverTouched:
         def __getattr__(self, name):
             pytest.fail('conversion accessed before policy check')
-    context = SimpleNamespace(host_policy='forbid', ops=NeverOps())
+    context = SimpleNamespace(host_policy='forbid', adapter=NeverTouched(), ops=NeverTouched())
     called = []
     solver = lambda x: called.append(x)
     for action in (
@@ -111,12 +111,15 @@ def test_device_direction_and_precision_checks_without_gpu_claim():
     class DeviceArray:
         def __init__(self, array):
             self.array, self.dtype, self.shape = array, array.dtype, array.shape
-    class DeviceOps:
+    class DeviceAdapter:
+        name = 'fake_device'
+        def owns(self, x):
+            return isinstance(x, DeviceArray)
         def to_numpy(self, x):
             return x.array.copy()
-        def from_numpy(self, x):
-            return DeviceArray(x.copy())
-    context = SimpleNamespace(host_policy='explicit', device='cuda:2', ops=DeviceOps())
+        def array(self, x, dtype=None, copy=None):
+            return DeviceArray(np.array(x, dtype=dtype, copy=True))
+    context = SimpleNamespace(host_policy='explicit', device='cuda:2', adapter=DeviceAdapter())
     ledger = []
     host = np.ones((0, 2), dtype='complex64')
     device = from_host(host, context=context, ledger=ledger, reason='unit control')
@@ -125,7 +128,7 @@ def test_device_direction_and_precision_checks_without_gpu_claim():
     assert [item['direction'] for item in ledger] == ['H2D', 'D2H']
     assert [item['logical_bytes'] for item in ledger] == [0, 0]
     assert ledger[0]['target_device'] == ledger[1]['source_device'] == 'cuda:2'
-    context.ops.from_numpy = lambda x: DeviceArray(x.astype('complex128'))
+    context.adapter.array = lambda x, dtype=None, copy=None: DeviceArray(x.astype('complex128'))
     with pytest.raises(PrecisionError):
         from_host(host, context=context, ledger=ledger, reason='bad conversion')
 

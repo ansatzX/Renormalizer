@@ -20,7 +20,7 @@ class NumpyBackend(AbstractBackend):
 
     @property
     def opt_einsum_module(self):
-        # Same functions as NumPy, with tensordot's bookkeeping cached by shape.
+        # Renormalizer's contractions use the cached tensordot (numpy_contraction).
         return numpy_contraction.__name__
 
     def __init__(self):

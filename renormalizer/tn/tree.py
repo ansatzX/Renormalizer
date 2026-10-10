@@ -412,6 +412,7 @@ class TTNS(TTNBase):
         -------
         The new TTNS
         """
+        # multibackend: tensors may arrive as native arrays; TTNS stores host arrays.
         tensors = asnumpy(tensors)
         ttns = template.metacopy()
         cursor = 0
@@ -865,6 +866,7 @@ class TTNS(TTNBase):
         args.extend(ttno.to_contract_args("up", "down"))
         val = oe_contract(*asxp_oe_args(args), optimize="greedy").ravel()[0]
 
+        # multibackend: xp.imag / xp.real also accept backend scalars.
         if np.isclose(float(xp.imag(val)), 0):
             return float(xp.real(val))
         else:
@@ -1073,6 +1075,7 @@ class TTNS(TTNBase):
             The 1-site entanglement entropy. The key is the index of the site in ``self.node_list``.
         """
         rdm = self.calc_1site_rdm(idx)
+        # multibackend: rdm may hold native arrays; the entropy is computed on the host.
         entropy = {key: calc_vn_entropy_dm(asnumpy(dm)) for key, dm in rdm.items()}
         return entropy
 
@@ -1119,6 +1122,7 @@ class TTNS(TTNBase):
 
     def calc_1dof_entropy(self, dof: Union[Any, List[Any]]=None) -> Dict[Any, float]:
         rdm = self.calc_1dof_rdm(dof)
+        # multibackend: rdm may hold native arrays; the entropy is computed on the host.
         return {key: calc_vn_entropy_dm(asnumpy(dm)) for key, dm in rdm.items()}
 
     def calc_2site_rdm(self, idxs: Union[Tuple[int, int], List[Tuple[int, int]]]=None) -> Dict[Tuple[int, int], np.ndarray]:
@@ -1225,6 +1229,7 @@ class TTNS(TTNBase):
             assert isinstance(idxs, list)
 
         rdm = self.calc_2site_rdm(idxs)
+        # multibackend: rdm may hold native arrays; the entropy is computed on the host.
         entropy = {key: calc_vn_entropy_dm(asnumpy(dm)) for key, dm in rdm.items()}
         return entropy
 
@@ -1290,6 +1295,7 @@ class TTNS(TTNBase):
         if rdm is None:
             rdm = self.calc_2dof_rdm(dofs)
         
+        # multibackend: rdm may hold native arrays; the entropy is computed on the host.
         entropy = {key: calc_vn_entropy_dm(asnumpy(dm)) for key, dm in rdm.items()}
         return entropy
 
@@ -1431,6 +1437,7 @@ class TTNS(TTNBase):
 
         return normalize(self, kind)
 
+    # multibackend: runs with the backend chosen at entry, or the one passed as backend_context=.
     @bind_backend
     def evolve(self, ttno: TTNO, tau: Union[complex, float], normalize: bool = True):
         imag_time = np.iscomplex(tau)
@@ -1561,6 +1568,7 @@ class TTNS(TTNBase):
         ichild = parent.children.index(node)
         del shape[ichild]
         shape = [-1] + shape
+        # multibackend: node tensors are host arrays.
         parent.tensor = np.moveaxis(asnumpy(m_parent).reshape(shape), 0, ichild)
 
     @property
@@ -1725,10 +1733,12 @@ class TTNEnviron(Tree):
         res = oe_contract(*asxp_oe_args(args))
         if len(enode.parent.environ_children) != len(enode.parent.children):
             # first run
+            # multibackend: environment storage follows the backend (asworkspace), as for MPS.
             enode.parent.environ_children.append(asworkspace(res))
         else:
             # updating
             ichild = snode.parent.children.index(snode)
+            # multibackend: as above.
             enode.parent.environ_children[ichild] = asworkspace(res)
 
     def build_parent_environ_node(self, snode: TreeNodeTensor, ichild: int, ttns: TTNS, ttno: TTNO, bra: TTNS = None):
@@ -1764,6 +1774,7 @@ class TTNEnviron(Tree):
 
         args.append(indices)
         res = oe_contract(*asxp_oe_args(args))
+        # multibackend: as above.
         enode.children[ichild].environ_parent = asworkspace(res)
 
     def get_child_indices(self, enode, i, ttns, ttno, bra=None):

@@ -28,6 +28,7 @@ def prepare_events(events):
         events = (events,)
 
     if events is not None:
+        # multibackend: event bookkeeping is host metadata, so NumPy rather than xp.
         is_terminal = np.empty(len(events), dtype=bool)
         direction = np.empty(len(events))
         for i, event in enumerate(events):
@@ -106,6 +107,7 @@ def handle_events(sol, events, active_events, is_terminal, t_old, t):
     for event_index in active_events:
         roots.append(solve_event_equation(events[event_index], sol, t_old, t))
 
+    # multibackend: event roots are host scalars (NumPy rather than xp).
     roots = np.asarray(roots)
 
     if np.any(is_terminal[active_events]):
@@ -392,6 +394,7 @@ def solve_ivp(
     t0, tf = float(t_span[0]), float(t_span[1])
 
     if t_eval is not None:
+        # multibackend: evaluation times stay on the host.
         t_eval = host_time_array(t_eval)
         if t_eval.ndim != 1:
             raise ValueError("`t_eval` must be 1-dimensional.")
@@ -512,6 +515,7 @@ def solve_ivp(
         ts = xp.array(ts)
         ys = xp.vstack(ys).T
     else:
+        # multibackend: times are collected on the host, then returned as a backend array.
         ts = xp.asarray(np.hstack(ts))
         ys = xp.hstack(ys)
 

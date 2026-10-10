@@ -6,10 +6,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from renormalizer.backend.factory import create_backend, normalize_backend_name
-from renormalizer.backend.contracts import StrictOperations, DeviceOperations
 from renormalizer.backend.proxy import BackendProxy
-# The legacy selection itself, read directly: two call frames per lookup are
-# measurable at the millions of ``xp.<op>`` lookups a sweep makes.
+# Read the legacy selection directly: the two calls through runtime_backend()
+# add up over the millions of ``xp.<op>`` lookups in a sweep.
 from renormalizer.cons import _manager as _legacy
 
 _active = ContextVar('renormalizer_algorithm_backend', default=None)
@@ -72,8 +71,10 @@ class NumericalContext:
 
     @property
     def ops(self):
-        # Resolve classes once at import, but do not retain an ops -> context ->
-        # ops cycle: context/native owners must release without cyclic GC.
+        # The strict array API is a development and test tool; imported on use
+        # so that production imports never load it. A new object per access
+        # keeps no ops -> context -> ops cycle.
+        from renormalizer.backend.testing.strict import StrictOperations, DeviceOperations
         return StrictOperations(self) if self.adapter.name == "numpy" else DeviceOperations(self)
 
 

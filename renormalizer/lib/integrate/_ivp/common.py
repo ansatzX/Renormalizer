@@ -9,6 +9,7 @@ from scipy.sparse import find, coo_matrix
 from renormalizer.backend.context import internal_backend as xp
 
 
+# multibackend: a host constant; no backend needed at import.
 EPS = np.finfo(float).eps
 
 
@@ -115,6 +116,7 @@ def select_initial_step(fun, t0, y0, f0, direction, order, rtol, atol):
     .. [1] E. Hairer, S. P. Norsett G. Wanner, "Solving Ordinary Differential
            Equations I: Nonstiff Problems", Sec. II.4.
     """
+    # Shape is portable host metadata (see norm above).
     if prod(y0.shape) == 0:
         return xp.inf
 
@@ -169,6 +171,7 @@ class OdeSolution(object):
     """
 
     def __init__(self, ts, interpolants):
+        # Evaluate later on the backend the solution was created with; times stay on the host.
         self._backend = xp.current
         ts = host_time_array(ts)
         d = np.diff(ts)
@@ -232,6 +235,7 @@ class OdeSolution(object):
             return self._call_single(t)
 
         order = np.argsort(t)
+        # argsort of a permutation is its inverse; same result as the indexed write.
         reverse = np.argsort(order)
         t_sorted = t[order]
 
@@ -319,11 +323,13 @@ def num_jac(fun, t, y, f, threshold, factor, sparsity=None):
     if factor is None:
         factor = xp.full(n, EPS ** 0.5)
     else:
+        # multibackend: copy through the adapter.
         factor = xp.array(factor, copy=True)
 
     # Direct the step as ODE dictates, hoping that such a step won't lead to
     # a problematic region. For complex ODEs it makes sense to use the real
     # part of f as we use steps along real axis.
+    # multibackend: cast through the adapter in the backend's real dtype.
     f_sign = 2 * xp.asarray(xp.real(f) >= 0, dtype=xp.real_dtype) - 1
     y_scale = f_sign * xp.maximum(threshold, xp.abs(y))
     h = (y + factor * y_scale) - y
@@ -332,6 +338,7 @@ def num_jac(fun, t, y, f, threshold, factor, sparsity=None):
     # executed often.
     for i in xp.nonzero(h == 0)[0]:
         while h[i] == 0:
+            # multibackend: writes go through the adapter; JAX arrays are immutable.
             factor = xp.write_owned(factor, i, factor[i] * 10)
             h = xp.write_owned(h, i, (y[i] + factor[i] * y_scale[i]) - y[i])
 
@@ -357,6 +364,7 @@ def _dense_num_jac(fun, t, y, f, h, factor, y_scale):
         ind, = xp.nonzero(diff_too_small)
         new_factor = NUM_JAC_FACTOR_INCREASE * factor[ind]
         h_new = (y[ind] + new_factor * y_scale[ind]) - y[ind]
+        # multibackend: writes go through the adapter; JAX arrays are immutable.
         h_vecs = xp.write_owned(h_vecs, (ind, ind), h_new)
         f_new = fun(t, y[:, None] + h_vecs[:, ind])
         diff_new = f_new - f[:, None]
@@ -369,14 +377,17 @@ def _dense_num_jac(fun, t, y, f, h, factor, y_scale):
         if xp.any(update):
             update, = xp.nonzero(update)
             update_ind = ind[update]
+            # multibackend: as above.
             factor = xp.write_owned(factor, update_ind, new_factor[update])
             h = xp.write_owned(h, update_ind, h_new[update])
             diff = xp.write_owned(diff, (slice(None), update_ind), diff_new[:, update])
             scale = xp.write_owned(scale, update_ind, scale_new[update])
             max_diff = xp.write_owned(max_diff, update_ind, max_diff_new[update])
 
+    # Out of place: JAX arrays are immutable.
     diff = diff / h
 
+    # xp.where instead of masked in-place multiplication; same values.
     factor = xp.where(max_diff < NUM_JAC_DIFF_SMALL * scale, factor * NUM_JAC_FACTOR_INCREASE, factor)
     factor = xp.where(max_diff > NUM_JAC_DIFF_BIG * scale, factor * NUM_JAC_FACTOR_DECREASE, factor)
     factor = xp.maximum(factor, NUM_JAC_MIN_FACTOR)
@@ -429,12 +440,14 @@ def _sparse_num_jac(fun, t, y, f, h, factor, y_scale, structure, groups):
         if xp.any(update):
             update, = xp.nonzero(update)
             update_ind = ind[update]
+            # multibackend: as above.
             factor = xp.write_owned(factor, update_ind, new_factor[update])
             h = xp.write_owned(h, update_ind, h_new[update])
             diff[:, np.asarray(xp.numpy(update_ind))] = diff_new[:, np.asarray(xp.numpy(update))]
             scale = xp.write_owned(scale, update_ind, scale_new[update])
             max_diff = xp.write_owned(max_diff, update_ind, max_diff_new[update])
 
+    # diff is SciPy sparse (host) storage; h is brought to the host for it.
     diff.data /= np.repeat(np.asarray(xp.numpy(h)), np.diff(diff.indptr))
     factor = xp.where(max_diff < NUM_JAC_DIFF_SMALL * scale, factor * NUM_JAC_FACTOR_INCREASE, factor)
     factor = xp.where(max_diff > NUM_JAC_DIFF_BIG * scale, factor * NUM_JAC_FACTOR_DECREASE, factor)

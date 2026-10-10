@@ -62,6 +62,7 @@ def backend_snapshot():
     }
 
 
+# Import-time values kept for old imports; backend_snapshot() gives current ones.
 _snapshot = backend_snapshot()
 USE_GPU = _snapshot["USE_GPU"]
 OE_BACKEND = _snapshot["OE_BACKEND"]

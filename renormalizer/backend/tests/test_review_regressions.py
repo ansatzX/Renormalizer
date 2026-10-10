@@ -120,12 +120,13 @@ def test_jax_numpy_integer_size(method):
 
 def test_execution_recording_is_scoped_to_record_execution():
     from renormalizer.backend import execution
+    from renormalizer.backend.testing import record_execution
     ctx = make_context(host_policy='explicit')
     @execution.bind_backend
     def run():
         return execution.contract('ij,jk->ik', np.eye(2), np.eye(2))
     np.testing.assert_array_equal(run(backend_context=ctx), np.eye(2))
-    with execution.record_execution(ctx) as ledger:
+    with record_execution(ctx) as ledger:
         run(backend_context=ctx)
     assert ledger.transfers and ledger.operations
 

@@ -98,3 +98,9 @@ def test_non_integer_axes(monkeypatch, strict):
     else:
         # Documented default: equal non-integer axes reuse the integer plan.
         assert np.array_equal(numpy_contraction.tensordot(a, b, ([1.0], [0])), np.tensordot(a, b, ([1], [0])))
+
+
+def test_proxy_tensordot_resolves_to_the_cached_tensordot():
+    from renormalizer.backend.context import capture_backend, internal_backend as xp
+    with capture_backend(NumpyBackend()):
+        assert xp.tensordot is numpy_contraction.tensordot

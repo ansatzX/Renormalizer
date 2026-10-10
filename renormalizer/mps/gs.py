@@ -54,6 +54,7 @@ def construct_mps_mpo(model, mmax, nexciton, offset=Quantity(0)):
     return mps, mpo
 
 
+# multibackend: runs with the backend chosen at entry, or the one passed as backend_context=.
 @bind_backend
 def optimize_mps(mps: Mps, mpo: Union[Mpo, StackedMpo], omega: float = None) -> Tuple[List, Mps]:
     r"""DMRG ground state algorithm and state-averaged excited states algorithm
@@ -646,6 +647,7 @@ def eigh_iterative(
             raise IMPORT_PRIMME_EXCEPTION
         h_dim = np.sum(qn_mask)
         precond = lambda x: scipy.sparse.diags(1 / (hdiag + 1e-4)) @ x
+        # dtype given so scipy does not call hop once just to infer it.
         A = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=hop, matmat=hop, dtype=np.result_type(hdiag, np.asarray(cguess)))
         M = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=precond, matmat=hop, dtype=np.result_type(hdiag, np.asarray(cguess)))
         e, c = primme.eigsh(

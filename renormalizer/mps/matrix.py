@@ -219,6 +219,7 @@ def einsum(subscripts, *operands):
 
 
 def tensordot(a: Union[Matrix, np.ndarray], b: Union[Matrix, np.ndarray, xp.ndarray], axes) -> xp.ndarray:
+    # multibackend: tensordot of the bound backend (NumPy: cached plan, same result).
     return current_backend().tensordot(asxp(a), asxp(b), axes)
 
 

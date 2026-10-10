@@ -12,13 +12,11 @@ Renormalizer is a Python based tensor network package with a special focus on el
 pip install renormalizer
 ```
 
-The multi-backend extras on this branch have not yet been released to PyPI.
-To use them now, install this checkout with `python -m pip install '.[torch]'`
-(or `.[jax]`, `.[jax-cuda12]`, `.[cupy]`); the plain `pip install renormalizer`
-command above installs the existing published release. After the new release,
-use the corresponding `renormalizer[...]` extra. Torch CPU-only/specific CUDA
-build selection and optional reproducible locks are explained in the
-[branch installation guide](doc/source/install.md).
+To use the current source code, install the checkout with `python -m pip install .`
+(add `'.[cupy]'` for GPU support). NumPy 1.26+ and NumPy 2 are supported.
+For multi-threaded runs we recommend [pixi](https://pixi.sh) (`pixi install`), which takes
+NumPy and SciPy from conda-forge so that they share one BLAS library; see the
+[installation guide](doc/source/install.md).
 
 For users who are not familiar with python, 
 please check out the step-by-step [installation guide](https://shuaigroup.github.io/Renormalizer/install.html).
@@ -71,12 +69,16 @@ More specifically, the computational wall time hardly decrease if more than 4 co
 > [!IMPORTANT]  
 > We highly recommend limiting the number of parallel CPU cores to 4 for large scale calculations and 1 for small scale tests
 
-To do this, set the environment variable before running Python
+To do this, set the environment variables before running Python
 ```bash
 export RENO_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
 ```
-which sets all environment variables for underlying linear algebra libraries, such as `MKL_NUM_THREADS`.
-Note that this is only effective if you import Renomalizer before import NumPy
+`RENO_NUM_THREADS` sets the environment variables of underlying linear algebra libraries, such as `MKL_NUM_THREADS`.
+Note that this is only effective if you import Renomalizer before import NumPy.
+It does not cover the OpenBLAS bundled with pip-installed NumPy and SciPy, hence `OPENBLAS_NUM_THREADS`.
+With pip wheels, NumPy and SciPy each bring their own OpenBLAS thread pool, and more threads can make runs slower;
+a pixi or conda-forge environment avoids this (see the [installation guide](doc/source/install.md)).
 Alternatively, if you are submitting tasks via (a properly configured) slurm, set `--cpus-per-task` to limit CPU usage.
 
 > [!IMPORTANT]  

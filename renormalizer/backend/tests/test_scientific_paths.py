@@ -11,6 +11,7 @@ import pytest
 from scipy.linalg import expm
 
 from renormalizer.backend import execution
+from renormalizer.backend.testing import record_execution
 from renormalizer import BasisHalfSpin, Model, Mpo, Mps, Op
 from renormalizer.model.model import heisenberg_ops
 from renormalizer.mps.matrix import asnumpy, asxp
@@ -115,7 +116,7 @@ def test_registered_evolution_dense_reference(captured_backend, family, method, 
         original_witness(result)
     with monkeypatch.context() as scoped:
         scoped.setattr(execution, '_witness', checked_witness)
-        with execution.record_execution(context) as ledger:
+        with record_execution(context) as ledger:
             evolved = state.evolve(operator, .001, normalize=False, backend_context=context)
             context.adapter.sync()
     for event in ledger.operations:

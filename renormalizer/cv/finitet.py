@@ -307,6 +307,7 @@ class SpectraFtCV(SpectraCv):
         # Matrix A
         mat_a = scipy.sparse.linalg.LinearOperator((nonzeros, nonzeros), matvec=hop)
 
+        # scipy compatibility: cg takes 'rtol' in newer scipy, 'tol' in older.
         _cg_params = inspect.signature(scipy.sparse.linalg.cg).parameters
         _tol_kw = {'rtol': 1.e-5} if 'rtol' in _cg_params else {'tol': 1.e-5}
         x, info = scipy.sparse.linalg.cg(

@@ -16,6 +16,7 @@ from renormalizer.tn.hop_expr import hop_expr2
 logger = logging.getLogger(__name__)
 
 
+# multibackend: runs with the backend chosen at entry, or the one passed as backend_context=.
 @bind_backend
 def optimize_ttns(ttns: TTNS, ttno: TTNO, procedure=None):
     if procedure is None:
@@ -92,6 +93,7 @@ def eigh_iterative(hop, hdiag, cguess, algo):
             logger.error("can not import primme")
             raise IMPORT_PRIMME_EXCEPTION
         precond = lambda x: scipy.sparse.diags(1 / (hdiag + 1e-4)) @ x
+        # dtype given so scipy does not call hop once just to infer it.
         A = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=hop, matmat=hop, dtype=np.result_type(hdiag, np.asarray(cguess)))
         M = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=precond, matmat=hop, dtype=np.result_type(hdiag, np.asarray(cguess)))
         e, c = primme.eigsh(
@@ -106,6 +108,7 @@ def eigh_iterative(hop, hdiag, cguess, algo):
         c = c[:, 0]
         e = e[0]
     elif algo == "arpack":
+        # dtype given so scipy does not call hop once just to infer it.
         A = scipy.sparse.linalg.LinearOperator((h_dim, h_dim), matvec=hop, dtype=np.result_type(hdiag, np.asarray(cguess)))
         e, c = scipy.sparse.linalg.eigsh(A, k=1, which="SA", v0=cguess)
         e = e[0]

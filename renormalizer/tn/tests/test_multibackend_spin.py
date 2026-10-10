@@ -26,7 +26,7 @@ def test_optimization_dense_ground_space(n, field, tmp_path, record_property):
     record_property('host_eigensolver', 'arpack')
     save_reference(tmp_path, dense, state.todense(model.basis).ravel(), record_property)
     ctx = selected_context()
-    from renormalizer.backend.execution import record_execution
+    from renormalizer.backend.testing import record_execution
     with record_execution(ctx) as ledger:
         optimize_ttns(state, operator, [[4, 0]]*4, backend_context=ctx)
     assert_witness(ledger, ctx, record_property)
@@ -50,7 +50,7 @@ def test_tdvp_vmf_dense_reference(bond, dt, tmp_path, record_property):
     psi0 = state.todense(model.basis).ravel().astype(np.complex128)
     save_reference(tmp_path, dense, psi0, record_property)
     ctx = selected_context()
-    from renormalizer.backend.execution import record_execution
+    from renormalizer.backend.testing import record_execution
     with record_execution(ctx) as ledger:
         for _ in range(round(FINAL_TIME/dt)):
             state = state.evolve(operator, dt, normalize=False, backend_context=ctx)

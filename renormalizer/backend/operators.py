@@ -1,5 +1,5 @@
 """Opt-in, stateless operator providers. See OPERATOR_PROVIDERS.md for v1."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 from types import MappingProxyType
 
@@ -45,6 +45,8 @@ class Kernel:
 
     execute(request, *args, **kwargs) must honor the operation's v1 semantics.
     Both callables must be stateless with respect to operand contents/lifetimes.
+    supports decides from the request metadata and the non-array arguments only,
+    never from array contents: its answer is cached per call signature.
     """
     supports: object
     execute: object
@@ -74,13 +76,44 @@ def discover_operator_providers():
     return tuple(metadata.entry_points(group=ENTRY_POINT_GROUP))
 
 
+# Development switch: check every provider result, not only the first one per
+# call signature.
+_STRICT_PROVIDERS = False
+
+
+def _signature(request, args, kwargs):
+    """Hashable key of everything supports may look at, or None if unhashable."""
+    key = (request, tuple(a for a in args if not (hasattr(a, 'shape') and hasattr(a, 'dtype'))),
+           tuple(sorted(kwargs.items())))
+    try:
+        hash(key)
+    except TypeError:
+        return None
+    return key
+
+
 @dataclass(frozen=True)
 class OperatorSelection:
     policy: str = 'builtin'
     providers: tuple = ()
     unavailable: tuple = ()
+    # Per call signature: the chosen kernel (resolve) and signatures whose
+    # results were already checked (dispatch). Never part of equality.
+    _resolved: dict = field(default_factory=dict, compare=False, repr=False)
+    _checked: set = field(default_factory=set, compare=False, repr=False)
 
     def resolve(self, request, *args, **kwargs):
+        key = _signature(request, args, kwargs)
+        if key is not None:
+            hit = self._resolved.get(key)
+            if hit is not None:
+                return hit
+        found = self._resolve(request, *args, **kwargs)
+        if key is not None:
+            self._resolved[key] = found
+        return found
+
+    def _resolve(self, request, *args, **kwargs):
         reasons = list(self.unavailable)
         for provider in self.providers:
             kernel = provider.kernels.get(request.operation)
@@ -182,6 +215,13 @@ def dispatch(context, operation, builtin, args, kwargs=None, *, metadata_values=
         return builtin(*args, **(kwargs or {}))
     request = make_request(context, operation, args if metadata_values is None else metadata_values)
     result = selection.call(request, builtin, *args, **(kwargs or {}))
+    # Result checks run once per call signature (every call with
+    # _STRICT_PROVIDERS): a kernel is chosen per signature, so its first result
+    # stands for the rest.
+    key = _signature(request, args, kwargs or {})
+    if not _STRICT_PROVIDERS and key is not None:
+        if key in selection._checked:
+            return result
     # Providers remain inside the selected array backend. Do not invoke implicit
     # host conversions on foreign results, including inside ctx.ops._result.
     import numpy as np
@@ -197,4 +237,6 @@ def dispatch(context, operation, builtin, args, kwargs=None, *, metadata_values=
         actual = np.dtype(str(result.dtype).removeprefix('torch.'))
         if actual != dtype:
             raise PrecisionError(f'requested {dtype}, received {actual}')
+    if key is not None:
+        selection._checked.add(key)
     return result

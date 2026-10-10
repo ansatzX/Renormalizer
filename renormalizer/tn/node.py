@@ -182,6 +182,7 @@ class TreeNodeTensor(TreeNode):
 
     @tensor.setter
     def tensor(self, tensor):
+        # multibackend: node tensors are stored on the host; convert first.
         tensor = asnumpy(tensor)
         if np.iscomplexobj(tensor):
             dtype = backend.complex_dtype

@@ -2,11 +2,12 @@
 
 Records describe logical array transfers, not allocator peaks or all library
 workspace. Existing Matrix/tree storage and scientific solvers remain on host.
+Recording itself lives in ``renormalizer.backend.testing``; this module only
+keeps the hooks it calls, and only while a recording is active.
 """
-from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
 from functools import lru_cache, wraps
+from typing import NamedTuple
 from math import prod
 import numpy as np
 import opt_einsum as oe
@@ -15,34 +16,30 @@ from .contracts import CapabilityError, NUMERIC_DTYPES, AUXILIARY_DTYPES
 
 _HOST_DTYPES = frozenset(NUMERIC_DTYPES + AUXILIARY_DTYPES)
 
-_context = ContextVar('renormalizer_numerical_context', default=None)
-_ledger = ContextVar('renormalizer_execution_ledger', default=None)
+class _Run(NamedTuple):
+    """Explicit numerical context and/or execution ledger of the current call."""
+    context: object
+    ledger: object
 
-@dataclass
-class ExecutionLedger:
-    adapter_id: int | None = None
-    operations: list = field(default_factory=list)
-    transfers: list = field(default_factory=list)
 
-@contextmanager
-def record_execution(context):
-    """Record calls explicitly bound to context; does not select a backend."""
-    ledger = ExecutionLedger(adapter_id=id(context.adapter))
-    token = _ledger.set(ledger)
-    try:
-        yield ledger
-    finally:
-        _ledger.reset(token)
+# None in plain runs: hot paths read this once and skip every context and
+# recording branch.
+_run = ContextVar('renormalizer_execution_run', default=None)
+
+
+def _set_run(context, ledger):
+    return _run.set(None if context is None and ledger is None else _Run(context, ledger))
 
 
 def bind_backend(function):
     @wraps(function)
     def wrapped(*args, backend_context=None, **kwargs):
-        context = backend_context or _context.get()
+        run = _run.get()
+        context = backend_context or (None if run is None else run.context)
         if context is not None and context.host_policy != 'explicit':
             raise CapabilityError('legacy hybrid algorithm requires explicit host policy')
         selected = context.adapter if context is not None else current_backend()
-        token = _context.set(context)
+        token = _set_run(context, None if run is None else run.ledger)
         try:
             # The device scope matters for CuPy, which launches every kernel on
             # the process-wide current device: an explicitly selected device
@@ -50,7 +47,7 @@ def bind_backend(function):
             with capture_backend(selected), selected.device_scope():
                 return function(*args, **kwargs)
         finally:
-            _context.reset(token)
+            _run.reset(token)
     return wrapped
 
 
@@ -69,29 +66,23 @@ def _device(array):
 
 
 def _record_transfer(source, result, reason):
-    ledger = _ledger.get()
-    if ledger is None or source is result:
-        return
-    src, dst = _device(source), _device(result)
-    source_host = src.split(':')[0].lower() == 'cpu'
-    target_host = dst.split(':')[0].lower() == 'cpu'
-    direction = ('host_to_host' if source_host and target_host else
-                 'H2D' if source_host else 'D2H' if target_host else 'device_to_device')
-    ledger.transfers.append(dict(direction=direction, logical_bytes=prod(result.shape) * np.dtype(str(result.dtype).removeprefix('torch.')).itemsize,
-                                 source_device=src,target_device=dst,reason=reason,
-                                 operation_id=len(ledger.operations)))
+    # Recording hook; a no-op unless a ledger is active.
+    run = _run.get()
+    if run is not None and run.ledger is not None and source is not result:
+        run.ledger.record_transfer(source, result, reason)
 
 
 def to_backend(array):
     selected = current_backend()
-    context, ledger = _context.get(), _ledger.get()
+    run = _run.get()
     # NumPy hot path: uploading a host ndarray to the NumPy adapter is the
     # identity, and without a ledger there is nothing to record. DMRG/TDVP issue
     # tens of thousands of small contractions, so skip the conversion chain.
     # Context uploads keep from_host's dtype domain; others take the slow path.
-    if ledger is None and type(array) is np.ndarray and selected.name == 'numpy' and (
-            context is None or array.dtype in _HOST_DTYPES):
+    if type(array) is np.ndarray and selected.name == 'numpy' and (run is None or (
+            run.ledger is None and (run.context is None or array.dtype in _HOST_DTYPES))):
         return array
+    context, ledger = (None, None) if run is None else run
     if context is not None and isinstance(array, np.ndarray):
         from .host_solver import from_host
         return from_host(array, context=context, ledger=None if ledger is None else ledger.transfers,
@@ -106,7 +97,8 @@ def to_host(array):
     # array is never recorded as a transfer.
     if type(array) is np.ndarray:
         return array
-    context, ledger = _context.get(), _ledger.get()
+    run = _run.get()
+    context, ledger = (None, None) if run is None else run
     if context is not None and not isinstance(array, np.ndarray):
         from .host_solver import to_host as download
         return download(array, context=context, ledger=None if ledger is None else ledger.transfers,
@@ -117,13 +109,10 @@ def to_host(array):
 
 
 def _witness(result):
-    ledger = _ledger.get()
-    if ledger is not None:
-        adapter = current_backend()
-        if ledger.adapter_id != id(adapter):
-            raise CapabilityError('execution witness differs from requested context')
-        ledger.operations.append(dict(operation='contraction',backend=adapter.name,
-            device=_device(result),dtype=str(result.dtype),adapter_id=id(adapter),shape=tuple(result.shape)))
+    # Recording hook, called only while a ledger is active.
+    run = _run.get()
+    if run is not None and run.ledger is not None:
+        run.ledger.record_contraction(current_backend(), result)
 
 
 def _contraction_dtype(values, adapter):
@@ -166,7 +155,8 @@ def contract(*args, **kwargs):
     args = tuple(to_backend(a) if hasattr(a,'shape') and hasattr(a,'dtype') else a for a in args)
     args = _promote_operands(args, selected)
     kwargs['backend'] = selected.opt_einsum_module
-    context = _context.get()
+    run = _run.get()
+    context = None if run is None else run.context
     if (selected.name == 'jax' and hasattr(selected, 'fused_einsum')
             and args and isinstance(args[0], str) and all(hasattr(a, 'shape') for a in args[1:])
             and set(kwargs) <= {'backend', 'optimize'} and isinstance(kwargs.get('optimize', 'auto'), str)
@@ -185,19 +175,19 @@ def contract(*args, **kwargs):
     else:
         from .operators import dispatch
         result = dispatch(context, 'contract', oe.contract, args, kwargs)
-    _witness(result)
+    if run is not None and run.ledger is not None:
+        _witness(result)
     return result
 
 
 def _host_expression(selected, args, kwargs):
-    # oe.contract searches the contraction path on every call (``optimal`` for
-    # Renormalizer's small expressions); sweeps call it with the same subscripts
-    # and shapes tens of thousands of times. The search depends only on those and
-    # the options, so evaluate a cached expression holding the same contraction
-    # list instead: the same pairwise operations run. Returns None when the call
-    # is not of that plain form. One visible difference: a ValueError raised
-    # inside the contraction reaches the caller reworded by ContractExpression
-    # ("Internal error while evaluating ..."), with the same exception type.
+    # oe.contract searches the contraction path on every call; sweeps repeat the
+    # same subscripts and shapes many times, and the search depends only on those
+    # and the options. A cached expression holds the same contraction list, so the
+    # same pairwise operations run. Returns None for calls of any other form.
+    #
+    # A ValueError raised inside the contraction arrives reworded by
+    # ContractExpression ("Internal error while evaluating ..."), same type.
     if not (selected.name == 'numpy' and args and set(kwargs) == {'backend', 'optimize'}
             and isinstance(kwargs['optimize'], str)):
         return None
@@ -244,6 +234,7 @@ def _interleaved_subscripts(labels, output):
     return oe.parser.convert_interleaved_input(interleaved)[0]
 
 
+# Built from the cached path; holds no operands, so one expression serves every call.
 @lru_cache(maxsize=4096)
 def _cached_expression(subscripts, shapes, optimize):
     path = _cached_path(subscripts, shapes, (('optimize', optimize),))
@@ -272,7 +263,9 @@ def _fused_expression(selected, converted, kwargs):
             raise TypeError(f'unsupported contraction options: {sorted(options)}')
         runtime = iter(to_backend(a) for a in operands)
         result = fused(*(constants[i] if i in constants else next(runtime) for i in range(len(specs))))
-        _witness(result)
+        run = _run.get()
+        if run is not None and run.ledger is not None:
+            _witness(result)
         return result
     return call
 
@@ -282,7 +275,8 @@ def contract_expression(*args, **kwargs):
     # process-default device conversion. Expressions belong to one instance.
     selected = current_backend()
     converted = tuple(to_backend(a) if hasattr(a, 'dtype') and hasattr(a, 'shape') else a for a in args)
-    context = _context.get()
+    run = _run.get()
+    context = None if run is None else run.context
     if isinstance(kwargs.get('optimize', 'auto'), str) and converted and isinstance(converted[0], str):
         # Sweeps rebuild the same expression at every site; a named path search
         # depends only on subscripts, shapes and options, so reuse its result.
@@ -320,7 +314,9 @@ def contract_expression(*args, **kwargs):
             else:
                 active_expr = cached[1]
             native = _promote_operands(native, selected, dtype)
-        if context is not None and context.operators.policy != 'builtin' and _context.get() is not context:
+        run = _run.get()
+        if (context is not None and context.operators.policy != 'builtin'
+                and (None if run is None else run.context) is not context):
             raise CapabilityError('contraction expression belongs to another numerical context')
         if context is None or context.operators.policy == 'builtin':
             result = active_expr(*native, **options)
@@ -331,6 +327,7 @@ def contract_expression(*args, **kwargs):
             result = dispatch(context, 'contract_expression', evaluate, native,
                               dict(options, expression=active_expr),
                               metadata_values=converted + native)
-        _witness(result)
+        if run is not None and run.ledger is not None:
+            _witness(result)
         return result
     return call

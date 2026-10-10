@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 
+# multibackend: the global (legacy) backend selection, moved here from
+# mps/backend.py; set_backend / get_backend / backend keep their old meaning.
+
 import logging
 import os
 from pathlib import Path

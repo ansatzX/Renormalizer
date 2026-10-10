@@ -182,6 +182,7 @@ class Op:
         if isinstance(factor, Quantity):
             factor = factor.as_au()
         # convert numpy scalar to native Python type
+        # NumPy 2: factor + 0.0 keeps NumPy scalar types; store a plain float or complex.
         if hasattr(factor, 'imag') and factor.imag != 0:
             self._factor: complex = complex(factor)
         else:

@@ -113,6 +113,7 @@ class TDA(object):
                 
                 vt = xp.einsum("i, ij -> ij", asxp(s), asxp(vt))
                 if ims == site_num-1:
+                    # np.prod(shape): not every backend's arrays have .size.
                     assert np.prod(vt.shape) == 1 and xp.allclose(vt, 1)
                 else:
                     mps[ims+1] = asnumpy(tensordot(vt, mps[ims+1], ([-1],[0])))
@@ -145,6 +146,7 @@ class TDA(object):
         
         logger.debug(f"DMRG-TDA H dimension: {xsize}")
 
+        # multibackend: replaces the USE_GPU switch between cupy and numpy.
         oe_backend = backend.opt_einsum_name
 
         mps_tangent = mps_r_cano.copy()
@@ -475,6 +477,7 @@ class TDA(object):
                 for mps_tangent in mps_tangent_list:
                     sentinel = xp.ones((1,1))
                     for ims, ms in enumerate(mps_tangent):
+                        # multibackend: dot through the adapter; not every array type has .dot.
                         sentinel = xp.dot(sentinel, asxp(ms[:,config[ims],:]))
                     ci_coeff_list.append(float(sentinel[0,0]))
                 ci_coeff = np.sum(ci_coeff_list)

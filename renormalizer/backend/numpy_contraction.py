@@ -45,10 +45,9 @@ _SEQUENCES = (list, tuple, range)
 
 
 def _fast_axes_key(axes):
-    # A hashable stand-in for axes, built without inspecting each axis; _plan
-    # validates them on a cache miss. Mirrors numpy: a sized part is a list of
-    # axes, anything else one axis. Only sequences that iterating does not
-    # consume are taken apart; anything else stays opaque and fails in _plan.
+    # Hashable stand-in for axes, built without checking each axis (_plan checks on
+    # a cache miss). As in numpy, a sized part is a list of axes, anything else one
+    # axis; only sequences that iteration does not consume are taken apart.
     if type(axes) is int:
         return axes
     if not isinstance(axes, _SEQUENCES):

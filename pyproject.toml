@@ -43,6 +43,11 @@ dev = [
     "sphinxcontrib-googleanalytics",
 ]
 cupy = ["cupy-cuda12x>=13,<14"]
+# Optional solvers, listed for information; nothing requires them and no
+# version is imposed. primme: iterative eigensolver for DMRG / TDA (algo="primme").
+# pyscf: electron-structure integrals and the DmrgFCISolver interface (h2o-type cases).
+primme = ["primme"]
+pyscf = ["pyscf"]
 # Standard PyPI metadata describes the dependency, not an accelerator index.
 # A compatible preinstalled Torch CPU/CUDA build satisfies this extra; see the
 # installation guide for optional CPU-only or specific CUDA build selection.
@@ -75,7 +80,7 @@ platforms = ["linux-64", "osx-arm64"]
 [tool.pixi.dependencies]
 # NumPy and SciPy from conda-forge share one BLAS library and thread pool.
 # PyPI wheels each bundle a private OpenBLAS, and those two pools contend when
-# NumPy and SciPy calls alternate (see notes/blas-two-thread-pools.md).
+# NumPy and SciPy calls alternate.
 python = ">=3.10,<3.14"
 numpy = ">=1.26,<3"
 scipy = ">=1.13,<2"
@@ -85,7 +90,15 @@ libblas = { version = "*", build = "*openblas" }
 renormalizer = { path = ".", editable = true }
 
 # Each [project.optional-dependencies] group is a pixi feature of the same name.
+[tool.pixi.feature.ci.dependencies]
+# CI: the Python the optional pyscf/primme pins have wheels for, and the
+# pytest plugins from conda-forge.
+python = "3.11.*"
+pytest-xdist = "*"
+pytest-cov = "*"
+
 [tool.pixi.environments]
 default = { features = ["dev"], solve-group = "default" }
+ci = { features = ["dev", "ci"] }
 torch = { features = ["dev", "torch"] }
 jax = { features = ["dev", "jax"] }

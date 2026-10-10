@@ -5,48 +5,44 @@ jobs:
     runs-on: ubuntu-latest
     name: test
     env:
-      # RENO_NUM_THREADS does not reach the OpenBLAS bundled with NumPy/SciPy
-      # wheels. Four xdist workers each starting one BLAS thread per core
-      # oversubscribe the runner: the suite stalled for 50+ minutes instead of
-      # finishing in a few. Job-level so every step (tests, examples) gets it.
+      # Four xdist workers already fill the runner's cores: one BLAS thread each.
+      # Steps that run a single process override this below.
       RENO_NUM_THREADS: 1
       OPENBLAS_NUM_THREADS: 1
     steps:
-      - name: install openblas
-        run: |
-            sudo apt-get update
-            sudo apt-get -y install libblas-dev liblapack-dev
-      - uses: actions/checkout@v2
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      # NumPy and SciPy from conda-forge share one OpenBLAS (the pixi
+      # environment in pyproject.toml). With pip wheels each brings its own
+      # thread pool and the two contend, so multi-threaded runs stall.
+      - uses: prefix-dev/setup-pixi@v0.8.1
         with:
-          # pyproject.toml requires Python >=3.10
-          python-version: "3.11"
-          cache: "pip"
-      - name: install dependencies
+          environments: ci
+          # pixi.lock is not committed; solve from pyproject.toml.
+          locked: false
+          cache: false
+      - name: install optional solvers
         run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir -e ".[dev]"
+          pixi run -e ci python -m pip install primme==3.2.* pyscf==2.4.0
       - name: run tests
         run: |
-          pip install pytest-xdist pytest-cov
-          pytest -n 4 --durations=0 --cov=renormalizer renormalizer tools/backend_validation/tests
+          pixi run -e ci pytest -n 4 --durations=0 --cov=renormalizer renormalizer tools/backend_validation/tests
       - name: run optional tests
         run: |
-          pip install primme==3.2.* pyscf==2.4.0
-          pytest --durations=0 renormalizer/mps/tests/test_gs.py::test_multistate --cov=renormalizer --cov-append
-          pytest --durations=0 renormalizer/mps/tests/test_gs.py::test_pyscf_solver --cov=renormalizer --cov-append
+          pixi run -e ci pytest --durations=0 renormalizer/mps/tests/test_gs.py::test_multistate --cov=renormalizer --cov-append
+          pixi run -e ci pytest --durations=0 renormalizer/mps/tests/test_gs.py::test_pyscf_solver --cov=renormalizer --cov-append
       - name: run examples
+        env:
+          # One process at a time: with a single BLAS it can use the cores.
+          RENO_NUM_THREADS: 4
+          OPENBLAS_NUM_THREADS: 4
         run: |
-            cd example; bash run.sh
-            cd ..
+          pixi run -e ci bash -c "cd example && bash run.sh"
       - name: install pandoc
         run:
-            sudo apt-get install pandoc
+            sudo apt-get update && sudo apt-get install -y pandoc
       - name: test build doc
         run: |
-          cd doc
-          make html
+          pixi run -e ci bash -c "cd doc && make html"
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         env:

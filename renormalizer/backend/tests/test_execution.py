@@ -2,7 +2,8 @@ import numpy as np
 import opt_einsum as oe
 import pytest
 from renormalizer.backend.context import make_context
-from renormalizer.backend.execution import bind_backend, record_execution, contract
+from renormalizer.backend.execution import bind_backend, contract
+from renormalizer.backend.testing import record_execution
 
 
 def test_bound_contraction_is_witnessed_and_context_restored():
@@ -120,3 +121,41 @@ def test_host_contract_interleaved_labels_match_opt_einsum():
     # Implicit output.
     assert np.array_equal(contract(a, [0, 1, 2], b, [1, 3], optimize='optimal'),
                           oe.contract(a, [0, 1, 2], b, [1, 3], optimize='optimal'))
+
+
+def test_contract_falls_back_for_mixed_labels_and_converts_array_subclasses():
+    from renormalizer.backend import execution
+    rng = np.random.default_rng(15)
+    a, b = rng.standard_normal((3, 4)), rng.standard_normal((4, 2))
+    # Labels opt_einsum cannot sort: both paths raise the same error type.
+    with pytest.raises(TypeError):
+        oe.contract(a, [('x', 0), 'p'], b, ['p', 'q'], optimize='optimal')
+    with pytest.raises(TypeError):
+        contract(a, [('x', 0), 'p'], b, ['p', 'q'], optimize='optimal')
+
+    class Sub(np.ndarray):
+        pass
+    # to_backend turns subclasses into plain ndarrays, so they take the cached path.
+    execution._cached_expression.cache_clear()
+    result = contract('ij,jk->ik', a.view(Sub), b.view(Sub), optimize='optimal')
+    assert type(result) is np.ndarray
+    assert np.array_equal(result, oe.contract('ij,jk->ik', a, b, optimize='optimal'))
+    assert execution._cached_expression.cache_info().currsize == 1
+
+
+def test_plain_runs_carry_no_run_state_and_recording_survives_binding():
+    from renormalizer.backend import execution
+    from renormalizer.backend.testing import record_execution
+    seen = []
+    @bind_backend
+    def probe():
+        seen.append(execution._run.get())
+        return contract('ij,jk->ik', np.eye(2), np.eye(2))
+    probe()
+    assert seen[-1] is None
+    ctx = make_context(host_policy='explicit')
+    with record_execution(ctx) as ledger:
+        probe(backend_context=ctx)
+    assert seen[-1].context is ctx and seen[-1].ledger is ledger
+    assert ledger.operations
+    assert execution._run.get() is None
