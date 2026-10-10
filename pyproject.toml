@@ -96,6 +96,8 @@ renormalizer = { path = ".", editable = true }
 python = "3.11.*"
 pytest-xdist = "*"
 pytest-cov = "*"
+# conda-forge Python ships without pip; CI installs the optional solvers with it.
+pip = "*"
 
 [tool.pixi.environments]
 default = { features = ["dev"], solve-group = "default" }

@@ -45,8 +45,8 @@ class Kernel:
 
     execute(request, *args, **kwargs) must honor the operation's v1 semantics.
     Both callables must be stateless with respect to operand contents/lifetimes.
-    supports decides from the request metadata and the non-array arguments only,
-    never from array contents: its answer is cached per call signature.
+    supports decides from request metadata and plain non-array arguments only,
+    never from array contents or other objects: its answer is cached per call signature.
     """
     supports: object
     execute: object
@@ -82,9 +82,13 @@ _STRICT_PROVIDERS = False
 
 
 def _signature(request, args, kwargs):
-    """Hashable key of everything supports may look at, or None if unhashable."""
-    key = (request, tuple(a for a in args if not (hasattr(a, 'shape') and hasattr(a, 'dtype'))),
-           tuple(sorted(kwargs.items())))
+    """Cache request metadata and plain values without retaining other objects."""
+    def is_plain(value):
+        return (type(value) in (str, int, float, complex, bool, type(None)) or
+                (type(value) is tuple and all(is_plain(item) for item in value)))
+
+    key = (request, tuple(a for a in args if is_plain(a)),
+           tuple(sorted((k, v) for k, v in kwargs.items() if is_plain(v))))
     try:
         hash(key)
     except TypeError:

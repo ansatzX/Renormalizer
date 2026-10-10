@@ -15,6 +15,15 @@ def pytest_addoption(parser):
     group.addoption('--reno-device', default=None)
 
 
+def pytest_configure(config):
+    # Share CLI choices with helpers that read the environment during collection.
+    for option, variable in (('--reno-backend', 'RENO_TEST_BACKEND'),
+                             ('--reno-device', 'RENO_TEST_DEVICE')):
+        value = config.getoption(option)
+        if value is not None:
+            os.environ[variable] = value
+
+
 @pytest.fixture
 def numerical_context(request):
     from renormalizer.backend.context import make_context

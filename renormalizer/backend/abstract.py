@@ -166,6 +166,25 @@ class AbstractBackend(SingleProcessDistributedMixin):
         w -= alpha_j*V[j] + (beta_prev*V[j-1] if j > 0 else 0)
         return w, self.linalg.norm(w)
 
+    def krylov_combine(self, V, coefficients):
+        """Krylov result V @ coefficients, from double-precision host coefficients.
+
+        Cast the coefficients to the basis precision at the explicit upload
+        boundary, promoting a real basis when complex time requires it. CuPy
+        overrides this with its original promotion.
+        """
+        basis_dtype = V.dtype if isinstance(V.dtype, _np.dtype) else _np.dtype(str(V.dtype).removeprefix("torch."))
+        result_dtype = _np.result_type(basis_dtype, _np.complex64) if _np.iscomplexobj(coefficients) else basis_dtype
+        if basis_dtype.kind != 'c' and _np.iscomplexobj(coefficients):
+            # A complex time step needs a complex result, not a complex copy of
+            # the entire real basis on each convergence check. Two same-dtype
+            # real matvecs trade an extra GEMV for avoiding that basis allocation;
+            # only the resulting vectors are combined into complex storage.
+            real = self.dot(V, self.asarray(coefficients.real, dtype=basis_dtype))
+            imag = self.dot(V, self.asarray(coefficients.imag, dtype=basis_dtype))
+            return self.asarray(real + 1j * imag, dtype=result_dtype)
+        return self.dot(V, self.asarray(coefficients, dtype=result_dtype))
+
     def lanczos_append(self, V, j, w, beta_j):
         """Store the next Krylov vector V[j] = w / beta_j; retain the returned workspace."""
         return self.write_owned(V, j, w / beta_j)

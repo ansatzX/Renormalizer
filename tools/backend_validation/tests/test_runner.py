@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 import numpy as np
 import pytest
@@ -23,6 +24,7 @@ def setup_run(tmp_path, source):
     return manifest,candidate,ExecutionPolicy(review=review)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS worker limits are only supported on Linux")
 @pytest.mark.parametrize('source,status,reason',[
     ('def candidate(a,b): return a @ b\n','pass','accepted'),
     ('import numpy as np\ndef candidate(a,b): return np.zeros((a.shape[0],b.shape[1]))\n','fail','numerical_error'),
@@ -41,6 +43,7 @@ def test_runner_adversarial_controls(tmp_path, source, status, reason):
     json.dumps(result,allow_nan=False)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS worker limits are only supported on Linux")
 def test_timeout_and_input_mutation(tmp_path):
     manifest,candidate,policy=setup_run(tmp_path,'import time\ndef candidate(a,b): time.sleep(30)\n')
     manifest['resource_policy']['timeout_seconds']=.25
@@ -53,6 +56,7 @@ def test_timeout_and_input_mutation(tmp_path):
     assert result['reason']=='worker_failed' and 'input_mutation' in result['stderr']
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS worker limits are only supported on Linux")
 def test_projection_omits_reference_and_extra_output_is_rejected(tmp_path):
     source='''import json
 from pathlib import Path
@@ -76,6 +80,7 @@ def test_untrusted_source_never_runs(tmp_path):
     assert not sentinel.exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS worker limits are only supported on Linux")
 def test_oversized_output_is_rejected(tmp_path):
     # Symlinked outputs are rejected by protocol.read_file; see
     # test_protocol.py::test_symlink_header_and_budget_rejection.
@@ -87,6 +92,7 @@ def test_oversized_output_is_rejected(tmp_path):
     assert result['status']=='fail'
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS worker limits are only supported on Linux")
 def test_layout_reconstruction_witness(tmp_path):
     manifest,candidate,policy=setup_run(tmp_path,'def candidate(a,b):\n assert not a.flags.c_contiguous\n return a @ b\n')
     input_dir=Path(manifest['input_directory']); ref_dir=Path(manifest['reference_directory'])
@@ -102,6 +108,7 @@ def test_layout_reconstruction_witness(tmp_path):
     assert result['witness']['input_strides'][0]==[80,16]
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS worker limits are only supported on Linux")
 def test_parent_environment_not_inherited(tmp_path,monkeypatch):
     monkeypatch.setenv('RENOVALIDATOR_TEST_SECRET','private-test-value')
     manifest,candidate,policy=setup_run(tmp_path,'''import os
@@ -113,6 +120,7 @@ def candidate(a,b):
 
 
 @pytest.mark.skipif(not Path('/proc/self/stat').exists(), reason='process state is read from Linux /proc')
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS worker limits are only supported on Linux")
 def test_owned_child_is_terminated_after_leader_exits(tmp_path):
     pidfile=tmp_path/'owned-child-pid'
     source=f'''import subprocess,sys

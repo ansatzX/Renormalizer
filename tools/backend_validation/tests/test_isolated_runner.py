@@ -2,12 +2,16 @@
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 import numpy as np
 import pytest
 from tools.backend_validation.policy import ExecutionPolicy
 from tools.backend_validation.protocol import freeze_manifest
 from tools.backend_validation.runner import run_candidate
+
+
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS worker limits are only supported on Linux")
 
 
 @pytest.fixture

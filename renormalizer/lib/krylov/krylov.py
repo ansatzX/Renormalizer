@@ -23,21 +23,9 @@ def _expm_krylov(alpha, beta, V, v_norm, dt):
         w_hess, u_hess = np.linalg.eigh(h)
 
     # The small projected eigensolve deliberately runs on the host in double
-    # precision. Cast its coefficients to the basis precision at the explicit
-    # upload boundary, promoting a real basis when complex time requires it.
+    # precision; the adapter combines its coefficients with the basis.
     coefficients = u_hess @ (v_norm * np.exp(dt*w_hess) * u_hess[0])
-    basis_dtype = V.dtype if isinstance(V.dtype, np.dtype) else np.dtype(str(V.dtype).removeprefix("torch."))
-    result_dtype = np.result_type(basis_dtype, np.complex64) if np.iscomplexobj(coefficients) else basis_dtype
-    if basis_dtype.kind != 'c' and np.iscomplexobj(coefficients):
-        # A complex time step needs a complex result, not a complex copy of
-        # the entire real basis on each convergence check. Two same-dtype
-        # real matvecs trade an extra GEMV for avoiding that basis allocation;
-        # only the resulting vectors are combined into complex storage.
-        real = xp.dot(V, xp.asarray(coefficients.real, dtype=basis_dtype))
-        imag = xp.dot(V, xp.asarray(coefficients.imag, dtype=basis_dtype))
-        return xp.asarray(real + 1j * imag, dtype=result_dtype)
-    native_coefficients = xp.asarray(coefficients, dtype=result_dtype)
-    return xp.dot(V, native_coefficients)
+    return xp.krylov_combine(V, coefficients)
 
 
 def expm_krylov(Afunc, dt, vstart: xp.ndarray, block_size=50):

@@ -66,10 +66,20 @@ class CupyBackend(AbstractBackend):
         attribute = getattr(_cupy, name)
         if not callable(attribute) or isinstance(attribute, type):
             return attribute
+        # CuPy launches work on the thread's current device. Each call enters this
+        # adapter's device so that several adapters on different GPUs stay correct;
+        # with a single GPU (the legacy RENO_GPU use) this is the same device anyway.
         def invoke(*args, **kwargs):
             with self._device:
                 return attribute(*args, **kwargs)
         return invoke
+
+    def krylov_combine(self, V, coefficients):
+        # Kept as in the original CuPy code (NumPy-style promotion). Measured on
+        # GPU: identical in float64; in float32 the promoted combination is closer
+        # to the float64 result than casting the coefficients to the basis dtype.
+        with self._device:
+            return V @ _cupy.asarray(coefficients)
 
     def current_device(self):
         return f'cuda:{self._device.id}'

@@ -969,14 +969,15 @@ class MatrixProduct:
 
         e0 = xp.eye(self[0].shape[0])
         tmp = xp.eye(other[0].shape[0])
-        e0 = tensordot(e0, tmp, 0).transpose(0,2,1,3)
+        # xp.transpose with an axes tuple: Torch tensors have no multi-axis .transpose.
+        e0 = xp.transpose(tensordot(e0, tmp, 0), (0, 2, 1, 3))
 
         for mt1, mt2 in zip(self, other):
             e0 = tensordot(e0, mt2.array, 1)
             if mt1.ndim == 3:
-                e0 = tensordot(e0, mt1.array, ([2, 3], [0, 1])).transpose(0,1,3,2)
+                e0 = xp.transpose(tensordot(e0, mt1.array, ([2, 3], [0, 1])), (0, 1, 3, 2))
             elif mt1.ndim == 4:
-                e0 = tensordot(e0, mt1.array, ([2, 3, 4], [0, 1, 2])).transpose(0,1,3,2)
+                e0 = xp.transpose(tensordot(e0, mt1.array, ([2, 3, 4], [0, 1, 2])), (0, 1, 3, 2))
             else:
                 assert False
 

@@ -183,7 +183,8 @@ class Op:
             factor = factor.as_au()
         # convert numpy scalar to native Python type
         # NumPy 2: factor + 0.0 keeps NumPy scalar types; store a plain float or complex.
-        if hasattr(factor, 'imag') and factor.imag != 0:
+        # Decide by type, not by value: 1+0j (e.g. 1j * -1j) stays complex, as in master.
+        if np.iscomplexobj(factor):
             self._factor: complex = complex(factor)
         else:
             self._factor: float = float(factor)
