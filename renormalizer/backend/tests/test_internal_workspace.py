@@ -63,3 +63,39 @@ def test_torch_identity_default_tracks_adapter_precision(context):
     assert adapter.owns(out)
     assert adapter.dtype_of(out) == np.dtype('float32')
     assert tuple(out.shape) == (0, 0)
+
+
+def test_environment_storage_follows_backend_for_mps_and_ttns(context):
+    # Environments kept across sweep steps are native arrays when the backend
+    # keeps workspaces native (no upload per read), host arrays otherwise; the
+    # same policy applies to MPS and TTNS.
+    from renormalizer.backend.context import capture_backend
+    from renormalizer.backend.tests.spin_reference import spin_fixture, host_seed
+    from renormalizer.mps import Mps, Mpo
+    from renormalizer.mps.lib import Environ
+    from renormalizer.tn import BasisTree, TTNO, TTNS
+    from renormalizer.tn.tree import TTNEnviron
+    adapter = context.adapter
+    model, _ = spin_fixture(4, 0.137)
+    with host_seed():
+        mps, mpo = Mps.random(model, 0, 4), Mpo(model)
+        tree = BasisTree.binary(model.basis)
+        ttns, ttno = TTNS.random(tree, qntot=0, m_max=4), TTNO(tree, model.ham_terms)
+
+    def check(value):
+        if adapter.native_workspace_storage:
+            assert adapter.owns(value)
+        else:
+            assert isinstance(value, np.ndarray)
+
+    with capture_backend(adapter):
+        environ = Environ(mps, mpo, "R")
+        ttne = TTNEnviron(ttns, ttno)
+    for (domain, idx), value in environ._virtual_disk.items():
+        if 0 <= idx < len(mps):
+            check(value)
+    for enode in ttne.node_list:
+        for value in enode.environ_children:
+            check(value)
+        if enode.parent is not None:
+            check(enode.environ_parent)

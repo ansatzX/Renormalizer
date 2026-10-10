@@ -159,9 +159,13 @@ def _promote_operands(values, adapter, dtype=None):
 def contract(*args, **kwargs):
     selected = current_backend()
     # Interleaved labels and shapes are metadata, never converted to tensors.
+    # to_backend resolves the backend again for each operand; that repetition is
+    # negligible at any size. For small tensors (bond dimension up to about 8) a
+    # contraction is cheap enough that the dispatch in this function as a whole,
+    # and opt_einsum's per-step overhead, become a visible share of each call.
     args = tuple(to_backend(a) if hasattr(a,'shape') and hasattr(a,'dtype') else a for a in args)
     args = _promote_operands(args, selected)
-    kwargs['backend'] = selected.opt_einsum_name
+    kwargs['backend'] = selected.opt_einsum_module
     context = _context.get()
     if (selected.name == 'jax' and hasattr(selected, 'fused_einsum')
             and args and isinstance(args[0], str) and all(hasattr(a, 'shape') for a in args[1:])
@@ -172,12 +176,78 @@ def contract(*args, **kwargs):
         path = _cached_path(args[0], shapes, (('optimize', kwargs.get('optimize', 'auto')),))
         result = selected.fused_einsum(args[0], path)(*args[1:])
     elif context is None or context.operators.policy == 'builtin':
-        result = oe.contract(*args, **kwargs)
+        cached = _host_expression(selected, args, kwargs)
+        if cached is None:
+            result = oe.contract(*args, **kwargs)
+        else:
+            expression, operands = cached
+            result = expression(*operands, backend=kwargs['backend'])
     else:
         from .operators import dispatch
         result = dispatch(context, 'contract', oe.contract, args, kwargs)
     _witness(result)
     return result
+
+
+def _host_expression(selected, args, kwargs):
+    # oe.contract searches the contraction path on every call (``optimal`` for
+    # Renormalizer's small expressions); sweeps call it with the same subscripts
+    # and shapes tens of thousands of times. The search depends only on those and
+    # the options, so evaluate a cached expression holding the same contraction
+    # list instead: the same pairwise operations run. Returns None when the call
+    # is not of that plain form. One visible difference: a ValueError raised
+    # inside the contraction reaches the caller reworded by ContractExpression
+    # ("Internal error while evaluating ..."), with the same exception type.
+    if not (selected.name == 'numpy' and args and set(kwargs) == {'backend', 'optimize'}
+            and isinstance(kwargs['optimize'], str)):
+        return None
+    if isinstance(args[0], str):
+        subscripts, operands = args[0], args[1:]
+    else:
+        # Interleaved (operand, labels, ..., [output labels]), as tree networks
+        # use: converted with opt_einsum's own mapping on every call (see
+        # _interleaved_subscripts for why the conversion is not cached).
+        try:
+            subscripts, operands = oe.parser.convert_interleaved_input(args)
+        except TypeError:  # labels opt_einsum cannot map either
+            return None
+    if not all(type(a) is np.ndarray for a in operands):
+        return None
+    return _cached_expression(subscripts, tuple(a.shape for a in operands), kwargs['optimize']), operands
+
+
+@lru_cache(maxsize=4096)
+def _interleaved_subscripts(labels, output):
+    """Cached interleaved-label conversion. Kept as a record; not called.
+
+    Tried as a cache in front of opt_einsum's conversion (labels mapped in
+    sorted order), keyed on the raw labels. Conclusions from trying it on the
+    tree-network examples:
+
+    * A hit is not free: building and hashing the key from large labels costs
+      about half a conversion. The cache pays off only when well over half of
+      the calls hit; below that it is slower than converting every call.
+    * Tree networks put object ids in their labels (``str(id(ttns))``) and
+      create new objects every time step, so the same contraction rarely
+      repeats its labels. Hits stay low and the cache is a net loss.
+    * With the ids taken out, most examples hit almost always, but some still
+      have more distinct label structures than the cache holds. Stripping ids
+      at call time costs more than it saves; it would have to happen where the
+      labels are made (``tn/tree.py``).
+    * Even at best the gain is small, because the conversion itself is a small
+      part of the run. The cached expression keyed on the converted subscripts
+      already removes the expensive part, the path search.
+    """
+    interleaved = [x for sub in labels for x in (None, list(sub))]
+    if output is not None:
+        interleaved.append(list(output))
+    return oe.parser.convert_interleaved_input(interleaved)[0]
+
+
+@lru_cache(maxsize=4096)
+def _cached_expression(subscripts, shapes, optimize):
+    path = _cached_path(subscripts, shapes, (('optimize', optimize),))
+    return oe.contract_expression(subscripts, *shapes, optimize=path)
 
 
 @lru_cache(maxsize=4096)
@@ -236,7 +306,7 @@ def contract_expression(*args, **kwargs):
         nonlocal specialization
         if current_backend() is not selected:
             raise CapabilityError('contraction expression belongs to another backend instance')
-        options['backend'] = selected.opt_einsum_name
+        options['backend'] = selected.opt_einsum_module
         native = tuple(to_backend(a) for a in operands)
         active_expr = expr
         if selected.name == 'torch':

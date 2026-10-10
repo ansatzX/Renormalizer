@@ -8,7 +8,7 @@ from renormalizer import Op, Mps, Model, OpSum
 from renormalizer.model.basis import BasisSet, BasisDummy
 from renormalizer.mps.backend import np
 from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
-from renormalizer.mps.matrix import asnumpy, asxp_oe_args, tensordot
+from renormalizer.mps.matrix import asnumpy, asworkspace, asxp_oe_args, tensordot
 from renormalizer.mps.svd_qn import add_outer, svd_qn, blockrecover, get_qn_mask
 from renormalizer.mps.lib import select_basis
 from renormalizer.mps.mps import normalize
@@ -1725,11 +1725,11 @@ class TTNEnviron(Tree):
         res = oe_contract(*asxp_oe_args(args))
         if len(enode.parent.environ_children) != len(enode.parent.children):
             # first run
-            enode.parent.environ_children.append(asnumpy(res))
+            enode.parent.environ_children.append(asworkspace(res))
         else:
             # updating
             ichild = snode.parent.children.index(snode)
-            enode.parent.environ_children[ichild] = asnumpy(res)
+            enode.parent.environ_children[ichild] = asworkspace(res)
 
     def build_parent_environ_node(self, snode: TreeNodeTensor, ichild: int, ttns: TTNS, ttno: TTNO, bra: TTNS = None):
         if bra is None:
@@ -1764,7 +1764,7 @@ class TTNEnviron(Tree):
 
         args.append(indices)
         res = oe_contract(*asxp_oe_args(args))
-        enode.children[ichild].environ_parent = asnumpy(res)
+        enode.children[ichild].environ_parent = asworkspace(res)
 
     def get_child_indices(self, enode, i, ttns, ttno, bra=None):
         if bra is None:

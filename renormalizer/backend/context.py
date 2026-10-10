@@ -8,14 +8,16 @@ import numpy as np
 from renormalizer.backend.factory import create_backend, normalize_backend_name
 from renormalizer.backend.contracts import StrictOperations, DeviceOperations
 from renormalizer.backend.proxy import BackendProxy
-from renormalizer.cons import runtime_backend
+# The legacy selection itself, read directly: two call frames per lookup are
+# measurable at the millions of ``xp.<op>`` lookups a sweep makes.
+from renormalizer.cons import _manager as _legacy
 
 _active = ContextVar('renormalizer_algorithm_backend', default=None)
 
 
 def current_backend():
     selected = _active.get()
-    return runtime_backend() if selected is None else selected
+    return _legacy.current if selected is None else selected
 
 
 @contextmanager
@@ -44,7 +46,7 @@ class InternalBackendProxy:
     def __getattr__(self, name):
         # Inlined current_backend(): every ``xp.<op>`` in the solvers lands here.
         selected = _active.get()
-        return getattr(runtime_backend() if selected is None else selected, name)
+        return getattr(_legacy.current if selected is None else selected, name)
 
     def __setattr__(self, name, value):
         setattr(self.current, name, value)

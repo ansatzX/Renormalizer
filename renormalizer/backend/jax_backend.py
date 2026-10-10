@@ -86,9 +86,12 @@ class JaxBackend(AbstractBackend):
     supports_autodiff = True
     supports_jit = True
     supports_functional_update = True
-    # Every host upload is a copy (see array()); environments re-read each step
-    # are cheaper kept native.
-    native_workspace_storage = True
+    @property
+    def native_workspace_storage(self):
+        # Every host upload is a copy (see array()), so environments re-read each
+        # step are cheaper kept native on CPU. Device memory is scarce: on GPU
+        # they stay on the host and are uploaded per site as they are used.
+        return self._device.platform == 'cpu'
 
     def __init__(self, device=None, *, real_dtype=None):
         # Reno's scientific default is double precision. Configure JAX before

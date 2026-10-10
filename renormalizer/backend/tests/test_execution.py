@@ -63,3 +63,60 @@ def test_expression_constants_captured_and_cross_instance_refused(monkeypatch):
     with capture_backend(make_context().adapter):
         with pytest.raises(Exception,match='another backend'):
             expr(np.eye(2))
+
+
+@pytest.mark.parametrize('optimize', ['optimal', 'dp', 'auto-hq'])
+@pytest.mark.parametrize('subscripts,shapes', [
+    ('ij,jk,kl->il', [(6, 5), (5, 7), (7, 4)]),
+    ('abc,bd,dce,ef->af', [(3, 4, 5), (4, 6), (6, 5, 2), (2, 3)]),
+    ('ij->ji', [(3, 4)]),
+])
+def test_host_contract_matches_opt_einsum_and_searches_the_path_once(subscripts, shapes, optimize):
+    from renormalizer.backend import execution
+    rng = np.random.default_rng(11)
+    operands = [rng.standard_normal(s) + 1j * rng.standard_normal(s) for s in shapes]
+    expected = oe.contract(subscripts, *operands, optimize=optimize)
+    execution._cached_expression.cache_clear()
+    execution._cached_path.cache_clear()
+    for _ in range(3):
+        assert np.array_equal(contract(subscripts, *operands, optimize=optimize), expected)
+    # One path search and one expression for three calls.
+    assert execution._cached_path.cache_info().misses == 1
+    assert execution._cached_expression.cache_info().misses == 1
+    assert execution._cached_expression.cache_info().hits == 2
+
+
+@pytest.mark.parametrize('extra', [{'memory_limit': 10 ** 6}, {'optimize': True}])
+def test_contract_with_other_options_falls_back_to_opt_einsum(extra):
+    from renormalizer.backend import execution
+    rng = np.random.default_rng(13)
+    a, b = rng.standard_normal((4, 5)), rng.standard_normal((5, 3))
+    kwargs = dict({'optimize': 'optimal'}, **extra)
+    execution._cached_expression.cache_clear()
+    assert np.array_equal(contract('ij,jk->ik', a, b, **kwargs), oe.contract('ij,jk->ik', a, b, **kwargs))
+    assert execution._cached_expression.cache_info().currsize == 0
+
+
+def test_expression_with_constants_matches_numpy_backend():
+    from renormalizer.backend import execution
+    rng = np.random.default_rng(14)
+    a, c = rng.standard_normal((4, 5)), rng.standard_normal((3, 6))
+    b = rng.standard_normal((5, 3))
+    expected = oe.contract_expression('ij,jk,kl->il', a, b.shape, c, constants=[0, 2],
+                                      optimize='optimal')(b, backend='numpy')
+    expr = execution.contract_expression('ij,jk,kl->il', a, b.shape, c, constants=[0, 2], optimize='optimal')
+    assert np.array_equal(expr(b), expected)
+
+
+def test_host_contract_interleaved_labels_match_opt_einsum():
+    # Tree networks pass (operand, labels, ..., output labels) with tuple labels.
+    rng = np.random.default_rng(12)
+    a, b, c = (rng.standard_normal(s) for s in [(3, 4, 5), (4, 6), (5, 6, 2)])
+    x, p, y, q, r = ('x', 0), ('p', 0), ('y', 1), ('q', 0), ('r', 2)
+    args = [a, [x, p, y], b, [p, q], c, [y, q, r], [x, r]]
+    expected = oe.contract(*args, optimize='optimal')
+    for _ in range(2):
+        assert np.array_equal(contract(*args, optimize='optimal'), expected)
+    # Implicit output.
+    assert np.array_equal(contract(a, [0, 1, 2], b, [1, 3], optimize='optimal'),
+                          oe.contract(a, [0, 1, 2], b, [1, 3], optimize='optimal'))

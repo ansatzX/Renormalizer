@@ -217,3 +217,14 @@ def test_write_owned_rows_match_functional_update_and_sync_skips_donated():
     adapter.sync()
     expected[3]=0
     np.testing.assert_array_equal(np.asarray(workspace), expected)
+
+
+def test_environments_stay_native_only_on_cpu():
+    # Device memory is scarce: on GPU, workspaces kept across steps stay on the
+    # host and are uploaded per site.
+    from types import SimpleNamespace
+    from renormalizer.backend.jax_backend import JaxBackend
+    adapter = JaxBackend('cpu')
+    assert adapter.native_workspace_storage is True
+    adapter._device = SimpleNamespace(platform='gpu')
+    assert adapter.native_workspace_storage is False

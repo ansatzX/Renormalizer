@@ -1321,7 +1321,9 @@ class Mps(MatrixProduct):
 
         # construct the environment matrix
         # almost half is not used. Not a big deal.
-        environ = Environ(mps, mpo)
+        # Starting from a chain end, the side behind the sweep is rebuilt before
+        # it is read, so only the side ahead is constructed.
+        environ = Environ(mps, mpo, _sweep_environ_domain(mps))
 
         # statistics for debug output
         local_steps = []
@@ -1460,7 +1462,9 @@ class Mps(MatrixProduct):
 
         # construct the environment matrix
         # almost half is not used. Not a big deal.
-        environ = Environ(mps, mpo)
+        # Starting from a chain end, the side behind the sweep is rebuilt before
+        # it is read, so only the side ahead is constructed.
+        environ = Environ(mps, mpo, _sweep_environ_domain(mps))
 
         # statistics for debug output
         local_steps = []
@@ -2127,6 +2131,22 @@ class BraKetPair:
 
     def __iter__(self):
         return iter((self.bra_mps, self.ket_mps))
+
+
+def _sweep_environ_domain(mps):
+    """Environment side a projector-splitting sweep from ``mps.qnidx`` reads.
+
+    Starting at a chain end, the first sweep reads only the environments ahead
+    of it and rewrites the ones behind before they are read; the second sweep
+    reads those rewritten ones. So only one side needs building (``None``:
+    both, when starting mid-chain). A wrong choice fails loudly: reading an
+    environment that was never written raises KeyError.
+    """
+    if mps.to_right and mps.qnidx == 0:
+        return "R"
+    if not mps.to_right and mps.qnidx == len(mps) - 1:
+        return "L"
+    return None
 
 
 def min_abs(t1, t2):

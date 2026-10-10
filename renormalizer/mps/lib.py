@@ -7,7 +7,7 @@ from collections import deque
 from renormalizer.mps.backend import np
 from renormalizer.backend.context import internal_backend as backend, internal_backend as xp
 from renormalizer.mps.matrix import (Matrix, multi_tensor_contract, asxp,
-    asnumpy, tensordot)
+    asnumpy, asworkspace, tensordot)
 from renormalizer.mps.block_env import (
     BlockEnvData,
     BlockEnvCache,
@@ -38,10 +38,8 @@ class Environ:
         self.block_env_threshold = block_env_threshold
         self.block_env_min_bond_dim = block_env_min_bond_dim
         self._block_env_cache = BlockEnvCache(mpo, block_env_threshold) if self.use_block_env else None
-        # Dense environments are stored on the host unless the backend asks for
-        # native storage, which spares an upload on every read. The block-sparse
-        # path works on host arrays and keeps host storage.
-        self._native_storage = xp.native_workspace_storage and not self.use_block_env
+        # Dense environments follow the backend's workspace storage (asworkspace).
+        # The block-sparse path works on host arrays and keeps host storage.
         if type(mpo) is list:
             ndim = len(mpo) + 2
         else:
@@ -181,7 +179,7 @@ class Environ:
         if isinstance(tensor, BlockEnvData):
             self._virtual_disk[(domain, siteidx)] = tensor
             return
-        self._virtual_disk[(domain, siteidx)] = asxp(tensor) if self._native_storage else asnumpy(tensor)
+        self._virtual_disk[(domain, siteidx)] = asnumpy(tensor) if self.use_block_env else asworkspace(tensor)
 
     def read(self, domain: str, siteidx: int):
         tensor = self._virtual_disk[(domain, siteidx)]

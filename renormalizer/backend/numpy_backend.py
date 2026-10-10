@@ -6,6 +6,7 @@ import os
 import numpy as np
 
 from renormalizer.backend.abstract import AbstractBackend
+from renormalizer.backend import numpy_contraction
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,11 @@ class NumpyBackend(AbstractBackend):
     memory_errors = (MemoryError,)
     opt_einsum_name = "numpy"
 
+    @property
+    def opt_einsum_module(self):
+        # Same functions as NumPy, with tensordot's bookkeeping cached by shape.
+        return numpy_contraction.__name__
+
     def __init__(self):
         super().__init__()
         if os.environ.get("RENO_FP32") is not None:
@@ -27,6 +33,9 @@ class NumpyBackend(AbstractBackend):
 
     def __getattr__(self, name):
         return getattr(np, name)
+
+    # Bitwise-identical to numpy.tensordot, with its bookkeeping cached by shape.
+    tensordot = staticmethod(numpy_contraction.tensordot)
 
     def array(self, data, dtype=None, *, copy=True, **kwargs):
         """Construct an array; copy=False is a strict no-allocation promise.

@@ -24,6 +24,11 @@ class AbstractBackend(SingleProcessDistributedMixin):
     # should stay as native arrays rather than host storage. Host storage costs
     # nothing for NumPy; adapters that copy on every upload opt in.
     native_workspace_storage = False
+    # Unset tolerances follow the precision. Class-level defaults keep the
+    # property off the failed-lookup path: adapters forward unknown attributes
+    # to their array library, so a missing one costs an exception per read.
+    _canonical_atol = None
+    _canonical_rtol = None
 
     def __init__(self):
         self.first_mp = False
@@ -72,7 +77,9 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @property
     def canonical_atol(self):
-        return getattr(self, "_canonical_atol", 1e-4 if self.is_32bits else 1e-8)
+        if self._canonical_atol is None:
+            return 1e-4 if self.is_32bits else 1e-8
+        return self._canonical_atol
 
     @canonical_atol.setter
     def canonical_atol(self, value):
@@ -82,13 +89,24 @@ class AbstractBackend(SingleProcessDistributedMixin):
 
     @property
     def canonical_rtol(self):
-        return getattr(self, "_canonical_rtol", 1e-2 if self.is_32bits else 1e-5)
+        if self._canonical_rtol is None:
+            return 1e-2 if self.is_32bits else 1e-5
+        return self._canonical_rtol
 
     @canonical_rtol.setter
     def canonical_rtol(self, value):
         if not isinstance(value, (int, float)) or value < 0:
             raise ValueError(f'canonical_rtol must be a non-negative number, got {value!r}')
         self._canonical_rtol = value
+
+    @property
+    def opt_einsum_module(self):
+        """The opt_einsum backend Renormalizer's own contractions run on.
+
+        ``opt_einsum_name`` by default. An adapter may name a module providing
+        the same ``tensordot``, ``transpose`` and ``einsum`` tuned for it.
+        """
+        return self.opt_einsum_name
 
     def numpy(self, x: Any):
         raise NotImplementedError

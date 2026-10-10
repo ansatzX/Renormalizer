@@ -32,7 +32,7 @@ dist/
 .coverage*
 .worktrees/
 
-# pixi environments (pixi.lock is meant to be committed)
+# pixi uv environments
 .pixi/
 uv.lock
 pixi.lock
